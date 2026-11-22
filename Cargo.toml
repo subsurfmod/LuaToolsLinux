@@ -1,0 +1,53 @@
+[package]
+name = "luatools-linux"
+version = "2.0.0-beta"
+edition = "2021"
+description = "Native lightweight Rust workstation for Steam stplug-in lua manifests, LuaVault variants, depot downloads, and game fixes"
+license = "MIT"
+authors = ["LuaTools Linux Contributors"]
+
+[[bin]]
+name = "luatools"
+path = "src/main.rs"
+
+[lib]
+name = "luatools_linux"
+path = "src/lib.rs"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
+egui = "0.31"
+egui_extras = { version = "0.31", default-features = false, features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yml = "0.0.12"
+
+ureq = { version = "2.12", default-features = false, features = ["tls", "json"] }
+tiny_http = "0.12"
+tungstenite = { version = "0.26", default-features = false }
+url = "2.5"
+urlencoding = "2.1"
+
+sha2 = "0.10"
+sha1 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+regex = "1.11"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+dirs = "6.0"
+
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+flate2 = "1.0"
+tar = "0.4"
+
+[dev-dependencies]
+tempfile = "3.14"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
