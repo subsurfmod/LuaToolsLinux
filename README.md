@@ -6,16 +6,23 @@ A complete **100% Pure-Rust** ground-up rewrite of LuaTools Linux — engineered
 
 ## One-Command Installation (Includes All Dependencies)
 
-Run the bundled universal installer — it automatically verifies/installs required Linux graphics & XDG runtime packages (`dnf` / `apt` / `pacman` / `zypper`), uses a prebuilt binary or bootstraps `rustup` to compile an LTO-stripped native executable, installs the app icon & desktop launcher, and registers the `luatools://` URI scheme:
+Run the universal `curl` one-liner — it automatically verifies/installs required Linux graphics & XDG runtime packages (`dnf` / `apt` / `pacman` / `zypper`), clones the repository into `~/.local/share/luatools/repo`, bootstraps `rustup` if needed to compile an LTO-stripped native executable, installs the app icon & desktop launcher, and registers the `luatools://` URI scheme:
 
 ```bash
-cd /home/slave/Documents/luatools-linux-v2
+curl -fsSL https://raw.githubusercontent.com/subsurfmod/LuaToolsLinux/main/install.sh | bash -s -- --yes
+```
+
+Or install from a local `git clone`:
+
+```bash
+git clone https://github.com/subsurfmod/LuaToolsLinux.git
+cd LuaToolsLinux
 ./install.sh --yes
 ```
 
-- **System-wide install (`/usr/local/bin/luatools`)**: `./install.sh --yes --system`
-- **Include optional Wine + .NET runtimes** (for Windows tools like Steamless / SteamAutoCrack): `./install.sh --yes --with-wine`
-- **Uninstall cleanly**: `./uninstall.sh` (or `./uninstall.sh --purge` to also remove cached data)
+- **System-wide install (`/usr/local/bin/luatools`)**: `curl -fsSL https://raw.githubusercontent.com/subsurfmod/LuaToolsLinux/main/install.sh | bash -s -- --yes --system`
+- **Include optional Wine + .NET runtimes** (for Windows tools like Steamless / SteamAutoCrack): `curl -fsSL https://raw.githubusercontent.com/subsurfmod/LuaToolsLinux/main/install.sh | bash -s -- --yes --with-wine`
+- **Uninstall cleanly**: `curl -fsSL https://raw.githubusercontent.com/subsurfmod/LuaToolsLinux/main/uninstall.sh | bash` (or pass `--purge` to also remove cached data)
 
 ---
 

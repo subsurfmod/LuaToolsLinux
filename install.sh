@@ -8,7 +8,11 @@ set -euo pipefail
 
 APP_NAME="luatools"
 APP_VERSION="2.0-beta"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_URL="https://github.com/subsurfmod/LuaToolsLinux.git"
+SCRIPT_DIR=""
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
 
 AUTO_YES=0
 SYSTEM_WIDE=0
@@ -74,6 +78,9 @@ check_missing_runtime_libs() {
     if ! command -v xdg-open >/dev/null 2>&1; then
         missing=1
     fi
+    if ! command -v git >/dev/null 2>&1; then
+        missing=1
+    fi
     echo "$missing"
 }
 
@@ -92,26 +99,44 @@ install_system_dependencies() {
 
     info "Installing missing system dependencies via native package manager..."
     if command -v dnf >/dev/null 2>&1; then
-        local pkgs=(gcc mesa-libEGL mesa-libGL libwayland-client libxkbcommon libX11 libXcursor libXi libXrandr fontconfig xdg-utils zenity curl)
+        local pkgs=(gcc git mesa-libEGL mesa-libGL libwayland-client libxkbcommon libX11 libXcursor libXi libXrandr fontconfig xdg-utils zenity curl)
         [ "$WITH_WINE" -eq 1 ] && pkgs+=(wine dotnet-runtime-8.0)
         run_privileged dnf install -y "${pkgs[@]}"
     elif command -v apt-get >/dev/null 2>&1; then
-        local pkgs=(build-essential libegl1 libgl1 libwayland-client0 libxkbcommon0 libx11-6 libxcursor1 libxi6 libxrandr2 libfontconfig1 xdg-utils zenity curl ca-certificates)
+        local pkgs=(build-essential git libegl1 libgl1 libwayland-client0 libxkbcommon0 libx11-6 libxcursor1 libxi6 libxrandr2 libfontconfig1 xdg-utils zenity curl ca-certificates)
         [ "$WITH_WINE" -eq 1 ] && pkgs+=(wine)
         run_privileged apt-get update
         run_privileged apt-get install -y "${pkgs[@]}"
     elif command -v pacman >/dev/null 2>&1; then
-        local pkgs=(base-devel mesa wayland libxkbcommon libx11 libxcursor libxi libxrandr fontconfig xdg-utils zenity curl)
+        local pkgs=(base-devel git mesa wayland libxkbcommon libx11 libxcursor libxi libxrandr fontconfig xdg-utils zenity curl)
         [ "$WITH_WINE" -eq 1 ] && pkgs+=(wine dotnet-runtime)
         run_privileged pacman -Sy --needed --noconfirm "${pkgs[@]}"
     elif command -v zypper >/dev/null 2>&1; then
-        local pkgs=(gcc Mesa-libEGL1 Mesa-libGL1 libwayland-client0 libxkbcommon0 libX11-6 fontconfig xdg-utils zenity curl)
+        local pkgs=(gcc git Mesa-libEGL1 Mesa-libGL1 libwayland-client0 libxkbcommon0 libX11-6 fontconfig xdg-utils zenity curl)
         [ "$WITH_WINE" -eq 1 ] && pkgs+=(wine)
         run_privileged zypper --non-interactive install "${pkgs[@]}"
     else
-        warn "Unrecognized package manager. Ensure libEGL, libGL, libwayland-client/libX11, libxkbcommon, and gcc are installed."
+        warn "Unrecognized package manager. Ensure git, libEGL, libGL, libwayland-client/libX11, libxkbcommon, and gcc are installed."
     fi
     ok "System dependencies verified."
+}
+
+ensure_source_checkout() {
+    if [ -n "$SCRIPT_DIR" ] && { [ -f "${SCRIPT_DIR}/Cargo.toml" ] || [ -x "${SCRIPT_DIR}/dist/${APP_NAME}" ] || [ -x "${SCRIPT_DIR}/bin/${APP_NAME}" ]; }; then
+        return 0
+    fi
+
+    local clone_dir="${HOME}/.local/share/luatools/repo"
+    mkdir -p "$(dirname "$clone_dir")"
+    if [ -d "${clone_dir}/.git" ]; then
+        info "Updating existing repository checkout in ${clone_dir}..."
+        git -C "$clone_dir" pull --ff-only || git -C "$clone_dir" pull --rebase --autostash
+    else
+        rm -rf "$clone_dir"
+        info "Cloning ${REPO_URL} into ${clone_dir}..."
+        git clone --depth 1 "$REPO_URL" "$clone_dir"
+    fi
+    SCRIPT_DIR="$clone_dir"
 }
 
 # ------------------------------------------------------------------------------
@@ -223,6 +248,7 @@ EOF
 main() {
     info "Starting LuaTools Linux v${APP_VERSION} setup..."
     install_system_dependencies
+    ensure_source_checkout
     ensure_binary
     install_files
 
