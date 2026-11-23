@@ -1,6 +1,6 @@
 # LuaTools Linux v2.1.0 (Native Rust Edition)
 
-A complete **100% Pure-Rust** ground-up rewrite of LuaTools Linux — engineered for minimal memory footprint (`~25–40 MB` RAM), instant `< 40 ms` startup, zero Python/Qt runtime dependencies, and a tactile **Papercut Monotone-Dark + Deep Sapphire** hardware-accelerated native GUI (`eframe` / `egui`).
+A complete rewrite of LuaTools Linux.  (`eframe` / `egui`).
 
 ---
 
