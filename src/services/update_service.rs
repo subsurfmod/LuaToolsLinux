@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::models::config::default_luatools_data_dir;
 use crate::services::steam_service::expand_tilde;
-use crate::VERSION;
+use crate::{BUILD_GIT_SHA, VERSION};
 
 pub const DEFAULT_GIT_REMOTE_URL: &str = "https://github.com/subsurfmod/LuaToolsLinux.git";
 
@@ -224,7 +224,21 @@ impl UpdateService {
 
     /// Performs a single lightweight background check against the Git remote.
     pub fn check_once(override_repo_dir: &str, override_remote_url: &str) -> UpdateCheckResult {
-        let current_version = VERSION.to_string();
+        Self::check_once_with_build_info(
+            override_repo_dir,
+            override_remote_url,
+            VERSION,
+            BUILD_GIT_SHA,
+        )
+    }
+
+    pub fn check_once_with_build_info(
+        override_repo_dir: &str,
+        override_remote_url: &str,
+        running_version: &str,
+        build_git_sha: &str,
+    ) -> UpdateCheckResult {
+        let current_version = running_version.to_string();
         let meta = if override_repo_dir.trim().is_empty() {
             Self::load_meta()
         } else {
@@ -314,9 +328,36 @@ impl UpdateService {
                         let remote_version =
                             remote_cargo.as_deref().and_then(Self::parse_cargo_version);
 
-                        let available = behind > 0;
+                        let binary_behind = if !build_git_sha.is_empty()
+                            && Self::git_cmd(
+                                dir,
+                                &["cat-file", "-e", &format!("{}^{{commit}}", build_git_sha)],
+                            )
+                            .is_ok()
+                        {
+                            Self::git_cmd(
+                                dir,
+                                &[
+                                    "rev-list",
+                                    "--count",
+                                    &format!("{}..{}", build_git_sha, up_ref),
+                                ],
+                            )
+                            .ok()
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        let version_behind = remote_version
+                            .as_deref()
+                            .map(|rv| Self::is_newer_semver(rv, &current_version))
+                            .unwrap_or(false);
+                        let effective_behind =
+                            behind.max(binary_behind).max(usize::from(version_behind));
+                        let available = effective_behind > 0;
 
-                        let summary = if available {
+                        let summary = if behind > 0 {
                             match (&remote_version, behind) {
                                 (Some(v), b) if b > 0 => {
                                     format!("Update available: v{} ({} new commit(s))", v, b)
@@ -324,6 +365,17 @@ impl UpdateService {
                                 (Some(v), _) => format!("Update available: v{}", v),
                                 (None, b) => format!("Update available: {} new commit(s)", b),
                             }
+                        } else if version_behind {
+                            format!(
+                                "Update ready to build: running v{}, repo is v{} (click Pull & Update Now)",
+                                current_version,
+                                remote_version.as_deref().unwrap_or("latest")
+                            )
+                        } else if binary_behind > 0 {
+                            format!(
+                                "Update ready to build: running binary is {} commit(s) behind repo (click Pull & Update Now)",
+                                binary_behind
+                            )
                         } else {
                             format!("Up to date (v{})", current_version)
                         };
@@ -332,7 +384,7 @@ impl UpdateService {
                             available,
                             current_version,
                             remote_version,
-                            commits_behind: behind,
+                            commits_behind: effective_behind,
                             latest_commit,
                             repo_dir: Some(dir.clone()),
                             remote_url: Some(rem_url.clone()),
@@ -778,9 +830,27 @@ mod tests {
         assert!(commit_note.contains("Release v2.1.0"));
         assert!(work.join("CHANGELOG_UPDATE.txt").exists());
 
-        // Re-check -> now up to date again
+        // Re-check -> now up to date again when running binary matches repo
         let chk2 = UpdateService::check_once(work.to_str().unwrap(), "");
         assert!(!chk2.available);
+
+        // Even when local git HEAD == origin/main (behind == 0), an older installed binary
+        // (by SemVer or by compiled commit SHA) must still report an update ready to build:
+        let initial_sha = UpdateService::git_cmd(&work, &["rev-parse", "HEAD~1"]).unwrap();
+        let chk_old_ver =
+            UpdateService::check_once_with_build_info(work.to_str().unwrap(), "", "2.0-beta", "");
+        assert!(chk_old_ver.available);
+        assert!(chk_old_ver.summary.contains("Update ready to build"));
+
+        let chk_old_sha = UpdateService::check_once_with_build_info(
+            work.to_str().unwrap(),
+            "",
+            "2.1.0",
+            &initial_sha,
+        );
+        assert!(chk_old_sha.available);
+        assert_eq!(chk_old_sha.commits_behind, 1);
+        assert!(chk_old_sha.summary.contains("1 commit(s) behind repo"));
 
         // Verify atomic binary replacement works cleanly
         let old_bin = tmp.path().join("bin/luatools");

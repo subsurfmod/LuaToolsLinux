@@ -17,6 +17,7 @@ use crate::services::depot_downloader::{DepotDownloadOptions, DepotSelection};
 use crate::services::external_tools::TOOLS;
 use crate::services::fixes_service::FixesService;
 use crate::services::protocol_service::ProtocolService;
+use crate::services::update_service::UpdateService;
 use crate::ui::app::LuaToolsApp;
 use crate::ui::state::{AppMessage, DepotsSubTab, SettingsSubTab, ToastKind};
 use crate::ui::theme::{
@@ -1705,6 +1706,9 @@ impl LuaToolsApp {
                         .hint_text("https://github.com/subsurfmod/LuaToolsLinux.git (default)"),
                 );
             });
+            let repo_hint = UpdateService::discover_repo_dir("")
+                .map(|p| format!("Auto-detected ({})", p.display()))
+                .unwrap_or_else(|| "Auto-detected (~/.local/share/luatools/repo)".into());
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Local Repo:")
@@ -1716,7 +1720,7 @@ impl LuaToolsApp {
                     [w, 30.0],
                     TextEdit::singleline(&mut self.settings_service.settings.update_repo_dir)
                         .margin(Margin::symmetric(10, 6))
-                        .hint_text("Auto-detected (~/.local/share/luatools/repo)"),
+                        .hint_text(repo_hint),
                 );
                 if secondary_button(ui, "Browse…").clicked() {
                     let tx = self.msg_tx.clone();

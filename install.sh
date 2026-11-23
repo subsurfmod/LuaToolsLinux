@@ -176,7 +176,7 @@ ensure_binary() {
     (cd "${SCRIPT_DIR}" && cargo build --release -j "${CARGO_BUILD_JOBS:-2}")
     BIN_SOURCE="${SCRIPT_DIR}/target/release/${APP_NAME}"
     mkdir -p "${SCRIPT_DIR}/dist"
-    cp -f "${BIN_SOURCE}" "${SCRIPT_DIR}/dist/${APP_NAME}"
+    install -m 0755 "${BIN_SOURCE}" "${SCRIPT_DIR}/dist/${APP_NAME}"
     ok "Built stripped native binary ($(du -h "${BIN_SOURCE}" | awk '{print $1}')) -> ${BIN_SOURCE}"
 }
 
