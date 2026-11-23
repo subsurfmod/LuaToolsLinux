@@ -11,9 +11,11 @@ pub mod pattern_db;
 pub mod preload_loader;
 pub mod ticket_store;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 static BRIDGE_STATE: OnceLock<BridgeState> = OnceLock::new();
+static INTEGRATION_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Default)]
 pub struct BridgeState {
@@ -29,13 +31,18 @@ pub fn state() -> &'static BridgeState {
 
 /// Mark the Steam client as integrated.
 pub fn set_integrated() {
-    let _ = BRIDGE_STATE.get();
+    let _ = BRIDGE_STATE.get_or_init(|| BridgeState {
+        integration_active: true,
+        ..Default::default()
+    });
+    INTEGRATION_ACTIVE.store(true, Ordering::Release);
 }
 
 /// Check if integration is active.
 pub fn is_integrated() -> bool {
-    BRIDGE_STATE
-        .get()
-        .map(|s| s.integration_active)
-        .unwrap_or(false)
+    INTEGRATION_ACTIVE.load(Ordering::Acquire)
+        || BRIDGE_STATE
+            .get()
+            .map(|s| s.integration_active)
+            .unwrap_or(false)
 }

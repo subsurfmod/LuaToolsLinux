@@ -652,7 +652,7 @@ impl UpdateService {
         );
 
         let built_bin = if let Some(cargo) = Self::find_cargo_bin() {
-            let out = Command::new(cargo)
+            let out = Command::new(&cargo)
                 .args(["build", "--workspace", "--release", "-j", "2"])
                 .current_dir(&crate_dir)
                 .stdout(Stdio::piped())
@@ -665,11 +665,49 @@ impl UpdateService {
                 let msg: Vec<_> = tail.into_iter().rev().collect();
                 return Err(format!("Cargo build failed: {}", msg.join(" | ")));
             }
-            let built_so = crate_dir.join("target/release/libsteam_integration.so");
+            // Prefer debug-debug symbols for bridge_lib so crash diagnostics are always symbolicated
+            let _ = Command::new(&cargo)
+                .args([
+                    "build",
+                    "--profile",
+                    "debug-debug",
+                    "-p",
+                    "bridge_lib",
+                    "-j",
+                    "2",
+                ])
+                .current_dir(&crate_dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+
+            let built_so = {
+                let dbg_so = crate_dir.join("target/debug-debug/libsteam_integration.so");
+                if dbg_so.is_file() {
+                    dbg_so
+                } else {
+                    crate_dir.join("target/release/libsteam_integration.so")
+                }
+            };
             if built_so.is_file() {
+                let _ = Self::atomic_replace_executable(
+                    &built_so,
+                    &crate_dir.join("dist/libsteam_integration.so"),
+                );
                 if let Some(home) = dirs::home_dir() {
                     let lib_dst = home.join(".local/lib/luatools/libsteam_integration.so");
                     let _ = Self::atomic_replace_executable(&built_so, &lib_dst);
+                }
+            }
+            let built_patch_so = crate_dir.join("target/release/libsteam_auto_patch_linux.so");
+            if built_patch_so.is_file() {
+                let _ = Self::atomic_replace_executable(
+                    &built_patch_so,
+                    &crate_dir.join("dist/libsteam_auto_patch_linux.so"),
+                );
+                if let Some(home) = dirs::home_dir() {
+                    let lib_dst = home.join(".local/lib/luatools/libsteam_auto_patch_linux.so");
+                    let _ = Self::atomic_replace_executable(&built_patch_so, &lib_dst);
                 }
             }
             crate_dir.join("target/release/luatools")

@@ -28,9 +28,12 @@ if [ "$SYSTEM_WIDE" -eq 1 ]; then
     echo "[OK] Removed system-wide LuaTools Linux files."
 else
     rm -f "${HOME}/.local/bin/luatools" \
+          "${HOME}/.local/bin/luatools-steam-launcher" \
+          "${HOME}/.local/lib/luatools/libsteam_integration.so" \
+          "${HOME}/.local/lib/luatools/libsteam_auto_patch_linux.so" \
           "${HOME}/.local/share/applications/luatools.desktop" \
           "${HOME}/.local/share/icons/hicolor/scalable/apps/luatools.svg"
-    echo "[OK] Removed user-local LuaTools Linux binary, launcher, and icon."
+    echo "[OK] Removed user-local LuaTools Linux binary, integration libraries, launcher, and icon."
 fi
 
 if [ "$PURGE_DATA" -eq 1 ]; then

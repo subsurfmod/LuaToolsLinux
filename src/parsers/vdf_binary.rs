@@ -301,11 +301,26 @@ impl AppInfoFile {
         let mut string_bytes = Vec::new();
 
         if indexed_keys {
-            let table_offset = read_i64_le(&mut r)? as u64;
+            let table_offset_raw = read_i64_le(&mut r)?;
+            if table_offset_raw < 0 {
+                return Err(format!(
+                    "Corrupt appinfo.vdf negative string table offset: {}",
+                    table_offset_raw
+                ));
+            }
+            let table_offset = table_offset_raw as u64;
             let resume = r.stream_position().map_err(|e| e.to_string())?;
             r.seek(SeekFrom::Start(table_offset))
                 .map_err(|e| e.to_string())?;
             let count = read_u32_le(&mut r)? as usize;
+            if count > 2_000_000 {
+                return Err(format!(
+                    "Corrupt appinfo.vdf string table count ({}) exceeds safety limit",
+                    count
+                ));
+            }
+            strings.reserve(count.min(65_536));
+            string_bytes.reserve(count.min(65_536));
             for _ in 0..count {
                 let raw = read_cstring_bytes(&mut r)?;
                 strings.push(String::from_utf8_lossy(&raw).to_string());

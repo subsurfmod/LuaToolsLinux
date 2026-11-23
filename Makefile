@@ -5,10 +5,11 @@ CARGO ?= $(shell command -v cargo 2>/dev/null || echo "$(HOME)/.cargo/bin/cargo"
 all: build
 
 build:
-	$(CARGO) build --release
+	$(CARGO) build --workspace --release -j 2
+	$(CARGO) build --profile debug-debug -p bridge_lib -j 2
 
 test:
-	$(CARGO) test
+	$(CARGO) test --workspace
 
 install:
 	bash ./install.sh --yes

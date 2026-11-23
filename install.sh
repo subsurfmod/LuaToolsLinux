@@ -7,7 +7,7 @@
 set -euo pipefail
 
 APP_NAME="luatools"
-APP_VERSION="2.6.0"
+APP_VERSION="2.6.1"
 REPO_URL="https://github.com/subsurfmod/LuaToolsLinux.git"
 SCRIPT_DIR=""
 if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
@@ -145,7 +145,7 @@ ensure_source_checkout() {
 ensure_binary() {
     local has_newer_src=0
     if [ -f "${SCRIPT_DIR}/Cargo.toml" ] && [ -x "${SCRIPT_DIR}/dist/${APP_NAME}" ]; then
-        if [ -n "$(find "${SCRIPT_DIR}/Cargo.toml" "${SCRIPT_DIR}/src" -newer "${SCRIPT_DIR}/dist/${APP_NAME}" 2>/dev/null | head -n 1)" ]; then
+        if [ -n "$(find "${SCRIPT_DIR}/Cargo.toml" "${SCRIPT_DIR}/src" "${SCRIPT_DIR}/bridge_lib" "${SCRIPT_DIR}/steam_auto_patch_linux" -newer "${SCRIPT_DIR}/dist/${APP_NAME}" 2>/dev/null | head -n 1)" ]; then
             has_newer_src=1
         fi
     fi
@@ -174,12 +174,15 @@ ensure_binary() {
     ok "Rust toolchain ready: $(rustc --version)"
     info "Compiling optimized native binary + Steam integration library (LuaTools Linux v${APP_VERSION})..."
     (cd "${SCRIPT_DIR}" && cargo build --workspace --release -j "${CARGO_BUILD_JOBS:-2}")
+    (cd "${SCRIPT_DIR}" && cargo build --profile debug-debug -p bridge_lib -j "${CARGO_BUILD_JOBS:-2}" || true)
     BIN_SOURCE="${SCRIPT_DIR}/target/release/${APP_NAME}"
     mkdir -p "${SCRIPT_DIR}/dist" "${HOME}/.local/lib/luatools"
     install -m 0755 "${BIN_SOURCE}" "${SCRIPT_DIR}/dist/${APP_NAME}"
-    if [ -f "${SCRIPT_DIR}/target/release/libsteam_integration.so" ]; then
-        install -m 0755 "${SCRIPT_DIR}/target/release/libsteam_integration.so" "${SCRIPT_DIR}/dist/libsteam_integration.so"
-        install -m 0755 "${SCRIPT_DIR}/target/release/libsteam_integration.so" "${HOME}/.local/lib/luatools/libsteam_integration.so"
+    local bridge_so="${SCRIPT_DIR}/target/debug-debug/libsteam_integration.so"
+    [ -f "$bridge_so" ] || bridge_so="${SCRIPT_DIR}/target/release/libsteam_integration.so"
+    if [ -f "$bridge_so" ]; then
+        install -m 0755 "$bridge_so" "${SCRIPT_DIR}/dist/libsteam_integration.so"
+        install -m 0755 "$bridge_so" "${HOME}/.local/lib/luatools/libsteam_integration.so"
     fi
     if [ -f "${SCRIPT_DIR}/target/release/libsteam_auto_patch_linux.so" ]; then
         install -m 0755 "${SCRIPT_DIR}/target/release/libsteam_auto_patch_linux.so" "${SCRIPT_DIR}/dist/libsteam_auto_patch_linux.so"

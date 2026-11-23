@@ -3,7 +3,7 @@ members = [".", "bridge_lib", "steam_auto_patch_linux"]
 
 [package]
 name = "luatools-linux"
-version = "2.6.0"
+version = "2.6.1"
 edition = "2021"
 description = "Native lightweight Rust workstation for Steam stplug-in lua manifests, LuaVault variants, depot downloads, and game fixes"
 license = "MIT"
@@ -58,4 +58,10 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
-panic = "abort"
+panic = "unwind"
+
+[profile.debug-debug]
+inherits = "release"
+debug = 2
+strip = false
+panic = "unwind"

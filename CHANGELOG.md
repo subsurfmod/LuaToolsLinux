@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.6.1] - 2026-11-23
+
+### Fixed
+- **CRITICAL — Eliminated Steam `SIGABRT` Crash & `steamwebhelper` Interference in `libsteam_integration.so` (BUG-20241123-001)**:
+  - **Fixed Swapped ELF64 Header Byte Offsets & Symbol-Table Overflow/Hang (`src/steam_bridge/binary_reader.rs`)**: `BinaryFile::open` previously read `e_shentsize` (`58..60`), `e_shnum` (`60..62`), and `e_shstrndx` (`62..64`) from swapped byte offsets, skipped the 64-byte header length check, used unchecked offset arithmetic, and looped up to `sec.size` times when `sec.entsize == 0` (triggering slice-bounds panics, arithmetic wrap, or OOM `SIGABRT` on real ELF64 `.so` libraries). All header, program-header, section-header, and symbol-table reads now use strict checked bounds, validate `entsize >= 24`, reject short pattern masks in `scan_range`, and skip `SHT_NOBITS` / non-allocated sections.
+  - **Stopped `LD_PRELOAD` Activation in `steamwebhelper` & Child Processes (`bridge_lib/src/lib.rs`, `src/steam_bridge/preload_loader.rs`)**: `libsteam_integration_init()` now inspects `/proc/self/comm` and `/proc/self/exe` before spawning any thread and activates strictly inside the main `steam` client process (staying completely dormant in `steamwebhelper`, `sh`/`bash`, `luatools`, `srt-bwrap`, `reaper`, and launched games unless `LUATOOLS_BRIDGE_FORCE=1` is set). Also scoped `scan_steam_binaries()` to target Steam binaries (`steamclient.so`, `steamui.so`, `steam`) with canonical-path deduplication instead of loading every `*.so` (including 150+ MB `libcef.so`) into RAM.
+  - **Fixed ASLR Runtime Address Translation & `mprotect`/`mmap` Validation (`src/steam_bridge/memory_patch.rs`, `src/steam_bridge/binary_reader.rs`, `bridge_lib/src/lib.rs`)**: Converted ELF virtual addresses using `steamclient.so`'s live load base from `/proc/self/maps` (`find_loaded_module_mapping` + `vaddr_to_runtime_addr`), polling briefly for `dlopen("steamclient.so")` after starting IPC. `MemoryPatch::install` now verifies `[target, target + len)` resides inside a mapped `r-x` executable page via `/proc/self/maps` before reading/patching, uses dynamic `sysconf(_SC_PAGESIZE)`, logs `errno` on `mmap`/`mprotect` failures, `munmap`s trampolines on error/uninstall/drop, and restores `PROT_READ | PROT_EXEC` (W^X) after patching.
+  - **Added Panic Hook, `catch_unwind` Containment & Removed All `.unwrap()` in `bridge_lib` / `src/steam_bridge/` (`Cargo.toml`, `bridge_lib/src/lib.rs`, `src/steam_bridge/ipc.rs`)**: Switched release panic strategy from `abort` to `unwind`, installed a diagnostic panic hook writing to `stderr`, `/tmp/steam_integration_panic.log`, and `~/.local/share/luatools/telemetry/steam_integration_panic.log`, wrapped the background thread and every `extern "C"` hook and IPC handler in `std::panic::catch_unwind`, replaced all 40+ lock `.unwrap()` calls with poison-tolerant accessors, added safe no-op fallback logging when pattern TOMLs are missing, and capped ownership/encrypted ticket buffer sizes to 64 KiB.
+- **Fixed `TicketStore` VDF Parsing & Upsert Data Corruption (`src/steam_bridge/ticket_store.rs`)**:
+  - Fixed off-by-one bug in `split_kv()` (`line[key_end..]` instead of `line[key_end + 1..]`) which previously returned the whitespace separator instead of actual `SteamID` / `AppTicket` / `ETicket` values.
+  - Fixed `upsert_app_block()` so updating an existing app replaces it in place (instead of silently deleting it) and inserting a new app writes it inside `"apps" { ... }` before the closing brace, with exact `"apps"` section matching (ignoring keys like `"steamapps"`).
+- **Fixed `find_steam_pid()`, Launcher Trailing Colons & Steam Restart UX (`src/steam_bridge/preload_loader.rs`, `src/ui/app.rs`, `src/ui/views_workbench.rs`)**:
+  - `find_steam_pid()` now matches only actual `steam` client processes instead of falsely matching `steamwebhelper`, `luatools-steam-launcher`, or `steam-sls`.
+  - Fixed trailing-colon `LD_PRELOAD` / `LD_LIBRARY_PATH` in `luatools-steam-launcher` (`${LD_PRELOAD:+:$LD_PRELOAD}`) and added `--gdb` and `--lldb` interactive debugging flags.
+  - `launch_steam_with_bridge()` now checks live Steam PID (not stale cached status), prefers `<steam_root>/steam.sh -shutdown`, waits up to 10 s for clean exit, detaches child stdio, and refreshes bridge status; `trigger_restart_steam()` falls back gracefully when Millennium RPC is unavailable.
+  - Fixed `Settings › Steam Integration` system-preload checkbox being unconditionally reset to `false` on click, refreshed stale `libsteam_integration.so` atomically during `Install Integration` / self-update, cleared `cover_in_flight` on failed cover fetches, guarded corrupt `appinfo.vdf` string table offsets/counts, purged corrupt cached pattern TOMLs, and removed remaining UI/service `.unwrap()` panics (`views_workbench.rs`, `dialogs.rs`, `play_unowned_service.rs`, `steam_bridge_service.rs`).
+- **Fixed Workspace Build, Install & Packaging Scripts (`Cargo.toml`, `Makefile`, `install.sh`, `uninstall.sh`, `packaging/`)**:
+  - Added `[profile.debug-debug]` (`inherits = "release"`, `debug = 2`, `strip = false`) and built `libsteam_integration.so` with debug symbols by default for symbolicated `gdb` backtraces.
+  - Updated `Makefile`, `install.sh`, `uninstall.sh`, `packaging/build-packages.sh`, and `packaging/luatools-linux.spec` to build/bundle/clean up the full workspace (`luatools` + `libsteam_integration.so` + `libsteam_auto_patch_linux.so`) and detect changes in `bridge_lib/` and `steam_auto_patch_linux/`.
+
+---
+
 ## [2.6.0] - 2026-11-23
 
 ### Added

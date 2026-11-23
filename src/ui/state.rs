@@ -128,6 +128,9 @@ pub enum AppMessage {
         height: usize,
         rgba: Vec<u8>,
     },
+    CoverFailed {
+        app_id: u32,
+    },
     FeaturedLoaded {
         top: Vec<SteamFeaturedItem>,
         new_releases: Vec<SteamFeaturedItem>,

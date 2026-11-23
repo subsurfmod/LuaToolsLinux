@@ -242,7 +242,12 @@ impl LuaToolsApp {
                         ];
                         ComboBox::from_id_salt("tpl_combo")
                             .width(310.0)
-                            .selected_text(templates[self.add_appid_modal.template_idx])
+                            .selected_text(
+                                templates
+                                    .get(self.add_appid_modal.template_idx)
+                                    .copied()
+                                    .unwrap_or(templates[0]),
+                            )
                             .show_ui(ui, |ui| {
                                 for (i, t) in templates.iter().enumerate() {
                                     ui.selectable_value(

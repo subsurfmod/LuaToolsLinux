@@ -6,9 +6,9 @@
 //! for the integration points used by the memory patcher.
 //!
 //! Lookup order (every launch):
-//!   1. GitHub raw — canonical source
-//!   2. jsDelivr CDN — fallback if GitHub raw is unreachable
-//!   3. Local cache — used only when remote is unreachable
+//!   1. Local cache — fast offline-first lookup (auto-purged if corrupt)
+//!   2. GitHub raw — canonical upstream source
+//!   3. jsDelivr CDN — fallback if GitHub raw is unreachable
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -131,10 +131,13 @@ impl PatternDb {
         let cache_path = self.cache_dir.join(&cache_name);
 
         if cache_path.exists() {
-            let content = fs::read_to_string(&cache_path)?;
-            let parsed: PatternFile =
-                toml::from_str(&content).map_err(|e| PatternError::Parse(e.to_string()))?;
-            return Ok(parsed);
+            if let Ok(content) = fs::read_to_string(&cache_path) {
+                if let Ok(parsed) = toml::from_str::<PatternFile>(&content) {
+                    return Ok(parsed);
+                }
+            }
+            // Remove corrupt cache entry so we can re-fetch cleanly from upstream
+            let _ = fs::remove_file(&cache_path);
         }
 
         let url = format!(

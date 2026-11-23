@@ -4,7 +4,7 @@
 # ==============================================================================
 set -euo pipefail
 
-VERSION="2.6.0"
+VERSION="2.6.1"
 ARCH="$(uname -m)"
 DEB_ARCH="amd64"
 [ "$ARCH" = "aarch64" ] && DEB_ARCH="arm64"
@@ -15,12 +15,18 @@ DIST_DIR="${ROOT_DIR}/dist"
 
 export PATH="${HOME}/.cargo/bin:${PATH}"
 
-echo "[1/4] Building stripped release binary..."
+echo "[1/4] Building workspace release binary + debug-symbol bridge library..."
 CARGO_JOBS="${CARGO_BUILD_JOBS:-2}"
-(cd "$ROOT_DIR" && cargo build --release -j "$CARGO_JOBS" ${CARGO_EXTRA_ARGS:-})
+(cd "$ROOT_DIR" && cargo build --workspace --release -j "$CARGO_JOBS" ${CARGO_EXTRA_ARGS:-})
+(cd "$ROOT_DIR" && cargo build --profile debug-debug -p bridge_lib -j "$CARGO_JOBS" ${CARGO_EXTRA_ARGS:-} || true)
 mkdir -p "$DIST_DIR"
 BIN="${ROOT_DIR}/target/release/luatools"
+BRIDGE_SO="${ROOT_DIR}/target/debug-debug/libsteam_integration.so"
+[ -f "$BRIDGE_SO" ] || BRIDGE_SO="${ROOT_DIR}/target/release/libsteam_integration.so"
+PATCH_SO="${ROOT_DIR}/target/release/libsteam_auto_patch_linux.so"
 cp -f "$BIN" "${DIST_DIR}/luatools"
+[ -f "$BRIDGE_SO" ] && cp -f "$BRIDGE_SO" "${DIST_DIR}/libsteam_integration.so"
+[ -f "$PATCH_SO" ] && cp -f "$PATCH_SO" "${DIST_DIR}/libsteam_auto_patch_linux.so"
 
 # ------------------------------------------------------------------------------
 # 2. Portable Tarball Bundle (with one-click install.sh)
@@ -30,6 +36,8 @@ STAGE_TAR="$(mktemp -d)"
 BUNDLE_NAME="luatools-linux-${VERSION}-${ARCH}"
 mkdir -p "${STAGE_TAR}/${BUNDLE_NAME}/dist" "${STAGE_TAR}/${BUNDLE_NAME}/assets"
 cp -f "$BIN" "${STAGE_TAR}/${BUNDLE_NAME}/dist/luatools"
+[ -f "$BRIDGE_SO" ] && cp -f "$BRIDGE_SO" "${STAGE_TAR}/${BUNDLE_NAME}/dist/libsteam_integration.so"
+[ -f "$PATCH_SO" ] && cp -f "$PATCH_SO" "${STAGE_TAR}/${BUNDLE_NAME}/dist/libsteam_auto_patch_linux.so"
 cp -f "${ROOT_DIR}/install.sh" "${ROOT_DIR}/uninstall.sh" "${ROOT_DIR}/README.md" "${STAGE_TAR}/${BUNDLE_NAME}/"
 cp -f "${ROOT_DIR}/assets/luatools.svg" "${ROOT_DIR}/assets/luatools.desktop.in" "${STAGE_TAR}/${BUNDLE_NAME}/assets/"
 chmod +x "${STAGE_TAR}/${BUNDLE_NAME}/install.sh" "${STAGE_TAR}/${BUNDLE_NAME}/uninstall.sh" "${STAGE_TAR}/${BUNDLE_NAME}/dist/luatools"
@@ -45,6 +53,8 @@ if command -v rpmbuild >/dev/null 2>&1; then
     RPM_TOP="$(mktemp -d)"
     mkdir -p "${RPM_TOP}"/{BUILD,RPMS,SOURCES,SPECS,SRPMS,TMP}
     cp -f "$BIN" "${RPM_TOP}/SOURCES/luatools"
+    [ -f "$BRIDGE_SO" ] && cp -f "$BRIDGE_SO" "${RPM_TOP}/SOURCES/libsteam_integration.so"
+    [ -f "$PATCH_SO" ] && cp -f "$PATCH_SO" "${RPM_TOP}/SOURCES/libsteam_auto_patch_linux.so"
     cp -f "${ROOT_DIR}/assets/luatools.svg" "${RPM_TOP}/SOURCES/luatools.svg"
     sed "s|@EXEC_PATH@|/usr/bin/luatools|g" "${ROOT_DIR}/assets/luatools.desktop.in" > "${RPM_TOP}/SOURCES/luatools.desktop"
     cp -f "${SCRIPT_DIR}/luatools-linux.spec" "${RPM_TOP}/SPECS/luatools-linux.spec"
@@ -66,10 +76,13 @@ DEB_WORK="$(mktemp -d)"
 DEB_ROOT="${DEB_WORK}/pkg"
 mkdir -p "${DEB_ROOT}/DEBIAN" \
          "${DEB_ROOT}/usr/bin" \
+         "${DEB_ROOT}/usr/lib/luatools" \
          "${DEB_ROOT}/usr/share/applications" \
          "${DEB_ROOT}/usr/share/icons/hicolor/scalable/apps"
 
 install -m 0755 "$BIN" "${DEB_ROOT}/usr/bin/luatools"
+[ -f "$BRIDGE_SO" ] && install -m 0755 "$BRIDGE_SO" "${DEB_ROOT}/usr/lib/luatools/libsteam_integration.so"
+[ -f "$PATCH_SO" ] && install -m 0755 "$PATCH_SO" "${DEB_ROOT}/usr/lib/luatools/libsteam_auto_patch_linux.so"
 install -m 0644 "${ROOT_DIR}/assets/luatools.svg" "${DEB_ROOT}/usr/share/icons/hicolor/scalable/apps/luatools.svg"
 sed "s|@EXEC_PATH@|/usr/bin/luatools|g" "${ROOT_DIR}/assets/luatools.desktop.in" > "${DEB_ROOT}/usr/share/applications/luatools.desktop"
 chmod 0644 "${DEB_ROOT}/usr/share/applications/luatools.desktop"

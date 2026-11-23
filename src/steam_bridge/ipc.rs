@@ -142,7 +142,7 @@ impl IpcServer {
     where
         F: Fn(IpcMessage) -> Option<IpcMessage> + Send + Sync + 'static,
     {
-        *self.handler.lock().unwrap() = Box::new(handler);
+        *self.handler.lock().unwrap_or_else(|e| e.into_inner()) = Box::new(handler);
     }
 
     pub fn start(&mut self) -> Result<(), String> {
@@ -180,7 +180,19 @@ impl IpcServer {
                             let mut raw = String::new();
                             if stream.read_to_string(&mut raw).is_ok() && !raw.trim().is_empty() {
                                 if let Ok(msg) = IpcMessage::from_json(raw.trim()) {
-                                    let response = (handler.lock().unwrap())(msg);
+                                    let response = std::panic::catch_unwind(
+                                        std::panic::AssertUnwindSafe(|| {
+                                            let guard =
+                                                handler.lock().unwrap_or_else(|e| e.into_inner());
+                                            (guard)(msg)
+                                        }),
+                                    )
+                                    .unwrap_or_else(|_| {
+                                        eprintln!(
+                                            "[steam_ipc] recovered from panic in IPC handler"
+                                        );
+                                        None
+                                    });
                                     if let Some(resp) = response {
                                         if let Ok(js) = resp.to_json() {
                                             let _ = stream.write_all(js.as_bytes());
@@ -205,10 +217,11 @@ impl IpcServer {
 
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // Wake up blocking accept() cleanly
-        let _ = UnixStream::connect(&self.socket_path);
-        let _ = std::fs::remove_file(&self.socket_path);
-        self.listener = None;
+        if self.listener.take().is_some() {
+            // Wake up blocking accept() cleanly and remove only a socket this server owned
+            let _ = UnixStream::connect(&self.socket_path);
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
     }
 }
 

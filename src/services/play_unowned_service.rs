@@ -62,7 +62,9 @@ impl PlayUnownedService {
             return Ok(None);
         }
 
-        let stplug = self.stplug_in_dir().unwrap();
+        let Some(stplug) = self.stplug_in_dir() else {
+            return Ok(None);
+        };
         fs::create_dir_all(&stplug)
             .map_err(|e| format!("Failed to create stplug-in dir: {}", e))?;
 

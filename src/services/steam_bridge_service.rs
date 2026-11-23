@@ -169,7 +169,7 @@ impl SteamBridgeService {
 
     pub fn set_steam_installation(&mut self, installation: Option<SteamInstallation>) {
         self.steam_installation = installation.clone();
-        let mut status = self.status.lock().unwrap();
+        let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
         status.steam_detected = installation.is_some();
         status.steam_root = installation.as_ref().map(|i| i.root.clone());
         status.steam_pid = find_steam_pid();
@@ -178,7 +178,7 @@ impl SteamBridgeService {
         status.system_preload_enabled = is_in_ld_so_preload(&self.lib_target_path);
         status.integration_active = check_ipc_or_maps_active();
         if let Some(inst) = &installation {
-            let mut store = self.ticket_store.lock().unwrap();
+            let mut store = self.ticket_store.lock().unwrap_or_else(|e| e.into_inner());
             *store = TicketStore::new(&inst.config_path);
             let _ = store.load();
             status.tickets_loaded = true;
@@ -201,7 +201,10 @@ impl SteamBridgeService {
     }
 
     pub fn snapshot_overrides(&self) -> BridgeOverrides {
-        self.overrides.lock().unwrap().clone()
+        self.overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Scans `steamclient.so` and `steamui.so`, records SHA-256 hashes, and queries `PatternDb`.
@@ -244,9 +247,10 @@ impl SteamBridgeService {
                     notes.push(format!("steamclient: {} pattern(s)", keys.len()));
                 }
                 Err(_) => {
+                    let sha = client.sha256_hex();
                     notes.push(format!(
                         "steamclient SHA-256 {} (no remote TOML published yet)",
-                        &client.sha256_hex()[..12]
+                        sha.get(..12).unwrap_or(sha)
                     ));
                 }
             }
@@ -264,16 +268,17 @@ impl SteamBridgeService {
                     notes.push(format!("steamui: {} pattern(s)", keys.len()));
                 }
                 Err(_) => {
+                    let sha = ui.sha256_hex();
                     notes.push(format!(
                         "steamui SHA-256 {} (no remote TOML published yet)",
-                        &ui.sha256_hex()[..12]
+                        sha.get(..12).unwrap_or(sha)
                     ));
                 }
             }
         }
 
         {
-            let mut status = self.status.lock().unwrap();
+            let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
             status.steam_client_found = steam_client.is_some();
             status.steam_ui_found = steam_ui.is_some();
             status.steam_client_sha256 = steam_client.as_ref().map(|b| b.sha256.clone());
@@ -301,51 +306,92 @@ impl SteamBridgeService {
         })
     }
 
-    /// Locates or builds `libsteam_integration.so` and stages it at `~/.local/lib/luatools/libsteam_integration.so`.
+    /// Locates or builds `libsteam_integration.so` and atomically stages/refreshes it
+    /// at `~/.local/lib/luatools/libsteam_integration.so`.
     pub fn ensure_integration_lib_staged(&self) -> Result<PathBuf, String> {
-        if self.lib_target_path.is_file() {
-            return Ok(self.lib_target_path.clone());
-        }
-
         let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(repo) = UpdateService::discover_repo_dir("") {
+            candidates.push(repo.join("target/debug-debug/libsteam_integration.so"));
+            candidates.push(repo.join("target/release/libsteam_integration.so"));
+            candidates.push(repo.join("dist/libsteam_integration.so"));
+            candidates.push(repo.join("target/debug/libsteam_integration.so"));
+        }
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 candidates.push(dir.join("libsteam_integration.so"));
                 candidates.push(dir.join("../lib/luatools/libsteam_integration.so"));
             }
         }
-        if let Some(repo) = UpdateService::discover_repo_dir("") {
-            candidates.push(repo.join("target/release/libsteam_integration.so"));
-            candidates.push(repo.join("target/debug/libsteam_integration.so"));
-            candidates.push(repo.join("dist/libsteam_integration.so"));
-        }
+        candidates.push(PathBuf::from("/usr/lib/luatools/libsteam_integration.so"));
 
         if let Some(src) = candidates.into_iter().find(|p| p.is_file()) {
-            if let Some(parent) = self.lib_target_path.parent() {
-                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            let needs_copy = if !self.lib_target_path.is_file() {
+                true
+            } else {
+                let same_file = fs::canonicalize(&src)
+                    .ok()
+                    .zip(fs::canonicalize(&self.lib_target_path).ok())
+                    .is_some_and(|(a, b)| a == b);
+                if same_file {
+                    false
+                } else {
+                    match (fs::metadata(&src), fs::metadata(&self.lib_target_path)) {
+                        (Ok(sm), Ok(dm)) => {
+                            let newer = sm
+                                .modified()
+                                .ok()
+                                .zip(dm.modified().ok())
+                                .is_some_and(|(s, d)| s > d);
+                            newer || sm.len() != dm.len()
+                        }
+                        _ => true,
+                    }
+                }
+            };
+            if needs_copy {
+                UpdateService::atomic_replace_executable(&src, &self.lib_target_path)?;
             }
-            fs::copy(&src, &self.lib_target_path).map_err(|e| e.to_string())?;
             return Ok(self.lib_target_path.clone());
         }
 
-        // Attempt on-demand cargo build -p bridge_lib if source repository is available
+        if self.lib_target_path.is_file() {
+            return Ok(self.lib_target_path.clone());
+        }
+
+        // Attempt on-demand cargo build -p bridge_lib (preferring debug-debug symbols)
         if let Some(repo) = UpdateService::discover_repo_dir("") {
             if repo.join("bridge_lib/Cargo.toml").is_file() {
                 let cargo_bin = dirs::home_dir()
                     .map(|h| h.join(".cargo/bin/cargo"))
                     .filter(|p| p.is_file())
                     .unwrap_or_else(|| PathBuf::from("cargo"));
-                let out = Command::new(cargo_bin)
+                let out = Command::new(&cargo_bin)
+                    .args([
+                        "build",
+                        "--profile",
+                        "debug-debug",
+                        "-p",
+                        "bridge_lib",
+                        "-j",
+                        "2",
+                    ])
+                    .current_dir(&repo)
+                    .output()
+                    .map_err(|e| format!("Failed to invoke cargo to build bridge_lib: {}", e))?;
+                let built_dbg = repo.join("target/debug-debug/libsteam_integration.so");
+                if out.status.success() && built_dbg.is_file() {
+                    UpdateService::atomic_replace_executable(&built_dbg, &self.lib_target_path)?;
+                    return Ok(self.lib_target_path.clone());
+                }
+
+                let out_rel = Command::new(&cargo_bin)
                     .args(["build", "--release", "-p", "bridge_lib", "-j", "2"])
                     .current_dir(&repo)
                     .output()
                     .map_err(|e| format!("Failed to invoke cargo to build bridge_lib: {}", e))?;
-                let built = repo.join("target/release/libsteam_integration.so");
-                if out.status.success() && built.is_file() {
-                    if let Some(parent) = self.lib_target_path.parent() {
-                        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-                    }
-                    fs::copy(&built, &self.lib_target_path).map_err(|e| e.to_string())?;
+                let built_rel = repo.join("target/release/libsteam_integration.so");
+                if out_rel.status.success() && built_rel.is_file() {
+                    UpdateService::atomic_replace_executable(&built_rel, &self.lib_target_path)?;
                     return Ok(self.lib_target_path.clone());
                 }
             }
@@ -394,7 +440,7 @@ impl SteamBridgeService {
             }
         }
 
-        let mut status = self.status.lock().unwrap();
+        let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
         status.integration_lib_installed = true;
         status.integration_lib_path = Some(lib_path);
         status.launcher_installed = self.launcher_path.is_file();
@@ -432,7 +478,7 @@ impl SteamBridgeService {
         if self.lib_target_path.exists() {
             let _ = fs::remove_file(&self.lib_target_path);
         }
-        let mut status = self.status.lock().unwrap();
+        let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
         status.integration_active = false;
         status.integration_lib_installed = false;
         status.integration_lib_path = None;
@@ -445,7 +491,7 @@ impl SteamBridgeService {
 
     pub fn add_redirect_app(&self, app_id: u32) {
         {
-            let mut ov = self.overrides.lock().unwrap();
+            let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
             ov.redirect_apps.insert(app_id);
             self.save_overrides(&ov);
         }
@@ -454,7 +500,7 @@ impl SteamBridgeService {
 
     pub fn remove_redirect_app(&self, app_id: u32) {
         {
-            let mut ov = self.overrides.lock().unwrap();
+            let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
             ov.redirect_apps.remove(&app_id);
             self.save_overrides(&ov);
         }
@@ -464,14 +510,14 @@ impl SteamBridgeService {
     pub fn is_redirect_app(&self, app_id: u32) -> bool {
         self.overrides
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .redirect_apps
             .contains(&app_id)
     }
 
     pub fn set_app_id_spoof(&self, app_id: u32, spoof_id: u32) {
         {
-            let mut ov = self.overrides.lock().unwrap();
+            let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
             ov.app_id_spoofs.insert(app_id, spoof_id);
             self.save_overrides(&ov);
         }
@@ -480,7 +526,7 @@ impl SteamBridgeService {
 
     pub fn remove_app_id_spoof(&self, app_id: u32) {
         {
-            let mut ov = self.overrides.lock().unwrap();
+            let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
             ov.app_id_spoofs.remove(&app_id);
             self.save_overrides(&ov);
         }
@@ -490,7 +536,7 @@ impl SteamBridgeService {
     pub fn get_app_id_spoof(&self, app_id: u32) -> Option<u32> {
         self.overrides
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .app_id_spoofs
             .get(&app_id)
             .copied()
@@ -498,7 +544,7 @@ impl SteamBridgeService {
 
     pub fn set_legacy_cd_key(&self, app_id: u32, key: String) {
         {
-            let mut ov = self.overrides.lock().unwrap();
+            let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
             ov.legacy_cd_keys.insert(app_id, key.clone());
             self.save_overrides(&ov);
         }
@@ -507,7 +553,7 @@ impl SteamBridgeService {
 
     pub fn remove_legacy_cd_key(&self, app_id: u32) {
         {
-            let mut ov = self.overrides.lock().unwrap();
+            let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
             ov.legacy_cd_keys.remove(&app_id);
             self.save_overrides(&ov);
         }
@@ -517,7 +563,7 @@ impl SteamBridgeService {
     pub fn get_legacy_cd_key(&self, app_id: u32) -> Option<String> {
         self.overrides
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .legacy_cd_keys
             .get(&app_id)
             .cloned()
@@ -525,7 +571,7 @@ impl SteamBridgeService {
 
     pub fn set_depot_key(&self, depot_id: u32, key: String) {
         {
-            let mut ov = self.overrides.lock().unwrap();
+            let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
             ov.depot_keys.insert(depot_id, key.clone());
             self.save_overrides(&ov);
         }
@@ -534,7 +580,7 @@ impl SteamBridgeService {
 
     pub fn remove_depot_key(&self, depot_id: u32) {
         {
-            let mut ov = self.overrides.lock().unwrap();
+            let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
             ov.depot_keys.remove(&depot_id);
             self.save_overrides(&ov);
         }
@@ -543,7 +589,7 @@ impl SteamBridgeService {
 
     pub fn set_stat(&self, app_id: u32, stat_name: String, stat_value: String) {
         {
-            let mut ov = self.overrides.lock().unwrap();
+            let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
             ov.stats
                 .entry(app_id)
                 .or_default()
@@ -559,7 +605,7 @@ impl SteamBridgeService {
 
     pub fn remove_stat(&self, app_id: u32, stat_name: &str) {
         {
-            let mut ov = self.overrides.lock().unwrap();
+            let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(map) = ov.stats.get_mut(&app_id) {
                 map.remove(stat_name);
                 if map.is_empty() {
@@ -577,7 +623,7 @@ impl SteamBridgeService {
     pub fn get_stats(&self, app_id: u32) -> BTreeMap<String, String> {
         self.overrides
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .stats
             .get(&app_id)
             .cloned()
@@ -585,7 +631,11 @@ impl SteamBridgeService {
     }
 
     pub fn get_tickets(&self, app_id: u32) -> Option<AppTicketData> {
-        self.ticket_store.lock().unwrap().get(app_id).ok()
+        self.ticket_store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(app_id)
+            .ok()
     }
 
     pub fn set_tickets(&self, data: AppTicketData) -> Result<(), String> {
@@ -595,7 +645,7 @@ impl SteamBridgeService {
         let e_ticket = data.e_ticket.clone();
         self.ticket_store
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .set(data)
             .map_err(|e| e.to_string())?;
         let _ = self.send_ipc_message(IpcMessage::SetTicket {
@@ -610,7 +660,7 @@ impl SteamBridgeService {
     pub fn remove_tickets(&self, app_id: u32) -> Result<(), String> {
         self.ticket_store
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .remove(app_id)
             .map_err(|e| e.to_string())?;
         let _ = self.send_ipc_message(IpcMessage::RemoveTicket { app_id });
@@ -620,13 +670,16 @@ impl SteamBridgeService {
     pub fn list_ticket_apps(&self) -> Vec<u32> {
         self.ticket_store
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .list_app_ids()
             .unwrap_or_default()
     }
 
     pub fn status(&self) -> BridgeStatus {
-        self.status.lock().unwrap().clone()
+        self.status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn pattern_db(&self) -> &PatternDb {
@@ -660,12 +713,15 @@ static BRIDGE_SERVICE: Mutex<Option<SteamBridgeService>> = Mutex::new(None);
 
 pub fn init_global_service() -> SteamBridgeService {
     let svc = SteamBridgeService::new();
-    *BRIDGE_SERVICE.lock().unwrap() = Some(svc.clone());
+    *BRIDGE_SERVICE.lock().unwrap_or_else(|e| e.into_inner()) = Some(svc.clone());
     svc
 }
 
 pub fn global_service() -> Option<SteamBridgeService> {
-    BRIDGE_SERVICE.lock().unwrap().clone()
+    BRIDGE_SERVICE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 #[cfg(test)]

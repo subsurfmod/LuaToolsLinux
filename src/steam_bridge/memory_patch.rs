@@ -4,18 +4,96 @@
 //! `E9` relative jumps can overflow. We use a 14-byte RIP-relative indirect jump
 //! (`jmp qword ptr [rip + 0]` followed by an 8-byte 64-bit target address) which reaches
 //! any 64-bit virtual address cleanly.
+//!
+//! Before modifying any code bytes, `MemoryPatch::install` validates via `/proc/self/maps`
+//! that the target range is actually mapped as readable + executable (`r-x` / `rwx`),
+//! logs `errno` on any `mmap`/`mprotect` error, restores `PROT_READ | PROT_EXEC` after
+//! patching (preserving W^X), and releases trampoline pages cleanly on failure or drop.
 
 use std::arch::x86_64::_mm_mfence;
+use std::io;
 use std::ptr;
 
 pub const JMP_ABS64_LEN: usize = 14;
 const TRAMPOLINE_SIZE: usize = 64;
+const MIN_VALID_USER_ADDR: usize = 0x10000;
+
+fn system_page_size() -> usize {
+    let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if ps > 0 && (ps as usize).is_power_of_two() {
+        ps as usize
+    } else {
+        4096
+    }
+}
+
+/// Pure parser checking whether `[addr, addr + len)` lies completely within a readable+executable
+/// virtual memory mapping in `/proc/self/maps` content.
+pub fn parse_maps_contains_exec_range(maps: &str, addr: usize, len: usize) -> bool {
+    if addr < MIN_VALID_USER_ADDR || len == 0 {
+        return false;
+    }
+    let Some(target_end) = addr.checked_add(len) else {
+        return false;
+    };
+
+    for line in maps.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(range_str) = parts.next() else {
+            continue;
+        };
+        let Some(perms) = parts.next() else {
+            continue;
+        };
+        if !perms.contains('r') || !perms.contains('x') {
+            continue;
+        }
+        let Some((start_hex, end_hex)) = range_str.split_once('-') else {
+            continue;
+        };
+        let Ok(start) = usize::from_str_radix(start_hex, 16) else {
+            continue;
+        };
+        let Ok(end) = usize::from_str_radix(end_hex, 16) else {
+            continue;
+        };
+        if addr >= start && target_end <= end {
+            return true;
+        }
+    }
+    false
+}
+
+/// Checks `/proc/self/maps` to verify `[addr, addr + len)` is mapped readable + executable.
+pub fn is_executable_mapped_range(addr: usize, len: usize) -> bool {
+    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
+        return false;
+    };
+    parse_maps_contains_exec_range(&maps, addr, len)
+}
+
+fn page_bounds(addr: usize, len: usize, page_size: usize) -> Result<(usize, usize), String> {
+    let end = addr
+        .checked_add(len)
+        .ok_or_else(|| "target address range overflow".to_string())?;
+    let page_start = addr & !(page_size - 1);
+    let page_end = end
+        .checked_add(page_size - 1)
+        .ok_or_else(|| "page alignment overflow".to_string())?
+        & !(page_size - 1);
+    let page_len = page_end
+        .checked_sub(page_start)
+        .filter(|&l| l > 0)
+        .ok_or_else(|| "computed zero mprotect page length".to_string())?;
+    Ok((page_start, page_len))
+}
 
 /// Represents an installed inline memory patch.
 #[derive(Debug)]
 pub struct MemoryPatch {
     pub target: *mut u8,
     pub trampoline: *mut u8,
+    pub trampoline_alloc_size: usize,
     pub replacement: *mut u8,
     pub original_bytes: Vec<u8>,
     pub orig_len: usize,
@@ -28,6 +106,7 @@ impl MemoryPatch {
             target,
             replacement,
             trampoline: ptr::null_mut(),
+            trampoline_alloc_size: 0,
             original_bytes: Vec::new(),
             orig_len: 0,
             active: false,
@@ -54,27 +133,71 @@ impl MemoryPatch {
         if self.active {
             return Err("patch already installed".into());
         }
+        if self.target.is_null() || (self.target as usize) < MIN_VALID_USER_ADDR {
+            return Err(format!("invalid target address {:p}", self.target));
+        }
+        if self.replacement.is_null() || (self.replacement as usize) < MIN_VALID_USER_ADDR {
+            return Err(format!(
+                "invalid replacement address {:p}",
+                self.replacement
+            ));
+        }
 
         let overwrite_len = JMP_ABS64_LEN.max(min_orig_bytes);
         if overwrite_len + JMP_ABS64_LEN > TRAMPOLINE_SIZE {
             return Err("overwrite_len exceeds trampoline capacity".into());
         }
 
+        if !is_executable_mapped_range(self.target as usize, overwrite_len) {
+            return Err(format!(
+                "refusing to patch {:p} ({} bytes): not inside a mapped r-x executable page",
+                self.target, overwrite_len
+            ));
+        }
+
         let orig_slice = std::slice::from_raw_parts(self.target, overwrite_len);
         self.original_bytes = orig_slice.to_vec();
         self.orig_len = overwrite_len;
 
-        let trampoline = Self::allocate_trampoline(TRAMPOLINE_SIZE)?;
-        self.trampoline = trampoline;
+        let (trampoline, alloc_size) = Self::allocate_trampoline(TRAMPOLINE_SIZE)?;
 
-        let ret_addr = self.target.add(overwrite_len) as usize;
+        let ret_addr = (self.target as usize)
+            .checked_add(overwrite_len)
+            .ok_or_else(|| {
+                let _ = libc::munmap(trampoline as *mut libc::c_void, alloc_size);
+                "trampoline return address overflow".to_string()
+            })?;
         ptr::copy_nonoverlapping(self.target, trampoline, overwrite_len);
         Self::write_abs_jmp64(trampoline.add(overwrite_len), ret_addr);
 
-        let page_size = 4096usize;
-        let page_start = (self.target as usize) & !(page_size - 1);
-        let page_end = ((self.target as usize) + overwrite_len + page_size - 1) & !(page_size - 1);
-        let page_len = page_end - page_start;
+        // Lock trampoline page to R-X (W^X) before publishing.
+        if libc::mprotect(
+            trampoline as *mut libc::c_void,
+            alloc_size,
+            libc::PROT_READ | libc::PROT_EXEC,
+        ) != 0
+        {
+            let err = io::Error::last_os_error();
+            let _ = libc::munmap(trampoline as *mut libc::c_void, alloc_size);
+            let msg = format!(
+                "mprotect(PROT_READ|PROT_EXEC) failed for trampoline {:p} (errno={:?}: {})",
+                trampoline,
+                err.raw_os_error(),
+                err
+            );
+            eprintln!("[memory_patch] {}", msg);
+            return Err(msg);
+        }
+
+        let page_size = system_page_size();
+        let (page_start, page_len) =
+            match page_bounds(self.target as usize, overwrite_len, page_size) {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = libc::munmap(trampoline as *mut libc::c_void, alloc_size);
+                    return Err(e);
+                }
+            };
 
         if libc::mprotect(
             page_start as *mut libc::c_void,
@@ -82,20 +205,49 @@ impl MemoryPatch {
             libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
         ) != 0
         {
-            return Err(format!("mprotect failed for target at {:p}", self.target));
+            let err = io::Error::last_os_error();
+            let _ = libc::munmap(trampoline as *mut libc::c_void, alloc_size);
+            let msg = format!(
+                "mprotect(RWX) failed for target {:p} [page=0x{:x}, len={}] (errno={:?}: {})",
+                self.target,
+                page_start,
+                page_len,
+                err.raw_os_error(),
+                err
+            );
+            eprintln!("[memory_patch] {}", msg);
+            return Err(msg);
         }
 
         Self::write_abs_jmp64(self.target, self.replacement as usize);
         for i in JMP_ABS64_LEN..overwrite_len {
             self.target.add(i).write(0x90);
         }
-
         _mm_mfence();
+
+        // Restore W^X (PROT_READ | PROT_EXEC) on target code page.
+        if libc::mprotect(
+            page_start as *mut libc::c_void,
+            page_len,
+            libc::PROT_READ | libc::PROT_EXEC,
+        ) != 0
+        {
+            let err = io::Error::last_os_error();
+            eprintln!(
+                "[memory_patch] warning: failed to restore PROT_READ|PROT_EXEC at {:p} (errno={:?}: {})",
+                self.target,
+                err.raw_os_error(),
+                err
+            );
+        }
+
+        self.trampoline = trampoline;
+        self.trampoline_alloc_size = alloc_size;
         self.active = true;
         Ok(())
     }
 
-    /// Restores the original bytes at `self.target`.
+    /// Restores the original bytes at `self.target` and releases the trampoline mapping.
     ///
     /// # Safety
     /// `self.target` must still be mapped in the current address space and no thread
@@ -104,10 +256,17 @@ impl MemoryPatch {
         if !self.active {
             return Err("patch not installed".into());
         }
-        let page_size = 4096usize;
-        let page_start = (self.target as usize) & !(page_size - 1);
-        let page_end = ((self.target as usize) + self.orig_len + page_size - 1) & !(page_size - 1);
-        let page_len = page_end - page_start;
+        if self.target.is_null() || !is_executable_mapped_range(self.target as usize, self.orig_len)
+        {
+            self.active = false;
+            return Err(format!(
+                "cannot uninstall patch at {:p}: target page no longer mapped executable",
+                self.target
+            ));
+        }
+
+        let page_size = system_page_size();
+        let (page_start, page_len) = page_bounds(self.target as usize, self.orig_len, page_size)?;
 
         if libc::mprotect(
             page_start as *mut libc::c_void,
@@ -115,11 +274,44 @@ impl MemoryPatch {
             libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
         ) != 0
         {
-            return Err("mprotect failed during removal".into());
+            let err = io::Error::last_os_error();
+            let msg = format!(
+                "mprotect(RWX) failed during uninstall at {:p} (errno={:?}: {})",
+                self.target,
+                err.raw_os_error(),
+                err
+            );
+            eprintln!("[memory_patch] {}", msg);
+            return Err(msg);
         }
 
         ptr::copy_nonoverlapping(self.original_bytes.as_ptr(), self.target, self.orig_len);
         _mm_mfence();
+
+        if libc::mprotect(
+            page_start as *mut libc::c_void,
+            page_len,
+            libc::PROT_READ | libc::PROT_EXEC,
+        ) != 0
+        {
+            let err = io::Error::last_os_error();
+            eprintln!(
+                "[memory_patch] warning: failed to restore R-X after uninstall at {:p} (errno={:?}: {})",
+                self.target,
+                err.raw_os_error(),
+                err
+            );
+        }
+
+        if !self.trampoline.is_null() && self.trampoline_alloc_size > 0 {
+            let _ = libc::munmap(
+                self.trampoline as *mut libc::c_void,
+                self.trampoline_alloc_size,
+            );
+            self.trampoline = ptr::null_mut();
+            self.trampoline_alloc_size = 0;
+        }
+
         self.active = false;
         Ok(())
     }
@@ -129,27 +321,41 @@ impl MemoryPatch {
     /// # Safety
     /// The patch must be active and the patched function must accept zero arguments.
     pub unsafe fn call_original_void(&self) {
+        if !self.active || self.trampoline.is_null() {
+            return;
+        }
         let tramp: unsafe extern "C" fn() = std::mem::transmute(self.trampoline);
         tramp()
     }
 
-    fn allocate_trampoline(size: usize) -> Result<*mut u8, String> {
-        let page_size = 4096usize;
-        let alloc_size = (size + page_size - 1) & !(page_size - 1);
+    fn allocate_trampoline(size: usize) -> Result<(*mut u8, usize), String> {
+        let page_size = system_page_size();
+        let alloc_size = size
+            .checked_add(page_size - 1)
+            .ok_or_else(|| "trampoline size overflow".to_string())?
+            & !(page_size - 1);
         let ptr = unsafe {
             libc::mmap(
                 ptr::null_mut(),
                 alloc_size,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                 -1,
                 0,
             )
         };
-        if ptr == libc::MAP_FAILED {
-            return Err("mmap failed for trampoline".into());
+        if ptr == libc::MAP_FAILED || ptr.is_null() {
+            let err = io::Error::last_os_error();
+            let msg = format!(
+                "mmap failed for trampoline ({} bytes) (errno={:?}: {})",
+                alloc_size,
+                err.raw_os_error(),
+                err
+            );
+            eprintln!("[memory_patch] {}", msg);
+            return Err(msg);
         }
-        Ok(ptr as *mut u8)
+        Ok((ptr as *mut u8, alloc_size))
     }
 }
 
@@ -160,6 +366,15 @@ impl Drop for MemoryPatch {
     fn drop(&mut self) {
         if self.active {
             let _ = unsafe { self.uninstall() };
+        } else if !self.trampoline.is_null() && self.trampoline_alloc_size > 0 {
+            unsafe {
+                let _ = libc::munmap(
+                    self.trampoline as *mut libc::c_void,
+                    self.trampoline_alloc_size,
+                );
+            }
+            self.trampoline = ptr::null_mut();
+            self.trampoline_alloc_size = 0;
         }
     }
 }
@@ -174,8 +389,90 @@ pub unsafe fn patch_by_offset(
     offset: u64,
     replacement: *mut u8,
 ) -> Result<MemoryPatch, String> {
-    let target = (base as *mut u8).add(offset as usize);
+    let addr = base
+        .checked_add(offset)
+        .ok_or_else(|| "patch_by_offset address overflow".to_string())?;
+    let target = addr as usize as *mut u8;
     let mut patch = MemoryPatch::new(target, replacement);
     patch.install(JMP_ABS64_LEN)?;
     Ok(patch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    extern "C" fn dummy_replacement() -> u32 {
+        99
+    }
+
+    #[test]
+    fn rejects_null_low_and_unmapped_target_addresses_without_segfault() {
+        let repl = dummy_replacement as *const () as *mut u8;
+
+        let res_null = unsafe { patch_by_offset(0, 0, repl) };
+        assert!(res_null.is_err());
+
+        // Typical un-rebased ELF RVA (e.g. 0x45000) is NOT mapped executable in this process
+        let res_rva = unsafe { patch_by_offset(0x45000, 0, repl) };
+        assert!(res_rva.is_err());
+    }
+
+    #[test]
+    fn parse_maps_checks_executable_permissions_and_bounds() {
+        let maps = "\
+00400000-00401000 r--p 00000000 08:01 1 /bin/example
+00401000-00405000 r-xp 00001000 08:01 1 /bin/example
+00405000-00406000 rw-p 00005000 08:01 1 /bin/example
+";
+        assert!(!parse_maps_contains_exec_range(maps, 0x0040_0000, 14));
+        assert!(parse_maps_contains_exec_range(maps, 0x0040_1000, 14));
+        assert!(!parse_maps_contains_exec_range(maps, 0x0040_4FF8, 14));
+        assert!(!parse_maps_contains_exec_range(maps, 0x0040_5000, 14));
+    }
+
+    #[test]
+    fn installs_and_uninstalls_patch_on_mapped_executable_code() {
+        // Allocate an executable page containing a simple 16-byte function:
+        // 14 NOPs + `mov eax, 42; ret` (B8 2A 00 00 00 C3)
+        let page_size = system_page_size();
+        let code_page = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                page_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(code_page, libc::MAP_FAILED);
+
+        unsafe {
+            let dst = code_page as *mut u8;
+            let mut fn_bytes = vec![0x90u8; 16];
+            fn_bytes.extend_from_slice(&[0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3]);
+            ptr::copy_nonoverlapping(fn_bytes.as_ptr(), dst, fn_bytes.len());
+            assert_eq!(
+                libc::mprotect(code_page, page_size, libc::PROT_READ | libc::PROT_EXEC),
+                0
+            );
+
+            let orig_fn: extern "C" fn() -> u32 = std::mem::transmute(dst);
+            assert_eq!(orig_fn(), 42);
+
+            let repl = dummy_replacement as *const () as *mut u8;
+            let mut patch = patch_by_offset(dst as usize as u64, 0, repl).unwrap();
+            assert_eq!(orig_fn(), 99);
+
+            // Calling the saved trampoline still runs original prologue + body -> 42
+            let tramp_fn: extern "C" fn() -> u32 = std::mem::transmute(patch.trampoline);
+            assert_eq!(tramp_fn(), 42);
+
+            patch.uninstall().unwrap();
+            assert_eq!(orig_fn(), 42);
+
+            libc::munmap(code_page, page_size);
+        }
+    }
 }

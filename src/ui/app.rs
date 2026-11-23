@@ -1033,6 +1033,7 @@ impl LuaToolsApp {
         let tx = self.msg_tx.clone();
         let ctx_c = ctx.clone();
         thread::spawn(move || {
+            let mut loaded = false;
             if let Some(path) = cc.ensure(app_id, custom_url.as_deref()) {
                 if let Ok(bytes) = fs::read(&path) {
                     if let Ok(img) = image::load_from_memory(&bytes) {
@@ -1044,10 +1045,14 @@ impl LuaToolsApp {
                             height: h as usize,
                             rgba: rgba.into_raw(),
                         });
-                        ctx_c.request_repaint();
+                        loaded = true;
                     }
                 }
             }
+            if !loaded {
+                let _ = tx.send(AppMessage::CoverFailed { app_id });
+            }
+            ctx_c.request_repaint();
         });
     }
 
@@ -1563,19 +1568,67 @@ impl LuaToolsApp {
 
     pub fn trigger_restart_steam(&mut self, ctx: &egui::Context) {
         let m = self.millennium_service.clone();
+        let steam_root = self.steam_bridge_service.status().steam_root;
+        let launcher = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".local/bin/luatools-steam-launcher");
         let tx = self.msg_tx.clone();
         let ctx_c = ctx.clone();
-        self.status_text = "Sending RestartSteam RPC to Millennium…".into();
+        self.status_text = "Restarting Steam…".into();
         thread::spawn(move || {
-            match m.restart_steam() {
-                Ok(()) => {
+            // Try Millennium RPC first when running; otherwise gracefully shut down & relaunch Steam directly
+            if m.restart_steam().is_ok() {
+                let _ = tx.send(AppMessage::SteamRestarted {
+                    ok: true,
+                    msg: "Restarting Steam via Millennium RPC…".into(),
+                });
+                ctx_c.request_repaint();
+                return;
+            }
+
+            let steam_cmd = steam_root
+                .as_ref()
+                .map(|r| r.join("steam.sh"))
+                .filter(|p| p.is_file())
+                .unwrap_or_else(|| std::path::PathBuf::from("steam"));
+
+            if crate::steam_bridge::preload_loader::find_steam_pid().is_some() {
+                let _ = std::process::Command::new(&steam_cmd)
+                    .arg("-shutdown")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                for _ in 0..40 {
+                    if crate::steam_bridge::preload_loader::find_steam_pid().is_none() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            }
+
+            let launch_bin = if launcher.is_file() {
+                launcher
+            } else {
+                steam_cmd
+            };
+            match std::process::Command::new(&launch_bin)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(_) => {
                     let _ = tx.send(AppMessage::SteamRestarted {
                         ok: true,
-                        msg: "Restarting Steam…".into(),
+                        msg: format!("Restarted Steam via {}.", launch_bin.display()),
                     });
                 }
                 Err(e) => {
-                    let _ = tx.send(AppMessage::SteamRestarted { ok: false, msg: e });
+                    let _ = tx.send(AppMessage::SteamRestarted {
+                        ok: false,
+                        msg: format!("Failed to restart Steam: {}", e),
+                    });
                 }
             }
             ctx_c.request_repaint();
@@ -1599,31 +1652,43 @@ impl LuaToolsApp {
             return;
         }
 
-        let st = self.steam_bridge_service.status();
-        let needs_restart = st.steam_pid.is_some();
-        self.status_text = if needs_restart {
+        let live_running = crate::steam_bridge::preload_loader::find_steam_pid().is_some();
+        self.status_text = if live_running {
             "Restarting Steam with integration bridge…".into()
         } else {
             "Launching Steam with integration bridge…".into()
         };
 
+        let steam_root = self.steam_bridge_service.status().steam_root;
         let tx = self.msg_tx.clone();
         let ctx_c = ctx.clone();
         thread::spawn(move || {
-            if needs_restart {
-                let _ = std::process::Command::new("steam")
+            let steam_cmd = steam_root
+                .as_ref()
+                .map(|r| r.join("steam.sh"))
+                .filter(|p| p.is_file())
+                .unwrap_or_else(|| std::path::PathBuf::from("steam"));
+
+            if crate::steam_bridge::preload_loader::find_steam_pid().is_some() {
+                let _ = std::process::Command::new(&steam_cmd)
                     .arg("-shutdown")
+                    .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .status();
-                for _ in 0..14 {
+                for _ in 0..40 {
                     if crate::steam_bridge::preload_loader::find_steam_pid().is_none() {
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(250));
                 }
             }
-            match std::process::Command::new(&launcher).spawn() {
+            match std::process::Command::new(&launcher)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
                 Ok(_) => {
                     let _ = tx.send(AppMessage::SteamRestarted {
                         ok: true,
@@ -1808,10 +1873,14 @@ impl LuaToolsApp {
                     height,
                     rgba,
                 } => {
+                    self.cover_in_flight.remove(&app_id);
                     let img = ColorImage::from_rgba_unmultiplied([width, height], &rgba);
                     let tex =
                         ctx.load_texture(format!("cover_{}", app_id), img, TextureOptions::LINEAR);
                     self.cover_textures.insert(app_id, tex);
+                }
+                AppMessage::CoverFailed { app_id } => {
+                    self.cover_in_flight.remove(&app_id);
                 }
                 AppMessage::FeaturedLoaded { top, new_releases } => {
                     self.featured_top = top;
@@ -2040,6 +2109,9 @@ impl LuaToolsApp {
                     self.notify(m, ToastKind::Info);
                 }
                 AppMessage::SteamRestarted { ok, msg } => {
+                    if ok {
+                        self.steam_bridge_service.refresh_steam_detection();
+                    }
                     self.notify(
                         msg,
                         if ok {

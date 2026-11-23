@@ -1,4 +1,4 @@
-# LuaTools Linux v2.6.0 (Native Rust Edition)
+# LuaTools Linux v2.6.1 (Native Rust Edition)
 
 A complete native Rust rewrite of LuaTools Linux (`eframe` / `egui`) featuring rootless Steam Client Interop (`libsteam_integration.so`), one-click game setup, native Linux Goldberg `SteamAutoPatch`, `LuaVault` build switching, `DepotDownloader` QR & depot-key automation, and an illustrated in-app **How to Use** manual.
 
@@ -55,13 +55,13 @@ cd LuaToolsLinux
 ```
 
 Outputs self-contained distributables into `dist/`:
-- **Fedora / RHEL / openSUSE**: `sudo dnf install ./dist/luatools-linux-2.6.0-1.*.rpm`
-- **Ubuntu / Debian / Pop!_OS**: `sudo apt install ./dist/luatools-linux_2.6.0_amd64.deb`
-- **Any Linux Distro (No root required)**: extract `dist/luatools-linux-2.6.0-x86_64.tar.gz` and run `./install.sh --yes --skip-deps`
+- **Fedora / RHEL / openSUSE**: `sudo dnf install ./dist/luatools-linux-2.6.1-1.*.rpm`
+- **Ubuntu / Debian / Pop!_OS**: `sudo apt install ./dist/luatools-linux_2.6.1_amd64.deb`
+- **Any Linux Distro (No root required)**: extract `dist/luatools-linux-2.6.1-x86_64.tar.gz` and run `./install.sh --yes --skip-deps`
 
 ---
 
-## Full v2.6.0 Feature Matrix
+## Full v2.6.1 Feature Matrix
 
 | Workspace | Capabilities |
 |-----------|--------------|

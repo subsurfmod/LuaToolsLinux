@@ -1311,10 +1311,12 @@ impl LuaToolsApp {
                                                             if primary_button(ui, "Apply Fix")
                                                                 .clicked()
                                                             {
-                                                                act_fix = Some((
-                                                                    fx.clone(),
-                                                                    install_dir.clone().unwrap(),
-                                                                ));
+                                                                if let Some(dir) = &install_dir {
+                                                                    act_fix = Some((
+                                                                        fx.clone(),
+                                                                        dir.clone(),
+                                                                    ));
+                                                                }
                                                             }
                                                         },
                                                     );
@@ -2753,8 +2755,12 @@ impl LuaToolsApp {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 ui.add_enabled_ui(!self.bridge_busy, |ui| {
-                    if primary_button(ui, "Install Integration (No Root)").clicked() {
-                        self.bridge_system_preload = false;
+                    let install_lbl = if self.bridge_system_preload {
+                        "Install Integration (System Preload)"
+                    } else {
+                        "Install Integration (No Root)"
+                    };
+                    if primary_button(ui, install_lbl).clicked() {
                         do_install = true;
                     }
                     if (st.integration_lib_installed
