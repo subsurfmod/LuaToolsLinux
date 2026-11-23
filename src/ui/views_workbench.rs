@@ -1590,6 +1590,14 @@ impl LuaToolsApp {
                 if ghost_button(ui, "Restart Steam").clicked() {
                     self.trigger_restart_steam(ui.ctx());
                 }
+                if danger_button(ui, "Kill Steam")
+                    .on_hover_text(
+                        "Close all running instances of Steam (client, steamwebhelper, overlays, and runtime wrappers).",
+                    )
+                    .clicked()
+                {
+                    self.trigger_kill_steam(ui.ctx());
+                }
             });
         });
     }
@@ -2787,9 +2795,11 @@ impl LuaToolsApp {
             // Progress bar for installation
             if st.install_progress > 0.0 && st.install_progress < 100.0 {
                 ui.add_space(4.0);
-                egui::ProgressBar::new(st.install_progress / 100.0)
-                    .text(format!("{}%", st.install_progress as u32))
-                    .animate(true);
+                ui.add(
+                    egui::ProgressBar::new(st.install_progress / 100.0)
+                        .text(format!("{}%", st.install_progress as u32))
+                        .animate(true),
+                );
                 ui.label(
                     RichText::new(&st.install_status)
                         .size(11.0)

@@ -107,6 +107,9 @@ pub struct LuaToolsApp {
     pub millennium_connected: bool,
     pub cover_textures: HashMap<u32, TextureHandle>,
     pub cover_in_flight: HashSet<u32>,
+    pub cover_known_urls: HashMap<u32, String>,
+    pub cover_retry_urls: HashMap<u32, String>,
+    pub cover_failed_at: HashMap<u32, std::time::Instant>,
     pub recent_installed: Vec<(u32, PathBuf)>,
 
     // Discover (Acquire) View State
@@ -311,6 +314,9 @@ impl LuaToolsApp {
             millennium_connected: false,
             cover_textures: HashMap::new(),
             cover_in_flight: HashSet::new(),
+            cover_known_urls: HashMap::new(),
+            cover_retry_urls: HashMap::new(),
+            cover_failed_at: HashMap::new(),
             recent_installed: Vec::new(),
             acquire_search_query: String::new(),
             acquire_tab: AcquireTab::TopSellers,
@@ -515,6 +521,9 @@ impl LuaToolsApp {
             millennium_connected: false,
             cover_textures: HashMap::new(),
             cover_in_flight: HashSet::new(),
+            cover_known_urls: HashMap::new(),
+            cover_retry_urls: HashMap::new(),
+            cover_failed_at: HashMap::new(),
             recent_installed: vec![
                 (1245620, PathBuf::from("1245620.lua")),
                 (1091500, PathBuf::from("1091500.lua")),
@@ -800,6 +809,7 @@ impl LuaToolsApp {
             self.hot_reload_service
                 .update_watch_dir(&inst.stplug_in_path);
             self.wired_service.steam_root = Some(inst.root.clone());
+            self.cover_cache.set_steam_root(Some(inst.root.clone()));
             if self.slssteam_service.config.play_not_owned {
                 let _ = self
                     .play_unowned_service
@@ -859,6 +869,7 @@ impl LuaToolsApp {
             self.steam_library_service.steam_installation = None;
             self.steam_bridge_service.set_steam_installation(None);
             self.wired_service.steam_root = None;
+            self.cover_cache.set_steam_root(None);
             if let Some(mut srv) = self.http_server.take() {
                 srv.stop();
             }
@@ -1032,21 +1043,76 @@ impl LuaToolsApp {
         });
     }
 
+    fn record_known_cover_url(&mut self, app_id: u32, url: &str) {
+        let trimmed = url.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let is_low_res = {
+            let lower = trimmed.to_ascii_lowercase();
+            lower.contains("capsule_sm_120") || lower.contains("capsule_231x87")
+        };
+        if let Some(existing) = self.cover_known_urls.get(&app_id) {
+            let existing_low_res = {
+                let lower = existing.to_ascii_lowercase();
+                lower.contains("capsule_sm_120") || lower.contains("capsule_231x87")
+            };
+            // Don't downgrade a known high-res header/capsule URL to a small search thumbnail
+            if !existing_low_res && is_low_res {
+                return;
+            }
+        }
+        self.cover_known_urls.insert(app_id, trimmed.to_string());
+    }
+
     pub fn ensure_cover_requested(
         &mut self,
         app_id: u32,
         custom_url: Option<String>,
         ctx: &egui::Context,
     ) {
-        if self.cover_textures.contains_key(&app_id) || !self.cover_in_flight.insert(app_id) {
+        if self.cover_textures.contains_key(&app_id) {
             return;
         }
+        let clean_url = custom_url
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty());
+
+        if let Some(ref u) = clean_url {
+            let changed =
+                self.cover_known_urls.get(&app_id).map(|s| s.as_str()) != Some(u.as_str());
+            self.record_known_cover_url(app_id, u);
+            if changed {
+                self.cover_failed_at.remove(&app_id);
+            }
+        }
+
+        if self.cover_in_flight.contains(&app_id) {
+            // Queue the newly learned URL so if the in-flight attempt fails it immediately retries
+            // instead of dropping the hashed header_image URL.
+            if let Some(u) = clean_url {
+                self.cover_retry_urls.insert(app_id, u);
+            }
+            return;
+        }
+
+        // Prevent per-frame retry storms when offline or for unknown AppIDs (45s cooldown)
+        if clean_url.is_none() {
+            if let Some(failed_at) = self.cover_failed_at.get(&app_id) {
+                if failed_at.elapsed() < std::time::Duration::from_secs(45) {
+                    return;
+                }
+            }
+        }
+
+        self.cover_in_flight.insert(app_id);
+        let effective_url = clean_url.or_else(|| self.cover_known_urls.get(&app_id).cloned());
         let cc = self.cover_cache.clone();
         let tx = self.msg_tx.clone();
         let ctx_c = ctx.clone();
         thread::spawn(move || {
             let mut loaded = false;
-            if let Some(path) = cc.ensure(app_id, custom_url.as_deref()) {
+            if let Some(path) = cc.ensure(app_id, effective_url.as_deref()) {
                 if let Ok(bytes) = fs::read(&path) {
                     if let Ok(img) = image::load_from_memory(&bytes) {
                         let rgba = img.to_rgba8();
@@ -1109,7 +1175,8 @@ impl LuaToolsApp {
         self.acquire_selected_source = None;
         self.acquire_dlc_info = None;
         self.acquire_status = format!("Checking providers for AppID {}…", app_id);
-        self.ensure_cover_requested(app_id, None, ctx);
+        let known_url = self.cover_known_urls.get(&app_id).cloned();
+        self.ensure_cover_requested(app_id, known_url, ctx);
 
         let info_cache = self.app_info_cache.clone();
         let api = self.api_client.clone();
@@ -1648,6 +1715,36 @@ impl LuaToolsApp {
         });
     }
 
+    /// Force-terminates all running Steam client, webhelper, overlay, and Steam Runtime instances.
+    pub fn trigger_kill_steam(&mut self, ctx: &egui::Context) {
+        let tx = self.msg_tx.clone();
+        let ctx_c = ctx.clone();
+        self.status_text = "Stopping all Steam instances…".into();
+        thread::spawn(move || {
+            match crate::steam_bridge::preload_loader::kill_all_steam_instances() {
+                Ok(0) => {
+                    let _ = tx.send(AppMessage::SteamRestarted {
+                        ok: true,
+                        msg: "No running Steam instances found.".into(),
+                    });
+                }
+                Ok(count) => {
+                    let _ = tx.send(AppMessage::SteamRestarted {
+                        ok: true,
+                        msg: format!(
+                            "Closed all running Steam instances ({} process(es)).",
+                            count
+                        ),
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(AppMessage::SteamRestarted { ok: false, msg: e });
+                }
+            }
+            ctx_c.request_repaint();
+        });
+    }
+
     /// Launch (or restart) Steam using the bridge launcher (~/.local/bin/luatools-steam-launcher)
     /// which preloads libsteam_integration.so into the Steam client process. No root required.
     pub fn launch_steam_with_bridge(&mut self, ctx: &egui::Context) {
@@ -1887,6 +1984,8 @@ impl LuaToolsApp {
                     rgba,
                 } => {
                     self.cover_in_flight.remove(&app_id);
+                    self.cover_retry_urls.remove(&app_id);
+                    self.cover_failed_at.remove(&app_id);
                     let img = ColorImage::from_rgba_unmultiplied([width, height], &rgba);
                     let tex =
                         ctx.load_texture(format!("cover_{}", app_id), img, TextureOptions::LINEAR);
@@ -1894,12 +1993,29 @@ impl LuaToolsApp {
                 }
                 AppMessage::CoverFailed { app_id } => {
                     self.cover_in_flight.remove(&app_id);
+                    if let Some(retry_url) = self.cover_retry_urls.remove(&app_id) {
+                        self.ensure_cover_requested(app_id, Some(retry_url), ctx);
+                    } else {
+                        self.cover_failed_at
+                            .insert(app_id, std::time::Instant::now());
+                    }
                 }
                 AppMessage::FeaturedLoaded { top, new_releases } => {
+                    for item in top.iter().chain(new_releases.iter()) {
+                        self.record_known_cover_url(item.app_id, &item.large_capsule_image);
+                    }
                     self.featured_top = top;
                     self.featured_new = new_releases;
+                    if let Some(aid) = self.acquire_selected_app {
+                        if let Some(url) = self.cover_known_urls.get(&aid).cloned() {
+                            self.ensure_cover_requested(aid, Some(url), ctx);
+                        }
+                    }
                 }
                 AppMessage::SearchFinished { items, error } => {
+                    for item in &items {
+                        self.record_known_cover_url(item.app_id, &item.icon);
+                    }
                     self.search_results = items;
                     self.acquire_tab = AcquireTab::SearchResults;
                     if let Some(e) = error {
@@ -1910,16 +2026,13 @@ impl LuaToolsApp {
                     }
                 }
                 AppMessage::AcquireDetailsLoaded { app_id, details } => {
-                    if self.acquire_selected_app == Some(app_id) {
-                        if let Some(ref d) = details {
-                            if !d.header_image.is_empty() {
-                                self.ensure_cover_requested(
-                                    app_id,
-                                    Some(d.header_image.clone()),
-                                    ctx,
-                                );
-                            }
+                    if let Some(ref d) = details {
+                        if !d.header_image.is_empty() {
+                            self.record_known_cover_url(app_id, &d.header_image);
+                            self.ensure_cover_requested(app_id, Some(d.header_image.clone()), ctx);
                         }
+                    }
+                    if self.acquire_selected_app == Some(app_id) {
                         self.acquire_details = details;
                     }
                 }
@@ -2387,11 +2500,12 @@ impl LuaToolsApp {
         let mut click_open_bridge_settings = false;
         let mut click_start_update = false;
         let mut click_launch_bridge = false;
+        let mut click_kill_steam = false;
         let mut click_relaunch_exe: Option<PathBuf> = None;
         let right_col_w = if matches!(self.update_banner, UpdateBannerState::Hidden) {
-            228.0
+            286.0
         } else {
-            356.0
+            414.0
         };
 
         egui::TopBottomPanel::top("top_command_bar")
@@ -2404,8 +2518,8 @@ impl LuaToolsApp {
             )
             .show(ctx, |ui| {
                 StripBuilder::new(ui)
-                    .size(Size::exact(196.0))
-                    .size(Size::remainder().at_least(180.0))
+                    .size(Size::exact(208.0))
+                    .size(Size::remainder().at_least(160.0))
                     .size(Size::exact(right_col_w))
                     .cell_layout(Layout::left_to_right(Align::Center))
                     .horizontal(|mut strip| {
@@ -2545,6 +2659,26 @@ impl LuaToolsApp {
                                     }
                                 }
 
+                                // Kill Steam button directly beside Restart/Launch Steam
+                                let kill_btn = egui::Button::new(
+                                    RichText::new("Kill Steam")
+                                        .font(semibold_font(11.5))
+                                        .color(Palette::DANGER_TEXT),
+                                )
+                                .fill(Palette::DANGER_BG)
+                                .stroke(Stroke::new(1.0_f32, Palette::DANGER_BORDER))
+                                .corner_radius(CornerRadius::same(4))
+                                .min_size(Vec2::new(76.0, 28.0));
+                                let kill_resp = ui.add(kill_btn).on_hover_text(
+                                    "Close all running instances of Steam (client, steamwebhelper, overlays, and runtime wrappers).",
+                                );
+                                if kill_resp.hovered() {
+                                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                }
+                                if kill_resp.clicked() {
+                                    click_kill_steam = true;
+                                }
+
                                 match &self.update_banner {
                                     UpdateBannerState::Hidden => {}
                                     UpdateBannerState::Available { badge, tooltip } => {
@@ -2618,6 +2752,9 @@ impl LuaToolsApp {
         }
         if click_launch_bridge {
             self.launch_steam_with_bridge(ctx);
+        }
+        if click_kill_steam {
+            self.trigger_kill_steam(ctx);
         }
         if click_start_update {
             self.trigger_git_self_update(ctx);

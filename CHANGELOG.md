@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.7.3-beta] - 2026-11-24
+
+### Added
+- **`Kill Steam` Button & All-Instance Steam Terminator (`src/steam_bridge/preload_loader.rs`, `src/ui/app.rs`, `src/ui/views_workbench.rs`)**:
+  - Added a dedicated **`Kill Steam`** button directly beside **`Restart Steam w/ Bridge`** / **`Launch Steam w/ Bridge`** in the top-right bar and next to **`Restart Steam`** in **`Settings › General & Steam`**.
+  - Scans `/proc` via `find_all_steam_pids()` / `kill_all_steam_instances()` to cleanly terminate all running Steam instances (`steam`, `steamwebhelper`, `steam.sh`, `steamservice`, `gameoverlayui`, `fossilize_replay`, `steam-runtime-*`, and Steam-scoped `reaper`/`srt-bwrap` wrappers) using `SIGTERM` with a 2-second grace window followed by `SIGKILL` for stubborn helpers — while strictly excluding `luatools`, debuggers, browsers, and unrelated apps.
+
+### Fixed
+- **Fixed Game Cover Images Showing AppIDs Instead of Artwork (`src/services/caches.rs`, `src/ui/app.rs`, `src/ui/views_primary.rs`)**:
+  - Modern Steam Store titles serve hashed asset URLs (`<appid>/<sha1>/header.jpg`) that return HTTP `404` on legacy unhashed CDN paths. `CoverCache::ensure` now checks Steam's local `appcache/librarycache/` (including nested hashed directories), reads cached `details/<appid>.json`, sends a standard browser `User-Agent`, validates decoded image bytes (auto-purging corrupt cached files), and automatically falls back to Steam's lightweight `appdetails?filters=basic` endpoint to resolve modern hashed `header_image` / `capsule_image` URLs.
+  - Wired featured (`large_capsule_image`), store search (`tiny_image`), and `AcquireDetailsLoaded` (`header_image`) URLs into `cover_known_urls` and an in-flight retry queue (`cover_retry_urls`) so newly loaded hashed cover URLs are never dropped when an initial unhashed request is already in flight.
+  - Added a 45-second failure cooldown (`cover_failed_at`) to eliminate per-frame thread spam on Home when offline or for unresolvable AppIDs.
+- **Resolved All 24 Compilation Errors, 47 Warnings & 8 Runtime Bugs from `beta/v2.7.2-alpha`**:
+  - **Services (`steamless_service.rs`, `github_proxy.rs`, `proxied_file_downloader.rs`, `analytics_service.rs`, `depot_downloader.rs`)**: Fixed field/type mismatches (`install_path`, `PathBuf`), raw binary byte downloads in `ProxiedFileDownloader::download_bytes`, invalid `ureq::Response::new`/`Transport::new` calls, mid-stream mirror fallback cleanup in `GithubProxy::download_async`, and missing HTTP timeouts.
+  - **OST Platform & Steam Bridge (`ost_platform/memory.rs`, `dynamic_library.rs`, `directory_watch.rs`, `steam_credential_store.rs`, `bkv_parser.rs`, `byte_search.rs`, `process.rs`, `encoding.rs`, `manifest_hooks.rs`, `cloud_redirect.rs`, `denuvo_auth.rs`)**: Fixed infinite loop in `memory::is_readable`, glibc `dlinfo(RTLD_DI_LINKMAP)` module base/directory lookup, non-blocking `inotify` watcher deadlock/early-exit, UB `static mut STORE` & partial-field overwrites in `steam_credential_store`, dropped child entries in `bkv_parser::read_object`, zero-padded offset corruption in `byte_search::find_in_file`, non-const `HashMap` statics in `manifest_hooks`, `&mut self` receiver mismatch in `CloudRedirectService::initialize`, and `/proc/<pid>/stat` parsing with spaces in `comm`.
+  - **UI (`lua_editor.rs`, `views_workbench.rs`)**: Fixed shadowed `changed` flag and live re-parse state in `LuaEditor` and rendered the previously discarded install `ProgressBar` in `views_workbench.rs`.
+
+---
+
 ## [2.6.1] - 2026-11-23
 
 ### Fixed

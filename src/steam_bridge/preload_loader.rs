@@ -12,8 +12,10 @@
 //!   `LD_PRELOAD` for user-session launches
 //! - Generates a runtime `LD_PRELOAD` launcher wrapper for Steam with `--gdb` / `--lldb` support
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Error type for preload operations.
 #[derive(Debug, thiserror::Error)]
@@ -106,6 +108,210 @@ pub fn find_steam_pid() -> Option<u32> {
         }
     }
     fallback_pid
+}
+
+/// Returns `true` when `/proc/<pid>` belongs to any Steam client, webhelper, overlay,
+/// runtime wrapper, or Steam launcher script process, while strictly excluding LuaTools
+/// itself, unrelated browsers, IDEs, shells, and non-Steam sandboxes.
+pub fn is_any_steam_process(comm: &str, exe_path: Option<&Path>, cmdline: &str) -> bool {
+    let comm_lower = comm.trim().to_ascii_lowercase();
+    let exe_name_lower = exe_path
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let exe_full_lower = exe_path
+        .map(|p| p.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let cmd_lower = cmdline.to_ascii_lowercase();
+
+    // Never terminate LuaTools itself, compilers, or interactive debuggers
+    if comm_lower.contains("luatools")
+        || exe_name_lower.contains("luatools")
+        || matches!(
+            exe_name_lower.as_str(),
+            "cargo" | "rustc" | "gdb" | "lldb" | "firefox" | "chrome" | "chromium" | "brave"
+        )
+    {
+        return false;
+    }
+
+    // 1. Direct Steam client / helper binaries
+    let is_direct_name = |name: &str| {
+        matches!(
+            name,
+            "steam"
+                | "steamwebhelper"
+                | "steam.sh"
+                | "steamservice"
+                | "steam-runtime"
+                | "steam-native"
+                | "steam-sls"
+                | "gameoverlayui"
+                | "gameoverlayui64"
+                | "fossilize_replay"
+                | "steamerrorreporter"
+                | "steam-runtime-l"
+                | "steam-runtime-launcher-service"
+                | "steam-runtime-supervisor"
+                | "steam-runtime-launcher-interface-0"
+                | "steam-runtime-l-0"
+        ) || name.starts_with("steamwebhelper")
+            || name.starts_with("steam-runtime-")
+    };
+
+    if is_direct_name(&exe_name_lower) || is_direct_name(&comm_lower) {
+        return true;
+    }
+
+    // 2. Executable resides directly inside Steam's own runtime/client folders
+    let exe_in_steam_runtime = exe_full_lower.contains("/.local/share/steam/")
+        || exe_full_lower.contains("/.steam/")
+        || exe_full_lower.contains("/steamrt64/")
+        || exe_full_lower.contains("/steamrt32/")
+        || exe_full_lower.contains("/ubuntu12_32/")
+        || exe_full_lower.contains("/ubuntu12_64/")
+        || exe_full_lower.contains("/steamlinuxruntime");
+    if exe_in_steam_runtime {
+        return true;
+    }
+
+    // 3. Shell wrappers executing steam.sh / /usr/bin/steam / steam-sls
+    if matches!(
+        exe_name_lower.as_str(),
+        "sh" | "bash" | "dash" | "zsh" | "fish"
+    ) {
+        let runs_steam_script = cmd_lower.contains("/steam.sh")
+            || cmd_lower.contains(" steam.sh")
+            || cmd_lower.contains("/usr/bin/steam")
+            || cmd_lower.contains("/usr/games/steam")
+            || cmd_lower.contains("/.local/share/steam/")
+            || cmd_lower.contains("/.steam/debian-installation/")
+            || cmd_lower.contains("steam-sls")
+            || cmd_lower.contains("luatools-steam-launcher");
+        if runs_steam_script {
+            return true;
+        }
+    }
+
+    // 4. Steam Runtime container / reaper processes scoped specifically to Steam
+    if matches!(
+        exe_name_lower.as_str(),
+        "reaper" | "srt-bwrap" | "pressure-vessel-wrap" | "pv-adverb" | "bwrap"
+    ) || matches!(comm_lower.as_str(), "reaper" | "srt-bwrap" | "pv-adverb")
+    {
+        let steam_scoped = cmd_lower.contains("steamlaunch")
+            || cmd_lower.contains("steamlinuxruntime")
+            || cmd_lower.contains("/.local/share/steam/")
+            || cmd_lower.contains("/.steam/")
+            || cmd_lower.contains("steamapps");
+        if steam_scoped {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Finds all running Steam client, webhelper, overlay, and Steam Runtime PIDs.
+pub fn find_all_steam_pids() -> Vec<u32> {
+    let my_pid = std::process::id();
+    let my_ppid = unsafe { libc::getppid() }.max(0) as u32;
+    let mut pids = Vec::new();
+
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for e in entries.flatten() {
+            let pid_str = e.file_name().to_string_lossy().to_string();
+            let Ok(pid): Result<u32, _> = pid_str.parse() else {
+                continue;
+            };
+            if pid == my_pid || pid == my_ppid || pid <= 1 {
+                continue;
+            }
+            let comm = fs::read_to_string(format!("/proc/{}/comm", pid)).unwrap_or_default();
+            let exe = fs::read_link(format!("/proc/{}/exe", pid)).ok();
+            let cmdline = fs::read(format!("/proc/{}/cmdline", pid))
+                .map(|b| {
+                    b.split(|&c| c == 0)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| String::from_utf8_lossy(s).into_owned())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+
+            if is_any_steam_process(&comm, exe.as_deref(), &cmdline) {
+                pids.push(pid);
+            }
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+/// Terminates all running instances of Steam (client, webhelpers, overlays, runtime wrappers).
+/// Sends `SIGTERM` first, waits up to 2 seconds for clean exit, then sends `SIGKILL` to any
+/// remaining Steam processes. Returns the total count of unique Steam processes terminated.
+pub fn kill_all_steam_instances() -> Result<usize, String> {
+    let initial = find_all_steam_pids();
+    if initial.is_empty() {
+        return Ok(0);
+    }
+
+    let mut terminated: HashSet<u32> = HashSet::new();
+    let mut perm_denied = false;
+
+    let send_sig =
+        |pids: &[u32], sig: libc::c_int, terminated: &mut HashSet<u32>, perm_denied: &mut bool| {
+            for &pid in pids {
+                let rc = unsafe { libc::kill(pid as libc::pid_t, sig) };
+                if rc == 0 {
+                    terminated.insert(pid);
+                } else {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EPERM) {
+                        *perm_denied = true;
+                    }
+                }
+            }
+        };
+
+    // Phase 1: Graceful SIGTERM to all detected Steam instances
+    send_sig(&initial, libc::SIGTERM, &mut terminated, &mut perm_denied);
+
+    // Wait up to 2.0 seconds, sending SIGTERM to any newly respawned helper along the way
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(100));
+        let alive = find_all_steam_pids();
+        if alive.is_empty() {
+            return Ok(terminated.len());
+        }
+        let newcomers: Vec<u32> = alive
+            .into_iter()
+            .filter(|p| !terminated.contains(p))
+            .collect();
+        if !newcomers.is_empty() {
+            send_sig(&newcomers, libc::SIGTERM, &mut terminated, &mut perm_denied);
+        }
+    }
+
+    // Phase 2: Force SIGKILL any remaining stubborn Steam processes
+    let remaining = find_all_steam_pids();
+    if !remaining.is_empty() {
+        send_sig(&remaining, libc::SIGKILL, &mut terminated, &mut perm_denied);
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    let still_alive = find_all_steam_pids();
+    if !still_alive.is_empty() && perm_denied {
+        return Err(format!(
+            "Permission denied stopping {} Steam process(es) owned by another user.",
+            still_alive.len()
+        ));
+    }
+
+    Ok(terminated.len())
 }
 
 pub fn is_loaded(pid: u32, lib_name: &str) -> bool {
@@ -273,6 +479,66 @@ mod tests {
         assert!(!is_steam_client_process(
             "steam-sls",
             Some(Path::new("/home/u/.local/bin/steam-sls"))
+        ));
+    }
+
+    #[test]
+    fn identifies_all_steam_instances_for_kill_without_false_positives() {
+        assert!(is_any_steam_process(
+            "steam",
+            Some(Path::new("/home/u/.local/share/Steam/steamrt64/steam")),
+            "/home/u/.local/share/Steam/steamrt64/steam"
+        ));
+        assert!(is_any_steam_process(
+            "steamwebhelper",
+            Some(Path::new(
+                "/home/u/.local/share/Steam/ubuntu12_64/steamwebhelper"
+            )),
+            "/home/u/.local/share/Steam/ubuntu12_64/steamwebhelper --type=renderer"
+        ));
+        assert!(is_any_steam_process(
+            "bash",
+            Some(Path::new("/usr/bin/bash")),
+            "/bin/bash /home/u/.local/share/Steam/steam.sh"
+        ));
+        assert!(is_any_steam_process(
+            "gameoverlayui",
+            Some(Path::new(
+                "/home/u/.local/share/Steam/ubuntu12_32/gameoverlayui"
+            )),
+            "gameoverlayui -pid 1234"
+        ));
+        assert!(is_any_steam_process(
+            "reaper",
+            Some(Path::new("/home/u/.local/share/Steam/ubuntu12_32/reaper")),
+            "reaper SteamLaunch AppId=1245620"
+        ));
+        assert!(is_any_steam_process(
+            "srt-bwrap",
+            Some(Path::new("/usr/bin/srt-bwrap")),
+            "srt-bwrap /home/u/.local/share/Steam/steamapps/common/SteamLinuxRuntime_sniper"
+        ));
+
+        // Strict negative safety checks
+        assert!(!is_any_steam_process(
+            "luatools",
+            Some(Path::new("/home/u/.local/bin/luatools")),
+            "/home/u/.local/bin/luatools"
+        ));
+        assert!(!is_any_steam_process(
+            "bash",
+            Some(Path::new("/usr/bin/bash")),
+            "/usr/bin/bash"
+        ));
+        assert!(!is_any_steam_process(
+            "firefox",
+            Some(Path::new("/usr/lib64/firefox/firefox")),
+            "/usr/lib64/firefox/firefox https://store.steampowered.com/app/1245620"
+        ));
+        assert!(!is_any_steam_process(
+            "bwrap",
+            Some(Path::new("/usr/bin/bwrap")),
+            "/usr/bin/bwrap --ro-bind / / /usr/bin/evince"
         ));
     }
 

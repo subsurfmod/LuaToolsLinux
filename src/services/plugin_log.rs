@@ -79,7 +79,10 @@ impl PluginLog {
                     writeln!(
                         f,
                         "[{}] [{}] {}: {}",
-                        entry.timestamp, entry.level, entry.plugin_name.unwrap_or_default(), entry.message
+                        entry.timestamp,
+                        entry.level,
+                        entry.plugin_name.unwrap_or_default(),
+                        entry.message
                     )
                 });
         }
@@ -155,7 +158,7 @@ mod tests {
     fn test_log_to_file() {
         let dir = tempdir().unwrap();
         let log_file = dir.path().join("plugin.log");
-        let mut log = PluginLog::new(10, Some(&log_file));
+        let log = PluginLog::new(10, Some(&log_file));
         log.info(Some("TestPlugin"), "File log test");
         assert!(log_file.exists());
     }

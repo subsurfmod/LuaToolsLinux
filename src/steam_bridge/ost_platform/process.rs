@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 
@@ -95,6 +94,14 @@ fn filetime_to_unix_time(filetime: u64) -> u64 {
 ///
 /// # Returns
 /// FILETIME timestamp on success, or None if the process doesn't exist or can't be read.
+fn parse_stat_starttime(content: &str) -> Option<u64> {
+    // /proc/<pid>/stat format: `pid (comm may contain spaces) state ppid ... starttime(22)`
+    // After the last ')', field 3 (state) is index 0, so field 22 (starttime) is index 19.
+    let rparen = content.rfind(')')?;
+    let after = content.get(rparen + 1..)?;
+    after.split_whitespace().nth(19)?.parse().ok()
+}
+
 pub fn get_creation_time(pid: u32) -> Option<u64> {
     if pid == 0 {
         return None;
@@ -102,26 +109,15 @@ pub fn get_creation_time(pid: u32) -> Option<u64> {
 
     let stat_path = format!("/proc/{}/stat", pid);
     let content = fs::read_to_string(&stat_path).ok()?;
+    let starttime_ticks = parse_stat_starttime(&content)?;
 
-    // stat format: pid (comm) state ppid ... starttime(22) ...
-    let fields: Vec<&str> = content.split_whitespace().collect();
-    if fields.len() < 22 {
-        return None;
-    }
-
-    // Field 22 (0-indexed 21) is starttime in clock ticks
-    let starttime_ticks: u64 = fields[21].parse().ok()?;
-
-    // Get system boot time from /proc/stat
     let boot_time = get_boot_time()?;
-
-    // Convert clock ticks to seconds (typically 100 ticks/sec on Linux)
-    let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
-    if clk_tck == 0 {
+    let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if clk_tck <= 0 {
         return None;
     }
 
-    let start_time_secs = boot_time + (starttime_ticks / clk_tck);
+    let start_time_secs = boot_time + (starttime_ticks / (clk_tck as u64));
     Some(unix_time_to_filetime(start_time_secs))
 }
 
@@ -129,8 +125,8 @@ pub fn get_creation_time(pid: u32) -> Option<u64> {
 fn get_boot_time() -> Option<u64> {
     let content = fs::read_to_string("/proc/stat").ok()?;
     for line in content.lines() {
-        if line.starts_with("btime ") {
-            return line[6..].trim().parse().ok();
+        if let Some(rest) = line.strip_prefix("btime ") {
+            return rest.trim().parse().ok();
         }
     }
     None
@@ -154,7 +150,6 @@ pub fn format_creation_time(file_time: u64) -> String {
         return format!("filetime={}", file_time);
     }
 
-    use std::time::Duration;
     let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(unix_secs as i64, 0);
     dt.map(|d| d.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
         .unwrap_or_else(|| format!("filetime={}", file_time))
@@ -300,36 +295,48 @@ pub fn enumerate_modules(pid: u32) -> Vec<ModuleInfo> {
             if existing.executable != executable {
                 // Update if we found an executable mapping
                 if executable {
-                    seen_paths.insert(path_clean.to_string(), ModuleInfo {
-                        path: path_clean.to_string(),
-                        native_path: path.to_path_buf(),
-                        size: existing.size + size,
-                        executable: true,
-                    });
+                    seen_paths.insert(
+                        path_clean.to_string(),
+                        ModuleInfo {
+                            path: path_clean.to_string(),
+                            native_path: path.to_path_buf(),
+                            size: existing.size + size,
+                            executable: true,
+                        },
+                    );
                 } else {
-                    seen_paths.insert(path_clean.to_string(), ModuleInfo {
-                        path: path_clean.to_string(),
-                        native_path: path.to_path_buf(),
-                        size: existing.size + size,
-                        executable: existing.executable,
-                    });
+                    seen_paths.insert(
+                        path_clean.to_string(),
+                        ModuleInfo {
+                            path: path_clean.to_string(),
+                            native_path: path.to_path_buf(),
+                            size: existing.size + size,
+                            executable: existing.executable,
+                        },
+                    );
                 }
             } else {
                 // Same executable status, just add size
-                seen_paths.insert(path_clean.to_string(), ModuleInfo {
-                    path: path_clean.to_string(),
-                    native_path: path.to_path_buf(),
-                    size: existing.size + size,
-                    executable,
-                });
+                seen_paths.insert(
+                    path_clean.to_string(),
+                    ModuleInfo {
+                        path: path_clean.to_string(),
+                        native_path: path.to_path_buf(),
+                        size: existing.size + size,
+                        executable,
+                    },
+                );
             }
         } else {
-            seen_paths.insert(path_clean.to_string(), ModuleInfo {
-                path: path_clean.to_string(),
-                native_path: path.to_path_buf(),
-                size,
-                executable,
-            });
+            seen_paths.insert(
+                path_clean.to_string(),
+                ModuleInfo {
+                    path: path_clean.to_string(),
+                    native_path: path.to_path_buf(),
+                    size,
+                    executable,
+                },
+            );
         }
     }
 
@@ -419,29 +426,28 @@ pub fn get_creation_time_checked(pid: u32) -> Result<u64> {
     }
 
     let stat_path = format!("/proc/{}/stat", pid);
-    let content = fs::read_to_string(&stat_path)
-        .map_err(|e| ProcessError::ProcReadError {
-            pid,
-            file: "stat".to_string(),
-            source: e,
-        })?;
+    let content = fs::read_to_string(&stat_path).map_err(|e| ProcessError::ProcReadError {
+        pid,
+        file: "stat".to_string(),
+        source: e,
+    })?;
 
-    let fields: Vec<&str> = content.split_whitespace().collect();
-    if fields.len() < 22 {
-        return Err(ProcessError::ParseError("stat has fewer than 22 fields".into()));
+    let starttime_ticks = parse_stat_starttime(&content).ok_or_else(|| {
+        ProcessError::ParseError("failed to parse starttime from /proc/stat".into())
+    })?;
+
+    let boot_time = get_boot_time().ok_or(ProcessError::ParseError(
+        "boot time not found in /proc/stat".into(),
+    ))?;
+
+    let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if clk_tck <= 0 {
+        return Err(ProcessError::ParseError(
+            "sysconf(_SC_CLK_TCK) returned <= 0".into(),
+        ));
     }
 
-    let starttime_ticks: u64 = fields[21].parse()
-        .map_err(|_| ProcessError::ParseError("starttime field is not a valid integer".into()))?;
-
-    let boot_time = get_boot_time().ok_or(ProcessError::ParseError("boot time not found in /proc/stat".into()))?;
-
-    let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
-    if clk_tck == 0 {
-        return Err(ProcessError::ParseError("sysconf(_SC_CLK_TCK) returned 0".into()));
-    }
-
-    let start_time_secs = boot_time + (starttime_ticks / clk_tck);
+    let start_time_secs = boot_time + (starttime_ticks / (clk_tck as u64));
     Ok(unix_time_to_filetime(start_time_secs))
 }
 
@@ -479,12 +485,11 @@ pub fn get_environment_variable_value_checked(pid: u32, name: &str) -> Result<Op
     }
 
     let environ_path = format!("/proc/{}/environ", pid);
-    let content = fs::read(&environ_path)
-        .map_err(|e| ProcessError::ProcReadError {
-            pid,
-            file: "environ".to_string(),
-            source: e,
-        })?;
+    let content = fs::read(&environ_path).map_err(|e| ProcessError::ProcReadError {
+        pid,
+        file: "environ".to_string(),
+        source: e,
+    })?;
 
     for part in content.split(|&b| b == 0) {
         if let Ok(s) = std::str::from_utf8(part) {
@@ -505,12 +510,11 @@ pub fn get_process_command_line_checked(pid: u32) -> Result<Option<String>> {
     }
 
     let cmdline_path = format!("/proc/{}/cmdline", pid);
-    let content = fs::read(&cmdline_path)
-        .map_err(|e| ProcessError::ProcReadError {
-            pid,
-            file: "cmdline".to_string(),
-            source: e,
-        })?;
+    let content = fs::read(&cmdline_path).map_err(|e| ProcessError::ProcReadError {
+        pid,
+        file: "cmdline".to_string(),
+        source: e,
+    })?;
 
     let args: Vec<String> = content
         .split(|&b| b == 0)
@@ -519,7 +523,11 @@ pub fn get_process_command_line_checked(pid: u32) -> Result<Option<String>> {
         .map(|s| s.to_string())
         .collect();
 
-    Ok(if args.is_empty() { None } else { Some(args.join(" ")) })
+    Ok(if args.is_empty() {
+        None
+    } else {
+        Some(args.join(" "))
+    })
 }
 
 /// Enumerate modules with full error information.
@@ -529,12 +537,11 @@ pub fn enumerate_modules_checked(pid: u32) -> Result<Vec<ModuleInfo>> {
     }
 
     let maps_path = format!("/proc/{}/maps", pid);
-    let content = fs::read_to_string(&maps_path)
-        .map_err(|e| ProcessError::ProcReadError {
-            pid,
-            file: "maps".to_string(),
-            source: e,
-        })?;
+    let content = fs::read_to_string(&maps_path).map_err(|e| ProcessError::ProcReadError {
+        pid,
+        file: "maps".to_string(),
+        source: e,
+    })?;
 
     let mut modules = Vec::new();
     let mut seen_paths: HashMap<String, ModuleInfo> = HashMap::new();
@@ -569,35 +576,47 @@ pub fn enumerate_modules_checked(pid: u32) -> Result<Vec<ModuleInfo>> {
         if let Some(existing) = seen_paths.get(path_clean) {
             if existing.executable != executable {
                 if executable {
-                    seen_paths.insert(path_clean.to_string(), ModuleInfo {
-                        path: path_clean.to_string(),
-                        native_path: path.to_path_buf(),
-                        size: existing.size + size,
-                        executable: true,
-                    });
+                    seen_paths.insert(
+                        path_clean.to_string(),
+                        ModuleInfo {
+                            path: path_clean.to_string(),
+                            native_path: path.to_path_buf(),
+                            size: existing.size + size,
+                            executable: true,
+                        },
+                    );
                 } else {
-                    seen_paths.insert(path_clean.to_string(), ModuleInfo {
-                        path: path_clean.to_string(),
-                        native_path: path.to_path_buf(),
-                        size: existing.size + size,
-                        executable: existing.executable,
-                    });
+                    seen_paths.insert(
+                        path_clean.to_string(),
+                        ModuleInfo {
+                            path: path_clean.to_string(),
+                            native_path: path.to_path_buf(),
+                            size: existing.size + size,
+                            executable: existing.executable,
+                        },
+                    );
                 }
             } else {
-                seen_paths.insert(path_clean.to_string(), ModuleInfo {
-                    path: path_clean.to_string(),
-                    native_path: path.to_path_buf(),
-                    size: existing.size + size,
-                    executable,
-                });
+                seen_paths.insert(
+                    path_clean.to_string(),
+                    ModuleInfo {
+                        path: path_clean.to_string(),
+                        native_path: path.to_path_buf(),
+                        size: existing.size + size,
+                        executable,
+                    },
+                );
             }
         } else {
-            seen_paths.insert(path_clean.to_string(), ModuleInfo {
-                path: path_clean.to_string(),
-                native_path: path.to_path_buf(),
-                size,
-                executable,
-            });
+            seen_paths.insert(
+                path_clean.to_string(),
+                ModuleInfo {
+                    path: path_clean.to_string(),
+                    native_path: path.to_path_buf(),
+                    size,
+                    executable,
+                },
+            );
         }
     }
 
@@ -610,7 +629,6 @@ pub fn enumerate_modules_checked(pid: u32) -> Result<Vec<ModuleInfo>> {
 mod tests {
     use super::*;
     use std::process::id;
-    use tempfile::tempdir;
 
     #[test]
     fn test_get_image_path_self() {
@@ -624,7 +642,11 @@ mod tests {
     fn test_get_image_path_checked_self() {
         let pid = id();
         let result = get_image_path_checked(pid);
-        assert!(result.is_ok(), "Should get our own executable path: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Should get our own executable path: {:?}",
+            result
+        );
         println!("Self exe path (checked): {:?}", result.unwrap());
     }
 
@@ -640,7 +662,11 @@ mod tests {
     fn test_get_command_line_checked_self() {
         let pid = id();
         let result = get_process_command_line_checked(pid);
-        assert!(result.is_ok(), "Should get our own command line: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Should get our own command line: {:?}",
+            result
+        );
         println!("Self cmdline (checked): {:?}", result.unwrap());
     }
 
@@ -671,7 +697,9 @@ mod tests {
         assert!(is_system_module_path("/lib/x86_64-linux-gnu/libm.so.6"));
         assert!(is_system_module_path("/usr/lib64/libstdc++.so.6"));
         assert!(is_system_module_path("/lib/aarch64-linux-gnu/libc.so.6"));
-        assert!(!is_system_module_path("/home/user/.local/share/Steam/linux64/steamclient.so"));
+        assert!(!is_system_module_path(
+            "/home/user/.local/share/Steam/linux64/steamclient.so"
+        ));
         assert!(!is_system_module_path("./my_binary"));
         assert!(!is_system_module_path("/opt/myapp/libfoo.so"));
     }
@@ -685,7 +713,10 @@ mod tests {
             println!("Process start time (FILETIME): {}", ts);
             println!("Formatted: {}", format_creation_time(ts));
             // Verify it's a reasonable FILETIME (after year 2000)
-            assert!(ts > unix_time_to_filetime(946684800), "FILETIME should be after year 2000");
+            assert!(
+                ts > unix_time_to_filetime(946684800),
+                "FILETIME should be after year 2000"
+            );
         }
     }
 

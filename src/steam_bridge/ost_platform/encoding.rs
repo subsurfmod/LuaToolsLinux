@@ -4,7 +4,6 @@
 //! On Linux, strings are typically UTF-8, so WideToUtf8 is a no-op.
 //! Utf8ToWide converts to UTF-16 for Windows API compatibility.
 
-
 /// Error type for encoding operations.
 #[derive(Debug, thiserror::Error)]
 pub enum EncodingError {
@@ -97,7 +96,7 @@ pub fn is_valid_utf16(value: &[u16]) -> bool {
     let mut chars = value.iter().peekable();
     while let Some(&c) = chars.next() {
         // Handle surrogate pairs
-        if (0xD800..=0xDBFF).contains(c) {
+        if (0xD800..=0xDBFF).contains(&c) {
             // High surrogate must be followed by low surrogate
             if let Some(&next) = chars.peek() {
                 if !matches!(next, 0xDC00..=0xDFFF) {
@@ -107,7 +106,7 @@ pub fn is_valid_utf16(value: &[u16]) -> bool {
             } else {
                 return false; // High surrogate without low surrogate
             }
-        } else if (0xDC00..=0xDFFF).contains(c) {
+        } else if (0xDC00..=0xDFFF).contains(&c) {
             // Low surrogate without high surrogate
             return false;
         }
@@ -122,7 +121,13 @@ mod tests {
     #[test]
     fn test_wide_to_utf8_ascii() {
         // "hello" in UTF-16
-        let input: &[u16] = &[b'h' as u16, b'e' as u16, b'l' as u16, b'l' as u16, b'o' as u16];
+        let input: &[u16] = &[
+            b'h' as u16,
+            b'e' as u16,
+            b'l' as u16,
+            b'l' as u16,
+            b'o' as u16,
+        ];
         let result = wide_to_utf8(input).unwrap();
         assert_eq!(result, "hello");
     }
@@ -158,7 +163,16 @@ mod tests {
     #[test]
     fn test_utf8_to_wide_ascii() {
         let result = utf8_to_wide("hello").unwrap();
-        assert_eq!(result, &[b'h' as u16, b'e' as u16, b'l' as u16, b'l' as u16, b'o' as u16][..]);
+        assert_eq!(
+            result,
+            &[
+                b'h' as u16,
+                b'e' as u16,
+                b'l' as u16,
+                b'l' as u16,
+                b'o' as u16
+            ][..]
+        );
     }
 
     #[test]
@@ -205,7 +219,7 @@ mod tests {
         assert!(is_valid_utf16(&[b'h' as u16, b'i' as u16]));
         // BMP character
         assert!(is_valid_utf16(&[0x00E9])); // é
-        // Valid surrogate pair
+                                            // Valid surrogate pair
         assert!(is_valid_utf16(&[0xD83D, 0xDE00])); // 😀
     }
 

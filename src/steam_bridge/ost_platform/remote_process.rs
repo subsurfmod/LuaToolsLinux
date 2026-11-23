@@ -5,9 +5,7 @@
 //! or ptrace to inject a shared library.
 
 use std::fs;
-use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Architecture {
@@ -137,7 +135,9 @@ pub fn inject_library(pid: u32, library_path: &Path) -> InjectStatus {
 
 /// Inject library via ptrace by calling dlopen in the target process.
 fn inject_via_ptrace(pid: u32, _library_path: &str) -> InjectStatus {
-    use libc::{ptrace, PTRACE_ATTACH, PTRACE_DETACH, PTRACE_CONT, PTRACE_GETREGS, PTRACE_SETREGS, waitpid, WIFSTOPPED};
+    use libc::{
+        ptrace, waitpid, PTRACE_ATTACH, PTRACE_DETACH, PTRACE_GETREGS, PTRACE_SETREGS, WIFSTOPPED,
+    };
     use std::mem;
 
     // Attach to target process
@@ -160,7 +160,14 @@ fn inject_via_ptrace(pid: u32, _library_path: &str) -> InjectStatus {
     #[cfg(target_arch = "x86")]
     let mut regs: libc::user_regs_struct32 = unsafe { mem::zeroed() };
 
-    let result = unsafe { ptrace(PTRACE_GETREGS, pid, 0, &mut regs as *mut _ as *mut libc::c_void) };
+    let result = unsafe {
+        ptrace(
+            PTRACE_GETREGS,
+            pid,
+            0,
+            &mut regs as *mut _ as *mut libc::c_void,
+        )
+    };
     if result == -1 {
         unsafe { ptrace(PTRACE_DETACH, pid, 0, 0) };
         return InjectStatus::PtraceAttachFailed;
@@ -178,7 +185,14 @@ fn inject_via_ptrace(pid: u32, _library_path: &str) -> InjectStatus {
     // instead of direct ptrace injection. The ptrace method is complex and error-prone.
     // We'll detach and return a status indicating to use LD_PRELOAD instead.
 
-    unsafe { ptrace(PTRACE_SETREGS, pid, 0, &original_regs as *const _ as *mut libc::c_void) };
+    unsafe {
+        ptrace(
+            PTRACE_SETREGS,
+            pid,
+            0,
+            &original_regs as *const _ as *mut libc::c_void,
+        )
+    };
     unsafe { ptrace(PTRACE_DETACH, pid, 0, 0) };
 
     // Return success - actual injection is done via LD_PRELOAD in preload_loader
@@ -190,7 +204,8 @@ fn inject_via_ptrace(pid: u32, _library_path: &str) -> InjectStatus {
 pub fn inject_via_ld_preload(pid: u32, library_path: &Path) -> InjectStatus {
     // Read the target's command line and environment
     let cmdline = super::process::get_process_command_line(pid);
-    let args: Vec<String> = cmdline.unwrap_or_default()
+    let args: Vec<String> = cmdline
+        .unwrap_or_default()
         .split_whitespace()
         .map(|s| s.to_string())
         .collect();
@@ -256,14 +271,20 @@ mod tests {
     fn test_get_architecture_self() {
         let pid = id();
         let arch = get_architecture(pid);
-        assert!(arch != Architecture::Unknown, "Should detect own architecture");
+        assert!(
+            arch != Architecture::Unknown,
+            "Should detect own architecture"
+        );
         println!("Self architecture: {}", arch.as_str());
     }
 
     #[test]
     fn test_inject_status_strings() {
         assert_eq!(InjectStatus::Ok.as_str(), "Ok");
-        assert_eq!(InjectStatus::PtraceAttachFailed.as_str(), "PtraceAttachFailed");
+        assert_eq!(
+            InjectStatus::PtraceAttachFailed.as_str(),
+            "PtraceAttachFailed"
+        );
     }
 
     #[test]

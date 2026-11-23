@@ -353,9 +353,11 @@ impl LuaToolsApp {
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = Vec2::new(14.0, 14.0);
                         for aid in cards {
-                            self.ensure_cover_requested(aid, None, ui.ctx());
+                            let known_url = self.cover_known_urls.get(&aid).cloned();
+                            self.ensure_cover_requested(aid, known_url, ui.ctx());
                             let tex: Option<TextureHandle> =
                                 self.cover_textures.get(&aid).cloned();
+                            let loading_cover = self.cover_in_flight.contains(&aid);
                             let name = self.resolve_game_title(aid);
 
                             paper_card_padded(ui, Margin::same(12), |ui| {
@@ -378,10 +380,15 @@ impl LuaToolsApp {
                                             CornerRadius::same(3),
                                             Palette::BG_VOID,
                                         );
+                                        let placeholder = if loading_cover {
+                                            format!("Loading #{}…", aid)
+                                        } else {
+                                            format!("#{}", aid)
+                                        };
                                         ui.painter().text(
                                             rect.center(),
                                             egui::Align2::CENTER_CENTER,
-                                            format!("#{}", aid),
+                                            placeholder,
                                             FontId::new(13.0, FontFamily::Monospace),
                                             Palette::TEXT_MUTED,
                                         );
@@ -555,6 +562,14 @@ impl LuaToolsApp {
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 if let Some(aid) = self.acquire_selected_app {
+                                    let known_url = self
+                                        .acquire_details
+                                        .as_ref()
+                                        .filter(|d| d.app_id == aid && !d.header_image.is_empty())
+                                        .map(|d| d.header_image.clone())
+                                        .or_else(|| self.cover_known_urls.get(&aid).cloned());
+                                    self.ensure_cover_requested(aid, known_url, ui.ctx());
+                                    let loading_cover = self.cover_in_flight.contains(&aid);
                                     let has_lua = self
                                         .lua_installer
                                         .as_ref()
@@ -579,10 +594,15 @@ impl LuaToolsApp {
                                                 CornerRadius::same(4),
                                                 Palette::BG_VOID,
                                             );
+                                            let placeholder = if loading_cover {
+                                                format!("Loading #{}…", aid)
+                                            } else {
+                                                format!("App #{}", aid)
+                                            };
                                             ui.painter().text(
                                                 rect.center(),
                                                 egui::Align2::CENTER_CENTER,
-                                                format!("App #{}", aid),
+                                                placeholder,
                                                 FontId::new(13.0, FontFamily::Monospace),
                                                 Palette::TEXT_MUTED,
                                             );

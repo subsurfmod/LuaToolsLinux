@@ -3,7 +3,6 @@
 //! Manages the addition of new plugins to the LuaTools plugin ecosystem,
 //! including validation, dependency checking, and installation.
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -133,7 +132,6 @@ impl Default for PluginAddService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use tempfile::tempdir;
 
     #[test]

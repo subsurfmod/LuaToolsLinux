@@ -22,6 +22,7 @@ impl SteamlessResult {
 }
 
 pub struct SteamlessService {
+    #[allow(dead_code)]
     depot_downloader: crate::services::depot_downloader::DepotDownloaderService,
     tools_dir: PathBuf,
 }
@@ -38,7 +39,9 @@ impl Default for SteamlessService {
 }
 
 impl SteamlessService {
-    pub fn new(depot_downloader: crate::services::depot_downloader::DepotDownloaderService) -> Self {
+    pub fn new(
+        depot_downloader: crate::services::depot_downloader::DepotDownloaderService,
+    ) -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         let tools_dir = home.join(".local/share/luatools/steamless");
         Self {
@@ -83,7 +86,9 @@ impl SteamlessService {
                     let p = entry.path();
                     if p.is_file() {
                         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        if name.contains("steamless") && (name.ends_with(".exe") || name.ends_with(".dll")) {
+                        if name.contains("steamless")
+                            && (name.ends_with(".exe") || name.ends_with(".dll"))
+                        {
                             return Some(p);
                         }
                     }
@@ -96,11 +101,7 @@ impl SteamlessService {
 
     /// Process game executables.
     /// Returns the number of patched executables, unchanged executables, and total count.
-    pub async fn patch_game(
-        &self,
-        app_id: u32,
-        install_path: &Path,
-    ) -> SteamlessResult {
+    pub async fn patch_game(&self, _app_id: u32, install_path: &Path) -> SteamlessResult {
         let cli = match self.ensure_tool().await {
             Some(p) => p,
             None => {
@@ -114,7 +115,7 @@ impl SteamlessService {
         };
 
         // Find executables to patch - look for .exe files in the install directory
-        let exes = match find_exes(install_dir) {
+        let exes = match find_exes(install_path) {
             Ok(e) => e,
             Err(_) => {
                 return SteamlessResult {
@@ -166,9 +167,26 @@ impl SteamlessService {
 fn find_exes(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
     let mut exes = Vec::new();
     let skip_patterns = [
-        "redist", "vcredist", "directx", "dxsetup", "vc_redist", "dotnet", "setup", "install",
-        "uninstall", "crashreport", "crashhandler", "bugsplat", "easyanticheat", "battleye",
-        "be_service", "_launcher", "bootstrap", "cefprocess", "cef_process", "steamwebhelper",
+        "redist",
+        "vcredist",
+        "directx",
+        "dxsetup",
+        "vc_redist",
+        "dotnet",
+        "setup",
+        "install",
+        "uninstall",
+        "crashreport",
+        "crashhandler",
+        "bugsplat",
+        "easyanticheat",
+        "battleye",
+        "be_service",
+        "_launcher",
+        "bootstrap",
+        "cefprocess",
+        "cef_process",
+        "steamwebhelper",
         "uplay",
     ];
 
@@ -181,10 +199,8 @@ fn find_exes(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
         if path.is_file() {
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 let lower = name.to_ascii_lowercase();
-                if lower.ends_with(".exe")
-                    && !skip_patterns.iter().any(|s| lower.contains(s))
-                {
-                    exes.push(path);
+                if lower.ends_with(".exe") && !skip_patterns.iter().any(|s| lower.contains(s)) {
+                    exes.push(path.to_path_buf());
                 }
             }
         }
@@ -218,12 +234,10 @@ fn run_steamless(cli: &Path, exe: &Path) -> Result<bool, Box<dyn std::error::Err
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use tempfile::tempdir;
 
     #[test]
     fn test_service_creation() {
-        let dd = crate::services::depot_downloader::DepotDownloaderService::new();
+        let dd = crate::services::depot_downloader::DepotDownloaderService::new(None);
         let svc = SteamlessService::new(dd);
         assert!(!svc.has_tool());
     }

@@ -156,6 +156,7 @@ fn find_module_path_in_maps(module_name: &str) -> Option<PathBuf> {
 ///
 /// # Returns
 /// Pointer to the symbol, or null if not found.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn get_symbol(module: ModuleHandle, symbol_name: &str) -> *mut std::ffi::c_void {
     if module.is_null() {
         return ptr::null_mut();
@@ -247,12 +248,48 @@ pub fn get_system_directory_path() -> String {
 ///
 /// # Returns
 /// Path to the directory containing the module, or empty path on error.
+#[repr(C)]
+struct LinkMap {
+    l_addr: usize,
+    l_name: *const libc::c_char,
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn get_module_directory(module: ModuleHandle) -> PathBuf {
     if module.is_null() {
         return PathBuf::new();
     }
 
-    // Use dladdr to get the path of the module
+    // 1. Prefer dlinfo(RTLD_DI_LINKMAP) for dlopen() handles on Linux glibc
+    let mut link_map: *mut LinkMap = ptr::null_mut();
+    let dlinfo_res = unsafe {
+        libc::dlinfo(
+            module,
+            libc::RTLD_DI_LINKMAP,
+            (&mut link_map as *mut *mut LinkMap).cast::<libc::c_void>(),
+        )
+    };
+    if dlinfo_res == 0 && !link_map.is_null() {
+        let name_ptr = unsafe { (*link_map).l_name };
+        if !name_ptr.is_null() {
+            let name = unsafe { CStr::from_ptr(name_ptr) }
+                .to_string_lossy()
+                .into_owned();
+            if !name.is_empty() {
+                if let Some(parent) = Path::new(&name).parent() {
+                    if !parent.as_os_str().is_empty() {
+                        return parent.to_path_buf();
+                    }
+                }
+            } else if let Ok(exe) = fs::read_link("/proc/self/exe") {
+                if let Some(parent) = exe.parent() {
+                    return parent.to_path_buf();
+                }
+            }
+        }
+    }
+
+    // 2. Fallback to dladdr when module is a symbol/code address inside a loaded DSO
     let path = unsafe {
         let mut info: libc::Dl_info = std::mem::zeroed();
         let result = libc::dladdr(module as *const _, &mut info);
@@ -369,7 +406,6 @@ pub fn dll_to_so_name(dll_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::CString;
 
     #[test]
     fn test_load_libc() {
@@ -494,12 +530,12 @@ mod tests {
     fn test_get_main_executable_path() {
         let path = get_main_executable_path();
         assert!(
-            path.exists() || path == PathBuf::from("steam"),
+            path.exists() || path == Path::new("steam"),
             "Main executable path should exist or be default"
         );
 
         // On a running process, /proc/self/exe should exist
-        if let Some(readlink_result) = fs::read_link("/proc/self/exe").ok() {
+        if let Ok(readlink_result) = fs::read_link("/proc/self/exe") {
             assert_eq!(path, readlink_result, "Should match /proc/self/exe");
         }
     }
@@ -587,9 +623,7 @@ mod tests {
     fn test_get_symbol_with_empty_name() {
         let handle = load(Path::new("libc.so.6"));
         if !handle.is_null() {
-            let symbol = get_symbol(handle, "");
-            // Empty symbol name - implementation-dependent behavior
-            // dlopen doesn't fail on empty name, but dlsym typically returns null
+            let _symbol = get_symbol(handle, "");
         }
     }
 

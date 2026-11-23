@@ -43,6 +43,10 @@ impl TicketStore {
         }
     }
 
+    pub fn config_dir(&self) -> &Path {
+        &self.config_dir
+    }
+
     pub fn default_path() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))

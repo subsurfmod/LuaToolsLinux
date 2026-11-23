@@ -193,6 +193,10 @@ impl LuaToolsApiClient {
         );
         let val: Value = Self::agent()
             .get(&url)
+            .set(
+                "User-Agent",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            )
             .call()
             .map_err(|e| e.to_string())?
             .into_json()
@@ -232,7 +236,14 @@ impl LuaToolsApiClient {
 
     pub fn get_featured(&self) -> (Vec<SteamFeaturedItem>, Vec<SteamFeaturedItem>) {
         let url = "https://store.steampowered.com/api/featuredcategories?cc=us&l=english";
-        let Ok(resp) = Self::agent().get(url).call() else {
+        let Ok(resp) = Self::agent()
+            .get(url)
+            .set(
+                "User-Agent",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            )
+            .call()
+        else {
             return (Vec::new(), Vec::new());
         };
         let Ok(data) = resp.into_json::<Value>() else {

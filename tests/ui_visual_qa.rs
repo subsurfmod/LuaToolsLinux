@@ -357,6 +357,13 @@ fn headless_papercut_views_render_cleanly_at_wide_and_narrow_resolutions() {
             d_sub: None,
             s_sub: None,
         },
+        QaViewCase {
+            fname: "20_settings_general.png",
+            size: [1380, 860],
+            view: ActiveView::Settings,
+            d_sub: None,
+            s_sub: Some(SettingsSubTab::General),
+        },
     ];
 
     let guide_out_opt = std::env::var("LUATOOLS_GUIDE_OUT").ok().map(PathBuf::from);
@@ -383,7 +390,7 @@ fn headless_papercut_views_render_cleanly_at_wide_and_narrow_resolutions() {
         }
         if fname == "09_settings_updates.png" {
             app.update_banner = luatools_linux::ui::state::UpdateBannerState::Available {
-                badge: "Update v2.6.1".into(),
+                badge: "Update v2.7.3-beta".into(),
                 tooltip: "New commits available on GitHub".into(),
             };
         } else {

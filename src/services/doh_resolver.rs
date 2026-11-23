@@ -55,7 +55,6 @@ impl DohResolver {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

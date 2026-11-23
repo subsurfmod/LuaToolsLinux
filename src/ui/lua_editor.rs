@@ -1,33 +1,21 @@
-//! LuaEditor - Syntax-highlighted Lua editor with error checking
+//! LuaEditor - Syntax-highlighted Lua editor with live error checking.
 //!
-//! Provides syntax highlighting for .lua stplug-in directives:
-//! addappid, setManifestid, addtoken, pin/unpin toggling
+//! Provides live editing & validation for `.lua` stplug-in directives:
+//! `addappid`, `setManifestid`, `addtoken`, and pin/unpin toggling.
 
-use eframe::egui::{
-    self, Align, Color32, FontId, Margin, RichText, ScrollArea, Sense, TextEdit, Vec2,
-};
+use eframe::egui::{self, Color32, RichText, ScrollArea, TextEdit};
 
 use crate::parsers::lua_parser::{LuaContents, LuaFileParser};
 
-/// Syntax-highlighted Lua editor with real-time error checking
+/// Lua editor with real-time parse validation.
+#[derive(Default)]
 pub struct LuaEditor {
     pub text: String,
+    pub app_id: u32,
     pub parsed: Option<LuaContents>,
     pub edit_live: bool,
     pub error_message: Option<String>,
     pub warnings: Vec<String>,
-}
-
-impl Default for LuaEditor {
-    fn default() -> Self {
-        Self {
-            text: String::new(),
-            parsed: None,
-            edit_live: false,
-            error_message: None,
-            warnings: Vec::new(),
-        }
-    }
 }
 
 impl LuaEditor {
@@ -36,8 +24,13 @@ impl LuaEditor {
     }
 
     pub fn set_text(&mut self, text: String, app_id: u32) {
-        self.text = text.clone();
-        self.parsed = LuaFileParser::parse_text(&text, app_id).into();
+        self.app_id = app_id;
+        self.text = text;
+        self.reparse();
+    }
+
+    fn reparse(&mut self) {
+        self.parsed = Some(LuaFileParser::parse_text(&self.text, self.app_id));
         self.validate();
     }
 
@@ -46,20 +39,19 @@ impl LuaEditor {
         self.warnings.clear();
 
         if let Some(parsed) = &self.parsed {
-            // Check for common issues
             if parsed.entries.is_empty() {
-                self.warnings.push("No addappid directives found in .lua file".into());
+                self.warnings
+                    .push("No addappid directives found in .lua file".into());
             }
 
-            // Check for duplicate entries
             let mut seen = std::collections::HashSet::new();
             for entry in &parsed.entries {
                 if !seen.insert(entry.id) {
-                    self.warnings.push(format!("Duplicate addappid for AppID {}", entry.id));
+                    self.warnings
+                        .push(format!("Duplicate addappid for AppID {}", entry.id));
                 }
             }
 
-            // Check for commented-out pins that might be intentional
             if !parsed.commented_pins.is_empty() {
                 self.warnings.push(format!(
                     "{} pinned manifest(s) are commented out",
@@ -71,13 +63,12 @@ impl LuaEditor {
         }
     }
 
-    /// Render the Lua editor with syntax highlighting
+    /// Render the Lua editor with live validation.
     pub fn render(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
 
         ui.spacing_mut().item_spacing.y = 8.0;
 
-        // Status bar
         if let Some(parsed) = &self.parsed {
             ui.horizontal(|ui| {
                 ui.label(
@@ -101,12 +92,9 @@ impl LuaEditor {
 
                 if !parsed.commented_pins.is_empty() {
                     ui.label(
-                        RichText::new(format!(
-                            "{} commented pins",
-                            parsed.commented_pins.len()
-                        ))
-                        .size(12.0)
-                        .color(Color32::from_rgb(200, 150, 100)),
+                        RichText::new(format!("{} commented pins", parsed.commented_pins.len()))
+                            .size(12.0)
+                            .color(Color32::from_rgb(200, 150, 100)),
                     );
                 }
             });
@@ -117,13 +105,14 @@ impl LuaEditor {
         }
 
         for warning in &self.warnings {
-            ui.colored_label(Color32::from_rgb(255, 200, 100), format!("Warning: {}", warning));
+            ui.colored_label(
+                Color32::from_rgb(255, 200, 100),
+                format!("Warning: {}", warning),
+            );
         }
 
         ui.add_space(4.0);
 
-        // Editor area - simple text editor without custom layout
-        let mut changed = false;
         ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -137,7 +126,7 @@ impl LuaEditor {
                 );
 
                 if response.changed() {
-                    self.validate();
+                    self.reparse();
                     changed = true;
                 }
             });
@@ -145,17 +134,14 @@ impl LuaEditor {
         changed
     }
 
-    /// Get the current edited text
     pub fn text(&self) -> &str {
         &self.text
     }
 
-    /// Get parsed contents
     pub fn parsed(&self) -> Option<&LuaContents> {
         self.parsed.as_ref()
     }
 
-    /// Check if there are any errors
     pub fn has_errors(&self) -> bool {
         self.error_message.is_some()
     }

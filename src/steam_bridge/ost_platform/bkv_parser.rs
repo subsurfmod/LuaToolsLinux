@@ -33,6 +33,8 @@ pub struct BkvNode {
     pub value: BkvValue,
 }
 
+const MAX_BKV_ALLOC_LEN: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub enum BkvError {
     #[error("IO error: {0}")]
@@ -45,6 +47,8 @@ pub enum BkvError {
     InvalidNodeType(u8),
     #[error("UTF-8 decode error: {0}")]
     Utf8Error(#[from] std::string::FromUtf8Error),
+    #[error("UTF-16 decode error: {0}")]
+    Utf16Error(#[from] std::string::FromUtf16Error),
     #[error("Parse error: {0}")]
     Parse(String),
 }
@@ -59,34 +63,35 @@ impl<R: Read + Seek> BkvReader<R> {
     }
 
     pub fn parse(&mut self) -> Result<BkvValue, BkvError> {
-        // Read and verify magic
         let mut magic = [0u8; 4];
         self.reader.read_exact(&mut magic)?;
         if magic != [b'B', b'K', b'V', 0] {
             return Err(BkvError::InvalidMagic(magic));
         }
 
-        self.read_node()
+        let (_name, value) = self.read_node()?;
+        Ok(value)
     }
 
-    fn read_node(&mut self) -> Result<BkvValue, BkvError> {
+    fn read_node(&mut self) -> Result<(String, BkvValue), BkvError> {
         let node_type = self.read_u8()?;
         let name = self.read_null_terminated_string()?;
 
-        match node_type {
-            0 => Ok(BkvValue::Object(BTreeMap::new())), // End of object
-            1 => self.read_string().map(BkvValue::String),
-            2 => self.read_int32().map(BkvValue::Int32),
-            3 => self.read_float().map(BkvValue::Float),
-            4 => self.read_pointer().map(BkvValue::Pointer),
-            5 => self.read_wide_string().map(BkvValue::WideString),
-            6 => self.read_color().map(BkvValue::Color),
-            7 => self.read_uint64().map(BkvValue::UInt64),
-            8 => self.read_binary().map(BkvValue::Binary),
-            9 => self.read_object().map(BkvValue::Object), // Nested object
-            10 => self.read_array().map(BkvValue::Array),  // Array
-            t => Err(BkvError::InvalidNodeType(t)),
-        }
+        let value = match node_type {
+            0 => BkvValue::Object(BTreeMap::new()),
+            1 => BkvValue::String(self.read_string()?),
+            2 => BkvValue::Int32(self.read_int32()?),
+            3 => BkvValue::Float(self.read_float()?),
+            4 => BkvValue::Pointer(self.read_pointer()?),
+            5 => BkvValue::WideString(self.read_wide_string()?),
+            6 => BkvValue::Color(self.read_color()?),
+            7 => BkvValue::UInt64(self.read_uint64()?),
+            8 => BkvValue::Binary(self.read_binary()?),
+            9 => BkvValue::Object(self.read_object()?),
+            10 => BkvValue::Array(self.read_array()?),
+            t => return Err(BkvError::InvalidNodeType(t)),
+        };
+        Ok((name, value))
     }
 
     fn read_object(&mut self) -> Result<BTreeMap<String, BkvValue>, BkvError> {
@@ -94,17 +99,12 @@ impl<R: Read + Seek> BkvReader<R> {
         loop {
             let node_type = self.peek_u8()?;
             if node_type == 0 {
-                self.read_u8()?; // consume end marker
-                let _name = self.read_null_terminated_string()?; // empty name for end
+                self.read_u8()?;
+                let _name = self.read_null_terminated_string()?;
                 break;
             }
-            let value = self.read_node()?;
-            if let BkvValue::Object(obj) = value {
-                // This shouldn't happen - read_node returns the value directly
-            }
-            // The name was read inside read_node, we need to track it differently
-            // Actually, let's re-read: read_node reads type + name + value
-            // For objects, the "value" is the object itself with children
+            let (child_name, child_value) = self.read_node()?;
+            map.insert(child_name, child_value);
         }
         Ok(map)
     }
@@ -114,11 +114,11 @@ impl<R: Read + Seek> BkvReader<R> {
         loop {
             let node_type = self.peek_u8()?;
             if node_type == 0 {
-                self.read_u8()?; // consume end marker
+                self.read_u8()?;
                 let _name = self.read_null_terminated_string()?;
                 break;
             }
-            let value = self.read_node()?;
+            let (_child_name, value) = self.read_node()?;
             arr.push(value);
         }
         Ok(arr)
@@ -126,6 +126,12 @@ impl<R: Read + Seek> BkvReader<R> {
 
     fn read_string(&mut self) -> Result<String, BkvError> {
         let len = self.read_varint()? as usize;
+        if len > MAX_BKV_ALLOC_LEN {
+            return Err(BkvError::Parse(format!(
+                "String length {} exceeds limit",
+                len
+            )));
+        }
         let mut buf = vec![0u8; len];
         self.reader.read_exact(&mut buf)?;
         Ok(String::from_utf8(buf)?)
@@ -133,9 +139,15 @@ impl<R: Read + Seek> BkvReader<R> {
 
     fn read_wide_string(&mut self) -> Result<String, BkvError> {
         let len = self.read_varint()? as usize;
-        let mut buf = vec![0u16; len];
-        for i in 0..len {
-            buf[i] = self.read_u16_le()?;
+        if len > MAX_BKV_ALLOC_LEN / 2 {
+            return Err(BkvError::Parse(format!(
+                "WideString length {} exceeds limit",
+                len
+            )));
+        }
+        let mut buf = Vec::with_capacity(len);
+        for _ in 0..len {
+            buf.push(self.read_u16_le()?);
         }
         Ok(String::from_utf16(&buf)?)
     }
@@ -163,6 +175,12 @@ impl<R: Read + Seek> BkvReader<R> {
 
     fn read_binary(&mut self) -> Result<Vec<u8>, BkvError> {
         let len = self.read_varint()? as usize;
+        if len > MAX_BKV_ALLOC_LEN {
+            return Err(BkvError::Parse(format!(
+                "Binary length {} exceeds limit",
+                len
+            )));
+        }
         let mut buf = vec![0u8; len];
         self.reader.read_exact(&mut buf)?;
         Ok(buf)
@@ -251,7 +269,8 @@ fn extract_achievements_recursive(value: &BkvValue, out: &mut BTreeMap<String, A
         BkvValue::Object(map) => {
             // Check if this is an achievement node
             if let (Some(BkvValue::String(name)), Some(BkvValue::Int32(unlocked))) =
-                (map.get("name"), map.get("unlocked")) {
+                (map.get("name"), map.get("unlocked"))
+            {
                 let mut ach = AchievementData {
                     name: name.clone(),
                     unlocked: *unlocked != 0,
@@ -283,7 +302,11 @@ fn extract_achievements_recursive(value: &BkvValue, out: &mut BTreeMap<String, A
 }
 
 /// Find the Steam stats file for a given app/account
-pub fn find_user_game_stats_file(steam_config_dir: &Path, account_id: u32, app_id: u32) -> Option<std::path::PathBuf> {
+pub fn find_user_game_stats_file(
+    steam_config_dir: &Path,
+    account_id: u32,
+    app_id: u32,
+) -> Option<std::path::PathBuf> {
     let pattern = format!("UserGameStats_{}_{}.bin", account_id, app_id);
     let depot_cache = steam_config_dir.parent()?.join("depotcache");
     if depot_cache.exists() {
@@ -326,14 +349,21 @@ mod tests {
                     byte |= 0x80;
                 }
                 buf.push(byte);
-                if v == 0 { break; }
+                if v == 0 {
+                    break;
+                }
             }
             assert_eq!(buf, expected, "varint encoding for {}", val);
 
             // Test decoding
             let mut cursor = Cursor::new(&buf);
             let mut reader = BkvReader::new(&mut cursor);
-            assert_eq!(reader.read_varint().unwrap(), val, "varint decoding for {}", val);
+            assert_eq!(
+                reader.read_varint().unwrap(),
+                val,
+                "varint decoding for {}",
+                val
+            );
         }
     }
 

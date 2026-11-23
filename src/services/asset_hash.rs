@@ -5,11 +5,11 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use md5::compute as md5_compute;
 use sha2::{Digest, Sha256};
-use md5::{compute as md5_compute};
 
 #[derive(Debug, Clone)]
 pub struct AssetHash {
@@ -96,15 +96,22 @@ impl AssetHashService {
     }
 
     pub fn verify_file(&self, app_id: u32, file_path: &Path) -> bool {
-        let hashes = self.cache.lock().unwrap().get(&app_id).cloned().unwrap_or_default();
-        hashes.iter().any(|h| h.file_path == file_path.to_string_lossy() && h.verify(file_path))
+        let hashes = self
+            .cache
+            .lock()
+            .unwrap()
+            .get(&app_id)
+            .cloned()
+            .unwrap_or_default();
+        hashes
+            .iter()
+            .any(|h| h.file_path == file_path.to_string_lossy() && h.verify(file_path))
     }
 
     pub fn clear_cache(&mut self) {
         self.cache.lock().unwrap().clear();
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -136,7 +143,7 @@ mod tests {
         std::fs::write(&file_path, b"test data").unwrap();
 
         let service = AssetHashService::new();
-        let hash = service.hash_file(1245620, &file_path, "test.bin");
+        let _hash = service.hash_file(1245620, &file_path, "test.bin");
 
         assert!(service.verify_file(1245620, &file_path));
     }

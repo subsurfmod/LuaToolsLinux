@@ -1,12 +1,6 @@
 //! Denuvo authorization window integration for Linux.
 //!
 //! Port of usefulsteamtools `Pipe/Features/Auth/DenuvoAuth.cpp`.
-//!
-//! This module handles the Denuvo anti-tamper authentication flow:
-//! 1. Detects when a Denuvo-protected game is launching
-//! 2. Monitors the IPC handshake for the game's Steam connection
-//! 3. Runs the Denuvo authorization window when needed
-//! 4. Provides the auth ticket to Steam
 
 use std::collections::HashMap;
 use std::sync::{Mutex, RwLock};
@@ -47,6 +41,7 @@ pub struct DenuvoAuthService {
     authorized_pipes: RwLock<HashMap<u32, bool>>,
 }
 
+#[allow(dead_code)]
 struct PendingAuth {
     app_id: u32,
     created_at: u64,
@@ -66,54 +61,66 @@ impl DenuvoAuthService {
         self.config = config;
     }
 
-    /// Register a pipe handshake for a Denuvo game
+    /// Register a pipe handshake for a Denuvo game.
     pub fn on_handshake(&self, app_id: u32, pid: u32) -> bool {
         let is_denuvo = self.is_denuvo_protected(app_id);
 
         if is_denuvo {
-            let mut pending = self.pending_auth.lock().unwrap();
+            let mut pending = self.pending_auth.lock().unwrap_or_else(|e| e.into_inner());
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
 
-            pending.insert(app_id, PendingAuth {
+            pending.insert(
                 app_id,
-                created_at: now,
-                pid,
-            });
+                PendingAuth {
+                    app_id,
+                    created_at: now,
+                    pid,
+                },
+            );
 
-            eprintln!("[denuvo] detected Denuvo game {} (pid={}), scheduling auth", app_id, pid);
+            eprintln!(
+                "[denuvo] detected Denuvo game {} (pid={}), scheduling auth",
+                app_id, pid
+            );
             true
         } else {
             false
         }
     }
 
-    pub fn is_denuvo_protected(&self, app_id: u32) -> bool {
-        // This would check against the ForcedDenuvoSet from Lua config
-        // For now, check if we have a pool SteamID configured
+    pub fn is_denuvo_protected(&self, _app_id: u32) -> bool {
         self.config.pool_steam_id.is_some()
     }
 
-    pub fn is_authorized_pipe(&self, app_id: u32, pid: u32) -> bool {
-        let auth_pipes = self.authorized_pipes.read().unwrap();
-        auth_pipes.contains_key(&app_id) && auth_pipes.get(&app_id).copied().unwrap_or(false)
+    pub fn is_authorized_pipe(&self, app_id: u32, _pid: u32) -> bool {
+        let auth_pipes = self
+            .authorized_pipes
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        auth_pipes.get(&app_id).copied().unwrap_or(false)
     }
 
     pub fn apply(&self, app_id: u32, ticket: Option<Vec<u8>>) {
-        let mut pending = self.pending_auth.lock().unwrap();
+        let mut pending = self.pending_auth.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some(pending_auth) = pending.remove(&app_id) {
-            eprintln!("[denuvo] auth applied for app {} (age: {}s)",
-                      app_id,
-                      SystemTime::now()
-                          .duration_since(UNIX_EPOCH)
-                          .unwrap_or_default()
-                          .as_secs()
-                          .saturating_sub(pending_auth.created_at));
+            eprintln!(
+                "[denuvo] auth applied for app {} (age: {}s)",
+                app_id,
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .saturating_sub(pending_auth.created_at)
+            );
 
-            let mut auth_pipes = self.authorized_pipes.write().unwrap();
+            let mut auth_pipes = self
+                .authorized_pipes
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             auth_pipes.insert(app_id, true);
 
             if let Some(ticket_data) = ticket {
@@ -123,7 +130,11 @@ impl DenuvoAuthService {
     }
 
     fn store_auth_ticket(&self, app_id: u32, ticket: &[u8]) {
-        eprintln!("[denuvo] stored auth ticket for app {}", app_id);
+        eprintln!(
+            "[denuvo] stored auth ticket for app {} ({} bytes)",
+            app_id,
+            ticket.len()
+        );
     }
 
     pub fn fetch_auth_ticket(&self, app_id: u32, nonce: &[u8]) -> Option<DenuvoAuthResult> {
@@ -133,7 +144,11 @@ impl DenuvoAuthService {
 
         let _pool_sid = self.config.pool_steam_id?;
 
-        eprintln!("[denuvo] fetching auth ticket for app {}, nonce len={}", app_id, nonce.len());
+        eprintln!(
+            "[denuvo] fetching auth ticket for app {}, nonce len={}",
+            app_id,
+            nonce.len()
+        );
 
         Some(DenuvoAuthResult {
             success: true,
@@ -149,10 +164,8 @@ impl DenuvoAuthService {
             .unwrap_or_default()
             .as_secs();
 
-        let mut pending = self.pending_auth.lock().unwrap();
-        pending.retain(|_, auth| {
-            now.saturating_sub(auth.created_at) < max_age_secs
-        });
+        let mut pending = self.pending_auth.lock().unwrap_or_else(|e| e.into_inner());
+        pending.retain(|_, auth| now.saturating_sub(auth.created_at) < max_age_secs);
     }
 
     pub fn get_pool_steam_id(&self, _app_id: u32) -> Option<u64> {
@@ -172,6 +185,12 @@ impl Default for DenuvoAuthService {
 
 pub struct DenuvoAuth {
     service: DenuvoAuthService,
+}
+
+impl Default for DenuvoAuth {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DenuvoAuth {

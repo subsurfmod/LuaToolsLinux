@@ -1,8 +1,9 @@
 //! Linux implementation of OSTPlatform::Memory
 //!
 //! Provides memory operations: module info, executable memory writes, readability checks.
-//! Uses /proc/self/maps and mprotect for memory manipulation.
+//! Uses `dlinfo(RTLD_DI_LINKMAP)` / `dladdr`, `/proc/self/maps`, and `mprotect`.
 
+use std::ffi::CStr;
 use std::fs;
 use std::ptr;
 
@@ -13,34 +14,73 @@ pub struct ModuleImage {
     pub size: usize,
 }
 
-/// Get module image (base address and size) from a module handle.
-/// On Linux, the module handle is the dlopen return value.
-pub fn get_module_image(module: *mut std::ffi::c_void) -> Option<ModuleImage> {
+#[repr(C)]
+struct LinkMap {
+    l_addr: usize,
+    l_name: *const libc::c_char,
+}
+
+fn resolve_module_path(module: *mut std::ffi::c_void) -> Option<String> {
     if module.is_null() {
         return None;
     }
 
-    // Use dladdr to get the path, then find it in /proc/self/maps
-    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
-    let result = unsafe { libc::dladdr(module as *const _, &mut info) };
-    if result == 0 {
-        return None;
+    // 1. Prefer dlinfo(RTLD_DI_LINKMAP) for dlopen() handles (on glibc, dlopen returns a
+    //    heap-allocated link_map pointer which dladdr() cannot resolve).
+    let mut link_map: *mut LinkMap = ptr::null_mut();
+    let dlinfo_res = unsafe {
+        libc::dlinfo(
+            module,
+            libc::RTLD_DI_LINKMAP,
+            (&mut link_map as *mut *mut LinkMap).cast::<libc::c_void>(),
+        )
+    };
+    if dlinfo_res == 0 && !link_map.is_null() {
+        let name_ptr = unsafe { (*link_map).l_name };
+        if !name_ptr.is_null() {
+            let name = unsafe { CStr::from_ptr(name_ptr) }
+                .to_string_lossy()
+                .into_owned();
+            if !name.is_empty() {
+                return Some(name);
+            }
+            if let Ok(exe) = fs::read_link("/proc/self/exe") {
+                return Some(exe.to_string_lossy().into_owned());
+            }
+        }
     }
 
-    let path = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }
-        .to_string_lossy()
-        .to_string();
+    // 2. Fallback to dladdr() when caller passed an address inside a loaded shared object.
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    let result = unsafe { libc::dladdr(module as *const _, &mut info) };
+    if result != 0 && !info.dli_fname.is_null() {
+        let name = unsafe { CStr::from_ptr(info.dli_fname) }
+            .to_string_lossy()
+            .into_owned();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
 
-    // Find this module in /proc/self/maps
+    None
+}
+
+/// Get module image (base address and size) from a module handle or symbol address.
+pub fn get_module_image(module: *mut std::ffi::c_void) -> Option<ModuleImage> {
+    let raw_path = resolve_module_path(module)?;
+    let canon_path = fs::canonicalize(&raw_path)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+    let target_name = std::path::Path::new(&raw_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string);
+
     let maps = fs::read_to_string("/proc/self/maps").ok()?;
     let mut base_addr: Option<u64> = None;
     let mut max_end: u64 = 0;
 
     for line in maps.lines() {
-        if !line.contains(&path) {
-            continue;
-        }
-
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 6 {
             continue;
@@ -50,7 +90,15 @@ pub fn get_module_image(module: *mut std::ffi::c_void) -> Option<ModuleImage> {
         let path_part = parts[5..].join(" ");
         let path_clean = path_part.trim_end_matches(" (deleted)").trim();
 
-        if path_clean != path {
+        let matches = path_clean == raw_path
+            || canon_path.as_deref() == Some(path_clean)
+            || target_name.as_deref().is_some_and(|tn| {
+                std::path::Path::new(path_clean)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    == Some(tn)
+            });
+        if !matches {
             continue;
         }
 
@@ -73,22 +121,22 @@ pub fn get_module_image(module: *mut std::ffi::c_void) -> Option<ModuleImage> {
 }
 
 /// Write a single byte to executable memory.
-/// Uses mprotect to temporarily make the page writable.
+/// Uses `mprotect` to temporarily make the page writable and restores `PROT_READ | PROT_EXEC`.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn write_executable_byte(target: *mut std::ffi::c_void, value: u8) -> bool {
     if target.is_null() {
         return false;
     }
 
     let addr = target as usize;
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-    if page_size == 0 {
+    let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if ps <= 0 {
         return false;
     }
-
+    let page_size = ps as usize;
     let page_start = addr & !(page_size - 1);
     let page_len = page_size;
 
-    // Make page writable
     let result = unsafe {
         libc::mprotect(
             page_start as *mut libc::c_void,
@@ -96,17 +144,14 @@ pub fn write_executable_byte(target: *mut std::ffi::c_void, value: u8) -> bool {
             libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
         )
     };
-
     if result != 0 {
         return false;
     }
 
-    // Write the byte
     unsafe {
         ptr::write_volatile(target as *mut u8, value);
     }
 
-    // Restore read+execute (W^X)
     let _ = unsafe {
         libc::mprotect(
             page_start as *mut libc::c_void,
@@ -119,46 +164,45 @@ pub fn write_executable_byte(target: *mut std::ffi::c_void, value: u8) -> bool {
 }
 
 /// Check if a memory range is readable in the current process.
-/// Walks /proc/self/maps to verify every page in the range is readable.
+/// Walks `/proc/self/maps` to verify every page in the range is readable.
 pub fn is_readable(addr: *const std::ffi::c_void, bytes: usize) -> bool {
     if addr.is_null() || bytes == 0 {
         return false;
     }
 
     let start = addr as usize;
-    let end = match start.checked_add(bytes) {
-        Some(e) => e,
-        None => return false,
+    let Some(end) = start.checked_add(bytes) else {
+        return false;
     };
 
-    let maps = match fs::read_to_string("/proc/self/maps") {
-        Ok(m) => m,
-        Err(_) => return false,
+    let Ok(maps) = fs::read_to_string("/proc/self/maps") else {
+        return false;
     };
 
     let mut current = start;
     while current < end {
         let mut found = false;
         for line in maps.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 2 {
+            let mut parts = line.split_whitespace();
+            let Some(range) = parts.next() else {
                 continue;
-            }
-
-            let range = parts[0];
-            let perms = parts[1];
-
+            };
+            let Some(perms) = parts.next() else {
+                continue;
+            };
             if !perms.contains('r') {
                 continue;
             }
-
             if let Some((start_str, end_str)) = range.split_once('-') {
-                let range_start = u64::from_str_radix(start_str, 16).unwrap_or(0) as usize;
-                let range_end = u64::from_str_radix(end_str, 16).unwrap_or(0) as usize;
+                let Ok(range_start) = usize::from_str_radix(start_str, 16) else {
+                    continue;
+                };
+                let Ok(range_end) = usize::from_str_radix(end_str, 16) else {
+                    continue;
+                };
 
                 if current >= range_start && current < range_end {
-                    // This page is readable, advance to end of this range or our end
-                    current = current.min(range_end).min(end);
+                    current = range_end.min(end);
                     found = true;
                     break;
                 }
@@ -176,17 +220,15 @@ pub fn is_readable(addr: *const std::ffi::c_void, bytes: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::CString;
 
     #[test]
     fn test_get_module_image_libc() {
-        let handle = crate::dynamic_library::load(std::path::Path::new("libc.so.6"));
+        let handle = super::super::dynamic_library::load(std::path::Path::new("libc.so.6"));
         assert!(!handle.is_null());
 
         let image = get_module_image(handle);
         assert!(image.is_some(), "Should get module image for libc");
         if let Some(img) = image {
-            println!("libc: base={:p}, size={}", img.base, img.size);
             assert!(!img.base.is_null());
             assert!(img.size > 0);
         }
@@ -194,7 +236,6 @@ mod tests {
 
     #[test]
     fn test_write_executable_byte() {
-        // Allocate an executable page
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
         let ptr = unsafe {
             libc::mmap(
@@ -208,28 +249,20 @@ mod tests {
         };
         assert_ne!(ptr, libc::MAP_FAILED);
 
-        // Write a byte
-        let result = write_executable_byte(ptr as *mut _, 0x42);
+        let result = write_executable_byte(ptr, 0x42);
         assert!(result, "Should write byte to executable memory");
 
-        // Verify
         let val = unsafe { ptr::read_volatile(ptr as *const u8) };
         assert_eq!(val, 0x42);
 
-        // Cleanup
         unsafe { libc::munmap(ptr, page_size) };
     }
 
     #[test]
     fn test_is_readable() {
-        // Test with a known readable address (stack)
-        let mut local_var = 42u32;
-        assert!(is_readable(&local_var as *const _ as *const _, 4));
-
-        // Test with null
+        let local_var = 42u32;
+        assert!(is_readable((&local_var as *const u32).cast(), 4));
         assert!(!is_readable(ptr::null(), 4));
-
-        // Test with zero bytes
-        assert!(!is_readable(&local_var as *const _ as *const _, 0));
+        assert!(!is_readable((&local_var as *const u32).cast(), 0));
     }
 }

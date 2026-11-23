@@ -5,7 +5,6 @@
 
 use std::time::Duration;
 
-use serde::Serialize;
 use ureq::Agent;
 
 use crate::VERSION;
@@ -18,8 +17,11 @@ pub struct AnalyticsService {
 
 impl Default for AnalyticsService {
     fn default() -> Self {
+        let http = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(3))
+            .build();
         Self {
-            http: Agent::new(),
+            http,
             umami_host: "https://api.umami.is".to_string(),
             website_id: "luatools-linux".to_string(),
         }
@@ -33,13 +35,12 @@ impl AnalyticsService {
 
     /// Track an app launch. Best-effort: never throws.
     pub fn track_app_launch(&self) {
-        let version = env!("CARGO_PKG_VERSION");
         let body = serde_json::json!({
             "type": "event",
             "payload": {
                 "website": self.umami_host,
                 "hostname": self.website_id,
-                "url": format!("/launch/{}", version),
+                "url": format!("/launch/{}", VERSION),
                 "title": "App Launch",
             },
         });

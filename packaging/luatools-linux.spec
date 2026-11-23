@@ -1,8 +1,8 @@
 %global debug_package %{nil}
 
 Name:           luatools-linux
-Version:        2.6.1
-Release:        1%{?dist}
+Version:        2.7.3
+Release:        0.1.beta%{?dist}
 Summary:        Native Rust workstation for Steam stplug-in lua manifests, depots, and fixes
 License:        MIT
 URL:            https://lua.tools
@@ -48,6 +48,8 @@ install -m 0644 %{_sourcedir}/luatools.desktop %{buildroot}%{_datadir}/applicati
 %{_datadir}/icons/hicolor/scalable/apps/luatools.svg
 
 %changelog
+* Tue Nov 24 2026 LuaTools Linux Contributors <noreply@lua.tools> - 2.7.3-0.1.beta
+- Beta v2.7.3-beta: Fix Steam game cover image loading (hashed modern Steam CDN URLs via appdetails + local librarycache + in-flight retry queue), add Kill Steam button to terminate all Steam instances, and resolve all compilation and runtime bugs from v2.7.2-alpha
 * Mon Nov 23 2026 LuaTools Linux Contributors <noreply@lua.tools> - 2.6.1-1
 - Release v2.6.1: Fix Steam SIGABRT crash in libsteam_integration.so (ELF64 header offset parsing, LD_PRELOAD process guard, ASLR runtime address validation, panic hook & catch_unwind, TicketStore VDF parser/upsert fixes, --gdb/--lldb launcher support)
 * Mon Nov 23 2026 LuaTools Linux Contributors <noreply@lua.tools> - 2.6.0-1

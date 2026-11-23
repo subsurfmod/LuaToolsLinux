@@ -12,16 +12,17 @@ use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 
 /// Legacy mode values from the C# version
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "PascalCase")]
 pub enum LegacyMode {
+    #[default]
     SteamTools,
     OpenSteamTools,
     OpenSteamToolsNightly,
 }
 
 /// Current mode
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum UnlockerMode {
     /// Original SteamTools mode (retired)
     SteamTools,
@@ -30,19 +31,8 @@ pub enum UnlockerMode {
     /// Custom mode
     Custom,
     /// No mode selected
+    #[default]
     None,
-}
-
-impl Default for UnlockerMode {
-    fn default() -> Self {
-        UnlockerMode::None
-    }
-}
-
-impl Default for LegacyMode {
-    fn default() -> Self {
-        LegacyMode::SteamTools
-    }
 }
 
 /// Result of migration

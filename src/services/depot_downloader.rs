@@ -55,7 +55,9 @@ pub struct DepotDownloaderService {
     pub tool_dir: PathBuf,
     pub steam_installation: Option<SteamInstallation>,
     pub slssteam_service: Option<SlssteamService>,
-    pub bridge_service: Option<std::sync::Arc<std::sync::Mutex<crate::services::steam_bridge_service::SteamBridgeService>>>,
+    pub bridge_service: Option<
+        std::sync::Arc<std::sync::Mutex<crate::services::steam_bridge_service::SteamBridgeService>>,
+    >,
 }
 
 impl Default for DepotDownloaderService {
@@ -81,7 +83,10 @@ impl DepotDownloaderService {
         self.slssteam_service = Some(sls);
     }
 
-    pub fn with_bridge(&mut self, bridge: crate::services::steam_bridge_service::SteamBridgeService) {
+    pub fn with_bridge(
+        &mut self,
+        bridge: crate::services::steam_bridge_service::SteamBridgeService,
+    ) {
         self.bridge_service = Some(std::sync::Arc::new(std::sync::Mutex::new(bridge)));
     }
 
@@ -597,11 +602,14 @@ impl DepotDownloaderService {
         }
 
         let target_app = selection.from_app_id.unwrap_or(app_id);
-        let bridge = self.bridge_service.as_ref().map(|b| b.lock().unwrap());
+        let bridge = self
+            .bridge_service
+            .as_ref()
+            .map(|b| b.lock().unwrap_or_else(|e| e.into_inner()));
         let depot_keys = Self::resolve_keys(
             self.steam_installation.as_ref(),
             self.slssteam_service.as_ref(),
-            bridge.as_ref().map(|b| &**b),
+            bridge.as_deref(),
             app_id,
         );
         let keys_file = if !depot_keys.is_empty() {

@@ -5,15 +5,15 @@
 //! pattern database lookup, inter-process communication, and manifest hooks.
 
 pub mod binary_reader;
+pub mod cloud_redirect;
+pub mod denuvo_auth;
+pub mod ipc;
+pub mod manifest_hooks;
 pub mod memory_patch;
+pub mod ost_platform;
 pub mod pattern_db;
 pub mod preload_loader;
 pub mod ticket_store;
-pub mod ost_platform;
-pub mod ipc;
-pub mod manifest_hooks;
-pub mod cloud_redirect;
-pub mod denuvo_auth;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;

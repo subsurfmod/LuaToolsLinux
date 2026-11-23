@@ -5,11 +5,11 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use sha2::{Digest, Sha256};
 use md5::compute as md5_compute;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
 pub struct FileHash {
@@ -103,7 +103,6 @@ impl FileHashService {
         self.cache.lock().unwrap().clear();
     }
 }
-
 
 #[cfg(test)]
 mod tests {
