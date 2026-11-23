@@ -1,0 +1,9 @@
+{
+  "name": "integrate-modules",
+  "description": "Deploy multiple parallel agents to verify and enhance different steam_bridge modules",
+  "phases": [
+    {"title": "Verify cloud_redirect BKV integration", "detail": "Adversarial verification of BKV parser integration in CloudRedirect"},
+    {"title": "Validate manifest hooks installation", "detail": "Verify manifest hooks infrastructure and static init pattern"},
+    {"title": "Test Denuvo auth flow stubs", "detail": "Verify Denuvo auth detection and ticket management logic"}
+  ]
+}

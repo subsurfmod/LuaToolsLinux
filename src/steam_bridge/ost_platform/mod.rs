@@ -4,6 +4,9 @@
 //! enabling the usefulsteamtools codebase to run on Linux via Rust.
 
 pub mod dynamic_library;
+
+// Linux thread implementation matching OSTPlatform::Thread API
+pub mod thread;
 pub mod process;
 pub mod remote_process;
 pub mod memory;

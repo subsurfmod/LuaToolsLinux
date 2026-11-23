@@ -1,0 +1,18 @@
+[package]
+name = "bridge_lib"
+version = "2.7.3-beta"
+edition = "2021"
+description = "Steam client integration shared library (LD_PRELOAD) for Linux"
+license = "MIT"
+
+[lib]
+name = "steam_integration"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+luatools-linux = { path = ".." }
+libc = "0.2"
+serde_json = "1.0"
+dirs = "6.0"
+ctor = "0.1"
