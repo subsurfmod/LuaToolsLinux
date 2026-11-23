@@ -46,7 +46,7 @@ Outputs self-contained distributables into `dist/`:
 | **Home** | Taped overview header, Rem Drop Sheet drag-and-drop ingest (`lua`/`manifest`/`zip`), 3-column live status summary (`Steam Engine`, `Manifest Providers`, `SLSsteam & Bridge`), recent configured titles with Steam cover art |
 | **Discover** | Unified Steam Store search, Featured (`Top Sellers` / `New Releases`), multi-provider manifest checks, Hubcap integration, FastFetch auto-install, DLC `.lua` generator |
 | **Library** | Multi-library ACF + `stplug-in` scanner, live filter chips (`All`, `Lua Ready`, `Installed`, `Overrides`), bulk `.lua` cleanup, per-game Configure & binary `appinfo.vdf` Launch Options |
-| **Depots & Vault** | Sub-tabbed workspace (`Manifests & Vault`, `Lua Editor`, `Download Depots`) with content-addressed `LuaVault` (`~/.local/share/luatools/luavault` — 100% compatible with v1.x), syntax-highlighted Lua editor, `Pin` / `Unpin` manifest toggling, and `DepotDownloaderMod` / `DepotDownloader` multi-depot picker |
+| **Depots & Vault** | Sub-tabbed workspace (`Manifests & Vault`, `Lua Editor`, `Download Depots`) with content-addressed `LuaVault` (`~/.local/share/luatools/luavault` — 100% compatible with v1.x), syntax-highlighted Lua editor, `Pin` / `Unpin` manifest toggling, and crash-hardened official `SteamRE/DepotDownloader` integration with QR/account session sign-in |
 | **Game Fixes** | `lua.tools` game & Denuvo fixes catalog, category filters, SHA-256 `.luatools-fix/` backup & verified revert |
 | **Settings** | 4 focused sub-tabs (`General & Steam`, `Account & Providers`, `SLSsteam & Store Bridge`, `Updates & Toolchain`) covering Discord PKCE OAuth (`:53789`) & Bot Code login, Hubcap API key validator, Steam path override, lossless `SLSsteam` `config.yaml` editor, Millennium `:38495` RPC, Steam CEF `:8080` WebSocket injector, local `:6767` RPC bridge, `luatools://` handler, external tools (`DepotDownloaderMod`, `SteamAutoCrack`, `Steamless`), and **Git Self-Updater** |
 
@@ -55,7 +55,7 @@ Outputs self-contained distributables into `dist/`:
 ## Effortless Git Self-Updates
 
 - On startup, `luatools` runs **one lightweight non-blocking background check** against your Git remote (`origin` or a custom Git URL configured in `Settings → Updates & Toolchain`).
-- When new commits or a newer version exist upstream, a compact **`⬆ Update`** button appears in the **bottom-right corner** of the window.
+- When new commits or a newer version exist upstream, a compact **`⬆ Update`** button appears in the **top-right corner** of the window.
 - Clicking **`⬆ Update`** pulls the latest changes (`git pull`), compiles an optimized native release binary, atomically replaces the installed binary without `ETXTBSY` locks, and turns into **`↻ Restart`** for a 1-click relaunch (also available via CLI as `luatools --update`).
 
 ---

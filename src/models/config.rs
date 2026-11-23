@@ -113,6 +113,8 @@ pub struct AppSettings {
     pub git_remote_url: String,
     #[serde(default)]
     pub update_repo_dir: String,
+    #[serde(default)]
+    pub steam_username: String,
 }
 
 impl Default for AppSettings {
@@ -131,6 +133,7 @@ impl Default for AppSettings {
             check_updates_on_startup: true,
             git_remote_url: String::new(),
             update_repo_dir: String::new(),
+            steam_username: String::new(),
         }
     }
 }

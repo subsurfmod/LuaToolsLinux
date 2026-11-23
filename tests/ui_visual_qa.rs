@@ -12,7 +12,7 @@ use eframe::egui::{
 };
 
 use luatools_linux::ui::app::LuaToolsApp;
-use luatools_linux::ui::state::{ActiveView, DepotsSubTab, SettingsSubTab};
+use luatools_linux::ui::state::{ActiveView, DepotsSubTab, SettingsSubTab, ToastKind};
 
 struct SoftAtlas {
     width: usize,
@@ -260,11 +260,11 @@ fn headless_papercut_views_render_cleanly_at_wide_and_narrow_resolutions() {
         ),
         ("07_fixes.png", [1380, 860], ActiveView::Fixes, None, None),
         (
-            "08_settings_general.png",
+            "08_settings_account.png",
             [1380, 860],
             ActiveView::Settings,
             None,
-            Some(SettingsSubTab::General),
+            Some(SettingsSubTab::Account),
         ),
         (
             "09_settings_updates.png",
@@ -280,9 +280,24 @@ fn headless_papercut_views_render_cleanly_at_wide_and_narrow_resolutions() {
             None,
             None,
         ),
+        (
+            "11_toast_top_right.png",
+            [1380, 860],
+            ActiveView::Depots,
+            Some(DepotsSubTab::DownloadPicker),
+            None,
+        ),
     ];
 
     for &(fname, [w, h], view, d_sub, s_sub) in cases {
+        if fname == "11_toast_top_right.png" {
+            app.notify(
+                "Saved settings.json and synced Steam configuration",
+                ToastKind::Success,
+            );
+        } else {
+            app.active_toast = None;
+        }
         app.active_view = view;
         if let Some(ds) = d_sub {
             app.depots_subtab = ds;

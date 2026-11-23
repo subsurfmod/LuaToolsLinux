@@ -14,7 +14,7 @@ use egui_extras::{Column, Size, StripBuilder, TableBuilder};
 
 use crate::parsers::vdf_binary::LaunchOptionsService;
 use crate::ui::app::LuaToolsApp;
-use crate::ui::state::{AcquireTab, ActiveView, AppMessage};
+use crate::ui::state::{AcquireTab, ActiveView, AppMessage, ToastKind};
 use crate::ui::theme::{
     chip_button, danger_button, display_font, draw_rem_medallion, ghost_button, inset_paper_sheet,
     paper_card, paper_card_padded, pick_files_native, primary_button, secondary_button,
@@ -325,6 +325,7 @@ impl LuaToolsApp {
                         self.open_game_in_depots(aid, ui.ctx());
                     }
                 }
+                ui.add_space(20.0);
             });
     }
 
@@ -396,309 +397,300 @@ impl LuaToolsApp {
         }
 
         ui.add_space(14.0);
-        let body_h = (ui.available_height() - 6.0).max(280.0);
+        let body_h = (ui.available_height() - 10.0).max(280.0);
         let mut clicked_app: Option<u32> = None;
 
         StripBuilder::new(ui)
             .size(Size::exact(310.0))
             .size(Size::exact(16.0))
-            .size(Size::remainder().at_least(320.0))
-            .vertical(|mut vstrip| {
-                vstrip.cell(|ui| {
-                    // Use horizontal strip inside the body height
-                    StripBuilder::new(ui)
-                        .size(Size::exact(310.0))
-                        .size(Size::exact(16.0))
-                        .size(Size::remainder())
-                        .horizontal(|mut strip| {
-                            // Left: Clean Spacious Game List
-                            strip.cell(|ui| {
-                                paper_card_padded(ui, Margin::same(10), |ui| {
-                                    ui.set_height(body_h - 24.0);
-                                    ScrollArea::vertical()
-                                        .id_salt("discover_list_scroll")
-                                        .auto_shrink([false, false])
-                                        .show(ui, |ui| {
-                                            ui.spacing_mut().item_spacing.y = 4.0;
-                                            let entries: Vec<(u32, String)> =
-                                                match self.acquire_tab {
-                                                    AcquireTab::TopSellers => self
-                                                        .featured_top
-                                                        .iter()
-                                                        .map(|i| (i.app_id, i.name.clone()))
-                                                        .collect(),
-                                                    AcquireTab::NewReleases => self
-                                                        .featured_new
-                                                        .iter()
-                                                        .map(|i| (i.app_id, i.name.clone()))
-                                                        .collect(),
-                                                    AcquireTab::SearchResults => self
-                                                        .search_results
-                                                        .iter()
-                                                        .map(|i| (i.app_id, i.name.clone()))
-                                                        .collect(),
-                                                };
+            .size(Size::remainder())
+            .horizontal(|mut strip| {
+                // Left: Clean Spacious Game List
+                strip.cell(|ui| {
+                    paper_card_padded(ui, Margin::same(10), |ui| {
+                        ui.set_height(body_h - 24.0);
+                        ScrollArea::vertical()
+                            .id_salt("discover_list_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 4.0;
+                                let entries: Vec<(u32, String)> = match self.acquire_tab {
+                                    AcquireTab::TopSellers => self
+                                        .featured_top
+                                        .iter()
+                                        .map(|i| (i.app_id, i.name.clone()))
+                                        .collect(),
+                                    AcquireTab::NewReleases => self
+                                        .featured_new
+                                        .iter()
+                                        .map(|i| (i.app_id, i.name.clone()))
+                                        .collect(),
+                                    AcquireTab::SearchResults => self
+                                        .search_results
+                                        .iter()
+                                        .map(|i| (i.app_id, i.name.clone()))
+                                        .collect(),
+                                };
 
-                                            if entries.is_empty() {
-                                                ui.add_space(24.0);
-                                                ui.vertical_centered(|ui| {
-                                                    ui.label(
-                                                        RichText::new("No games in this list yet")
-                                                            .color(Palette::TEXT_MUTED),
-                                                    );
-                                                });
-                                            }
-
-                                            for (aid, name) in entries {
-                                                let is_sel = self.acquire_selected_app == Some(aid);
-                                                if clean_list_row(ui, &name, &format!("#{}", aid), is_sel)
-                                                    .clicked()
-                                                {
-                                                    clicked_app = Some(aid);
-                                                }
-                                            }
-                                        });
-                                });
-                            });
-
-                            strip.empty();
-
-                            // Right: Spacious Selected Game Card
-                            strip.cell(|ui| {
-                                paper_card(ui, |ui| {
-                                    ui.set_height(body_h - 40.0);
-                                    if let Some(aid) = self.acquire_selected_app {
-                                        let has_lua = self
-                                            .lua_installer
-                                            .as_ref()
-                                            .and_then(|i| i.read_installed_lua_path(aid))
-                                            .is_some();
-
-                                        ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 16.0;
-                                            if let Some(tex) = self.cover_textures.get(&aid) {
-                                                ui.add(
-                                                    egui::Image::new(tex)
-                                                        .fit_to_exact_size(Vec2::new(220.0, 103.0))
-                                                        .corner_radius(CornerRadius::same(4)),
-                                                );
-                                            } else {
-                                                let (rect, _) = ui.allocate_exact_size(
-                                                    Vec2::new(220.0, 103.0),
-                                                    Sense::hover(),
-                                                );
-                                                ui.painter().rect_filled(
-                                                    rect,
-                                                    CornerRadius::same(4),
-                                                    Palette::BG_VOID,
-                                                );
-                                                ui.painter().text(
-                                                    rect.center(),
-                                                    egui::Align2::CENTER_CENTER,
-                                                    format!("App #{}", aid),
-                                                    FontId::new(13.0, FontFamily::Monospace),
-                                                    Palette::TEXT_MUTED,
-                                                );
-                                            }
-
-                                            ui.vertical(|ui| {
-                                                ui.spacing_mut().item_spacing.y = 5.0;
-                                                let title = self
-                                                    .acquire_details
-                                                    .as_ref()
-                                                    .map(|d| d.name.as_str())
-                                                    .unwrap_or("Loading title…");
-                                                ui.label(
-                                                    RichText::new(title)
-                                                        .font(display_font(20.0))
-                                                        .color(Palette::TEXT_PRIMARY),
-                                                );
-
-                                                ui.horizontal(|ui| {
-                                                    ui.label(
-                                                        RichText::new(format!("AppID {}", aid))
-                                                            .font(FontId::new(
-                                                                12.0,
-                                                                FontFamily::Monospace,
-                                                            ))
-                                                            .color(Palette::BLUE_LIGHT),
-                                                    );
-                                                    if has_lua {
-                                                        status_badge(
-                                                            ui,
-                                                            "Configured",
-                                                            BadgeTone::Ready,
-                                                        );
-                                                    }
-                                                });
-
-                                                if let Some(d) = &self.acquire_details {
-                                                    let mut meta = Vec::new();
-                                                    if !d.release_date.is_empty() {
-                                                        meta.push(d.release_date.clone());
-                                                    }
-                                                    if !d.genres.is_empty() {
-                                                        meta.push(
-                                                            d.genres
-                                                                .iter()
-                                                                .take(3)
-                                                                .cloned()
-                                                                .collect::<Vec<_>>()
-                                                                .join(", "),
-                                                        );
-                                                    }
-                                                    if !meta.is_empty() {
-                                                        ui.label(
-                                                            RichText::new(meta.join("  ·  "))
-                                                                .size(12.5)
-                                                                .color(Palette::TEXT_MUTED),
-                                                        );
-                                                    }
-                                                }
-                                            });
-                                        });
-
-                                        ui.add_space(16.0);
+                                if entries.is_empty() {
+                                    ui.add_space(24.0);
+                                    ui.vertical_centered(|ui| {
                                         ui.label(
-                                            RichText::new("Manifest Sources")
-                                                .font(semibold_font(13.0))
-                                                .color(Palette::TEXT_SECONDARY),
+                                            RichText::new("No games in this list yet")
+                                                .color(Palette::TEXT_MUTED),
                                         );
-                                        ui.add_space(6.0);
+                                    });
+                                }
 
-                                        let mut avail_providers: Vec<String> = Vec::new();
-                                        inset_paper_sheet(ui, Margin::same(10), |ui| {
-                                            ui.set_min_height(108.0);
-                                            ui.set_width(ui.available_width());
-                                            if self.acquire_sources.is_empty() {
-                                                ui.label(
-                                                    RichText::new(&self.acquire_status)
-                                                        .size(12.5)
-                                                        .color(Palette::TEXT_MUTED),
-                                                );
-                                            } else {
-                                                ui.spacing_mut().item_spacing.y = 4.0;
-                                                for (prov, st) in &self.acquire_sources {
-                                                    let is_av =
-                                                        st.eq_ignore_ascii_case("available");
-                                                    if is_av {
-                                                        avail_providers.push(prov.clone());
-                                                    }
-                                                    let is_sel = self
-                                                        .acquire_selected_source
-                                                        .as_deref()
-                                                        == Some(prov.as_str());
-                                                    let badge = if is_av {
-                                                        "● Available"
-                                                    } else {
-                                                        "○ Unavailable"
-                                                    };
-                                                    if clean_list_row(ui, prov, badge, is_sel)
-                                                        .clicked()
-                                                    {
-                                                        self.acquire_selected_source =
-                                                            Some(prov.clone());
-                                                    }
-                                                }
-                                            }
-                                        });
+                                for (aid, name) in entries {
+                                    let is_sel = self.acquire_selected_app == Some(aid);
+                                    if clean_list_row(ui, &name, &format!("#{}", aid), is_sel)
+                                        .clicked()
+                                    {
+                                        clicked_app = Some(aid);
+                                    }
+                                }
+                                ui.add_space(12.0);
+                            });
+                    });
+                });
 
-                                        ui.add_space(14.0);
-                                        ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 10.0;
-                                            ui.add_enabled_ui(
-                                                !avail_providers.is_empty() && !self.acquire_busy,
-                                                |ui| {
-                                                    if primary_button(ui, "Install Manifest")
-                                                        .clicked()
-                                                    {
-                                                        let chosen = self
-                                                            .acquire_selected_source
-                                                            .clone()
-                                                            .filter(|s| {
-                                                                avail_providers.contains(s)
-                                                            })
-                                                            .or_else(|| {
-                                                                avail_providers.first().cloned()
-                                                            });
-                                                        if let Some(src) = chosen {
-                                                            self.start_acquire_download(
-                                                                aid,
-                                                                src,
-                                                                ui.ctx(),
-                                                            );
-                                                        }
-                                                    }
-                                                },
-                                            );
+                strip.empty();
 
-                                            if has_lua
-                                                && secondary_button(ui, "Open Workbench").clicked()
-                                            {
-                                                self.open_game_in_depots(aid, ui.ctx());
-                                            }
+                // Right: Spacious Selected Game Card (scrollable so low text is never clipped)
+                strip.cell(|ui| {
+                    paper_card(ui, |ui| {
+                        ui.set_height(body_h - 40.0);
+                        ScrollArea::vertical()
+                            .id_salt("discover_detail_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if let Some(aid) = self.acquire_selected_app {
+                                    let has_lua = self
+                                        .lua_installer
+                                        .as_ref()
+                                        .and_then(|i| i.read_installed_lua_path(aid))
+                                        .is_some();
 
-                                            if let Some(dlc) = &self.acquire_dlc_info {
-                                                if dlc.missing_count > 0
-                                                    && secondary_button(
-                                                        ui,
-                                                        &format!(
-                                                            "Generate DLC (+{})",
-                                                            dlc.missing_count
-                                                        ),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    self.start_dlc_generation(aid, ui.ctx());
-                                                }
-                                            }
-
-                                            if ghost_button(ui, "Steam Store ›").clicked() {
-                                                let _ = Command::new("xdg-open")
-                                                    .arg(format!(
-                                                        "https://store.steampowered.com/app/{}",
-                                                        aid
-                                                    ))
-                                                    .spawn();
-                                            }
-                                        });
-
-                                        if self.acquire_busy {
-                                            ui.add_space(8.0);
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 16.0;
+                                        if let Some(tex) = self.cover_textures.get(&aid) {
                                             ui.add(
-                                                ProgressBar::new(self.acquire_progress)
-                                                    .show_percentage()
-                                                    .corner_radius(CornerRadius::same(3)),
+                                                egui::Image::new(tex)
+                                                    .fit_to_exact_size(Vec2::new(220.0, 103.0))
+                                                    .corner_radius(CornerRadius::same(4)),
+                                            );
+                                        } else {
+                                            let (rect, _) = ui.allocate_exact_size(
+                                                Vec2::new(220.0, 103.0),
+                                                Sense::hover(),
+                                            );
+                                            ui.painter().rect_filled(
+                                                rect,
+                                                CornerRadius::same(4),
+                                                Palette::BG_VOID,
+                                            );
+                                            ui.painter().text(
+                                                rect.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                format!("App #{}", aid),
+                                                FontId::new(13.0, FontFamily::Monospace),
+                                                Palette::TEXT_MUTED,
                                             );
                                         }
-                                        ui.add_space(6.0);
-                                        ui.label(
-                                            RichText::new(&self.acquire_status)
-                                                .size(12.0)
-                                                .color(Palette::TEXT_MUTED),
-                                        );
-                                    } else {
-                                        ui.vertical_centered(|ui| {
-                                            ui.add_space(70.0);
-                                            draw_rem_medallion(ui, 48.0);
-                                            ui.add_space(10.0);
+
+                                        ui.vertical(|ui| {
+                                            ui.spacing_mut().item_spacing.y = 5.0;
+                                            let title = self
+                                                .acquire_details
+                                                .as_ref()
+                                                .map(|d| d.name.as_str())
+                                                .unwrap_or("Loading title…");
                                             ui.label(
-                                                RichText::new("Select a game from the list")
-                                                    .font(display_font(17.0))
+                                                RichText::new(title)
+                                                    .font(display_font(20.0))
                                                     .color(Palette::TEXT_PRIMARY),
                                             );
-                                            ui.label(
-                                                RichText::new(
-                                                    "Or search by name, AppID, or Steam link above.",
-                                                )
-                                                .size(13.0)
-                                                .color(Palette::TEXT_MUTED),
-                                            );
+
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    RichText::new(format!("AppID {}", aid))
+                                                        .font(FontId::new(
+                                                            12.0,
+                                                            FontFamily::Monospace,
+                                                        ))
+                                                        .color(Palette::BLUE_LIGHT),
+                                                );
+                                                if has_lua {
+                                                    status_badge(
+                                                        ui,
+                                                        "Configured",
+                                                        BadgeTone::Ready,
+                                                    );
+                                                }
+                                            });
+
+                                            if let Some(d) = &self.acquire_details {
+                                                let mut meta = Vec::new();
+                                                if !d.release_date.is_empty() {
+                                                    meta.push(d.release_date.clone());
+                                                }
+                                                if !d.genres.is_empty() {
+                                                    meta.push(
+                                                        d.genres
+                                                            .iter()
+                                                            .take(3)
+                                                            .cloned()
+                                                            .collect::<Vec<_>>()
+                                                            .join(", "),
+                                                    );
+                                                }
+                                                if !meta.is_empty() {
+                                                    ui.label(
+                                                        RichText::new(meta.join("  ·  "))
+                                                            .size(12.5)
+                                                            .color(Palette::TEXT_MUTED),
+                                                    );
+                                                }
+                                            }
                                         });
+                                    });
+
+                                    ui.add_space(16.0);
+                                    ui.label(
+                                        RichText::new("Manifest Sources")
+                                            .font(semibold_font(13.0))
+                                            .color(Palette::TEXT_SECONDARY),
+                                    );
+                                    ui.add_space(6.0);
+
+                                    let mut avail_providers: Vec<String> = Vec::new();
+                                    inset_paper_sheet(ui, Margin::same(10), |ui| {
+                                        ui.set_min_height(108.0);
+                                        ui.set_width(ui.available_width());
+                                        if self.acquire_sources.is_empty() {
+                                            ui.label(
+                                                RichText::new(&self.acquire_status)
+                                                    .size(12.5)
+                                                    .color(Palette::TEXT_MUTED),
+                                            );
+                                        } else {
+                                            ui.spacing_mut().item_spacing.y = 4.0;
+                                            for (prov, st) in &self.acquire_sources {
+                                                let is_av = st.eq_ignore_ascii_case("available");
+                                                if is_av {
+                                                    avail_providers.push(prov.clone());
+                                                }
+                                                let is_sel =
+                                                    self.acquire_selected_source.as_deref()
+                                                        == Some(prov.as_str());
+                                                let badge = if is_av {
+                                                    "● Available"
+                                                } else {
+                                                    "○ Unavailable"
+                                                };
+                                                if clean_list_row(ui, prov, badge, is_sel).clicked()
+                                                {
+                                                    self.acquire_selected_source =
+                                                        Some(prov.clone());
+                                                }
+                                            }
+                                        }
+                                    });
+
+                                    ui.add_space(14.0);
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                        ui.add_enabled_ui(
+                                            !avail_providers.is_empty() && !self.acquire_busy,
+                                            |ui| {
+                                                if primary_button(ui, "Install Manifest").clicked()
+                                                {
+                                                    let chosen = self
+                                                        .acquire_selected_source
+                                                        .clone()
+                                                        .filter(|s| avail_providers.contains(s))
+                                                        .or_else(|| {
+                                                            avail_providers.first().cloned()
+                                                        });
+                                                    if let Some(src) = chosen {
+                                                        self.start_acquire_download(
+                                                            aid,
+                                                            src,
+                                                            ui.ctx(),
+                                                        );
+                                                    }
+                                                }
+                                            },
+                                        );
+
+                                        if has_lua
+                                            && secondary_button(ui, "Open Workbench").clicked()
+                                        {
+                                            self.open_game_in_depots(aid, ui.ctx());
+                                        }
+
+                                        if let Some(dlc) = &self.acquire_dlc_info {
+                                            if dlc.missing_count > 0
+                                                && secondary_button(
+                                                    ui,
+                                                    &format!(
+                                                        "Generate DLC (+{})",
+                                                        dlc.missing_count
+                                                    ),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.start_dlc_generation(aid, ui.ctx());
+                                            }
+                                        }
+
+                                        if ghost_button(ui, "Steam Store ›").clicked() {
+                                            let _ = Command::new("xdg-open")
+                                                .arg(format!(
+                                                    "https://store.steampowered.com/app/{}",
+                                                    aid
+                                                ))
+                                                .spawn();
+                                        }
+                                    });
+
+                                    if self.acquire_busy {
+                                        ui.add_space(8.0);
+                                        ui.add(
+                                            ProgressBar::new(self.acquire_progress)
+                                                .show_percentage()
+                                                .corner_radius(CornerRadius::same(3)),
+                                        );
                                     }
-                                });
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        RichText::new(&self.acquire_status)
+                                            .size(12.0)
+                                            .color(Palette::TEXT_MUTED),
+                                    );
+                                    ui.add_space(16.0);
+                                } else {
+                                    ui.vertical_centered(|ui| {
+                                        ui.add_space(70.0);
+                                        draw_rem_medallion(ui, 48.0);
+                                        ui.add_space(10.0);
+                                        ui.label(
+                                            RichText::new("Select a game from the list")
+                                                .font(display_font(17.0))
+                                                .color(Palette::TEXT_PRIMARY),
+                                        );
+                                        ui.label(
+                                            RichText::new(
+                                                "Or search by name, AppID, or Steam link above.",
+                                            )
+                                            .size(13.0)
+                                            .color(Palette::TEXT_MUTED),
+                                        );
+                                    });
+                                }
                             });
-                        });
+                    });
                 });
             });
 
@@ -997,7 +989,7 @@ impl LuaToolsApp {
             if let Some(installer) = self.lua_installer.clone() {
                 let _ = installer.uninstall_lua(aid, false, Some(&mut self.slssteam_service));
                 self.refresh_all_local_state();
-                self.status_text = format!("Removed {}.lua", aid);
+                self.notify(format!("Removed {}.lua", aid), ToastKind::Info);
             }
         }
     }

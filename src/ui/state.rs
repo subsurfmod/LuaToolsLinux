@@ -13,6 +13,21 @@ use crate::services::depot_downloader::DepotRunResult;
 use crate::services::depot_info::{AppDepotInfo, ContentDepot};
 use crate::services::update_service::{UpdateApplyResult, UpdateCheckResult};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastKind {
+    Info,
+    Success,
+    Warning,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToastNotification {
+    pub text: String,
+    pub kind: ToastKind,
+    pub created_at: std::time::Instant,
+    pub duration_secs: f32,
+}
+
 #[derive(Debug, Clone)]
 pub enum UpdateBannerState {
     Hidden,

@@ -1,10 +1,12 @@
-//! DepotDownloaderMod / DepotDownloader service — tool discovery, GitHub auto-update,
-//! key/manifest resolution, and streaming multi-depot / single-depot execution.
+//! Official `SteamRE/DepotDownloader` integration — binary/DLL discovery, GitHub release
+//! installer, Fedora/.NET runtime crash hardening (`stdin=null`, `W^X=0`, `RLIMIT_CORE=0`),
+//! optional `-remember-password` / `-qr` Steam session login, and streaming depot downloads.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -39,10 +41,13 @@ pub struct DepotRunResult {
     pub error: Option<String>,
 }
 
-const GITHUB_REPOS: &[(&str, &str)] = &[
-    ("SteamAutoCracks/DepotDownloaderMod", "DepotDownloaderMod"),
-    ("SteamRE/DepotDownloader", "DepotDownloader"),
-];
+#[derive(Debug, Clone, Default)]
+pub struct DepotDownloadOptions {
+    pub custom_tool_path: String,
+    pub steam_username: String,
+}
+
+const DEPOTDOWNLOADER_REPO: &str = "SteamRE/DepotDownloader";
 const TOOL_CHECK_INTERVAL_SECS: u64 = 6 * 3600;
 
 #[derive(Debug, Clone)]
@@ -63,11 +68,8 @@ impl DepotDownloaderService {
         Self { tool_dir: dir }
     }
 
-    pub fn find_executable(&self, custom_workshop_path: Option<&str>) -> Option<PathBuf> {
-        if let Some(wp) = custom_workshop_path
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
+    pub fn find_executable(&self, custom_tool_path: Option<&str>) -> Option<PathBuf> {
+        if let Some(wp) = custom_tool_path.map(str::trim).filter(|s| !s.is_empty()) {
             let p = PathBuf::from(wp);
             if p.is_file() {
                 return Some(p);
@@ -85,7 +87,6 @@ impl DepotDownloaderService {
             default_luatools_data_dir()
                 .join("tools")
                 .join("depotdownloader"),
-            home.join(".local/share/millennium/plugins/luatools/backend"),
             home.join(".local/share/LuaTools/depotdownloader"),
             home.join("Applications"),
         ];
@@ -96,20 +97,22 @@ impl DepotDownloaderService {
             }
         }
 
-        which_in_path("DepotDownloaderMod").or_else(|| which_in_path("DepotDownloader"))
+        which_in_path("DepotDownloader").or_else(|| which_in_path("depotdownloader"))
     }
 
     fn scan_dir_for_bin(dir: &Path) -> Option<PathBuf> {
         if !dir.exists() {
             return None;
         }
-        let candidates = [
-            "DepotDownloaderMod",
-            "DepotDownloader",
-            "DepotDownloaderMod.dll",
-            "DepotDownloader.dll",
-            "DepotDownloaderMod.exe",
-        ];
+        // When system `dotnet` is installed (e.g. Fedora 44/45 with native glibc 2.44 / OpenSSL 3.5),
+        // prefer `DepotDownloader.dll` so it runs on the host .NET runtime instead of a older bundled runtime.
+        let has_system_dotnet = which_in_path("dotnet").is_some();
+        let candidates: &[&str] = if has_system_dotnet {
+            &["DepotDownloader.dll", "DepotDownloader", "depotdownloader"]
+        } else {
+            &["DepotDownloader", "depotdownloader", "DepotDownloader.dll"]
+        };
+
         for name in candidates {
             let direct = dir.join(name);
             if direct.is_file() {
@@ -175,24 +178,70 @@ impl DepotDownloaderService {
         }
     }
 
+    /// Constructs strictly valid `SteamRE/DepotDownloader` CLI arguments (no unsupported flags).
+    pub fn build_download_args(
+        target_app: u32,
+        selection: &DepotSelection,
+        download_dir: &Path,
+        steam_username: &str,
+    ) -> Vec<String> {
+        let mut args = vec![
+            "-app".to_string(),
+            target_app.to_string(),
+            "-depot".to_string(),
+            selection.depot_id.to_string(),
+        ];
+        if let Some(gid) = selection
+            .manifest_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            args.push("-manifest".to_string());
+            args.push(gid.to_string());
+        }
+        args.extend([
+            "-dir".to_string(),
+            download_dir.to_string_lossy().to_string(),
+            "-max-downloads".to_string(),
+            "8".to_string(),
+            "-validate".to_string(),
+        ]);
+
+        let clean_user = steam_username.trim();
+        if !clean_user.is_empty() && !clean_user.eq_ignore_ascii_case("anonymous") {
+            args.push("-username".to_string());
+            args.push(clean_user.to_string());
+            args.push("-remember-password".to_string());
+        }
+        // Note: In SteamRE/DepotDownloader v2.6+/v3.x, omitting `-username` logs in anonymously,
+        // whereas passing `-username anonymous` attempts password authentication for an account
+        // literally named "anonymous" unless handled carefully. Omitting `-username` when blank
+        // uses DepotDownloader's native anonymous session cleanly.
+        args
+    }
+
     pub fn ensure_tool<F>(
         &self,
-        custom_workshop_path: Option<&str>,
+        custom_tool_path: Option<&str>,
         mut progress_cb: F,
     ) -> Option<PathBuf>
     where
         F: FnMut(f32, String),
     {
         let meta_file = self.tool_dir.join("meta.json");
-        if let Some(existing) = self.find_executable(custom_workshop_path) {
+        if let Some(existing) = self.find_executable(custom_tool_path) {
             if let Ok(raw) = fs::read_to_string(&meta_file) {
                 if let Ok(v) = serde_json::from_str::<Value>(&raw) {
                     let last = v.get("last_check").and_then(|x| x.as_u64()).unwrap_or(0);
+                    let repo = v.get("repo").and_then(|x| x.as_str()).unwrap_or("");
                     let now = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    if now.saturating_sub(last) < TOOL_CHECK_INTERVAL_SECS {
+                    if repo == DEPOTDOWNLOADER_REPO
+                        && now.saturating_sub(last) < TOOL_CHECK_INTERVAL_SECS
+                    {
                         return Some(existing);
                     }
                 }
@@ -202,7 +251,7 @@ impl DepotDownloaderService {
         }
 
         self.update_tool(&mut progress_cb)
-            .or_else(|| self.find_executable(custom_workshop_path))
+            .or_else(|| self.find_executable(custom_tool_path))
     }
 
     fn update_tool<F>(&self, progress_cb: &mut F) -> Option<PathBuf>
@@ -212,34 +261,32 @@ impl DepotDownloaderService {
         let _ = fs::create_dir_all(&self.tool_dir);
         progress_cb(
             0.05,
-            "Checking GitHub for Linux DepotDownloader releases...".into(),
+            "Checking GitHub for official SteamRE/DepotDownloader release...".into(),
         );
 
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(60))
             .build();
 
-        for &(repo, label) in GITHUB_REPOS {
-            let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
-            let Ok(resp) = agent
-                .get(&url)
-                .set("User-Agent", "LuaToolsLinux/2.0")
-                .call()
-            else {
-                continue;
-            };
-            let Ok(rel) = resp.into_json::<Value>() else {
-                continue;
-            };
-            let tag = rel
-                .get("tag_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("latest");
-            let Some(assets) = rel.get("assets").and_then(|v| v.as_array()) else {
-                continue;
-            };
+        let url = format!(
+            "https://api.github.com/repos/{}/releases/latest",
+            DEPOTDOWNLOADER_REPO
+        );
+        let resp = agent
+            .get(&url)
+            .set("User-Agent", "LuaToolsLinux/2.0")
+            .call()
+            .ok()?;
+        let rel = resp.into_json::<Value>().ok()?;
+        let tag = rel
+            .get("tag_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("latest");
+        let assets = rel.get("assets").and_then(|v| v.as_array())?;
 
-            let chosen = assets
+        let has_system_dotnet = which_in_path("dotnet").is_some();
+        let chosen = if has_system_dotnet {
+            assets
                 .iter()
                 .find(|a| {
                     let n = a
@@ -247,68 +294,77 @@ impl DepotDownloaderService {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_ascii_lowercase();
-                    n.ends_with(".zip") && n.contains("linux") && !n.contains("arm")
+                    n.ends_with(".zip") && n.contains("framework")
                 })
-                .or_else(|| {
-                    assets.iter().find(|a| {
-                        let n = a
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_ascii_lowercase();
-                        n.ends_with(".zip") && n.contains("linux")
-                    })
-                });
+                .or_else(|| Self::pick_linux_x64_asset(assets))
+        } else {
+            Self::pick_linux_x64_asset(assets)
+        };
 
-            let Some(asset) = chosen else {
-                continue;
-            };
-            let Some(dl_url) = asset.get("browser_download_url").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let aname = asset
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("depotdownloader.zip");
-            let zip_path = self.tool_dir.join(aname);
+        let asset = chosen?;
+        let dl_url = asset.get("browser_download_url").and_then(|v| v.as_str())?;
+        let aname = asset
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("depotdownloader.zip");
+        let zip_path = self.tool_dir.join(aname);
 
-            progress_cb(0.1, format!("Downloading {} {}...", label, tag));
-            let Ok(dl_resp) = agent.get(dl_url).call() else {
-                continue;
-            };
-            if stream_response_to_file(dl_resp, &zip_path, progress_cb).is_err() {
-                continue;
-            }
+        progress_cb(0.1, format!("Downloading DepotDownloader {}...", tag));
+        let dl_resp = agent.get(dl_url).call().ok()?;
+        stream_response_to_file(dl_resp, &zip_path, progress_cb).ok()?;
 
-            progress_cb(0.92, "Extracting archive...".into());
-            if let Ok(zf) = File::open(&zip_path) {
-                if let Ok(mut archive) = ZipArchive::new(zf) {
-                    let _ = archive.extract(&self.tool_dir);
-                }
-            }
-            let _ = fs::remove_file(&zip_path);
-
-            if let Some(exe) = Self::scan_dir_for_bin(&self.tool_dir) {
-                let _ = Self::build_invocation(&exe);
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let _ = fs::write(
-                    self.tool_dir.join("meta.json"),
-                    serde_json::to_string_pretty(&json!({
-                        "version": tag,
-                        "repo": repo,
-                        "last_check": now,
-                        "exe_path": exe,
-                    }))
-                    .unwrap_or_default(),
-                );
-                progress_cb(1.0, format!("{} {} ready", label, tag));
-                return Some(exe);
+        progress_cb(0.92, "Extracting archive...".into());
+        if let Ok(zf) = File::open(&zip_path) {
+            if let Ok(mut archive) = ZipArchive::new(zf) {
+                let _ = archive.extract(&self.tool_dir);
             }
         }
-        None
+        let _ = fs::remove_file(&zip_path);
+
+        let exe = Self::scan_dir_for_bin(&self.tool_dir)?;
+        let _ = Self::build_invocation(&exe);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = fs::write(
+            self.tool_dir.join("meta.json"),
+            serde_json::to_string_pretty(&json!({
+                "version": tag,
+                "repo": DEPOTDOWNLOADER_REPO,
+                "last_check": now,
+                "exe_path": exe,
+            }))
+            .unwrap_or_default(),
+        );
+        progress_cb(1.0, format!("DepotDownloader {} ready", tag));
+        Some(exe)
+    }
+
+    fn pick_linux_x64_asset(assets: &[Value]) -> Option<&Value> {
+        assets
+            .iter()
+            .find(|a| {
+                let n = a
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                n.ends_with(".zip")
+                    && n.contains("linux")
+                    && !n.contains("arm")
+                    && !n.contains("musl")
+            })
+            .or_else(|| {
+                assets.iter().find(|a| {
+                    let n = a
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    n.ends_with(".zip") && n.contains("linux") && !n.contains("arm")
+                })
+            })
     }
 
     pub fn resolve_keys(
@@ -347,27 +403,92 @@ impl DepotDownloaderService {
         }
         dirs.into_iter()
             .map(|d| d.join(&fname))
-            .find(|p| p.exists())
+            .find(|p| p.is_file())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Opens an interactive terminal window running `DepotDownloader -qr -remember-password`
+    /// (or `-username <user> -remember-password`) so the user can authenticate their Steam
+    /// session once and reuse cached credentials during background downloads.
+    pub fn launch_interactive_login(
+        &self,
+        custom_tool_path: Option<&str>,
+        steam_username: &str,
+    ) -> Result<String, String> {
+        let exe = self
+            .ensure_tool(custom_tool_path, |_, _| {})
+            .ok_or_else(|| "Could not locate or download DepotDownloader".to_string())?;
+        let prefix = Self::build_invocation(&exe)?;
+
+        let mut shell_cmd = prefix
+            .iter()
+            .map(|s| shell_quote(s))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let clean_user = steam_username.trim();
+        if !clean_user.is_empty() && !clean_user.eq_ignore_ascii_case("anonymous") {
+            shell_cmd.push_str(&format!(
+                " -username {} -remember-password",
+                shell_quote(clean_user)
+            ));
+        } else {
+            shell_cmd.push_str(" -qr -remember-password");
+        }
+        let full_script = format!(
+            "DOTNET_EnableWriteXorExecute=0 DOTNET_EnableDiagnostics=0 {} ; echo ''; read -rp 'Press Enter to close...' _",
+            shell_cmd
+        );
+
+        let terminals: &[(&str, &[&str])] = &[
+            ("ptyxis", &["--", "bash", "-lc"]),
+            ("kgx", &["--", "bash", "-lc"]),
+            ("gnome-terminal", &["--", "bash", "-lc"]),
+            ("konsole", &["-e", "bash", "-lc"]),
+            ("xfce4-terminal", &["-x", "bash", "-lc"]),
+            ("kitty", &["bash", "-lc"]),
+            ("alacritty", &["-e", "bash", "-lc"]),
+            ("foot", &["bash", "-lc"]),
+            ("xterm", &["-e", "bash", "-lc"]),
+        ];
+
+        for &(term, args) in terminals {
+            if let Some(term_bin) = which_in_path(term) {
+                let mut cmd = Command::new(term_bin);
+                cmd.args(args).arg(&full_script);
+                if cmd.spawn().is_ok() {
+                    return Ok(format!(
+                        "Opened {} for Steam login — complete QR / Steam Guard once to cache your session.",
+                        term
+                    ));
+                }
+            }
+        }
+
+        Err(format!(
+            "No desktop terminal found. Run manually: {}",
+            shell_cmd
+        ))
+    }
+
     pub fn download_depot<F>(
         &self,
         app_id: u32,
         selection: &DepotSelection,
         download_dir: &Path,
-        keys: &BTreeMap<u32, String>,
-        custom_workshop_path: Option<&str>,
+        opts: &DepotDownloadOptions,
         mut progress_cb: F,
     ) -> DepotRunResult
     where
         F: FnMut(f32, String),
     {
-        let Some(exe) = self.ensure_tool(custom_workshop_path, &mut progress_cb) else {
+        let custom_opt = opts.custom_tool_path.trim();
+        let Some(exe) = self.ensure_tool(
+            (!custom_opt.is_empty()).then_some(custom_opt),
+            &mut progress_cb,
+        ) else {
             return DepotRunResult {
                 depot_id: selection.depot_id,
                 ok: false,
-                error: Some("DepotDownloaderMod / DepotDownloader not found".into()),
+                error: Some("DepotDownloader not found (check internet or Settings)".into()),
             };
         };
 
@@ -391,37 +512,29 @@ impl DepotDownloaderService {
         }
 
         let target_app = selection.from_app_id.unwrap_or(app_id);
+        let dl_args =
+            Self::build_download_args(target_app, selection, download_dir, &opts.steam_username);
+
         let mut cmd = Command::new(&prefix[0]);
         for p in &prefix[1..] {
             cmd.arg(p);
         }
-        cmd.args([
-            "-app",
-            &target_app.to_string(),
-            "-depot",
-            &selection.depot_id.to_string(),
-            "-dir",
-            &download_dir.to_string_lossy(),
-            "-username",
-            "anonymous",
-            "-max-downloads",
-            "32",
-            "-validate",
-        ]);
+        cmd.args(&dl_args);
 
-        if let Some(mp) = &selection.manifest_path {
-            if mp.exists() {
-                cmd.arg("-manifestfile").arg(mp);
-            }
-        }
-        if let Some(k) = keys.get(&selection.depot_id) {
-            cmd.arg("-depotkey").arg(k);
-        }
-        if let Some(gid) = &selection.manifest_id {
-            cmd.arg("-manifest").arg(gid);
-        }
+        // Critical Fedora 45 / headless desktop .NET runtime guards:
+        // 1. Null stdin prevents Console.ReadKey / password prompt InvalidOperationException -> SIGABRT
+        // 2. W^X=0 & Diagnostics=0 prevent .NET Native/CoreCLR crashes on glibc 2.44 / SELinux
+        // 3. RLIMIT_CORE=0 + DbgEnableMiniDump=0 stop systemd-coredump / Crash Reporter storms
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("DOTNET_EnableWriteXorExecute", "0")
+            .env("DOTNET_EnableDiagnostics", "0")
+            .env("DOTNET_DbgEnableMiniDump", "0")
+            .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
+            .env("DOTNET_SYSTEM_GLOBALIZATION_INVARIANT", "1");
+        disable_core_dumps(&mut cmd);
 
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -436,19 +549,20 @@ impl DepotDownloaderService {
         let stderr_handle = child.stderr.take().map(|stderr| {
             std::thread::spawn(move || {
                 let reader = BufReader::new(stderr);
-                let mut last_err = String::new();
+                let mut lines = Vec::new();
                 for line in reader.lines().map_while(Result::ok) {
                     let clean = line.trim();
                     if !clean.is_empty() {
-                        last_err = clean.to_string();
+                        lines.push(clean.to_string());
                     }
                 }
-                last_err
+                lines
             })
         });
 
         let pct_re = Regex::new(r"(\d{1,3}\.\d{2})%").unwrap();
-        let mut last_line = String::new();
+        let mut last_stdout = String::new();
+        let mut recent_stdout = Vec::new();
         if let Some(stdout) = child.stdout.take() {
             let reader = BufReader::new(stdout);
             for line in reader.lines().map_while(Result::ok) {
@@ -456,7 +570,11 @@ impl DepotDownloaderService {
                 if clean.is_empty() {
                     continue;
                 }
-                last_line = clean.clone();
+                last_stdout = clean.clone();
+                recent_stdout.push(clean.clone());
+                if recent_stdout.len() > 6 {
+                    recent_stdout.remove(0);
+                }
                 let pct = pct_re
                     .captures(&clean)
                     .and_then(|c| c.get(1))
@@ -466,12 +584,9 @@ impl DepotDownloaderService {
             }
         }
 
-        let last_err = stderr_handle
+        let stderr_lines = stderr_handle
             .and_then(|h| h.join().ok())
             .unwrap_or_default();
-        if last_line.is_empty() && !last_err.is_empty() {
-            last_line = last_err;
-        }
 
         match child.wait() {
             Ok(status) if status.success() => DepotRunResult {
@@ -479,21 +594,106 @@ impl DepotDownloaderService {
                 ok: true,
                 error: None,
             },
-            Ok(status) => DepotRunResult {
-                depot_id: selection.depot_id,
-                ok: false,
-                error: Some(format!(
-                    "Exited with code {}: {}",
-                    status.code().unwrap_or(-1),
-                    last_line
-                )),
-            },
+            Ok(status) => {
+                let combined = recent_stdout
+                    .iter()
+                    .chain(stderr_lines.iter())
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let detail = summarize_depotdownloader_failure(
+                    status.code(),
+                    status.signal(),
+                    &last_stdout,
+                    &stderr_lines,
+                    &combined,
+                );
+                DepotRunResult {
+                    depot_id: selection.depot_id,
+                    ok: false,
+                    error: Some(detail),
+                }
+            }
             Err(e) => DepotRunResult {
                 depot_id: selection.depot_id,
                 ok: false,
                 error: Some(e.to_string()),
             },
         }
+    }
+}
+
+fn summarize_depotdownloader_failure(
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    last_stdout: &str,
+    stderr_lines: &[String],
+    combined: &str,
+) -> String {
+    let low = combined.to_ascii_lowercase();
+    if low.contains("no subscription")
+        || low.contains("accessdenied")
+        || low.contains("access denied")
+        || low.contains("not available from this account")
+        || low.contains("401")
+    {
+        return "Steam requires an account that owns this depot — set your Steam Username and click 'Sign In (QR)' first.".into();
+    }
+    if low.contains("invalidpassword")
+        || low.contains("accountlogondenied")
+        || low.contains("steam guard")
+        || low.contains("twofactor")
+        || low.contains("console.read")
+        || low.contains("invalidoperationexception")
+    {
+        return "Steam session expired or needs Steam Guard — click 'Sign In (QR)' to refresh saved credentials.".into();
+    }
+    let meaningful_err = stderr_lines
+        .iter()
+        .rev()
+        .find(|l| !l.starts_with("at ") && !l.starts_with("---"))
+        .cloned()
+        .unwrap_or_else(|| last_stdout.to_string());
+    if let Some(sig) = signal {
+        if meaningful_err.is_empty() {
+            format!(
+                "DepotDownloader terminated by signal {} (install 'dotnet-runtime-8.0' or sign in via QR)",
+                sig
+            )
+        } else {
+            format!("Signal {}: {}", sig, meaningful_err)
+        }
+    } else if meaningful_err.is_empty() {
+        format!("Exited with code {}", exit_code.unwrap_or(1))
+    } else {
+        meaningful_err
+    }
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn disable_core_dumps(cmd: &mut Command) {
+    #[repr(C)]
+    struct Rlimit {
+        rlim_cur: u64,
+        rlim_max: u64,
+    }
+    extern "C" {
+        fn setrlimit(resource: c_int, rlim: *const Rlimit) -> c_int;
+    }
+    use std::ffi::c_int;
+    const RLIMIT_CORE: c_int = 4;
+    unsafe {
+        cmd.pre_exec(|| {
+            let zero = Rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            let _ = setrlimit(RLIMIT_CORE, &zero);
+            Ok(())
+        });
     }
 }
 
@@ -506,4 +706,56 @@ pub fn which_in_path(binary: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn download_args_omit_unsupported_flags_and_anonymous_username() {
+        let sel = DepotSelection {
+            depot_id: 3321461,
+            manifest_id: Some("1669007755731719796".into()),
+            manifest_path: Some(PathBuf::from("/tmp/3321461_1669007755731719796.manifest")),
+            size: 1024,
+            from_app_id: None,
+            language: None,
+            os: None,
+            is_shared: false,
+            is_dlc: false,
+        };
+        let args =
+            DepotDownloaderService::build_download_args(3321460, &sel, Path::new("/tmp/out"), "");
+        assert!(!args.iter().any(|a| a == "-depotkey" || a == "-depotkeys"));
+        assert!(!args.iter().any(|a| a == "-manifestfile"));
+        assert!(!args.iter().any(|a| a == "-username"));
+        assert!(args.windows(2).any(|w| w == ["-max-downloads", "8"]));
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["-manifest", "1669007755731719796"]));
+    }
+
+    #[test]
+    fn download_args_include_remember_password_for_named_steam_account() {
+        let sel = DepotSelection {
+            depot_id: 731,
+            manifest_id: None,
+            manifest_path: None,
+            size: 0,
+            from_app_id: Some(730),
+            language: None,
+            os: None,
+            is_shared: false,
+            is_dlc: false,
+        };
+        let args = DepotDownloaderService::build_download_args(
+            730,
+            &sel,
+            Path::new("/tmp/cs2"),
+            "my_steam_user",
+        );
+        assert!(args.windows(2).any(|w| w == ["-username", "my_steam_user"]));
+        assert!(args.iter().any(|a| a == "-remember-password"));
+    }
 }

@@ -13,12 +13,12 @@ use egui_extras::{Column, Size, StripBuilder, TableBuilder};
 use crate::parsers::lua_parser::LuaFileParser;
 use crate::services::api_client::HubcapService;
 use crate::services::cef_injector::CefInjectorService;
-use crate::services::depot_downloader::DepotSelection;
+use crate::services::depot_downloader::{DepotDownloadOptions, DepotSelection};
 use crate::services::external_tools::TOOLS;
 use crate::services::fixes_service::FixesService;
 use crate::services::protocol_service::ProtocolService;
 use crate::ui::app::LuaToolsApp;
-use crate::ui::state::{AppMessage, DepotsSubTab, SettingsSubTab};
+use crate::ui::state::{AppMessage, DepotsSubTab, SettingsSubTab, ToastKind};
 use crate::ui::theme::{
     chip_button, danger_button, display_font, draw_rem_medallion, format_bytes, ghost_button,
     inset_paper_sheet, lua_layouter, paper_card, paper_card_padded, pick_directory_native,
@@ -298,8 +298,10 @@ impl LuaToolsApp {
                         if let Some(h) = apply_hash {
                             if self.lua_vault.apply(app_id, &h) {
                                 self.reload_depots_local(app_id);
-                                self.status_text =
-                                    format!("Applied LuaVault variant for AppID {}", app_id);
+                                self.notify(
+                                    format!("Applied LuaVault variant for AppID {}", app_id),
+                                    ToastKind::Success,
+                                );
                             }
                         }
                         if let Some((h, cur)) = rename_hash {
@@ -451,14 +453,17 @@ impl LuaToolsApp {
                                 LuaFileParser::toggle_manifest_pin_in_text(&raw, did, None);
                             if changed && self.lua_vault.write_live(app_id, &updated) {
                                 self.reload_depots_local(app_id);
-                                self.status_text = format!(
-                                    "{} manifest pin on depot {}",
-                                    if enable_pin {
-                                        "Enabled"
-                                    } else {
-                                        "Commented out"
-                                    },
-                                    did
+                                self.notify(
+                                    format!(
+                                        "{} manifest pin on depot {}",
+                                        if enable_pin {
+                                            "Enabled"
+                                        } else {
+                                            "Commented out"
+                                        },
+                                        did
+                                    ),
+                                    ToastKind::Info,
                                 );
                             }
                         }
@@ -542,7 +547,10 @@ impl LuaToolsApp {
                         self.depots_editing_live = false;
                         self.reload_depots_local(app_id);
                         self.refresh_all_local_state();
-                        self.status_text = format!("Saved {}.lua and synced SLSsteam.", app_id);
+                        self.notify(
+                            format!("Saved {}.lua and synced SLSsteam.", app_id),
+                            ToastKind::Success,
+                        );
                     }
                 }
             }
@@ -586,7 +594,9 @@ impl LuaToolsApp {
             let body_h = (ui.available_height() - 12.0).max(260.0);
             ui.set_min_height(body_h);
 
-            // Output folder row
+            let mut click_qr_login = false;
+
+            // Output folder + Steam Login / Selection controls
             egui::Sides::new().show(
                 ui,
                 |ui| {
@@ -596,7 +606,7 @@ impl LuaToolsApp {
                             .font(semibold_font(13.0))
                             .color(Palette::TEXT_SECONDARY),
                     );
-                    let w = (ui.available_width() - 260.0).clamp(180.0, 520.0);
+                    let w = (ui.available_width() - 340.0).clamp(150.0, 480.0);
                     ui.add_sized(
                         [w, 30.0],
                         TextEdit::singleline(&mut self.depots_dest_dir)
@@ -614,7 +624,13 @@ impl LuaToolsApp {
                     }
                 },
                 |ui| {
+                    // Sides right closure runs right-to-left
                     ui.spacing_mut().item_spacing.x = 8.0;
+                    if ghost_button(ui, "Clear").clicked() {
+                        for p in &mut self.depots_picks {
+                            p.is_selected = false;
+                        }
+                    }
                     if ghost_button(ui, "Select All").clicked() {
                         for p in &mut self.depots_picks {
                             if p.blocked_reason.is_none() {
@@ -622,24 +638,44 @@ impl LuaToolsApp {
                             }
                         }
                     }
-                    if ghost_button(ui, "Clear").clicked() {
-                        for p in &mut self.depots_picks {
-                            p.is_selected = false;
+                    ui.add_enabled_ui(!self.depots_downloading, |ui| {
+                        if secondary_button(ui, "Sign In (QR)")
+                            .on_hover_text(
+                                "Open a terminal once to sign in to official DepotDownloader via Steam QR / Guard (-remember-password)",
+                            )
+                            .clicked()
+                        {
+                            click_qr_login = true;
                         }
-                    }
+                    });
                 },
             );
 
-            ui.add_space(14.0);
+            if click_qr_login {
+                let _ = self.settings_service.save();
+                let wp = self.slssteam_service.config.workshop_path.clone();
+                let user = self.settings_service.settings.steam_username.clone();
+                match self
+                    .depot_downloader
+                    .launch_interactive_login(Some(wp.as_str()), &user)
+                {
+                    Ok(msg) => self.notify(msg, ToastKind::Info),
+                    Err(err) => self.notify(err, ToastKind::Warning),
+                }
+            }
 
-            let table_h = (ui.available_height() - 62.0).max(150.0);
+            ui.add_space(12.0);
+
+            // Reserve comfortable bottom room for action buttons + progress bar so low text never clips
+            let reserve_bottom = if self.depots_downloading { 96.0 } else { 64.0 };
+            let table_h = (ui.available_height() - reserve_bottom).max(140.0);
             inset_paper_sheet(ui, Margin::same(8), |ui| {
                 ui.set_min_height(table_h);
                 if self.depots_picks.is_empty() {
                     ui.vertical_centered(|ui| {
                         ui.add_space(40.0);
                         ui.label(
-                            RichText::new("No keyed depots found in this title's .lua file.")
+                            RichText::new("No depots declared in this title's configuration.")
                                 .color(Palette::TEXT_MUTED),
                         );
                     });
@@ -700,7 +736,7 @@ impl LuaToolsApp {
                                     } else if pick.manifest_path.is_some() {
                                         status_badge(ui, "Local Manifest", BadgeTone::Ready);
                                     } else {
-                                        status_badge(ui, "CDN Ready", BadgeTone::Blue);
+                                        status_badge(ui, "Steam CDN", BadgeTone::Blue);
                                     }
                                 });
                             });
@@ -712,6 +748,14 @@ impl LuaToolsApp {
             let sel_count = self.depots_picks.iter().filter(|p| p.is_selected).count();
             let dl_status_txt = self.depots_dl_status.clone();
             let is_downloading = self.depots_downloading;
+            let acct_hint = {
+                let u = self.settings_service.settings.steam_username.trim();
+                if u.is_empty() {
+                    "Session: anonymous / cached QR (set Steam Username in Settings › Account if needed)".to_string()
+                } else {
+                    format!("Session: {} (-remember-password)", u)
+                }
+            };
             let mut click_dl = false;
 
             egui::Sides::new().show(
@@ -722,6 +766,12 @@ impl LuaToolsApp {
                             RichText::new(&dl_status_txt)
                                 .size(12.0)
                                 .color(Palette::TEXT_SECONDARY),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new(acct_hint)
+                                .size(12.0)
+                                .color(Palette::TEXT_MUTED),
                         );
                     }
                 },
@@ -776,19 +826,17 @@ impl LuaToolsApp {
         }
 
         let dest_root = PathBuf::from(self.depots_dest_dir.trim());
-        let keys = crate::services::depot_downloader::DepotDownloaderService::resolve_keys(
-            self.steam_service.installation.as_ref(),
-            &self.slssteam_service,
-            app_id,
-        );
-        let wp = self.slssteam_service.config.workshop_path.clone();
+        let dl_opts = DepotDownloadOptions {
+            custom_tool_path: self.slssteam_service.config.workshop_path.clone(),
+            steam_username: self.settings_service.settings.steam_username.clone(),
+        };
         let dd = self.depot_downloader.clone();
         let tx = self.msg_tx.clone();
         let ctx_c = ctx.clone();
 
         self.depots_downloading = true;
         self.depots_dl_pct = 0.0;
-        self.depots_dl_status = "Starting DepotDownloader…".into();
+        self.depots_dl_status = "Starting official SteamRE/DepotDownloader…".into();
 
         thread::spawn(move || {
             let mut results = Vec::new();
@@ -797,7 +845,7 @@ impl LuaToolsApp {
                 let tx_p = tx.clone();
                 let ctx_p = ctx_c.clone();
                 let label = format!("Depot {}", sel.depot_id);
-                let r = dd.download_depot(app_id, &sel, &sub, &keys, Some(&wp), move |pct, msg| {
+                let r = dd.download_depot(app_id, &sel, &sub, &dl_opts, move |pct, msg| {
                     let _ = tx_p.send(AppMessage::DepotDownloadProgress {
                         depot_label: label.clone(),
                         pct,
@@ -1050,15 +1098,21 @@ impl LuaToolsApp {
                             }
                             if let Some((fid, dir)) = act_rev {
                                 let res = FixesService::unfix_game(&dir, &fid);
-                                self.status_text = if res.ok {
-                                    format!(
-                                        "Reverted {} file(s) for AppID {}",
-                                        res.applied_files.len(),
-                                        aid
-                                    )
+                                if res.ok {
+                                    self.notify(
+                                        format!(
+                                            "Reverted {} file(s) for AppID {}",
+                                            res.applied_files.len(),
+                                            aid
+                                        ),
+                                        ToastKind::Success,
+                                    );
                                 } else {
-                                    res.error.unwrap_or_else(|| "Revert failed".into())
-                                };
+                                    self.notify(
+                                        res.error.unwrap_or_else(|| "Revert failed".into()),
+                                        ToastKind::Warning,
+                                    );
+                                }
                             }
                         } else {
                             ui.vertical_centered(|ui| {
@@ -1125,11 +1179,17 @@ impl LuaToolsApp {
                 self.cef_injector.stop();
             }
             self.detect_steam_and_sync();
-            self.status_text = if sls_ok && app_ok {
-                "Saved settings.json and SLSsteam config.yaml".into()
+            if sls_ok && app_ok {
+                self.notify(
+                    "Saved settings.json and SLSsteam config.yaml",
+                    ToastKind::Success,
+                );
             } else {
-                "Failed to save one or more configuration files".into()
-            };
+                self.notify(
+                    "Failed to save one or more configuration files",
+                    ToastKind::Warning,
+                );
+            }
         }
 
         // Clean Sub-Tab Strip
@@ -1421,6 +1481,58 @@ impl LuaToolsApp {
                 );
             }
         });
+
+        ui.add_space(16.0);
+
+        paper_card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 10.0;
+            ui.label(
+                RichText::new("Steam DepotDownloader Session")
+                    .font(display_font(17.5))
+                    .color(Palette::TEXT_PRIMARY),
+            );
+            ui.label(
+                RichText::new(
+                    "Official SteamRE/DepotDownloader authenticates with your Steam account for owned depots (-remember-password) or runs anonymously for public depots.",
+                )
+                .size(12.5)
+                .color(Palette::TEXT_MUTED),
+            );
+            let mut open_qr = false;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.label(
+                    RichText::new("Steam Username:")
+                        .size(12.5)
+                        .color(Palette::TEXT_SECONDARY),
+                );
+                let w = (ui.available_width() - 210.0).max(140.0);
+                ui.add_sized(
+                    [w, 30.0],
+                    TextEdit::singleline(&mut self.settings_service.settings.steam_username)
+                        .margin(Margin::symmetric(10, 6))
+                        .hint_text("Optional (leave blank for anonymous / QR)"),
+                );
+                if secondary_button(ui, "Sign In via QR (Terminal)").clicked() {
+                    open_qr = true;
+                }
+            });
+            if open_qr {
+                let _ = self.settings_service.save();
+                let wp = self.slssteam_service.config.workshop_path.clone();
+                let user = self.settings_service.settings.steam_username.clone();
+                match self
+                    .depot_downloader
+                    .launch_interactive_login(Some(wp.as_str()), &user)
+                {
+                    Ok(msg) => self.notify(msg, ToastKind::Info),
+                    Err(err) => self.notify(err, ToastKind::Warning),
+                }
+            }
+        });
+
+        ui.add_space(24.0);
     }
 
     fn render_settings_integrations(&mut self, ui: &mut egui::Ui) {
@@ -1494,7 +1606,7 @@ impl LuaToolsApp {
             );
             ui.checkbox(
                 &mut self.settings_service.settings.cef_injector_enabled,
-                "Enable CEF DevTools Store Injector (127.0.0.1:8080 → local RPC :6767)",
+                "Enable CEF DevTools Store Injector (127.0.0.1:8080 › local RPC :6767)",
             );
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
@@ -1504,19 +1616,22 @@ impl LuaToolsApp {
                 if secondary_button(ui, "Enable Steam CEF Debugging").clicked() {
                     if let Some(inst) = &self.steam_service.installation {
                         match CefInjectorService::ensure_cef_debugging_enabled(&inst.root) {
-                            Ok(m) | Err(m) => self.status_text = m,
+                            Ok(m) => self.notify(m, ToastKind::Success),
+                            Err(m) => self.notify(m, ToastKind::Warning),
                         }
                     } else {
-                        self.status_text = "Steam installation not detected.".into();
+                        self.notify("Steam installation not detected.", ToastKind::Warning);
                     }
                 }
                 if secondary_button(ui, "Register luatools:// Handler").clicked() {
                     match ProtocolService::register_desktop_handler() {
-                        Ok(m) | Err(m) => self.status_text = m,
+                        Ok(m) => self.notify(m, ToastKind::Success),
+                        Err(m) => self.notify(m, ToastKind::Warning),
                     }
                 }
             });
         });
+        ui.add_space(24.0);
     }
 
     fn render_settings_updates_and_tools(&mut self, ui: &mut egui::Ui) {
@@ -1536,7 +1651,7 @@ impl LuaToolsApp {
             );
             ui.checkbox(
                 &mut self.settings_service.settings.check_updates_on_startup,
-                "Check Git remote once in the background on startup (shows ⬆ Update button in bottom-right corner)",
+                "Check Git remote once in the background on startup (shows ⬆ Update button in top-right corner)",
             );
 
             ui.horizontal(|ui| {

@@ -7,6 +7,7 @@ use eframe::egui::{self, Align, ComboBox, Layout, Margin, RichText, ScrollArea, 
 
 use crate::parsers::vdf_binary::{LaunchEntry, LaunchOptionsService};
 use crate::ui::app::LuaToolsApp;
+use crate::ui::state::ToastKind;
 use crate::ui::theme::{
     danger_button, display_font, format_bytes, ghost_button, inset_paper_sheet, lua_layouter,
     primary_button, secondary_button, semibold_font, Palette,
@@ -126,14 +127,14 @@ impl LuaToolsApp {
                     );
                     if res.ok {
                         self.refresh_all_local_state();
-                        self.status_text = format!("Created {}.lua", aid);
+                        self.notify(format!("Created {}.lua", aid), ToastKind::Success);
                         close = true;
                     }
                 } else {
-                    self.status_text = "Steam installation not detected.".into();
+                    self.notify("Steam installation not detected.", ToastKind::Warning);
                 }
             } else {
-                self.status_text = "Enter a valid numeric AppID.".into();
+                self.notify("Enter a valid numeric AppID.", ToastKind::Warning);
             }
         }
         if close {
@@ -281,7 +282,10 @@ impl LuaToolsApp {
                 }
             }
             self.refresh_all_local_state();
-            self.status_text = format!("Saved overrides & lua for AppID {}", app_id);
+            self.notify(
+                format!("Saved overrides & lua for AppID {}", app_id),
+                ToastKind::Success,
+            );
             close = true;
         }
         if do_delete {
@@ -554,7 +558,10 @@ impl LuaToolsApp {
                         };
                         if !text.trim().is_empty() {
                             if let Some(v) = self.lua_vault.save_text(aid, &text, Some(&val)) {
-                                self.status_text = format!("Saved preset: {}", v.display_label());
+                                self.notify(
+                                    format!("Saved preset: {}", v.display_label()),
+                                    ToastKind::Success,
+                                );
                                 self.depots_variants = self.lua_vault.get_variants(aid);
                             }
                         }

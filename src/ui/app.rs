@@ -41,7 +41,7 @@ use crate::services::update_service::UpdateService;
 use crate::ui::state::{
     AcquireTab, ActiveView, AddByAppIdModal, AppMessage, DepotDetailModal, DepotPickRow,
     DepotsSubTab, GameDetailModal, LaunchOptionsModal, LibraryRow, QaCaptureState, SettingsSubTab,
-    TextPromptModal, UpdateBannerState,
+    TextPromptModal, ToastKind, ToastNotification, UpdateBannerState,
 };
 use crate::ui::theme::{
     apply_papercut_monotone_theme, display_font, draw_rem_medallion, nav_rail_button,
@@ -81,6 +81,7 @@ pub struct LuaToolsApp {
     pub command_input: String,
     pub focus_command_next: bool,
     pub status_text: String,
+    pub active_toast: Option<ToastNotification>,
     pub millennium_connected: bool,
     pub cover_textures: HashMap<u32, TextureHandle>,
     pub cover_in_flight: HashSet<u32>,
@@ -232,6 +233,7 @@ impl LuaToolsApp {
             command_input: String::new(),
             focus_command_next: false,
             status_text: "Ready — drop .lua, .manifest, or .zip files anywhere to install".into(),
+            active_toast: None,
             millennium_connected: false,
             cover_textures: HashMap::new(),
             cover_in_flight: HashSet::new(),
@@ -367,6 +369,7 @@ impl LuaToolsApp {
             command_input: String::new(),
             focus_command_next: false,
             status_text: "Ready — drop .lua, .manifest, or .zip files anywhere to install".into(),
+            active_toast: None,
             millennium_connected: false,
             cover_textures: HashMap::new(),
             cover_in_flight: HashSet::new(),
@@ -668,6 +671,18 @@ impl LuaToolsApp {
             .unwrap_or_else(|| format!("App {}", app_id))
     }
 
+    /// Shows a non-blocking top-right toast notification (never placed at the bottom).
+    pub fn notify(&mut self, msg: impl Into<String>, kind: ToastKind) {
+        let text = msg.into();
+        self.status_text = text.clone();
+        self.active_toast = Some(ToastNotification {
+            text,
+            kind,
+            created_at: std::time::Instant::now(),
+            duration_secs: 4.5,
+        });
+    }
+
     // ===== Background Dispatchers =====
 
     pub fn probe_bridge_async(&self, ctx: &egui::Context) {
@@ -857,7 +872,7 @@ impl LuaToolsApp {
         }
         if source != "hubcap" && !self.auth_service.is_signed_in() {
             self.acquire_status =
-                "Sign in with Discord in Settings → Account first (or configure a Hubcap key)."
+                "Sign in with Discord in Settings › Account first (or configure a Hubcap key)."
                     .into();
             return;
         }
@@ -1005,7 +1020,7 @@ impl LuaToolsApp {
         );
 
         for entry in lua.entries {
-            if !entry.has_key() {
+            if entry.id == aid && entry.manifest_id.is_none() && !entry.has_key() {
                 continue;
             }
             let depot = depot_map.get(&entry.id).cloned().unwrap_or(ContentDepot {
@@ -1027,10 +1042,6 @@ impl LuaToolsApp {
 
             let blocked_reason = if depot.is_shared {
                 Some("Shared redistributable".into())
-            } else if !has_key {
-                Some("Missing decryption key".into())
-            } else if manifest_id.is_none() {
-                Some("No manifest GID".into())
             } else {
                 None
             };
@@ -1081,7 +1092,10 @@ impl LuaToolsApp {
         ctx: &egui::Context,
     ) {
         if !self.auth_service.is_signed_in() {
-            self.status_text = "Sign in with Discord in Settings → Account first.".into();
+            self.notify(
+                "Sign in with Discord in Settings › Account first.",
+                ToastKind::Warning,
+            );
             return;
         }
         self.fixes_busy = true;
@@ -1133,7 +1147,10 @@ impl LuaToolsApp {
         ctx: &egui::Context,
     ) {
         if !self.auth_service.is_signed_in() {
-            self.status_text = "Sign in with Discord in Settings → Account first.".into();
+            self.notify(
+                "Sign in with Discord in Settings › Account first.",
+                ToastKind::Warning,
+            );
             return;
         }
         self.fixes_busy = true;
@@ -1316,9 +1333,12 @@ impl LuaToolsApp {
         }
         self.refresh_all_local_state();
         if ok_count > 0 {
-            self.status_text = format!("Installed {} package(s) into Steam.", ok_count);
+            self.notify(
+                format!("Installed {} package(s) into Steam.", ok_count),
+                ToastKind::Success,
+            );
         } else if let Some(e) = last_err {
-            self.status_text = format!("Install error: {}", e);
+            self.notify(format!("Install error: {}", e), ToastKind::Warning);
         }
     }
 
@@ -1433,19 +1453,22 @@ impl LuaToolsApp {
                                 let _ = fs::remove_dir_all(parent);
                             }
                             if res.ok {
-                                self.acquire_status = format!(
+                                let msg = format!(
                                     "Installed AppID {} ({} manifest file(s))",
                                     app_id, res.manifest_count
                                 );
-                                self.status_text = self.acquire_status.clone();
+                                self.acquire_status = msg.clone();
+                                self.notify(msg, ToastKind::Success);
                                 self.refresh_all_local_state();
                             } else {
-                                self.acquire_status =
-                                    res.error.unwrap_or_else(|| "Install failed".into());
+                                let err = res.error.unwrap_or_else(|| "Install failed".into());
+                                self.acquire_status = err.clone();
+                                self.notify(err, ToastKind::Warning);
                             }
                         }
                     } else {
-                        self.acquire_status = msg;
+                        self.acquire_status = msg.clone();
+                        self.notify(msg, ToastKind::Warning);
                     }
                 }
                 AppMessage::DepotInfoLoaded { app_id, info } => {
@@ -1470,9 +1493,18 @@ impl LuaToolsApp {
                     self.depots_downloading = false;
                     let ok = results.iter().filter(|r| r.ok).count();
                     let total = results.len();
-                    self.depots_dl_status =
-                        format!("Completed · {} of {} depot(s) downloaded", ok, total);
-                    self.status_text = self.depots_dl_status.clone();
+                    let first_err = results.iter().find_map(|r| r.error.as_deref());
+                    if let Some(err) = first_err {
+                        let summary = format!("Downloaded {}/{} depot(s) — {}", ok, total, err);
+                        self.depots_dl_status = summary.clone();
+                        self.notify(summary, ToastKind::Warning);
+                    } else {
+                        let summary =
+                            format!("Completed · {} of {} depot(s) downloaded", ok, total);
+                        self.depots_dl_status = summary.clone();
+                        self.notify(summary, ToastKind::Success);
+                    }
+                    self.rebuild_depot_picks();
                 }
                 AppMessage::FixListingsLoaded { games, tags } => {
                     self.fixes_listings = games;
@@ -1514,22 +1546,39 @@ impl LuaToolsApp {
                             self.refresh_all_local_state();
                         }
                     }
-                    self.status_text = msg;
+                    self.notify(
+                        msg,
+                        if ok {
+                            ToastKind::Success
+                        } else {
+                            ToastKind::Warning
+                        },
+                    );
                 }
                 AppMessage::ToolProgress { tool_key, pct, msg } => {
                     self.tool_progress.insert(tool_key, pct);
                     self.status_text = msg;
                 }
-                AppMessage::ToolFinished {
-                    tool_key,
-                    ok: _,
-                    msg,
-                } => {
+                AppMessage::ToolFinished { tool_key, ok, msg } => {
                     self.tool_busy.insert(tool_key, false);
-                    self.status_text = msg;
+                    self.notify(
+                        msg,
+                        if ok {
+                            ToastKind::Success
+                        } else {
+                            ToastKind::Warning
+                        },
+                    );
                 }
                 AppMessage::AuthCompleted { ok, msg } => {
-                    self.status_text = msg;
+                    self.notify(
+                        msg,
+                        if ok {
+                            ToastKind::Success
+                        } else {
+                            ToastKind::Warning
+                        },
+                    );
                     if ok {
                         self.fetch_usage_async(ctx);
                     }
@@ -1541,14 +1590,22 @@ impl LuaToolsApp {
                     self.settings_hubcap_status = msg;
                 }
                 AppMessage::DonatedKeys(count) => {
-                    self.status_text = if count > 0 {
+                    let m = if count > 0 {
                         format!("Submitted {} new decryption key(s) from config.vdf.", count)
                     } else {
                         "No new decryption keys to submit.".into()
                     };
+                    self.notify(m, ToastKind::Info);
                 }
-                AppMessage::SteamRestarted { ok: _, msg } => {
-                    self.status_text = msg;
+                AppMessage::SteamRestarted { ok, msg } => {
+                    self.notify(
+                        msg,
+                        if ok {
+                            ToastKind::Info
+                        } else {
+                            ToastKind::Warning
+                        },
+                    );
                 }
                 AppMessage::FilesPickedForIngest(files) => {
                     self.install_dropped_paths(&files);
@@ -1610,11 +1667,11 @@ impl LuaToolsApp {
                 AppMessage::UpdateApplyFinished(outcome) => match outcome {
                     Ok(res) => {
                         let summary = format!(
-                            "Updated to v{} ({}) — click ↻ Restart in the corner to relaunch.",
+                            "Updated to v{} ({}) — click ↻ Restart in the top-right corner.",
                             res.new_version, res.commit_info
                         );
-                        self.status_text = summary.clone();
                         self.settings_update_status = summary.clone();
+                        self.notify(summary.clone(), ToastKind::Success);
                         self.update_banner = UpdateBannerState::ReadyToRestart {
                             new_version: res.new_version,
                             exe_path: res.updated_exe,
@@ -1622,8 +1679,8 @@ impl LuaToolsApp {
                         };
                     }
                     Err(err) => {
-                        self.status_text = format!("Update failed: {}", err);
                         self.settings_update_status = format!("Error: {}", err);
+                        self.notify(format!("Update failed: {}", err), ToastKind::Warning);
                         self.update_banner = UpdateBannerState::Available {
                             badge: "⬆ Retry Update".into(),
                             tooltip: format!("Last attempt failed: {}\nClick to retry.", err),
@@ -1726,8 +1783,16 @@ impl LuaToolsApp {
         }
 
         // 1. Top Bar — Strict 3-Column StripBuilder (mathematically zero overlap at any width)
+        //    Houses Brand (left), Omnibox (center), and Steam status + corner Git Update button (top-right).
         let mut run_omnibox = false;
         let mut click_rescan = false;
+        let mut click_start_update = false;
+        let mut click_relaunch_exe: Option<PathBuf> = None;
+        let right_col_w = if matches!(self.update_banner, UpdateBannerState::Hidden) {
+            156.0
+        } else {
+            288.0
+        };
 
         egui::TopBottomPanel::top("top_command_bar")
             .exact_height(56.0)
@@ -1740,8 +1805,8 @@ impl LuaToolsApp {
             .show(ctx, |ui| {
                 StripBuilder::new(ui)
                     .size(Size::exact(196.0))
-                    .size(Size::remainder().at_least(220.0))
-                    .size(Size::exact(156.0))
+                    .size(Size::remainder().at_least(210.0))
+                    .size(Size::exact(right_col_w))
                     .cell_layout(Layout::left_to_right(Align::Center))
                     .horizontal(|mut strip| {
                         // Left: Cut-Paper Rem Medallion + Rich Display Title
@@ -1760,10 +1825,10 @@ impl LuaToolsApp {
                             );
                         });
 
-                        // Center: Single Clean Bounded Omnibox + Go Button
+                        // Center: Single Clean Bounded Omnibox + Search Button
                         strip.cell(|ui| {
                             let avail = ui.available_width();
-                            let input_w = (avail - 78.0).clamp(130.0, 480.0);
+                            let input_w = (avail - 78.0).clamp(120.0, 480.0);
                             let pad_left = ((avail - (input_w + 68.0)) * 0.5).max(0.0);
                             if pad_left > 2.0 {
                                 ui.add_space(pad_left);
@@ -1786,9 +1851,11 @@ impl LuaToolsApp {
                             }
                         });
 
-                        // Right: Single Calm Steam Status Pill (click to rescan)
+                        // Right: Steam Status Pill + Corner Git Update Button (never placed at the bottom!)
                         strip.cell(|ui| {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+
                                 let online = self.steam_service.is_available();
                                 let (lbl, bg, fg) = if online {
                                     ("● Steam Ready", Palette::GO_BG, Palette::GO_TEXT)
@@ -1833,6 +1900,63 @@ impl LuaToolsApp {
                                 if pill_resp.on_hover_text(tip).clicked() {
                                     click_rescan = true;
                                 }
+
+                                match &self.update_banner {
+                                    UpdateBannerState::Hidden => {}
+                                    UpdateBannerState::Available { badge, tooltip } => {
+                                        let btn = egui::Button::new(
+                                            RichText::new(badge)
+                                                .font(semibold_font(11.5))
+                                                .color(Palette::TEXT_PRIMARY),
+                                        )
+                                        .fill(Palette::BLUE_PRIMARY)
+                                        .stroke(Stroke::new(1.0_f32, Palette::BLUE_BORDER))
+                                        .corner_radius(CornerRadius::same(4))
+                                        .min_size(Vec2::new(104.0, 28.0));
+                                        let resp = ui.add(btn).on_hover_text(tooltip);
+                                        if resp.hovered() {
+                                            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                        }
+                                        if resp.clicked() {
+                                            click_start_update = true;
+                                        }
+                                    }
+                                    UpdateBannerState::Updating { pct, step } => {
+                                        let lbl = format!("⟳ {:>2.0}%", pct * 100.0);
+                                        let btn = egui::Button::new(
+                                            RichText::new(lbl)
+                                                .font(semibold_font(11.5))
+                                                .color(Palette::BLUE_LIGHT),
+                                        )
+                                        .fill(Palette::BLUE_SUBTLE)
+                                        .stroke(Stroke::new(1.0_f32, Palette::BLUE_BORDER))
+                                        .corner_radius(CornerRadius::same(4))
+                                        .min_size(Vec2::new(76.0, 28.0));
+                                        ui.add_enabled(false, btn).on_disabled_hover_text(step);
+                                    }
+                                    UpdateBannerState::ReadyToRestart {
+                                        new_version,
+                                        exe_path,
+                                        summary,
+                                    } => {
+                                        let btn = egui::Button::new(
+                                            RichText::new(format!("↻ Restart v{}", new_version))
+                                                .font(semibold_font(11.5))
+                                                .color(Palette::TEXT_PRIMARY),
+                                        )
+                                        .fill(Palette::BLUE_HOVER)
+                                        .stroke(Stroke::new(1.0_f32, Palette::BLUE_LIGHT))
+                                        .corner_radius(CornerRadius::same(4))
+                                        .min_size(Vec2::new(112.0, 28.0));
+                                        let resp = ui.add(btn).on_hover_text(summary);
+                                        if resp.hovered() {
+                                            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                        }
+                                        if resp.clicked() {
+                                            click_relaunch_exe = Some(exe_path.clone());
+                                        }
+                                    }
+                                }
                             });
                         });
                     });
@@ -1844,114 +1968,13 @@ impl LuaToolsApp {
         if click_rescan {
             self.detect_steam_and_sync();
         }
-
-        // 2. Bottom Status Bar — Zero-Overlap Sides + Tactile Corner Git Update Button
-        let mut click_start_update = false;
-        let mut click_relaunch_exe: Option<PathBuf> = None;
-
-        egui::TopBottomPanel::bottom("bottom_status_strip")
-            .exact_height(32.0)
-            .frame(
-                Frame::new()
-                    .fill(Palette::BG_VOID)
-                    .stroke(Stroke::new(1.0_f32, Palette::BORDER_SUBTLE))
-                    .inner_margin(Margin::symmetric(16, 0)),
-            )
-            .show(ctx, |ui| {
-                egui::Sides::new().show(
-                    ui,
-                    |ui| {
-                        ui.horizontal_centered(|ui| {
-                            ui.label(
-                                RichText::new(&self.status_text)
-                                    .size(12.0)
-                                    .color(Palette::TEXT_SECONDARY),
-                            );
-                        });
-                    },
-                    |ui| {
-                        ui.horizontal_centered(|ui| {
-                            ui.spacing_mut().item_spacing.x = 10.0;
-                            if let Some(i) = &self.steam_service.installation {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{} ({} lib)",
-                                        i.root.display(),
-                                        i.libraries.len()
-                                    ))
-                                    .font(FontId::new(11.0, FontFamily::Monospace))
-                                    .color(Palette::TEXT_MUTED),
-                                );
-                            }
-
-                            match &self.update_banner {
-                                UpdateBannerState::Hidden => {}
-                                UpdateBannerState::Available { badge, tooltip } => {
-                                    let btn = egui::Button::new(
-                                        RichText::new(badge)
-                                            .font(semibold_font(11.5))
-                                            .color(Palette::TEXT_PRIMARY),
-                                    )
-                                    .fill(Palette::BLUE_PRIMARY)
-                                    .stroke(Stroke::new(1.0_f32, Palette::BLUE_BORDER))
-                                    .corner_radius(CornerRadius::same(4))
-                                    .min_size(Vec2::new(98.0, 22.0));
-                                    let resp = ui.add(btn).on_hover_text(tooltip);
-                                    if resp.hovered() {
-                                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                                    }
-                                    if resp.clicked() {
-                                        click_start_update = true;
-                                    }
-                                }
-                                UpdateBannerState::Updating { pct, step } => {
-                                    let lbl = format!("⟳ Updating {:>2.0}%", pct * 100.0);
-                                    let btn = egui::Button::new(
-                                        RichText::new(lbl)
-                                            .font(semibold_font(11.5))
-                                            .color(Palette::BLUE_LIGHT),
-                                    )
-                                    .fill(Palette::BLUE_SUBTLE)
-                                    .stroke(Stroke::new(1.0_f32, Palette::BLUE_BORDER))
-                                    .corner_radius(CornerRadius::same(4))
-                                    .min_size(Vec2::new(112.0, 22.0));
-                                    ui.add_enabled(false, btn).on_disabled_hover_text(step);
-                                }
-                                UpdateBannerState::ReadyToRestart {
-                                    new_version,
-                                    exe_path,
-                                    summary,
-                                } => {
-                                    let btn = egui::Button::new(
-                                        RichText::new(format!("↻ Restart (v{})", new_version))
-                                            .font(semibold_font(11.5))
-                                            .color(Palette::TEXT_PRIMARY),
-                                    )
-                                    .fill(Palette::BLUE_HOVER)
-                                    .stroke(Stroke::new(1.0_f32, Palette::BLUE_LIGHT))
-                                    .corner_radius(CornerRadius::same(4))
-                                    .min_size(Vec2::new(116.0, 22.0));
-                                    let resp = ui.add(btn).on_hover_text(summary);
-                                    if resp.hovered() {
-                                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                                    }
-                                    if resp.clicked() {
-                                        click_relaunch_exe = Some(exe_path.clone());
-                                    }
-                                }
-                            }
-                        });
-                    },
-                );
-            });
-
         if click_start_update {
             self.trigger_git_self_update(ctx);
         }
         if let Some(exe) = click_relaunch_exe {
             match UpdateService::relaunch_binary(&exe) {
                 Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                Err(e) => self.status_text = e,
+                Err(e) => self.notify(e, ToastKind::Warning),
             }
         }
 
@@ -2082,8 +2105,85 @@ impl LuaToolsApp {
             );
         }
 
-        // 6. Modal Windows
+        // 6. Top-Right Dismissible Toast Notification (never hinders low-placed text!)
+        self.render_top_right_toast(ctx);
+
+        // 7. Modal Windows
         self.render_modals(ctx);
+    }
+
+    fn render_top_right_toast(&mut self, ctx: &egui::Context) {
+        let Some(toast) = self.active_toast.clone() else {
+            return;
+        };
+        let elapsed = toast.created_at.elapsed().as_secs_f32();
+        if elapsed >= toast.duration_secs {
+            self.active_toast = None;
+            return;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(120));
+
+        let accent = match toast.kind {
+            ToastKind::Info => Palette::BLUE_LIGHT,
+            ToastKind::Success => Palette::GO_TEXT,
+            ToastKind::Warning => Palette::WARN_TEXT,
+        };
+
+        let mut dismiss = false;
+        egui::Area::new(egui::Id::new("top_toast_area"))
+            .anchor(egui::Align2::CENTER_TOP, Vec2::new(96.0, 64.0))
+            .order(egui::Order::Tooltip)
+            .show(ctx, |ui| {
+                let inner = Frame::new()
+                    .fill(Palette::BG_ELEVATED)
+                    .stroke(Stroke::new(1.0_f32, accent))
+                    .shadow(egui::Shadow {
+                        offset: [0, 4],
+                        blur: 10,
+                        spread: 0,
+                        color: Color32::from_black_alpha(140),
+                    })
+                    .corner_radius(CornerRadius::same(5))
+                    .inner_margin(Margin::symmetric(14, 9))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            let (bar, _) =
+                                ui.allocate_exact_size(Vec2::new(3.5, 18.0), Sense::hover());
+                            ui.painter().rect_filled(bar, CornerRadius::same(2), accent);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&toast.text)
+                                        .size(12.5)
+                                        .color(Palette::TEXT_PRIMARY),
+                                )
+                                .wrap_mode(egui::TextWrapMode::Extend),
+                            );
+                            ui.add_space(4.0);
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("x")
+                                            .font(semibold_font(12.5))
+                                            .color(Palette::TEXT_MUTED),
+                                    )
+                                    .frame(false),
+                                )
+                                .on_hover_text("Dismiss notification")
+                                .clicked()
+                            {
+                                dismiss = true;
+                            }
+                        });
+                    });
+                if inner.response.interact(Sense::click()).clicked() {
+                    dismiss = true;
+                }
+            });
+
+        if dismiss {
+            self.active_toast = None;
+        }
     }
 
     fn drive_qa_screenshots(&mut self, ctx: &egui::Context) {
