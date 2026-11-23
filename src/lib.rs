@@ -1,5 +1,6 @@
 //! LuaTools Linux — Core library modules.
 
+pub mod steam_bridge;
 pub mod models;
 pub mod parsers;
 pub mod services;

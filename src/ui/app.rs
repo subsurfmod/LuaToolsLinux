@@ -39,6 +39,7 @@ use crate::services::settings_service::SettingsService;
 use crate::services::slssteam_service::SlssteamService;
 use crate::services::steam_auto_crack_service::SteamAutoCrackService;
 use crate::services::steam_library_service::SteamLibraryService;
+use crate::services::steam_bridge_service::SteamBridgeService;
 use crate::services::steam_service::SteamService;
 use crate::services::telemetry_service::TelemetryService;
 use crate::services::update_service::UpdateService;
@@ -59,6 +60,7 @@ pub struct LuaToolsApp {
     pub settings_service: SettingsService,
     pub auth_service: AuthService,
     pub steam_service: SteamService,
+    pub steam_bridge_service: SteamBridgeService,
     pub slssteam_service: SlssteamService,
     pub millennium_service: MillenniumService,
     pub api_client: LuaToolsApiClient,
@@ -205,6 +207,7 @@ impl LuaToolsApp {
         auth_service.initialize();
 
         let steam_service = SteamService::new();
+        let steam_bridge_service = SteamBridgeService::new();
         let slssteam_service = SlssteamService::default();
         let millennium_service = MillenniumService::default();
         let api_client = LuaToolsApiClient::new(auth_service.clone());
@@ -246,6 +249,7 @@ impl LuaToolsApp {
             settings_service,
             auth_service,
             steam_service,
+            steam_bridge_service,
             slssteam_service,
             millennium_service,
             api_client,
@@ -380,6 +384,7 @@ impl LuaToolsApp {
         let settings_service = SettingsService::new(Some(scratch_dir.join("settings.json")));
         let auth_service = AuthService::new(Some(scratch_dir.join("auth.json")));
         let steam_service = SteamService::new();
+        let steam_bridge_service = SteamBridgeService::new();
         let slssteam_service = SlssteamService::new(Some(scratch_dir.join("sls.yaml")));
         let millennium_service = MillenniumService::default();
         let api_client = LuaToolsApiClient::new(auth_service.clone());
@@ -408,6 +413,7 @@ impl LuaToolsApp {
             settings_service,
             auth_service,
             steam_service,
+            steam_bridge_service,
             slssteam_service,
             millennium_service,
             api_client,

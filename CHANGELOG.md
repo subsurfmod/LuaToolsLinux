@@ -7,6 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.4.0-beta] - 2026-11-23
+
+### Added
+- **Steam Client Interop Layer (`src/steam_bridge/`)**:
+  - **`binary_reader.rs`**: ELF64 parser for Steam Linux binaries (`steamclient.so`, `steamui.so`); reads section headers, symbol tables, dynamic symbols, and computes SHA-256 hashes for build-compatibility pattern lookup.
+  - **`memory_patch.rs`**: x86-64 inline memory patching via trampolines (`mprotect` + relative jump + jump-back trampoline) for safe runtime code redirection.
+  - **`preload_loader.rs`**: `LD_PRELOAD`-based injection of the integration shared library into the Steam client process; generates launcher scripts, manages `/etc/ld.so.preload` entries, and detects running Steam PIDs.
+  - **`ticket_store.rs`**: Steam ticket store backed by `localconfig.vdf`; reads/writes `AppTicket`, `ETicket`, and `SteamID` per app ID.
+  - **`pattern_db.rs`**: Steam build compatibility lookup from the upstream pattern tracker (GitHub raw → jsDelivr CDN fallback → local cache); matches SHA-256 hashes to pattern TOML files.
+  - **`ipc.rs`**: Unix domain socket IPC between the GUI and the integration library running inside Steam; supports typed messages for ping, tickets, play-unowned apps, stats, legacy CD keys, depot keys, manifest codes, app ID redirects, and manifest pins.
+- **`bridge_lib/`** (`bridge_lib/Cargo.toml`, `bridge_lib/src/lib.rs`):
+  - New `cdylib` crate built as `libsteam_integration.so` for `LD_PRELOAD` injection into Steam.
+  - Constructor initializes at Steam load, scans Steam binaries, resolves byte patterns via `pattern_db`, installs memory patches, and starts the IPC server.
+  - **`BIsSubscribedApp` redirect**: Installs a memory patch on the Steam client ownership-check function; apps in the redirect set report as owned.
+  - **`GetAppId` redirect**: Installs a memory patch on the Steam client app-ID query function; returns configured redirect IDs (e.g. 480 for online-play compatibility).
+  - IPC message handlers for tickets, play-unowned apps, stats, legacy CD keys, depot keys, manifest codes, app ID redirects, and manifest pins.
+- **`SteamBridgeService` (`src/services/steam_bridge_service.rs`)**:
+  - High-level service connecting the bridge layer to the GUI; detects Steam, scans binaries, loads patterns, installs the integration library, manages tickets, and sends IPC messages.
+  - Exposes `install_integration()`, `uninstall_integration()`, `scan_and_load_patterns()`, `get/set/remove_tickets()`, `send_ipc_message()`, and `status()`.
+- **Manifest Binding Service (`src/services/manifest_binding_service.rs`)**:
+  - Tracks manifest pins per app+depot; `set_pin()`, `remove_pin()`, `get_pin()`, `get_pins_for_app()`, `list_pinned_depots()`.
+  - IPC messages: `SetManifestPin`, `RemoveManifestPin`, `ManifestBound`.
+- **Hot-Reload Service (`src/services/hot_reload_service.rs`)**:
+  - `inotify`-based watcher on the Steam `stplug-in/` directory; detects CREATE/MODIFY/DELETE/MOVE events on `.lua` files; runs in a background thread and notifies the bridge via IPC.
+- **Cloud Redirect Service (`src/services/cloud_redirect_service.rs`)**:
+  - Detects CloudRedirect installation (`~/.local/share/Steam/config/cloudredirect`); per-app cloud enable/disable; `sync_to_cloudredirect()` writes `cloudredirect.conf`; status tracking (`NotInstalled` → `Installed` → `Active`).
+- **Game Process Integration Service (`src/services/game_process_injection_service.rs`)**:
+  - Per-app integration configuration (library path, env vars, launch args); `build_launch_command()` constructs a `Command` with `LD_PRELOAD` set for game-process integration; ptrace-based running-process injection prototype; status tracking (`NotInjected` → `Injected` → `Failed`).
+
+### Changed
+- **Cargo workspace**: Root `Cargo.toml` converted to a workspace with members `.` and `bridge_lib`; version bumped to `2.4.0`.
+- **`src/lib.rs`**: Registered `pub mod steam_bridge;`
+- **`src/services/mod.rs`**: Registered `steam_bridge_service`, `manifest_binding_service`, `hot_reload_service`, `cloud_redirect_service`, `game_process_injection_service`.
+- **`src/ui/app.rs`**: Added `steam_bridge_service: SteamBridgeService` field to `LuaToolsApp` in both `new()` and `new_headless_demo()` constructors.
+- **`Cargo.toml`**: Added dependencies `thiserror`, `toml`, `libc`, `inotify`.
+
+### Known Limitations / Prototype Notes
+- **`bridge_lib`** is built as a separate `cdylib` and must be placed at `~/.local/lib/luatools/libsteam_integration.so` before `install_integration()` can register it.
+- **Memory patches** are installed at Steam startup via `LD_PRELOAD` constructor; pattern addresses depend on the upstream pattern tracker publishing matching TOML files for the running Steam build.
+- **ptrace running-process injection** is prototype-level and requires `CAP_SYS_PTRACE` and a permissive Yama ptrace scope; `LD_PRELOAD` launch is the recommended path.
+- **Manifest binding enforcement** stores pins and signals via IPC; Steam-side manifest interception requires additional pattern patches for the current Steam build.
+
+### GUI Changes Needed (not yet implemented)
+The following GUI integration work remains for the 2.4.0 release:
+
+- **Settings › Steam Integration** tab:
+  - Steam detection status indicator
+  - Integration library install/uninstall buttons
+  - Pattern load status (steamclient / steamui SHA-256 + pattern matches)
+  - LD_PRELOAD toggle (system-wide vs per-launch)
+- **Library › More › Integration Actions** per game:
+  - Add/Remove from redirect set (play unowned)
+  - Set/Remove app ID redirect (480 spoof)
+  - Set/Remove legacy CD key
+  - Set/Remove depot decryption key
+  - Set/Remove stat value
+- **Depots › Manifest Binding** sub-tab:
+  - List pinned manifests per depot
+  - Add/Remove manifest pins
+  - Show bind status (active / pending)
+- **Hot-Reload status** in Home or Settings:
+  - Watcher running/stopped indicator
+  - Last file change event log
+- **Cloud Redirect** status in Settings › SLSsteam & Store Bridge:
+  - Installed/Not installed indicator
+  - Per-app cloud enable/disable toggles
+  - Sync button
+- **Game Process Integration** in Library › More:
+  - Per-app integration enable/disable
+  - Library path selector
+  - Launch with integration button
+
+---
+
 ## [2.3.1] - 2026-11-23
 
 ### Added
