@@ -96,6 +96,11 @@ pub enum IpcMessage {
         manifest_id: String,
         active: bool,
     },
+    /// Integration → GUI: manifest code response
+    ManifestCodeResponse {
+        gid: String,
+        code: String,
+    },
 }
 
 impl IpcMessage {

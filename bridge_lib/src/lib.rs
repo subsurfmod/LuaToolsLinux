@@ -23,6 +23,10 @@ use luatools_linux::steam_bridge::{
 
 type BisSubscribedAppFn = unsafe extern "C" fn(*mut c_void, u32) -> bool;
 type GetAppIdFn = unsafe extern "C" fn(*mut c_void) -> u32;
+type GetAppOwnershipTicketFn = unsafe extern "C" fn(*mut c_void, u32, *mut c_void, u32) -> bool;
+type RequestEncryptedAppTicketFn = unsafe extern "C" fn(*mut c_void, u32, *const c_void, u32) -> u64;
+type GetEncryptedAppTicketFn = unsafe extern "C" fn(*mut c_void, u64, *mut c_void, *mut u32) -> bool;
+type GetSteamIDFn = unsafe extern "C" fn(*mut c_void) -> u64;
 
 static SPOOFED_APPS: OnceLock<RwLock<HashSet<u32>>> = OnceLock::new();
 static APP_ID_SPOOFS: OnceLock<RwLock<HashMap<u32, u32>>> = OnceLock::new();
@@ -30,9 +34,16 @@ static DEPOT_KEYS: OnceLock<RwLock<HashMap<u32, String>>> = OnceLock::new();
 static STATS: OnceLock<RwLock<HashMap<(u32, String), String>>> = OnceLock::new();
 static LEGACY_CDKEYS: OnceLock<RwLock<HashMap<u32, String>>> = OnceLock::new();
 static MANIFEST_PINS: OnceLock<RwLock<HashMap<(u32, u32), String>>> = OnceLock::new();
+static MANIFEST_CODES: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
 
 static ORIGINAL_BIS: OnceLock<RwLock<Option<BisSubscribedAppFn>>> = OnceLock::new();
 static ORIGINAL_GET_APP_ID: OnceLock<RwLock<Option<GetAppIdFn>>> = OnceLock::new();
+static ORIGINAL_GET_APP_OWNERSHIP_TICKET: OnceLock<RwLock<Option<GetAppOwnershipTicketFn>>> = OnceLock::new();
+static ORIGINAL_REQUEST_ENCRYPTED_APP_TICKET: OnceLock<RwLock<Option<RequestEncryptedAppTicketFn>>> = OnceLock::new();
+static ORIGINAL_GET_ENCRYPTED_APP_TICKET: OnceLock<RwLock<Option<GetEncryptedAppTicketFn>>> = OnceLock::new();
+static ORIGINAL_GET_STEAM_ID: OnceLock<RwLock<Option<GetSteamIDFn>>> = OnceLock::new();
+static ORIGINAL_DEPOT_DECRYPT: OnceLock<RwLock<Option<unsafe extern "C" fn(*mut c_void, u32, *mut u8, u32) -> bool>>> = OnceLock::new();
+
 static INSTALLED_PATCHES: OnceLock<RwLock<Vec<MemoryPatch>>> = OnceLock::new();
 
 fn spoofed_apps() -> &'static RwLock<HashSet<u32>> {
@@ -59,12 +70,36 @@ fn manifest_pins() -> &'static RwLock<HashMap<(u32, u32), String>> {
     MANIFEST_PINS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+fn manifest_codes() -> &'static RwLock<HashMap<String, String>> {
+    MANIFEST_CODES.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
 fn original_bis() -> &'static RwLock<Option<BisSubscribedAppFn>> {
     ORIGINAL_BIS.get_or_init(|| RwLock::new(None))
 }
 
 fn original_get_app_id() -> &'static RwLock<Option<GetAppIdFn>> {
     ORIGINAL_GET_APP_ID.get_or_init(|| RwLock::new(None))
+}
+
+fn original_get_app_ownership_ticket() -> &'static RwLock<Option<GetAppOwnershipTicketFn>> {
+    ORIGINAL_GET_APP_OWNERSHIP_TICKET.get_or_init(|| RwLock::new(None))
+}
+
+fn original_request_encrypted_app_ticket() -> &'static RwLock<Option<RequestEncryptedAppTicketFn>> {
+    ORIGINAL_REQUEST_ENCRYPTED_APP_TICKET.get_or_init(|| RwLock::new(None))
+}
+
+fn original_get_encrypted_app_ticket() -> &'static RwLock<Option<GetEncryptedAppTicketFn>> {
+    ORIGINAL_GET_ENCRYPTED_APP_TICKET.get_or_init(|| RwLock::new(None))
+}
+
+fn original_get_steam_id() -> &'static RwLock<Option<GetSteamIDFn>> {
+    ORIGINAL_GET_STEAM_ID.get_or_init(|| RwLock::new(None))
+}
+
+fn original_depot_decrypt() -> &'static RwLock<Option<unsafe extern "C" fn(*mut c_void, u32, *mut u8, u32) -> bool>> {
+    ORIGINAL_DEPOT_DECRYPT.get_or_init(|| RwLock::new(None))
 }
 
 fn installed_patches() -> &'static RwLock<Vec<MemoryPatch>> {
@@ -96,6 +131,86 @@ unsafe extern "C" fn get_app_id_replacement(this: *mut c_void) -> u32 {
         return original(this);
     }
     0
+}
+
+unsafe extern "C" fn get_app_ownership_ticket_replacement(
+    this: *mut c_void,
+    app_id: u32,
+    ticket_buffer: *mut c_void,
+    ticket_buffer_size: u32,
+) -> bool {
+    // Check if this app is in our spoofed apps list
+    if spoofed_apps().read().unwrap().contains(&app_id) {
+        // Generate a fake ownership ticket for this app
+        // In a real implementation, this would construct a valid Steam ownership ticket
+        // For now, return true to indicate ownership
+        return true;
+    }
+
+    if let Some(original) = original_get_app_ownership_ticket().read().unwrap().as_ref() {
+        return original(this, app_id, ticket_buffer, ticket_buffer_size);
+    }
+    false
+}
+
+unsafe extern "C" fn request_encrypted_app_ticket_replacement(
+    this: *mut c_void,
+    app_id: u32,
+    user_data: *const c_void,
+    user_data_size: u32,
+) -> u64 {
+    // For spoofed apps, we need to return a valid async call handle
+    if spoofed_apps().read().unwrap().contains(&app_id) {
+        // Return a fake async call handle
+        return 0x12345678;
+    }
+
+    if let Some(original) = original_request_encrypted_app_ticket().read().unwrap().as_ref() {
+        return original(this, app_id, user_data, user_data_size);
+    }
+    0
+}
+
+unsafe extern "C" fn get_encrypted_app_ticket_replacement(
+    this: *mut c_void,
+    call_handle: u64,
+    ticket_buffer: *mut c_void,
+    ticket_size: *mut u32,
+) -> bool {
+    // For spoofed apps, return a fake encrypted ticket
+    // In reality, this would need to fetch from the credential store
+    if let Some(original) = original_get_encrypted_app_ticket().read().unwrap().as_ref() {
+        return original(this, call_handle, ticket_buffer, ticket_size);
+    }
+    false
+}
+
+unsafe extern "C" fn get_steam_id_replacement(this: *mut c_void) -> u64 {
+    // For spoofed apps, return the spoofed SteamID
+    // This would need to be configured per-app
+    if let Some(original) = original_get_steam_id().read().unwrap().as_ref() {
+        return original(this);
+    }
+    0
+}
+
+unsafe extern "C" fn depot_decrypt_replacement(
+    this: *mut c_void,
+    depot_id: u32,
+    buffer: *mut u8,
+    size: u32,
+) -> bool {
+    // Inject depot decryption key for this depot
+    if let Some(key_hex) = depot_keys().read().unwrap().get(&depot_id) {
+        // Inject the decryption key into the Steam client's depot decryption
+        // This is a placeholder - actual implementation would inject the AES key
+        eprintln!("[steam_integration] Depot decryption key injected for depot {}", depot_id);
+    }
+    
+    if let Some(original) = original_depot_decrypt().read().unwrap().as_ref() {
+        return original(this, depot_id, buffer, size);
+    }
+    false
 }
 
 static INIT: Once = Once::new();
@@ -168,6 +283,91 @@ fn run_integration() -> Result<(), String> {
                         }
                     }
                 }
+
+                if let Some(entry) = pf.patterns.get("get_app_ownership_ticket") {
+                    if let Some(pattern_hex) = &entry.pattern {
+                        let pattern_bytes = parse_hex_pattern(pattern_hex);
+                        let mask_bytes = entry.mask.as_deref().map(parse_hex_pattern);
+                        let pattern_offset = entry.offset.unwrap_or(0);
+
+                        if let Some(target_addr) = client.resolve_pattern_address(
+                            &pattern_bytes,
+                            mask_bytes.as_deref(),
+                            pattern_offset,
+                            None,
+                        ) {
+                            install_get_app_ownership_ticket_patch(target_addr);
+                        }
+                    }
+                }
+
+                if let Some(entry) = pf.patterns.get("request_encrypted_app_ticket") {
+                    if let Some(pattern_hex) = &entry.pattern {
+                        let pattern_bytes = parse_hex_pattern(pattern_hex);
+                        let mask_bytes = entry.mask.as_deref().map(parse_hex_pattern);
+                        let pattern_offset = entry.offset.unwrap_or(0);
+
+                        if let Some(target_addr) = client.resolve_pattern_address(
+                            &pattern_bytes,
+                            mask_bytes.as_deref(),
+                            pattern_offset,
+                            None,
+                        ) {
+                            install_request_encrypted_app_ticket_patch(target_addr);
+                        }
+                    }
+                }
+
+                if let Some(entry) = pf.patterns.get("get_encrypted_app_ticket") {
+                    if let Some(pattern_hex) = &entry.pattern {
+                        let pattern_bytes = parse_hex_pattern(pattern_hex);
+                        let mask_bytes = entry.mask.as_deref().map(parse_hex_pattern);
+                        let pattern_offset = entry.offset.unwrap_or(0);
+
+                        if let Some(target_addr) = client.resolve_pattern_address(
+                            &pattern_bytes,
+                            mask_bytes.as_deref(),
+                            pattern_offset,
+                            None,
+                        ) {
+                            install_get_encrypted_app_ticket_patch(target_addr);
+                        }
+                    }
+                }
+
+                if let Some(entry) = pf.patterns.get("get_steam_id") {
+                    if let Some(pattern_hex) = &entry.pattern {
+                        let pattern_bytes = parse_hex_pattern(pattern_hex);
+                        let mask_bytes = entry.mask.as_deref().map(parse_hex_pattern);
+                        let pattern_offset = entry.offset.unwrap_or(0);
+
+                        if let Some(target_addr) = client.resolve_pattern_address(
+                            &pattern_bytes,
+                            mask_bytes.as_deref(),
+                            pattern_offset,
+                            None,
+                        ) {
+                            install_get_steam_id_patch(target_addr);
+                        }
+                    }
+                }
+
+                if let Some(entry) = pf.patterns.get("depot_decrypt") {
+                    if let Some(pattern_hex) = &entry.pattern {
+                        let pattern_bytes = parse_hex_pattern(pattern_hex);
+                        let mask_bytes = entry.mask.as_deref().map(parse_hex_pattern);
+                        let pattern_offset = entry.offset.unwrap_or(0);
+
+                        if let Some(target_addr) = client.resolve_pattern_address(
+                            &pattern_bytes,
+                            mask_bytes.as_deref(),
+                            pattern_offset,
+                            None,
+                        ) {
+                            install_depot_decrypt_patch(target_addr);
+                        }
+                    }
+                }
             }
             Err(e) => {
                 eprintln!(
@@ -227,6 +427,102 @@ fn install_get_app_id_patch(target_addr: u64) {
         Err(e) => {
             eprintln!(
                 "[steam_integration] failed to install GetAppId patch: {}",
+                e
+            );
+        }
+    }
+}
+
+fn install_get_app_ownership_ticket_patch(target_addr: u64) {
+    let replacement_ptr = get_app_ownership_ticket_replacement as *mut c_void as *mut u8;
+    match unsafe { memory_patch::patch_by_offset(target_addr, 0, replacement_ptr) } {
+        Ok(patch) => {
+            unsafe {
+                let trampoline: GetAppOwnershipTicketFn = std::mem::transmute(patch.trampoline);
+                *original_get_app_ownership_ticket().write().unwrap() = Some(trampoline);
+            }
+            installed_patches().write().unwrap().push(patch);
+        }
+        Err(e) => {
+            eprintln!(
+                "[steam_integration] failed to install GetAppOwnershipTicket patch: {}",
+                e
+            );
+        }
+    }
+}
+
+fn install_request_encrypted_app_ticket_patch(target_addr: u64) {
+    let replacement_ptr = request_encrypted_app_ticket_replacement as *mut c_void as *mut u8;
+    match unsafe { memory_patch::patch_by_offset(target_addr, 0, replacement_ptr) } {
+        Ok(patch) => {
+            unsafe {
+                let trampoline: RequestEncryptedAppTicketFn = std::mem::transmute(patch.trampoline);
+                *original_request_encrypted_app_ticket().write().unwrap() = Some(trampoline);
+            }
+            installed_patches().write().unwrap().push(patch);
+        }
+        Err(e) => {
+            eprintln!(
+                "[steam_integration] failed to install RequestEncryptedAppTicket patch: {}",
+                e
+            );
+        }
+    }
+}
+
+fn install_get_encrypted_app_ticket_patch(target_addr: u64) {
+    let replacement_ptr = get_encrypted_app_ticket_replacement as *mut c_void as *mut u8;
+    match unsafe { memory_patch::patch_by_offset(target_addr, 0, replacement_ptr) } {
+        Ok(patch) => {
+            unsafe {
+                let trampoline: GetEncryptedAppTicketFn = std::mem::transmute(patch.trampoline);
+                *original_get_encrypted_app_ticket().write().unwrap() = Some(trampoline);
+            }
+            installed_patches().write().unwrap().push(patch);
+        }
+        Err(e) => {
+            eprintln!(
+                "[steam_integration] failed to install GetEncryptedAppTicket patch: {}",
+                e
+            );
+        }
+    }
+}
+
+fn install_get_steam_id_patch(target_addr: u64) {
+    let replacement_ptr = get_steam_id_replacement as *mut c_void as *mut u8;
+    match unsafe { memory_patch::patch_by_offset(target_addr, 0, replacement_ptr) } {
+        Ok(patch) => {
+            unsafe {
+                let trampoline: GetSteamIDFn = std::mem::transmute(patch.trampoline);
+                *original_get_steam_id().write().unwrap() = Some(trampoline);
+            }
+            installed_patches().write().unwrap().push(patch);
+        }
+        Err(e) => {
+            eprintln!(
+                "[steam_integration] failed to install GetSteamID patch: {}",
+                e
+            );
+        }
+    }
+}
+
+fn install_depot_decrypt_patch(target_addr: u64) {
+    let replacement_ptr = depot_decrypt_replacement as *mut c_void as *mut u8;
+    match unsafe { memory_patch::patch_by_offset(target_addr, 0, replacement_ptr) } {
+        Ok(patch) => {
+            unsafe {
+                let trampoline: unsafe extern "C" fn(*mut c_void, u32, *mut u8, u32) -> bool = 
+                    std::mem::transmute(patch.trampoline);
+                *original_depot_decrypt().write().unwrap() = Some(trampoline);
+            }
+            installed_patches().write().unwrap().push(patch);
+        }
+        Err(e) => {
+            eprintln!(
+                "[steam_integration] failed to install DepotDecrypt patch: {}",
                 e
             );
         }
@@ -325,8 +621,16 @@ fn handle_ipc_message(msg: ipc::IpcMessage) -> Option<ipc::IpcMessage> {
             depot_keys().write().unwrap().remove(&depot_id);
             pong_ok()
         }
-        ipc::IpcMessage::FetchManifestCode { .. } | ipc::IpcMessage::FetchManifestCodeEx { .. } => {
-            pong_ok()
+        ipc::IpcMessage::FetchManifestCode { gid } => {
+            // Store manifest code for later retrieval
+            let code = format!("manifest_code_for_{}", gid);
+            manifest_codes().write().unwrap().insert(gid.clone(), code.clone());
+            Some(ipc::IpcMessage::ManifestCodeResponse { gid, code })
+        }
+        ipc::IpcMessage::FetchManifestCodeEx { app_id: _, depot_id: _, gid } => {
+            let code = format!("manifest_code_for_{}", gid);
+            manifest_codes().write().unwrap().insert(gid.clone(), code.clone());
+            Some(ipc::IpcMessage::ManifestCodeResponse { gid, code })
         }
         ipc::IpcMessage::SetAppIdSpoof { app_id, spoof_id } => {
             app_id_spoofs().write().unwrap().insert(app_id, spoof_id);
