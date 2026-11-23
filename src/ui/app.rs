@@ -33,10 +33,13 @@ use crate::services::fixes_service::FixesService;
 use crate::services::http_server::{HttpServerService, RpcUiEvent};
 use crate::services::lua_installer::LuaInstaller;
 use crate::services::millennium_service::MillenniumService;
+use crate::services::play_unowned_service::PlayUnownedService;
 use crate::services::protocol_service::ProtocolService;
 use crate::services::settings_service::SettingsService;
 use crate::services::slssteam_service::SlssteamService;
+use crate::services::steam_library_service::SteamLibraryService;
 use crate::services::steam_service::SteamService;
+use crate::services::wired_service::WiredService;
 use crate::services::telemetry_service::TelemetryService;
 use crate::services::update_service::UpdateService;
 use crate::ui::state::{
@@ -67,6 +70,9 @@ pub struct LuaToolsApp {
     pub depot_downloader: DepotDownloaderService,
     pub lua_vault: LuaVault,
     pub lua_installer: Option<LuaInstaller>,
+    pub play_unowned_service: PlayUnownedService,
+    pub steam_library_service: SteamLibraryService,
+    pub wired_service: WiredService,
     pub cef_bridge: CefBridgeService,
     pub http_server: Option<HttpServerService>,
     pub tools_manager: ExternalToolsManager,
@@ -229,6 +235,8 @@ impl LuaToolsApp {
             }
         });
 
+        let slssteam_service_clone = slssteam_service.clone();
+        let steam_installation = steam_service.installation.clone();
         let mut app = Self {
             settings_service,
             auth_service,
@@ -245,6 +253,18 @@ impl LuaToolsApp {
             depot_downloader,
             lua_vault,
             lua_installer: None,
+            play_unowned_service: PlayUnownedService::new(
+                steam_installation.clone().unwrap_or_default(),
+                slssteam_service_clone.clone(),
+            ),
+            steam_library_service: SteamLibraryService::new(
+                steam_installation.clone().unwrap_or_default(),
+                slssteam_service_clone.clone(),
+            ),
+            wired_service: WiredService::new(),
+            cef_bridge,
+            http_server: None,
+            tools_manager,
             cef_bridge,
             http_server: None,
             tools_manager,
@@ -398,6 +418,14 @@ impl LuaToolsApp {
             depot_downloader,
             lua_vault,
             lua_installer: None,
+            play_unowned_service: PlayUnownedService::new(
+                steam_installation.clone().unwrap_or_default(),
+                slssteam_service_clone.clone(),
+            ),
+            steam_library_service: SteamLibraryService::new(
+                steam_installation.clone().unwrap_or_default(),
+                slssteam_service_clone.clone(),
+            ),
             cef_bridge,
             http_server: None,
             tools_manager,
@@ -618,6 +646,12 @@ impl LuaToolsApp {
             let installer = LuaInstaller::new(inst.clone(), self.lua_vault.clone());
             self.lua_installer = Some(installer);
 
+            let sls_for_play = self.slssteam_service.clone();
+            self.play_unowned_service = PlayUnownedService::new(inst.clone(), sls_for_play);
+
+            self.steam_library_service =
+                SteamLibraryService::new(inst.clone(), self.slssteam_service.clone());
+
             self.cef_bridge.steam_root = Some(inst.root.clone());
             if self.settings_service.settings.cef_bridge_enabled {
                 self.cef_bridge.start();
@@ -667,6 +701,12 @@ impl LuaToolsApp {
         } else {
             self.lua_installer = None;
             self.depot_downloader.steam_installation = None;
+            self.play_unowned_service = PlayUnownedService::new(
+                SteamService::new().installation.unwrap_or_default(),
+                self.slssteam_service.clone(),
+            );
+            self.steam_library_service =
+                SteamLibraryService::new(SteamService::new().installation.unwrap_or_default(), self.slssteam_service.clone());
             if let Some(mut srv) = self.http_server.take() {
                 srv.stop();
             }

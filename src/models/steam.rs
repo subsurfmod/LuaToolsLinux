@@ -49,7 +49,7 @@ impl SteamLibrary {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SteamInstallation {
     pub root: PathBuf,
     pub libraries: Vec<SteamLibrary>,
