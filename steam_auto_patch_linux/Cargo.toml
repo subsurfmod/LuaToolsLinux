@@ -1,0 +1,32 @@
+[package]
+name = "steam-auto-patch-linux"
+version = "0.1.0"
+edition = "2021"
+description = "Native Linux implementation of SteamAutoPatch (Goldberg Steam emulator deployment)"
+license = "MIT"
+
+[lib]
+name = "steam_auto_patch_linux"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = "1.0"
+configparser = "3.3"
+dirs = "6.0"
+log = "0.4"
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+walkdir = "2.4"
+lazy_static = "1.4"
+
+[dev-dependencies]
+tempfile = "3.14"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

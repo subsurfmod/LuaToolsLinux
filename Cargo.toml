@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "bridge_lib"]
+members = [".", "bridge_lib", "steam_auto_patch_linux"]
 
 [package]
 name = "luatools-linux"
