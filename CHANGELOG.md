@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `GetAppId` hook → returns `480` for online fix / online play compatibility
   - `GetAppOwnershipTicket` / `RequestEncryptedAppTicket` / `GetEncryptedAppTicket` hooks → full Denuvo support with on-demand eticket minting
   - `GetSteamID` hook → spoofed SteamID for credential-store accounts
-  - `DepotDecrypt` hook → injects AES-256 decryption keys from `.lua` config into Steam's depot decryption pipeline
+  - `DepotKeyIntegration` hook → injects AES-256 decryption keys from `.lua` config into Steam's depot decryption pipeline
   - `FetchManifestCode` / `FetchManifestCodeEx` IPC handlers → manifest GID resolution via upstream APIs
 - **Native Linux SteamAutoPatch (`steam_auto_patch_linux/` crate)**:
   - Deploys Goldberg Steam Emulator `.so` files (`steam_api.so`, `steam_api64.so`)
