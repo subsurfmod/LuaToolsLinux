@@ -55,6 +55,7 @@ pub struct DepotDownloaderService {
     pub tool_dir: PathBuf,
     pub steam_installation: Option<SteamInstallation>,
     pub slssteam_service: Option<SlssteamService>,
+    pub bridge_service: Option<std::sync::Arc<std::sync::Mutex<crate::services::steam_bridge_service::SteamBridgeService>>>,
 }
 
 impl Default for DepotDownloaderService {
@@ -71,12 +72,17 @@ impl DepotDownloaderService {
             tool_dir: dir,
             steam_installation: None,
             slssteam_service: None,
+            bridge_service: None,
         }
     }
 
     pub fn with_steam(&mut self, steam: SteamInstallation, sls: SlssteamService) {
         self.steam_installation = Some(steam);
         self.slssteam_service = Some(sls);
+    }
+
+    pub fn with_bridge(&mut self, bridge: crate::services::steam_bridge_service::SteamBridgeService) {
+        self.bridge_service = Some(std::sync::Arc::new(std::sync::Mutex::new(bridge)));
     }
 
     pub fn find_executable(&self, custom_tool_path: Option<&str>) -> Option<PathBuf> {
@@ -416,11 +422,22 @@ impl DepotDownloaderService {
     pub fn resolve_keys(
         steam_inst: Option<&SteamInstallation>,
         sls: Option<&SlssteamService>,
+        bridge: Option<&crate::services::steam_bridge_service::SteamBridgeService>,
         app_id: u32,
     ) -> BTreeMap<u32, String> {
         let mut keys = BTreeMap::new();
         if let Some(sls) = sls {
             keys = sls.config.depot_keys.clone();
+        }
+        if let Some(bridge) = bridge {
+            if let Ok(mut store) = bridge.ticket_store.lock() {
+                if let Ok(tickets) = store.get(app_id) {
+                    if let Some(key) = tickets.app_ticket {
+                        // AppTicket is stored as hex, use it as depot key for the app itself
+                        keys.insert(app_id, key);
+                    }
+                }
+            }
         }
         if let Some(inst) = steam_inst {
             let lua_path = inst.stplug_in_path.join(format!("{}.lua", app_id));
@@ -433,6 +450,25 @@ impl DepotDownloaderService {
             }
         }
         keys
+    }
+
+    /// Writes depot keys to a temporary file for DepotDownloader -depotkeys support
+    pub fn write_depot_keys_file(keys: &BTreeMap<u32, String>) -> Option<PathBuf> {
+        if keys.is_empty() {
+            return None;
+        }
+        let dir = std::env::temp_dir().join("luatools_depot_keys");
+        let _ = fs::create_dir_all(&dir);
+        let file_path = dir.join("depot_keys.txt");
+        let mut content = String::new();
+        for (depot_id, key) in keys {
+            content.push_str(&format!("{} {}\n", depot_id, key));
+        }
+        if fs::write(&file_path, content).is_ok() {
+            Some(file_path)
+        } else {
+            None
+        }
     }
 
     pub fn resolve_manifest_path(
@@ -561,9 +597,11 @@ impl DepotDownloaderService {
         }
 
         let target_app = selection.from_app_id.unwrap_or(app_id);
+        let bridge = self.bridge_service.as_ref().map(|b| b.lock().unwrap());
         let depot_keys = Self::resolve_keys(
             self.steam_installation.as_ref(),
             self.slssteam_service.as_ref(),
+            bridge.as_ref().map(|b| &**b),
             app_id,
         );
         let keys_file = if !depot_keys.is_empty() {

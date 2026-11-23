@@ -828,7 +828,7 @@ impl LuaToolsApp {
             "In Settings › SLSsteam & Store Bridge:\n\
              - Wired Suite: Installs ACCELA (~/.local/share/ACCELA) and SLSsteam (~/.local/share/SLSsteam + ~/.local/bin/steam-sls LD_AUDIT launcher) natively in Rust (.7z, .tar.zst, .tar.gz, .zip) without executing remote shell scripts.\n\
              - Cloud Redirect: Restores per-game save cloud sync — tick games or enter an AppID and click 'Sync to CloudRedirect'.\n\
-             - Store Bridge: Probe Millennium (:38495), enable Steam CEF Debugging (:8080 › :6767) to bypass Linux Steam Store CSP, and register the luatools:// desktop URI handler.",
+             - Store Bridge: Probe Millennium (:38495), enable Steam CEF Debugging (:8080 › :6767) to configure Linux Steam Store CSP access, and register the luatools:// desktop URI handler.",
             |ui| {
                 if secondary_button(ui, "Open SLSsteam & Store Bridge ›").clicked() {
                     go_settings = Some(SettingsSubTab::Integrations);

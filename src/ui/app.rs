@@ -674,6 +674,18 @@ impl LuaToolsApp {
                 header_image: String::new(),
                 release_date: "Feb 25, 2022".into(),
                 is_free: false,
+                // Extended fields
+                windows: true,
+                mac: false,
+                linux: false,
+                release_date_text: Some("Feb 25, 2022".into()),
+                release_year: Some(2022),
+                metacritic: Some(96),
+                reviews: Some(100000),
+                is_adult: false,
+                short_description: Some("Elden Ring is an action RPG...".into()),
+                developers: vec!["FromSoftware".into()],
+                publishers: vec!["Bandai Namco".into()],
             });
             self.acquire_sources
                 .insert("morrenus".into(), "available".into());
@@ -1297,6 +1309,7 @@ impl LuaToolsApp {
         let keys = DepotDownloaderService::resolve_keys(
             self.steam_service.installation.as_ref(),
             Some(&self.slssteam_service),
+            Some(&self.steam_bridge_service),
             aid,
         );
 

@@ -341,8 +341,8 @@ impl LuaFileParser {
         format!(
             "-- LuaTools stplug-in configuration for AppID {app_id}{header}\n\
              addappid({app_id}){header}\n\n\
-             -- Content depot with decryption key & optional pinned manifest:\n\
-             -- addappid({next_id}, 1, \"64_CHAR_HEX_DECRYPTION_KEY\")\n\
+             -- Content depot with key & optional pinned manifest:\n\
+             -- addappid({next_id}, 1, \"64_CHAR_HEX_KEY\")\n\
              -- setManifestid({next_id}, \"MANIFEST_GID\", 0)\n",
             app_id = app_id,
             next_id = app_id.saturating_add(1),

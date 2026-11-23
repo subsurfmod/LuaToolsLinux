@@ -1,4 +1,4 @@
-//! FixesService — Game & DRMFix fixes catalog, `.luatools-fix/` SHA-256 backup, apply & verified revert.
+//! FixesService — Game fixes catalog, `.luatools-fix/` SHA-256 backup, apply & verified revert.
 
 use std::fs::{self, File};
 use std::io;

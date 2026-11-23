@@ -8,6 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+
+
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -18,8 +21,54 @@ const STEAM_PLACEHOLDER_SHA256: &str =
 const HARDWARE_APPID_URL: &str =
     "https://raw.githubusercontent.com/jsnli/steamappidlist/master/data/hardware_appid.json";
 const TTL_14_DAYS: u64 = 14 * 24 * 3600;
+const RATE_LIMIT_WINDOW_SECS: u64 = 200;
+const MAX_REQ_PER_WINDOW: usize = 190;
+const REQUEST_TIMESTAMPS_FILE: &str = "request_timestamps.json";
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AppFilterData {
+    pub app_type: Option<String>,
+    pub genres: Vec<String>,
+    pub windows: bool,
+    pub mac: bool,
+    pub linux: bool,
+    pub release_year: Option<i32>,
+    pub release_date: Option<String>,
+    pub release_date_text: Option<String>,
+    pub is_free: bool,
+    pub metacritic: Option<i32>,
+    pub reviews: Option<u64>,
+    pub is_adult: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AppOverview {
+    pub short_description: Option<String>,
+    pub developers: Vec<String>,
+    pub publishers: Vec<String>,
+    pub genres: Vec<String>,
+}
+
+impl AppOverview {
+    pub fn has_description(&self) -> bool {
+        !self.short_description.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true)
+    }
+    pub fn has_developer(&self) -> bool {
+        !self.developers.is_empty()
+    }
+    pub fn has_distinct_publisher(&self) -> bool {
+        !self.publishers.is_empty() &&
+            !self.publishers.iter().any(|p| self.developers.iter().any(|d| d.eq_ignore_ascii_case(p)))
+    }
+    pub fn has_genres(&self) -> bool {
+        !self.genres.is_empty()
+    }
+    pub fn has_anything(&self) -> bool {
+        self.has_description() || self.has_developer() || self.has_genres()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GameDetails {
     pub app_id: u32,
     pub name: String,
@@ -29,6 +78,18 @@ pub struct GameDetails {
     pub header_image: String,
     pub release_date: String,
     pub is_free: bool,
+    // Extended fields for filtering
+    pub windows: bool,
+    pub mac: bool,
+    pub linux: bool,
+    pub release_date_text: Option<String>,
+    pub release_year: Option<i32>,
+    pub metacritic: Option<i32>,
+    pub reviews: Option<u64>,
+    pub is_adult: bool,
+    pub short_description: Option<String>,
+    pub developers: Vec<String>,
+    pub publishers: Vec<String>,
 }
 
 impl GameDetails {
@@ -169,6 +230,74 @@ impl SteamAppInfoCache {
                 .get("is_free")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            // Extended fields
+            windows: obj
+                .get("platforms")
+                .and_then(|p| p.get("windows"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            mac: obj
+                .get("platforms")
+                .and_then(|p| p.get("mac"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            linux: obj
+                .get("platforms")
+                .and_then(|p| p.get("linux"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            release_date_text: obj
+                .get("release_date")
+                .and_then(|r| r.get("date"))
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            release_year: obj
+                .get("release_date")
+                .and_then(|r| r.get("date"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| {
+                    let year_str = s.split_whitespace().last().unwrap_or(s);
+                    year_str.parse::<i32>().ok()
+                }),
+            metacritic: obj
+                .get("metacritic")
+                .and_then(|m| m.get("score"))
+                .and_then(|v| v.as_i64())
+                .map(|n| n as i32),
+            reviews: obj
+                .get("recommendations")
+                .and_then(|r| r.get("total"))
+                .and_then(|v| v.as_u64()),
+            is_adult: obj
+                .get("content_descriptors")
+                .and_then(|cd| cd.get("ids"))
+                .and_then(|ids| ids.as_array())
+                .map(|arr| arr.iter().any(|v| v.as_i64().map(|id| id == 3 || id == 4).unwrap_or(false)))
+                .unwrap_or(false),
+            short_description: obj
+                .get("short_description")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            developers: obj
+                .get("developers")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(ToString::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            publishers: obj
+                .get("publishers")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(ToString::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 }

@@ -78,7 +78,7 @@ pub const TOOLS: &[ExternalToolSpec] = &[
     ExternalToolSpec {
         key: "stub_remover",
         name: "StubRemover",
-        description: "SteamStub DRM unpacker for protected game executables (.exe via Wine).",
+        description: "SteamStub unpacker for protected game executables (.exe via Wine).",
         github_repo: "atom0s/Steamless",
         fallback_repo: None,
         exe_candidates: &[
@@ -346,7 +346,7 @@ impl ExternalToolsManager {
             .unwrap_or_default();
         if fname_lower.contains("cli") && app_id > 0 {
             let subcmd = if fname_lower.contains("steamautocrack") {
-                "crack"
+                "apply"
             } else {
                 "patch"
             };

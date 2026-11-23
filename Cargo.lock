@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "bridge_lib"
-version = "2.6.1"
+version = "2.7.0"
 dependencies = [
  "ctor",
  "dirs",
@@ -1146,6 +1146,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284"
 
 [[package]]
+name = "hex"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
 name = "hexf-parse"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1520,21 +1526,25 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "luatools-linux"
-version = "2.6.1"
+version = "2.7.0"
 dependencies = [
  "base64",
+ "bytes",
  "chrono",
  "dirs",
  "eframe",
  "egui",
  "egui_extras",
  "flate2",
+ "hex",
  "image",
  "inotify",
  "libc",
+ "md5",
  "rand 0.8.8",
  "regex",
  "serde",
+ "serde_derive",
  "serde_json",
  "serde_yml",
  "sha1",
@@ -1549,6 +1559,7 @@ dependencies = [
  "ureq",
  "url",
  "urlencoding",
+ "walkdir",
  "zip",
 ]
 
@@ -1560,6 +1571,12 @@ checksum = "62bb907fe88d54d8d9ce32a3cceab4218ed2f6b7d35617cafe9adf84e43919cb"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "md5"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ebb8d8732c6a6df3d8f032a82911cfc747e00efb95cc46e8d0acd5b5b88570c"
 
 [[package]]
 name = "memchr"
@@ -2758,7 +2775,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "steam-auto-patch-linux"
-version = "2.6.1"
+version = "2.7.0"
 dependencies = [
  "anyhow",
  "configparser",

@@ -2783,6 +2783,26 @@ impl LuaToolsApp {
                         .color(Palette::BLUE_LIGHT),
                 );
             }
+
+            // Progress bar for installation
+            if st.install_progress > 0.0 && st.install_progress < 100.0 {
+                ui.add_space(4.0);
+                egui::ProgressBar::new(st.install_progress / 100.0)
+                    .text(format!("{}%", st.install_progress as u32))
+                    .animate(true);
+                ui.label(
+                    RichText::new(&st.install_status)
+                        .size(11.0)
+                        .color(Palette::TEXT_SECONDARY),
+                );
+                ui.add_space(4.0);
+            } else if st.install_progress >= 100.0 && !st.install_status.is_empty() {
+                ui.label(
+                    RichText::new(&st.install_status)
+                        .size(12.0)
+                        .color(Palette::BLUE_LIGHT),
+                );
+            }
         });
 
         if do_refresh {

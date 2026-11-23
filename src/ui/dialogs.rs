@@ -1032,11 +1032,11 @@ impl LuaToolsApp {
                         });
                     });
 
-                    // 2. Legacy CD Key & Depot Decryption Key
+                    // 2. Legacy CD Key & Depot Key
                     inset_paper_sheet(ui, Margin::same(12), |ui| {
                         ui.set_width(ui.available_width());
                         ui.label(
-                            RichText::new("2. Legacy CD Key & Depot Decryption Key")
+                            RichText::new("2. Legacy CD Key & Depot Key")
                                 .font(semibold_font(13.5))
                                 .color(Palette::TEXT_PRIMARY),
                         );

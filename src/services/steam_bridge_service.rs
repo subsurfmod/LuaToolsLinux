@@ -67,6 +67,8 @@ pub struct BridgeStatus {
     pub steam_ui_patterns: Option<String>,
     pub tickets_loaded: bool,
     pub apps_with_tickets: Vec<u32>,
+    pub install_progress: f32,
+    pub install_status: String,
 }
 
 /// Main service handle.
@@ -414,7 +416,18 @@ impl SteamBridgeService {
             .as_ref()
             .ok_or_else(|| "Steam installation not detected.".to_string())?;
 
+        let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        status.install_progress = 5.0;
+        status.install_status = "Scanning Steam binaries...".to_string();
+        drop(status);
+
         let lib_path = self.ensure_integration_lib_staged()?;
+
+        {
+            let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+            status.install_progress = 40.0;
+            status.install_status = "Generating Steam launch wrapper...".to_string();
+        }
 
         let steam_exe = if inst.root.join("steam.sh").is_file() {
             inst.root.join("steam.sh")
@@ -428,6 +441,12 @@ impl SteamBridgeService {
         preload_loader::generate_ld_preload_launcher(&steam_exe, &lib_path, &self.launcher_path)
             .map_err(|e| format!("Failed to generate launcher: {}", e))?;
 
+        {
+            let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+            status.install_progress = 60.0;
+            status.install_status = "Configuring Steam preload...".to_string();
+        }
+
         let mut preload_ok = false;
         if enable_system_preload {
             match preload_loader::enable_system_preload(&lib_path) {
@@ -440,12 +459,15 @@ impl SteamBridgeService {
             }
         }
 
-        let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
-        status.integration_lib_installed = true;
-        status.integration_lib_path = Some(lib_path);
-        status.launcher_installed = self.launcher_path.is_file();
-        status.system_preload_enabled = preload_ok;
-        status.integration_active = check_ipc_or_maps_active();
+        {
+            let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+            status.integration_lib_installed = true;
+            status.integration_lib_path = Some(lib_path);
+            status.launcher_installed = self.launcher_path.is_file();
+            status.system_preload_enabled = preload_ok;
+            status.install_progress = 90.0;
+            status.install_status = "Finalizing Steam integration...".to_string();
+        }
 
         let preload_note = if enable_system_preload && !preload_ok {
             " (system ld.so.preload needs administrator/root — using per-launch launcher instead)"
@@ -454,6 +476,13 @@ impl SteamBridgeService {
         } else {
             " (per-launch launcher, no root required)"
         };
+
+        {
+            let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+            status.integration_active = check_ipc_or_maps_active();
+            status.install_progress = 100.0;
+            status.install_status = "Integration ready".to_string();
+        }
 
         Ok(BridgeInstallResult {
             success: true,

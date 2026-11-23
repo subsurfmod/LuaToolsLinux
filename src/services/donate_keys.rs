@@ -1,4 +1,4 @@
-//! DonateKeysService — scans Steam `config/config.vdf` for 64-char hex depot decryption keys.
+//! DonateKeysService — scans Steam `config/config.vdf` for 64-char hex depot keys.
 
 use std::collections::BTreeMap;
 use std::fs;

@@ -64,9 +64,9 @@ pub enum IpcMessage {
     SetLegacyCdKey { app_id: u32, key: String },
     /// GUI → Integration: remove a legacy CD key for an app
     RemoveLegacyCdKey { app_id: u32 },
-    /// GUI → Integration: set a depot decryption key
+    /// GUI → Integration: set a depot key
     SetDepotKey { depot_id: u32, key: String },
-    /// GUI → Integration: remove a depot decryption key
+    /// GUI → Integration: remove a depot key
     RemoveDepotKey { depot_id: u32 },
     /// GUI → Integration: fetch a manifest code by GID
     FetchManifestCode { gid: String },

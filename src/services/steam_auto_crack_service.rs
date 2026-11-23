@@ -1,6 +1,6 @@
-//! SteamAutoCrackService — applies native Rust `steam_auto_patch_linux` Goldberg `.so`/`.dll`
+//! SteamAutoPatchService — applies native Rust `steam_auto_patch_linux` Goldberg `.so`/`.dll`
 //! deployment first when Goldberg libraries are staged, with automatic fallback to external
-//! `SteamAutoPatch` (`SteamAutoCrack`) CLI via `ExternalToolsManager`.
+//! `SteamAutoPatch` CLI via `ExternalToolsManager`.
 
 use std::path::{Path, PathBuf};
 
