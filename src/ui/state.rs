@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use crate::parsers::lua_parser::LuaEntry;
 use crate::parsers::vdf_binary::LaunchEntry;
 use crate::services::api_client::{
-    DenuvoFixItem, DenuvoGameListing, DenuvoTag, DlcInfo, SteamFeaturedItem, SteamSearchItem,
+    DRMFixFixItem, DRMFixGameListing, DRMFixTag, DlcInfo, SteamFeaturedItem, SteamSearchItem,
 };
 use crate::services::caches::GameDetails;
 use crate::services::depot_downloader::DepotRunResult;
@@ -155,12 +155,12 @@ pub enum AppMessage {
         results: Vec<DepotRunResult>,
     },
     FixListingsLoaded {
-        games: Vec<DenuvoGameListing>,
-        tags: Vec<DenuvoTag>,
+        games: Vec<DRMFixGameListing>,
+        tags: Vec<DRMFixTag>,
     },
     FixesLoaded {
         app_id: u32,
-        fixes: Vec<DenuvoFixItem>,
+        fixes: Vec<DRMFixFixItem>,
     },
     FixProgress {
         pct: f32,
@@ -202,7 +202,7 @@ pub enum AppMessage {
     FolderPickedForSteamOverride(PathBuf),
     FilePickedForWorkshop(PathBuf),
     FolderPickedForAutoCrack(PathBuf),
-    FilePickedForSteamless(PathBuf),
+    FilePickedForStubRemover(PathBuf),
     UpdateCheckFinished(UpdateCheckResult),
     UpdateProgress {
         pct: f32,

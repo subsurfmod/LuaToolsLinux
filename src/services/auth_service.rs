@@ -126,7 +126,9 @@ impl AuthService {
         let needs_refresh = {
             let guard = self.session.lock().unwrap();
             let Some(sess) = guard.as_ref() else {
-                return Err("Not signed in. Sign in from 07 // SYSTEM first.".into());
+                return Err(
+                    "Not signed in. Sign in from Settings › Account & Providers first.".into(),
+                );
             };
             if sess.refresh_token.is_empty() {
                 return Err("Not signed in.".into());
@@ -379,11 +381,17 @@ impl AuthService {
             "AUTHENTICATION FAILED"
         };
         let accent = if ok { "#3B82F6" } else { "#EF4444" };
-        let msg = if ok {
-            "You can close this tab and return to LuaTools Linux v2.0."
+        let raw_msg = if ok {
+            "You can close this tab and return to LuaTools Linux."
         } else {
             err.unwrap_or("Please try signing in again from LuaTools Linux.")
         };
+        let msg = raw_msg
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&#39;");
         format!(
             "<!doctype html><html><head><meta charset='utf-8'><title>LuaTools Linux</title>\
              <style>body{{background:#09090B;color:#F4F4F6;font-family:Inter,sans-serif;\

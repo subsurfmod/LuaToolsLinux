@@ -477,7 +477,7 @@ impl LuaToolsApp {
 
                             ui.label("Decryption Key:");
                             ui.monospace(match &e.key {
-                                Some(k) => format!("{}…{}", &k[..8], &k[k.len() - 8..]),
+                                Some(k) => format_key_preview(k),
                                 None => "None".into(),
                             });
                             ui.end_row();
@@ -574,30 +574,28 @@ impl LuaToolsApp {
                         self.depots_variants = self.lua_vault.get_variants(aid);
                     }
                 }
-                "bot_code" => {
-                    if !val.is_empty() {
-                        let auth = self.auth_service.clone();
-                        let tx = self.msg_tx.clone();
-                        let ctx_c = ctx.clone();
-                        self.status_text = "Redeeming 6-char Discord bot code…".into();
-                        thread::spawn(move || {
-                            match auth.sign_in_with_code(&val) {
-                                Ok(sess) => {
-                                    let _ = tx.send(crate::ui::state::AppMessage::AuthCompleted {
-                                        ok: true,
-                                        msg: format!("Signed in as {}", sess.display_name),
-                                    });
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(crate::ui::state::AppMessage::AuthCompleted {
-                                        ok: false,
-                                        msg: e,
-                                    });
-                                }
+                "bot_code" if !val.is_empty() => {
+                    let auth = self.auth_service.clone();
+                    let tx = self.msg_tx.clone();
+                    let ctx_c = ctx.clone();
+                    self.status_text = "Redeeming 6-char Discord bot code…".into();
+                    thread::spawn(move || {
+                        match auth.sign_in_with_code(&val) {
+                            Ok(sess) => {
+                                let _ = tx.send(crate::ui::state::AppMessage::AuthCompleted {
+                                    ok: true,
+                                    msg: format!("Signed in as {}", sess.display_name),
+                                });
                             }
-                            ctx_c.request_repaint();
-                        });
-                    }
+                            Err(e) => {
+                                let _ = tx.send(crate::ui::state::AppMessage::AuthCompleted {
+                                    ok: false,
+                                    msg: e,
+                                });
+                            }
+                        }
+                        ctx_c.request_repaint();
+                    });
                 }
                 _ => {}
             }
@@ -652,5 +650,16 @@ impl LuaToolsApp {
         if close {
             self.about_modal_open = false;
         }
+    }
+}
+
+fn format_key_preview(k: &str) -> String {
+    let chars: Vec<char> = k.chars().collect();
+    if chars.len() > 16 {
+        let head: String = chars[..8].iter().collect();
+        let tail: String = chars[chars.len() - 8..].iter().collect();
+        format!("{}…{}", head, tail)
+    } else {
+        k.to_string()
     }
 }

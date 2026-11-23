@@ -1,8 +1,8 @@
 %global debug_package %{nil}
 
 Name:           luatools-linux
-Version:        2.0
-Release:        0.1.beta%{?dist}
+Version:        2.1.0
+Release:        1%{?dist}
 Summary:        Native Rust workstation for Steam stplug-in lua manifests, depots, and fixes
 License:        MIT
 URL:            https://lua.tools

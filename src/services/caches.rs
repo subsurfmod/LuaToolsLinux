@@ -96,7 +96,7 @@ impl SteamAppInfoCache {
             app_id
         );
         let payload: Value = agent.get(&url).call().ok()?.into_json().ok()?;
-        let entry = payload.get(&app_id.to_string())?;
+        let entry = payload.get(app_id.to_string())?;
         if entry.get("success").and_then(|v| v.as_bool()) != Some(true) {
             return None;
         }

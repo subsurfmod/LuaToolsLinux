@@ -152,7 +152,7 @@ impl SteamDepotInfo {
             .build();
         let url = format!("https://api.steamcmd.net/v1/info/{}", app_id);
         let data: Value = agent.get(&url).call().ok()?.into_json().ok()?;
-        let app = data.get("data")?.get(&app_id.to_string())?;
+        let app = data.get("data")?.get(app_id.to_string())?;
 
         let mut depots = Vec::new();
         let mut public_build_id = None;

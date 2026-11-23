@@ -123,7 +123,12 @@ impl LuaVault {
     }
 
     fn variant_path(&self, app_id: u32, hash_str: &str) -> PathBuf {
-        self.app_dir(app_id).join(format!("{}.lua", hash_str))
+        let safe: String = hash_str
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        let stem = if safe.is_empty() { "invalid" } else { &safe };
+        self.app_dir(app_id).join(format!("{}.lua", stem))
     }
 
     pub fn live_path(&self, app_id: u32) -> Option<PathBuf> {

@@ -103,6 +103,9 @@ impl UpdateService {
 
         candidates.push(default_luatools_data_dir().join("repo"));
         if let Some(home) = dirs::home_dir() {
+            candidates.push(home.join("Documents/luatools-linux-v2.1"));
+            candidates.push(home.join("Documents/LuaToolsLinux"));
+            candidates.push(home.join("LuaToolsLinux"));
             candidates.push(home.join("Documents/luatools-linux-v2"));
         }
 
@@ -120,7 +123,9 @@ impl UpdateService {
 
         // Otherwise return a directory with Cargo.toml if present
         candidates.into_iter().find(|c| {
-            c.join("Cargo.toml").exists() || c.join("luatools-linux-v2/Cargo.toml").exists()
+            c.join("Cargo.toml").exists()
+                || c.join("luatools-linux-v2.1/Cargo.toml").exists()
+                || c.join("luatools-linux-v2/Cargo.toml").exists()
         })
     }
 
@@ -128,9 +133,11 @@ impl UpdateService {
         if repo_dir.join("Cargo.toml").is_file() {
             return Some(repo_dir.to_path_buf());
         }
-        let sub = repo_dir.join("luatools-linux-v2");
-        if sub.join("Cargo.toml").is_file() {
-            return Some(sub);
+        for sub_name in ["luatools-linux-v2.1", "luatools-linux-v2"] {
+            let sub = repo_dir.join(sub_name);
+            if sub.join("Cargo.toml").is_file() {
+                return Some(sub);
+            }
         }
         None
     }
@@ -210,7 +217,7 @@ impl UpdateService {
         match (r_pre, c_pre) {
             (None, Some(_)) => true, // Stable 2.0.0 is newer than 2.0-beta
             (Some(_), None) => false,
-            (Some(rp), Some(cp)) => rp > cp,
+            (Some(rp), Some(cp)) => compare_prerelease(&rp, &cp) == std::cmp::Ordering::Greater,
             (None, None) => false,
         }
     }
@@ -341,7 +348,7 @@ impl UpdateService {
                         latest_commit: None,
                         repo_dir: Some(dir.clone()),
                         remote_url: None,
-                        summary: "Git repo has no 'origin' remote configured yet (set Remote URL in 07 // SYSTEM)."
+                        summary: "Git repo has no 'origin' remote configured yet (set Remote URL in Settings › Updates & Toolchain)."
                             .into(),
                     };
                 }
@@ -380,7 +387,7 @@ impl UpdateService {
             latest_commit: None,
             repo_dir,
             remote_url: Some(fallback_remote),
-            summary: "No reachable Git remote (configure in 07 // SYSTEM to enable Git updates)."
+            summary: "No reachable Git remote (configure in Settings › Updates & Toolchain to enable Git updates)."
                 .into(),
         }
     }
@@ -675,6 +682,29 @@ impl UpdateService {
     }
 }
 
+fn compare_prerelease(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut ai = a.split('.');
+    let mut bi = b.split('.');
+    loop {
+        match (ai.next(), bi.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(ap), Some(bp)) => {
+                let ord = match (ap.parse::<u64>(), bp.parse::<u64>()) {
+                    (Ok(an), Ok(bn)) => an.cmp(&bn),
+                    (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+                    (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+                    (Err(_), Err(_)) => ap.cmp(bp),
+                };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -766,6 +796,10 @@ mod tests {
         // Verify prerelease SemVer ordering (2.0-beta < 2.0.0 < 2.1.0)
         assert!(UpdateService::is_newer_semver("2.0.0", "2.0-beta"));
         assert!(UpdateService::is_newer_semver("2.0.0-beta.2", "2.0-beta"));
+        assert!(UpdateService::is_newer_semver(
+            "2.0.0-beta.10",
+            "2.0.0-beta.2"
+        ));
         assert!(!UpdateService::is_newer_semver("2.0.0-beta", "2.0-beta"));
         assert!(!UpdateService::is_newer_semver("2.0-beta", "2.0.0"));
     }

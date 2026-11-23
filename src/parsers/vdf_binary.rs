@@ -281,7 +281,7 @@ pub struct AppInfoFile {
     pub strings: Vec<String>,
     string_bytes: Vec<Vec<u8>>,
     index_order: Vec<u32>,
-    index_map: HashMap<u32, (u64, i32)>,
+    index_map: HashMap<u32, (u64, u32)>,
 }
 
 impl AppInfoFile {
@@ -296,6 +296,7 @@ impl AppInfoFile {
         }
 
         let indexed_keys = magic >= MAGIC_29;
+        let meta_len = if magic >= MAGIC_28 { 60u32 } else { 40u32 };
         let mut strings = Vec::new();
         let mut string_bytes = Vec::new();
 
@@ -317,14 +318,18 @@ impl AppInfoFile {
         let mut index_map = HashMap::new();
         loop {
             let offset = r.stream_position().map_err(|e| e.to_string())?;
-            let mut hdr = [0u8; 8];
-            if r.read_exact(&mut hdr).is_err() {
+            let Ok(app_id) = read_u32_le(&mut r) else {
                 break;
-            }
-            let app_id = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
-            let size = i32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+            };
             if app_id == 0 {
                 break;
+            }
+            let size = read_u32_le(&mut r)?;
+            if size < meta_len {
+                return Err(format!(
+                    "Corrupt appinfo.vdf entry for AppID {} (size {} < {})",
+                    app_id, size, meta_len
+                ));
             }
             index_order.push(app_id);
             index_map.insert(app_id, (offset, size));
@@ -427,7 +432,7 @@ impl AppInfoFile {
                     meta[40..60].copy_from_slice(&digest);
                 }
 
-                let new_size = (meta.len() + blob.len()) as i32;
+                let new_size = (meta.len() + blob.len()) as u32;
                 out.write_all(&app_id.to_le_bytes())
                     .map_err(|e| e.to_string())?;
                 out.write_all(&new_size.to_le_bytes())

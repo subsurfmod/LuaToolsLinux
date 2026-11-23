@@ -53,6 +53,8 @@ const TOOL_CHECK_INTERVAL_SECS: u64 = 6 * 3600;
 #[derive(Debug, Clone)]
 pub struct DepotDownloaderService {
     pub tool_dir: PathBuf,
+    pub steam_installation: Option<SteamInstallation>,
+    pub slssteam_service: Option<SlssteamService>,
 }
 
 impl Default for DepotDownloaderService {
@@ -65,7 +67,16 @@ impl DepotDownloaderService {
     pub fn new(tool_dir: Option<PathBuf>) -> Self {
         let dir = tool_dir.unwrap_or_else(|| default_luatools_data_dir().join("depotdownloader"));
         let _ = fs::create_dir_all(&dir);
-        Self { tool_dir: dir }
+        Self {
+            tool_dir: dir,
+            steam_installation: None,
+            slssteam_service: None,
+        }
+    }
+
+    pub fn with_steam(&mut self, steam: SteamInstallation, sls: SlssteamService) {
+        self.steam_installation = Some(steam);
+        self.slssteam_service = Some(sls);
     }
 
     pub fn find_executable(&self, custom_tool_path: Option<&str>) -> Option<PathBuf> {
@@ -178,12 +189,38 @@ impl DepotDownloaderService {
         }
     }
 
-    /// Constructs strictly valid `SteamRE/DepotDownloader` CLI arguments (no unsupported flags).
+    pub fn is_mod_binary(tool_path: &Path) -> bool {
+        tool_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase().contains("mod"))
+            .unwrap_or(false)
+    }
+
     pub fn build_download_args(
         target_app: u32,
         selection: &DepotSelection,
         download_dir: &Path,
         steam_username: &str,
+        depot_keys_file: Option<&Path>,
+    ) -> Vec<String> {
+        Self::build_download_args_for_tool(
+            target_app,
+            selection,
+            download_dir,
+            steam_username,
+            depot_keys_file,
+            false,
+        )
+    }
+
+    pub fn build_download_args_for_tool(
+        target_app: u32,
+        selection: &DepotSelection,
+        download_dir: &Path,
+        steam_username: &str,
+        depot_keys_file: Option<&Path>,
+        is_mod: bool,
     ) -> Vec<String> {
         let mut args = vec![
             "-app".to_string(),
@@ -200,6 +237,16 @@ impl DepotDownloaderService {
             args.push("-manifest".to_string());
             args.push(gid.to_string());
         }
+        if is_mod {
+            if let Some(mp) = selection.manifest_path.as_deref().filter(|p| p.is_file()) {
+                args.push("-manifestfile".to_string());
+                args.push(mp.to_string_lossy().to_string());
+            }
+        }
+        if let Some(keys_path) = depot_keys_file {
+            args.push("-depotkeys".to_string());
+            args.push(keys_path.to_string_lossy().to_string());
+        }
         args.extend([
             "-dir".to_string(),
             download_dir.to_string_lossy().to_string(),
@@ -214,10 +261,6 @@ impl DepotDownloaderService {
             args.push(clean_user.to_string());
             args.push("-remember-password".to_string());
         }
-        // Note: In SteamRE/DepotDownloader v2.6+/v3.x, omitting `-username` logs in anonymously,
-        // whereas passing `-username anonymous` attempts password authentication for an account
-        // literally named "anonymous" unless handled carefully. Omitting `-username` when blank
-        // uses DepotDownloader's native anonymous session cleanly.
         args
     }
 
@@ -260,7 +303,7 @@ impl DepotDownloaderService {
     {
         let _ = fs::create_dir_all(&self.tool_dir);
         progress_cb(
-            0.05,
+            5.0,
             "Checking GitHub for official SteamRE/DepotDownloader release...".into(),
         );
 
@@ -274,7 +317,7 @@ impl DepotDownloaderService {
         );
         let resp = agent
             .get(&url)
-            .set("User-Agent", "LuaToolsLinux/2.0")
+            .set("User-Agent", "LuaToolsLinux/2.1")
             .call()
             .ok()?;
         let rel = resp.into_json::<Value>().ok()?;
@@ -309,11 +352,14 @@ impl DepotDownloaderService {
             .unwrap_or("depotdownloader.zip");
         let zip_path = self.tool_dir.join(aname);
 
-        progress_cb(0.1, format!("Downloading DepotDownloader {}...", tag));
+        progress_cb(10.0, format!("Downloading DepotDownloader {}...", tag));
         let dl_resp = agent.get(dl_url).call().ok()?;
-        stream_response_to_file(dl_resp, &zip_path, progress_cb).ok()?;
+        stream_response_to_file(dl_resp, &zip_path, &mut |frac, msg| {
+            progress_cb((10.0 + frac * 80.0).clamp(10.0, 90.0), msg);
+        })
+        .ok()?;
 
-        progress_cb(0.92, "Extracting archive...".into());
+        progress_cb(92.0, "Extracting archive...".into());
         if let Ok(zf) = File::open(&zip_path) {
             if let Ok(mut archive) = ZipArchive::new(zf) {
                 let _ = archive.extract(&self.tool_dir);
@@ -337,7 +383,7 @@ impl DepotDownloaderService {
             }))
             .unwrap_or_default(),
         );
-        progress_cb(1.0, format!("DepotDownloader {} ready", tag));
+        progress_cb(100.0, format!("DepotDownloader {} ready", tag));
         Some(exe)
     }
 
@@ -369,10 +415,13 @@ impl DepotDownloaderService {
 
     pub fn resolve_keys(
         steam_inst: Option<&SteamInstallation>,
-        sls: &SlssteamService,
+        sls: Option<&SlssteamService>,
         app_id: u32,
     ) -> BTreeMap<u32, String> {
-        let mut keys = sls.config.depot_keys.clone();
+        let mut keys = BTreeMap::new();
+        if let Some(sls) = sls {
+            keys = sls.config.depot_keys.clone();
+        }
         if let Some(inst) = steam_inst {
             let lua_path = inst.stplug_in_path.join(format!("{}.lua", app_id));
             if let Some(lua) = LuaFileParser::parse_file(&lua_path, app_id) {
@@ -512,8 +561,41 @@ impl DepotDownloaderService {
         }
 
         let target_app = selection.from_app_id.unwrap_or(app_id);
-        let dl_args =
-            Self::build_download_args(target_app, selection, download_dir, &opts.steam_username);
+        let depot_keys = Self::resolve_keys(
+            self.steam_installation.as_ref(),
+            self.slssteam_service.as_ref(),
+            app_id,
+        );
+        let keys_file = if !depot_keys.is_empty() {
+            let keys_path = std::env::temp_dir().join(format!(
+                "luatools_depotkeys_{}_{}.txt",
+                std::process::id(),
+                selection.depot_id
+            ));
+            let content = depot_keys
+                .iter()
+                .map(|(id, key)| format!("{};{}", id, key))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if fs::write(&keys_path, content).is_ok() {
+                let _ = fs::set_permissions(&keys_path, fs::Permissions::from_mode(0o600));
+                Some(keys_path)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let is_mod = Self::is_mod_binary(&exe);
+        let dl_args = Self::build_download_args_for_tool(
+            target_app,
+            selection,
+            download_dir,
+            &opts.steam_username,
+            keys_file.as_deref(),
+            is_mod,
+        );
 
         let mut cmd = Command::new(&prefix[0]);
         for p in &prefix[1..] {
@@ -538,11 +620,14 @@ impl DepotDownloaderService {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
+                if let Some(ref kp) = keys_file {
+                    let _ = fs::remove_file(kp);
+                }
                 return DepotRunResult {
                     depot_id: selection.depot_id,
                     ok: false,
                     error: Some(e.to_string()),
-                }
+                };
             }
         };
 
@@ -579,7 +664,7 @@ impl DepotDownloaderService {
                     .captures(&clean)
                     .and_then(|c| c.get(1))
                     .and_then(|m| m.as_str().parse::<f32>().ok())
-                    .unwrap_or(0.0);
+                    .unwrap_or(-1.0);
                 progress_cb(pct, clean);
             }
         }
@@ -588,7 +673,12 @@ impl DepotDownloaderService {
             .and_then(|h| h.join().ok())
             .unwrap_or_default();
 
-        match child.wait() {
+        let wait_res = child.wait();
+        if let Some(ref kp) = keys_file {
+            let _ = fs::remove_file(kp);
+        }
+
+        match wait_res {
             Ok(status) if status.success() => DepotRunResult {
                 depot_id: selection.depot_id,
                 ok: true,
@@ -725,8 +815,13 @@ mod tests {
             is_shared: false,
             is_dlc: false,
         };
-        let args =
-            DepotDownloaderService::build_download_args(3321460, &sel, Path::new("/tmp/out"), "");
+        let args = DepotDownloaderService::build_download_args(
+            3321460,
+            &sel,
+            Path::new("/tmp/out"),
+            "",
+            None,
+        );
         assert!(!args.iter().any(|a| a == "-depotkey" || a == "-depotkeys"));
         assert!(!args.iter().any(|a| a == "-manifestfile"));
         assert!(!args.iter().any(|a| a == "-username"));
@@ -737,7 +832,7 @@ mod tests {
     }
 
     #[test]
-    fn download_args_include_remember_password_for_named_steam_account() {
+    fn download_args_include_remember_password_and_depotkeys_when_present() {
         let sel = DepotSelection {
             depot_id: 731,
             manifest_id: None,
@@ -749,13 +844,18 @@ mod tests {
             is_shared: false,
             is_dlc: false,
         };
+        let keys_file = Path::new("/tmp/luatools_depotkeys.txt");
         let args = DepotDownloaderService::build_download_args(
             730,
             &sel,
             Path::new("/tmp/cs2"),
             "my_steam_user",
+            Some(keys_file),
         );
         assert!(args.windows(2).any(|w| w == ["-username", "my_steam_user"]));
         assert!(args.iter().any(|a| a == "-remember-password"));
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["-depotkeys", "/tmp/luatools_depotkeys.txt"]));
     }
 }

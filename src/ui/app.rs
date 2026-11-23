@@ -17,14 +17,14 @@ use crate::models::lua_vault::{LuaVariant, LuaVault};
 use crate::parsers::lua_parser::{LuaContents, LuaFileParser};
 use crate::parsers::steam_link::SteamLinkParser;
 use crate::services::api_client::{
-    DenuvoFixItem, DenuvoGameListing, DenuvoTag, DlcInfo, HubcapService, LuaToolsApiClient,
+    DRMFixFixItem, DRMFixGameListing, DRMFixTag, DlcInfo, HubcapService, LuaToolsApiClient,
     SteamFeaturedItem, SteamSearchItem,
 };
 use crate::services::auth_service::AuthService;
 use crate::services::caches::{
     CoverCache, GameDetails, HardwareAppIdService, SteamAppInfoCache, SteamAppListCache,
 };
-use crate::services::cef_injector::CefInjectorService;
+use crate::services::cef_bridge::CefBridgeService;
 use crate::services::depot_downloader::DepotDownloaderService;
 use crate::services::depot_info::{AppDepotInfo, ContentDepot, SteamDepotInfo};
 use crate::services::donate_keys::DonateKeysService;
@@ -66,11 +66,12 @@ pub struct LuaToolsApp {
     pub depot_downloader: DepotDownloaderService,
     pub lua_vault: LuaVault,
     pub lua_installer: Option<LuaInstaller>,
-    pub cef_injector: CefInjectorService,
+    pub cef_bridge: CefBridgeService,
     pub http_server: Option<HttpServerService>,
     pub tools_manager: ExternalToolsManager,
 
     // Async Channels
+    pub egui_ctx: Option<egui::Context>,
     pub msg_tx: Sender<AppMessage>,
     pub msg_rx: Receiver<AppMessage>,
     pub rpc_tx: Sender<RpcUiEvent>,
@@ -125,13 +126,13 @@ pub struct LuaToolsApp {
     pub depots_dl_status: String,
 
     // Fixes View State
-    pub fixes_listings: Vec<DenuvoGameListing>,
-    pub fixes_tags: Vec<DenuvoTag>,
+    pub fixes_listings: Vec<DRMFixGameListing>,
+    pub fixes_tags: Vec<DRMFixTag>,
     pub fixes_selected_tag: Option<String>,
     pub fixes_search: String,
     pub fixes_my_games_only: bool,
     pub fixes_current_app: Option<u32>,
-    pub fixes_items: Vec<DenuvoFixItem>,
+    pub fixes_items: Vec<DRMFixFixItem>,
     pub fixes_selected_row: Option<usize>,
     pub fixes_busy: bool,
     pub fixes_progress: f32,
@@ -182,8 +183,7 @@ impl LuaToolsApp {
         let depot_info_service = SteamDepotInfo::default();
         let depot_downloader = DepotDownloaderService::default();
         let lua_vault = LuaVault::new(None, None);
-        let cef_injector =
-            CefInjectorService::new(None, settings_service.settings.http_server_port);
+        let cef_bridge = CefBridgeService::new(None, settings_service.settings.http_server_port);
         let tools_manager = ExternalToolsManager::default();
 
         let (msg_tx, msg_rx) = mpsc::channel();
@@ -222,9 +222,10 @@ impl LuaToolsApp {
             depot_downloader,
             lua_vault,
             lua_installer: None,
-            cef_injector,
+            cef_bridge,
             http_server: None,
             tools_manager,
+            egui_ctx: Some(cc.egui_ctx.clone()),
             msg_tx,
             msg_rx,
             rpc_tx,
@@ -337,7 +338,7 @@ impl LuaToolsApp {
         let depot_info_service = SteamDepotInfo::new(Some(scratch_dir.join("depots")));
         let depot_downloader = DepotDownloaderService::new(Some(scratch_dir.join("dd")));
         let lua_vault = LuaVault::new(None, Some(scratch_dir.join("vault")));
-        let cef_injector = CefInjectorService::new(None, 6767);
+        let cef_bridge = CefBridgeService::new(None, 6767);
         let tools_manager = ExternalToolsManager::new(Some(scratch_dir.join("tools")));
         let (msg_tx, msg_rx) = mpsc::channel();
         let (rpc_tx, rpc_rx) = mpsc::channel();
@@ -358,9 +359,10 @@ impl LuaToolsApp {
             depot_downloader,
             lua_vault,
             lua_installer: None,
-            cef_injector,
+            cef_bridge,
             http_server: None,
             tools_manager,
+            egui_ctx: Some(ctx.clone()),
             msg_tx,
             msg_rx,
             rpc_tx,
@@ -518,23 +520,23 @@ impl LuaToolsApp {
         );
         self.depots_lua = Some(LuaFileParser::parse_text(&sample_lua, 1245620));
         self.depots_editor_text = sample_lua;
-        self.fixes_listings = vec![DenuvoGameListing {
+        self.fixes_listings = vec![DRMFixGameListing {
             app_id: "2358720".into(),
             name: "Black Myth: Wukong".into(),
             fix_count: 2,
-            tags: vec![DenuvoTag {
+            tags: vec![DRMFixTag {
                 id: "online".into(),
                 name: "Online Fix".into(),
                 slug: "online".into(),
             }],
         }];
-        self.fixes_tags = vec![DenuvoTag {
+        self.fixes_tags = vec![DRMFixTag {
             id: "online".into(),
             name: "Online Fix".into(),
             slug: "online".into(),
         }];
         self.fixes_current_app = Some(2358720);
-        self.fixes_items = vec![DenuvoFixItem {
+        self.fixes_items = vec![DRMFixFixItem {
             id: "fx_1".into(),
             title: "Verified Launch & Offline Bypass Patch".into(),
             description: "Backs up original binaries with SHA-256 verification before applying."
@@ -555,21 +557,42 @@ impl LuaToolsApp {
         let ov = self.settings_service.settings.steam_path_override.clone();
         if let Some(inst) = self.steam_service.detect(Some(&ov)) {
             self.lua_vault.steam_installation = Some(inst.clone());
+            self.depot_downloader
+                .with_steam(inst.clone(), self.slssteam_service.clone());
             let installer = LuaInstaller::new(inst.clone(), self.lua_vault.clone());
             self.lua_installer = Some(installer);
 
-            self.cef_injector.steam_root = Some(inst.root.clone());
-            if self.settings_service.settings.cef_injector_enabled {
-                self.cef_injector.start();
+            self.cef_bridge.steam_root = Some(inst.root.clone());
+            if self.settings_service.settings.cef_bridge_enabled {
+                self.cef_bridge.start();
             }
 
-            if self.settings_service.settings.http_server_enabled && self.http_server.is_none() {
-                self.http_server = HttpServerService::start(
-                    self.settings_service.settings.http_server_port,
-                    inst.stplug_in_path.clone(),
-                    self.rpc_tx.clone(),
-                    None,
-                );
+            let desired_port = self.settings_service.settings.http_server_port;
+            if !self.settings_service.settings.http_server_enabled {
+                if let Some(mut srv) = self.http_server.take() {
+                    srv.stop();
+                }
+            } else {
+                let needs_restart = self
+                    .http_server
+                    .as_ref()
+                    .map(|s| s.port != desired_port)
+                    .unwrap_or(true);
+                if needs_restart {
+                    if let Some(mut srv) = self.http_server.take() {
+                        srv.stop();
+                    }
+                    let wakeup: Option<Arc<dyn Fn() + Send + Sync>> =
+                        self.egui_ctx.clone().map(|c| {
+                            Arc::new(move || c.request_repaint()) as Arc<dyn Fn() + Send + Sync>
+                        });
+                    self.http_server = HttpServerService::start(
+                        desired_port,
+                        inst.stplug_in_path.clone(),
+                        self.rpc_tx.clone(),
+                        wakeup,
+                    );
+                }
             }
 
             if self.settings_service.settings.donate_keys {
@@ -587,6 +610,10 @@ impl LuaToolsApp {
             );
         } else {
             self.lua_installer = None;
+            self.depot_downloader.steam_installation = None;
+            if let Some(mut srv) = self.http_server.take() {
+                srv.stop();
+            }
             self.recent_installed.clear();
             self.library_rows.clear();
             self.status_text =
@@ -597,6 +624,7 @@ impl LuaToolsApp {
 
     pub fn refresh_all_local_state(&mut self) {
         self.slssteam_service.reload();
+        self.depot_downloader.slssteam_service = Some(self.slssteam_service.clone());
         if let Some(installer) = &self.lua_installer {
             self.recent_installed = installer.enumerate_installed();
         }
@@ -724,7 +752,7 @@ impl LuaToolsApp {
         let tx = self.msg_tx.clone();
         let ctx_c = ctx.clone();
         thread::spawn(move || {
-            let (games, tags) = api.get_denuvo_listings();
+            let (games, tags) = api.get_drm_fix_listings();
             let _ = tx.send(AppMessage::FixListingsLoaded { games, tags });
             ctx_c.request_repaint();
         });
@@ -1015,12 +1043,21 @@ impl LuaToolsApp {
             .unwrap_or_default();
         let keys = DepotDownloaderService::resolve_keys(
             self.steam_service.installation.as_ref(),
-            &self.slssteam_service,
+            Some(&self.slssteam_service),
             aid,
         );
 
         for entry in lua.entries {
             if entry.id == aid && entry.manifest_id.is_none() && !entry.has_key() {
+                continue;
+            }
+            // Skip keyless/manifestless DLC AppID entitlements that are not content depots
+            if entry.id != aid
+                && !entry.has_key()
+                && entry.manifest_id.is_none()
+                && entry.commented_manifest_id.is_none()
+                && !depot_map.contains_key(&entry.id)
+            {
                 continue;
             }
             let depot = depot_map.get(&entry.id).cloned().unwrap_or(ContentDepot {
@@ -1079,7 +1116,7 @@ impl LuaToolsApp {
         let tx = self.msg_tx.clone();
         let ctx_c = ctx.clone();
         thread::spawn(move || {
-            let fixes = api.get_denuvo_fixes(app_id);
+            let fixes = api.get_drm_fix_fixes(app_id);
             let _ = tx.send(AppMessage::FixesLoaded { app_id, fixes });
             ctx_c.request_repaint();
         });
@@ -1088,7 +1125,7 @@ impl LuaToolsApp {
     pub fn apply_fix_manifest_async(
         &mut self,
         app_id: u32,
-        fix: DenuvoFixItem,
+        fix: DRMFixFixItem,
         ctx: &egui::Context,
     ) {
         if !self.auth_service.is_signed_in() {
@@ -1112,7 +1149,7 @@ impl LuaToolsApp {
                 .unwrap_or_else(|| format!("{}.zip", app_id));
             let tx_p = tx.clone();
             let ctx_p = ctx_c.clone();
-            match api.download_denuvo_slot(&fix.id, "manifest", &tmp, &fb, move |p, m| {
+            match api.download_drm_fix_slot(&fix.id, "manifest", &tmp, &fb, move |p, m| {
                 let _ = tx_p.send(AppMessage::FixProgress { pct: p, msg: m });
                 ctx_p.request_repaint();
             }) {
@@ -1142,7 +1179,7 @@ impl LuaToolsApp {
     pub fn apply_fix_files_async(
         &mut self,
         app_id: u32,
-        fix: DenuvoFixItem,
+        fix: DRMFixFixItem,
         install_dir: PathBuf,
         ctx: &egui::Context,
     ) {
@@ -1162,7 +1199,7 @@ impl LuaToolsApp {
             let tx_p = tx.clone();
             let ctx_p = ctx_c.clone();
             let res =
-                FixesService::apply_denuvo_fix(&api, app_id, &fix, &install_dir, move |p, m| {
+                FixesService::apply_drm_fix_fix(&api, app_id, &fix, &install_dir, move |p, m| {
                     let _ = tx_p.send(AppMessage::FixProgress { pct: p, msg: m });
                     ctx_p.request_repaint();
                 });
@@ -1302,7 +1339,12 @@ impl LuaToolsApp {
             return;
         };
         match act.kind.as_str() {
-            "game" | "install" => self.open_app_in_acquire(act.app_id, ctx),
+            "game" | "install" => {
+                self.open_app_in_acquire(act.app_id, ctx);
+                if let Some(src) = act.source {
+                    self.acquire_selected_source = Some(src);
+                }
+            }
             "manage" => self.open_game_in_depots(act.app_id, ctx),
             "fix" => self.open_app_in_fixes(act.app_id, ctx),
             _ => {}
@@ -1419,6 +1461,14 @@ impl LuaToolsApp {
                             .values()
                             .filter(|s| s.eq_ignore_ascii_case("available"))
                             .count();
+                        if self.settings_service.settings.fast_fetch
+                            && self.acquire_selected_source.is_none()
+                        {
+                            self.acquire_selected_source = sources
+                                .iter()
+                                .find(|(_, st)| st.eq_ignore_ascii_case("available"))
+                                .map(|(prov, _)| prov.clone());
+                        }
                         self.acquire_sources = sources;
                         self.acquire_dlc_info = dlc_info;
                         self.acquire_status =
@@ -1484,10 +1534,12 @@ impl LuaToolsApp {
                     pct,
                     msg,
                 } => {
-                    if pct > 0.0 {
+                    if pct >= 0.0 {
                         self.depots_dl_pct = pct;
                     }
-                    self.depots_dl_status = format!("{} · {:.1}% — {}", depot_label, pct, msg);
+                    let shown_pct = if pct >= 0.0 { pct } else { self.depots_dl_pct };
+                    self.depots_dl_status =
+                        format!("{} · {:.1}% — {}", depot_label, shown_pct, msg);
                 }
                 AppMessage::DepotDownloadFinished { results } => {
                     self.depots_downloading = false;
@@ -1622,12 +1674,12 @@ impl LuaToolsApp {
                 }
                 AppMessage::FolderPickedForAutoCrack(dir) => {
                     let aid = self.depots_app_id.unwrap_or(0);
-                    match self.tools_manager.launch_steamautocrack(aid, &dir) {
+                    match self.tools_manager.launch_steamautopatch(aid, &dir) {
                         Ok(m) | Err(m) => self.status_text = m,
                     }
                 }
-                AppMessage::FilePickedForSteamless(exe) => {
-                    match self.tools_manager.launch_steamless(&exe) {
+                AppMessage::FilePickedForStubRemover(exe) => {
+                    match self.tools_manager.launch_stub_remover(&exe) {
                         Ok(m) | Err(m) => self.status_text = m,
                     }
                 }
@@ -2212,52 +2264,78 @@ impl LuaToolsApp {
             qa.frames_waited = 0;
         }
 
-        let steps: &[(
-            &str,
-            ActiveView,
-            Option<SettingsSubTab>,
-            Option<DepotsSubTab>,
-            Option<[f32; 2]>,
-        )] = &[
-            ("01_home.png", ActiveView::Overview, None, None, None),
-            ("02_discover.png", ActiveView::Acquire, None, None, None),
-            ("03_library.png", ActiveView::Library, None, None, None),
-            (
-                "04_depots_vault.png",
-                ActiveView::Depots,
-                None,
-                Some(DepotsSubTab::Declarations),
-                None,
-            ),
-            (
-                "05_depots_editor.png",
-                ActiveView::Depots,
-                None,
-                Some(DepotsSubTab::LiveEditor),
-                None,
-            ),
-            ("06_fixes.png", ActiveView::Fixes, None, None, None),
-            (
-                "07_settings_general.png",
-                ActiveView::Settings,
-                Some(SettingsSubTab::General),
-                None,
-                None,
-            ),
-            (
-                "08_settings_updates.png",
-                ActiveView::Settings,
-                Some(SettingsSubTab::UpdatesAndTools),
-                None,
-                None,
-            ),
-            (
-                "09_narrow_1060x660.png",
-                ActiveView::Overview,
-                None,
-                None,
-                Some([1060.0, 660.0]),
-            ),
+        struct QaShotStep {
+            fname: &'static str,
+            view: ActiveView,
+            s_tab: Option<SettingsSubTab>,
+            d_tab: Option<DepotsSubTab>,
+            resize: Option<[f32; 2]>,
+        }
+
+        let steps: &[QaShotStep] = &[
+            QaShotStep {
+                fname: "01_home.png",
+                view: ActiveView::Overview,
+                s_tab: None,
+                d_tab: None,
+                resize: None,
+            },
+            QaShotStep {
+                fname: "02_discover.png",
+                view: ActiveView::Acquire,
+                s_tab: None,
+                d_tab: None,
+                resize: None,
+            },
+            QaShotStep {
+                fname: "03_library.png",
+                view: ActiveView::Library,
+                s_tab: None,
+                d_tab: None,
+                resize: None,
+            },
+            QaShotStep {
+                fname: "04_depots_vault.png",
+                view: ActiveView::Depots,
+                s_tab: None,
+                d_tab: Some(DepotsSubTab::Declarations),
+                resize: None,
+            },
+            QaShotStep {
+                fname: "05_depots_editor.png",
+                view: ActiveView::Depots,
+                s_tab: None,
+                d_tab: Some(DepotsSubTab::LiveEditor),
+                resize: None,
+            },
+            QaShotStep {
+                fname: "06_fixes.png",
+                view: ActiveView::Fixes,
+                s_tab: None,
+                d_tab: None,
+                resize: None,
+            },
+            QaShotStep {
+                fname: "07_settings_general.png",
+                view: ActiveView::Settings,
+                s_tab: Some(SettingsSubTab::General),
+                d_tab: None,
+                resize: None,
+            },
+            QaShotStep {
+                fname: "08_settings_updates.png",
+                view: ActiveView::Settings,
+                s_tab: Some(SettingsSubTab::UpdatesAndTools),
+                d_tab: None,
+                resize: None,
+            },
+            QaShotStep {
+                fname: "09_narrow_1060x660.png",
+                view: ActiveView::Overview,
+                s_tab: None,
+                d_tab: None,
+                resize: Some([1060.0, 660.0]),
+            },
         ];
 
         if qa.step >= steps.len() {
@@ -2265,23 +2343,23 @@ impl LuaToolsApp {
             return;
         }
 
-        let (fname, view, s_tab, d_tab, resize) = steps[qa.step];
-        self.active_view = view;
-        if let Some(st) = s_tab {
+        let cur = &steps[qa.step];
+        self.active_view = cur.view;
+        if let Some(st) = cur.s_tab {
             self.settings_subtab = st;
         }
-        if let Some(dt) = d_tab {
+        if let Some(dt) = cur.d_tab {
             self.depots_subtab = dt;
         }
         if qa.frames_waited == 0 {
-            if let Some(sz) = resize {
+            if let Some(sz) = cur.resize {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(sz[0], sz[1])));
             }
         }
 
         qa.frames_waited += 1;
         if qa.frames_waited == 4 && qa.pending_save.is_none() {
-            qa.pending_save = Some(fname.to_string());
+            qa.pending_save = Some(cur.fname.to_string());
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
         }
         ctx.request_repaint();

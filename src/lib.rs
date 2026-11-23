@@ -1,8 +1,8 @@
-//! LuaTools Linux v2.0-beta — Core library modules.
+//! LuaTools Linux — Core library modules.
 
 pub mod models;
 pub mod parsers;
 pub mod services;
 pub mod ui;
 
-pub const VERSION: &str = "2.0-beta";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

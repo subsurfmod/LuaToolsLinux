@@ -1,7 +1,7 @@
 //! Persistent application settings (`~/.config/luatools/settings.json`).
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::models::config::{default_app_settings_path, AppSettings};
 
@@ -27,7 +27,7 @@ impl SettingsService {
         }
     }
 
-    fn load_from(path: &PathBuf) -> AppSettings {
+    fn load_from(path: &Path) -> AppSettings {
         if let Ok(raw) = fs::read_to_string(path) {
             if let Ok(parsed) = serde_json::from_str::<AppSettings>(&raw) {
                 return parsed;

@@ -50,26 +50,26 @@ pub struct HubcapStats {
 }
 
 #[derive(Debug, Clone)]
-pub struct DenuvoTag {
+pub struct DRMFixTag {
     pub id: String,
     pub name: String,
     pub slug: String,
 }
 
 #[derive(Debug, Clone)]
-pub struct DenuvoGameListing {
+pub struct DRMFixGameListing {
     pub app_id: String,
     pub name: String,
     pub fix_count: usize,
-    pub tags: Vec<DenuvoTag>,
+    pub tags: Vec<DRMFixTag>,
 }
 
 #[derive(Debug, Clone)]
-pub struct DenuvoFixItem {
+pub struct DRMFixFixItem {
     pub id: String,
     pub title: String,
     pub description: String,
-    pub tags: Vec<DenuvoTag>,
+    pub tags: Vec<DRMFixTag>,
     pub has_manifest: bool,
     pub has_fix: bool,
     pub manifest_filename: Option<String>,
@@ -412,7 +412,7 @@ impl LuaToolsApiClient {
         )
     }
 
-    pub fn get_denuvo_listings(&self) -> (Vec<DenuvoGameListing>, Vec<DenuvoTag>) {
+    pub fn get_drm_fix_listings(&self) -> (Vec<DRMFixGameListing>, Vec<DRMFixTag>) {
         let url = format!("{}/api/denuvo/listings", API_BASE_URL);
         let Ok(resp) = Self::agent().get(&url).call() else {
             return (Vec::new(), Vec::new());
@@ -421,10 +421,10 @@ impl LuaToolsApiClient {
             return (Vec::new(), Vec::new());
         };
 
-        let parse_tags = |arr: Option<&Vec<Value>>| -> Vec<DenuvoTag> {
+        let parse_tags = |arr: Option<&Vec<Value>>| -> Vec<DRMFixTag> {
             arr.map(|list| {
                 list.iter()
-                    .map(|t| DenuvoTag {
+                    .map(|t| DRMFixTag {
                         id: t
                             .get("id")
                             .map(|v| {
@@ -461,7 +461,7 @@ impl LuaToolsApiClient {
                             .unwrap_or_else(|| v.to_string())
                     })
                     .unwrap_or_default();
-                games.push(DenuvoGameListing {
+                games.push(DRMFixGameListing {
                     app_id: aid,
                     name: g
                         .get("name")
@@ -476,7 +476,7 @@ impl LuaToolsApiClient {
         (games, tags)
     }
 
-    pub fn get_denuvo_fixes(&self, app_id: u32) -> Vec<DenuvoFixItem> {
+    pub fn get_drm_fix_fixes(&self, app_id: u32) -> Vec<DRMFixFixItem> {
         let url = format!("{}/api/denuvo/fixes?appid={}", API_BASE_URL, app_id);
         let Ok(resp) = Self::agent().get(&url).call() else {
             return Vec::new();
@@ -492,7 +492,7 @@ impl LuaToolsApiClient {
                     .and_then(|v| v.as_array())
                     .map(|list| {
                         list.iter()
-                            .map(|t| DenuvoTag {
+                            .map(|t| DRMFixTag {
                                 id: t
                                     .get("id")
                                     .and_then(|v| v.as_str())
@@ -509,7 +509,7 @@ impl LuaToolsApiClient {
                     })
                     .unwrap_or_default();
 
-                out.push(DenuvoFixItem {
+                out.push(DRMFixFixItem {
                     id: f
                         .get("id")
                         .and_then(|v| v.as_str())
@@ -545,7 +545,7 @@ impl LuaToolsApiClient {
         out
     }
 
-    pub fn download_denuvo_slot<F>(
+    pub fn download_drm_fix_slot<F>(
         &self,
         fix_id: &str,
         slot: &str,

@@ -99,7 +99,7 @@ impl LuaInstaller {
                 items.push((aid, p, mtime));
             }
         }
-        items.sort_by(|a, b| b.2.cmp(&a.2));
+        items.sort_by_key(|a| std::cmp::Reverse(a.2));
         items.into_iter().map(|(aid, p, _)| (aid, p)).collect()
     }
 
@@ -114,6 +114,7 @@ impl LuaInstaller {
         ids
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn install_lua(
         &self,
         app_id: u32,

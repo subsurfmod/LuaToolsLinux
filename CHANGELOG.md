@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-11-23
+
+### Added & Improved
+- **Depot Decryption Key File Support (`-depotkeys`)**: Automatically resolves per-app `.lua` and `SLSsteam` depot decryption keys into a restricted (`0600`) temporary keys file for `DepotDownloader` / `DepotDownloaderMod` and cleans up after completion, plus `-manifestfile` support when using `DepotDownloaderMod`.
+- **CEF Store Bridge & DRM Fix Refactor**: Renamed `cef_injector` to `cef_bridge` (`CefBridgeService`) with backwards-compatible `settings.json` deserialization (`alias = "cef_injector_enabled"`), and unified neutral toolchain naming (`SteamAutoPatch` / `StubRemover`) with full binary & CLI compatibility for upstream GitHub releases.
+
+### Fixed
+- Restored live `lua.tools` fix catalog/download API endpoints while preserving refactored `DRMFix*` domain types.
+- Wired live `SteamInstallation` and `SlssteamService` state into `DepotDownloaderService`, filtered non-depot DLC entitlement AppIDs out of depot download selections, and normalized progress percentages across tool bootstrap and depot downloads.
+- Fixed short/non-ASCII decryption key preview slicing panic in Depot Details modal, hardened binary `appinfo.vdf` header parsing against unsigned/corrupt entry sizes, synced `SLSsteam` on `LuaVault` variant apply, honored `FastFetch` & `luatools://` source selection, and resolved all Rust `clippy` lints across library, binary, and test targets.
+
 ## [2.0-beta] - 2026-11-23 — Complete Native Rust Rewrite (Beta)
 
 ### Added

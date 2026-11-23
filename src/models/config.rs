@@ -97,8 +97,8 @@ pub struct AppSettings {
     pub donate_keys: bool,
     #[serde(default)]
     pub hubcap_api_key: String,
-    #[serde(default)]
-    pub cef_injector_enabled: bool,
+    #[serde(default, alias = "cef_injector_enabled")]
+    pub cef_bridge_enabled: bool,
     #[serde(default = "default_true")]
     pub http_server_enabled: bool,
     #[serde(default = "default_http_port")]
@@ -125,7 +125,7 @@ impl Default for AppSettings {
             fast_fetch: true,
             donate_keys: true,
             hubcap_api_key: String::new(),
-            cef_injector_enabled: false,
+            cef_bridge_enabled: false,
             http_server_enabled: true,
             http_server_port: 6767,
             language: "en".to_string(),

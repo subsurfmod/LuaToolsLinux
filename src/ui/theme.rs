@@ -309,29 +309,26 @@ pub fn paper_card_padded<R>(
 
     let rect = inner.response.rect;
     let radius = CornerRadius::same(5);
-    let mut shapes = Vec::with_capacity(4);
-    // 1. Cast drop shadow (+3, +4)
-    shapes.push(egui::Shape::rect_filled(
-        rect.translate(Vec2::new(3.0, 4.0)),
-        radius,
-        Palette::SHADOW,
-    ));
-    // 2. Stacked underside paper thickness lip (+0, +2)
-    shapes.push(egui::Shape::rect_filled(
-        rect.translate(Vec2::new(0.0, 2.0)),
-        radius,
-        Palette::BG_PANEL_LO,
-    ));
-    // 3. Flat matte paper body
-    shapes.push(egui::Shape::rect_filled(rect, radius, Palette::BG_PANEL));
-    // 4. Top cut-edge highlight sliver
-    shapes.push(egui::Shape::line_segment(
-        [
-            Pos2::new(rect.left() + 4.0, rect.top() + 0.5),
-            Pos2::new(rect.right() - 4.0, rect.top() + 0.5),
-        ],
-        Stroke::new(1.0_f32, Palette::BG_PANEL_HI),
-    ));
+    let shapes = vec![
+        // 1. Cast drop shadow (+3, +4)
+        egui::Shape::rect_filled(rect.translate(Vec2::new(3.0, 4.0)), radius, Palette::SHADOW),
+        // 2. Stacked underside paper thickness lip (+0, +2)
+        egui::Shape::rect_filled(
+            rect.translate(Vec2::new(0.0, 2.0)),
+            radius,
+            Palette::BG_PANEL_LO,
+        ),
+        // 3. Flat matte paper body
+        egui::Shape::rect_filled(rect, radius, Palette::BG_PANEL),
+        // 4. Top cut-edge highlight sliver
+        egui::Shape::line_segment(
+            [
+                Pos2::new(rect.left() + 4.0, rect.top() + 0.5),
+                Pos2::new(rect.right() - 4.0, rect.top() + 0.5),
+            ],
+            Stroke::new(1.0_f32, Palette::BG_PANEL_HI),
+        ),
+    ];
     ui.painter().set(shape_idx, egui::Shape::Vec(shapes));
     inner
 }
@@ -372,9 +369,8 @@ pub fn void_frame() -> Frame {
         .inner_margin(Margin::same(12))
 }
 
-fn draw_cut_paper_button(
-    ui: &mut Ui,
-    label: &str,
+#[derive(Clone, Copy)]
+struct CutButtonStyle {
     face: Color32,
     face_hover: Color32,
     shade_lip: Color32,
@@ -383,14 +379,16 @@ fn draw_cut_paper_button(
     min_h: f32,
     pad_x: f32,
     font_sz: f32,
-) -> egui::Response {
-    let font_id = semibold_font(font_sz);
+}
+
+fn draw_cut_paper_button(ui: &mut Ui, label: &str, style: CutButtonStyle) -> egui::Response {
+    let font_id = semibold_font(style.font_sz);
     let galley = ui
         .painter()
-        .layout_no_wrap(label.to_string(), font_id, text_col);
+        .layout_no_wrap(label.to_string(), font_id, style.text_col);
     let desired = Vec2::new(
-        (galley.size().x + pad_x * 2.0).max(52.0),
-        (galley.size().y + 12.0).max(min_h),
+        (galley.size().x + style.pad_x * 2.0).max(52.0),
+        (galley.size().y + 12.0).max(style.min_h),
     );
     let (rect, resp) = ui.allocate_exact_size(desired, Sense::click());
     if resp.hovered() && ui.is_enabled() {
@@ -414,15 +412,15 @@ fn draw_cut_paper_button(
                 radius,
                 Color32::from_black_alpha(95),
             );
-            painter.rect_filled(rect.translate(Vec2::new(0.0, 2.0)), radius, shade_lip);
+            painter.rect_filled(rect.translate(Vec2::new(0.0, 2.0)), radius, style.shade_lip);
         }
 
         let active_face = if !enabled {
             Color32::from_rgb(24, 26, 32)
         } else if resp.hovered() {
-            face_hover
+            style.face_hover
         } else {
-            face
+            style.face
         };
         let face_rect = rect.translate(Vec2::new(0.0, press_y));
         painter.rect_filled(face_rect, radius, active_face);
@@ -433,12 +431,12 @@ fn draw_cut_paper_button(
                     Pos2::new(face_rect.left() + 3.0, face_rect.top() + 0.5),
                     Pos2::new(face_rect.right() - 3.0, face_rect.top() + 0.5),
                 ],
-                Stroke::new(1.0_f32, top_hi),
+                Stroke::new(1.0_f32, style.top_hi),
             );
         }
 
         let fg = if enabled {
-            text_col
+            style.text_col
         } else {
             Palette::TEXT_MUTED
         };
@@ -455,14 +453,16 @@ pub fn primary_button(ui: &mut Ui, label: &str) -> egui::Response {
     draw_cut_paper_button(
         ui,
         label,
-        Palette::BLUE_PRIMARY,
-        Palette::BLUE_HOVER,
-        Palette::BLUE_SHADE,
-        Palette::BLUE_BORDER,
-        Palette::TEXT_PRIMARY,
-        32.0,
-        15.0,
-        12.5,
+        CutButtonStyle {
+            face: Palette::BLUE_PRIMARY,
+            face_hover: Palette::BLUE_HOVER,
+            shade_lip: Palette::BLUE_SHADE,
+            top_hi: Palette::BLUE_BORDER,
+            text_col: Palette::TEXT_PRIMARY,
+            min_h: 32.0,
+            pad_x: 15.0,
+            font_sz: 12.5,
+        },
     )
 }
 
@@ -470,14 +470,16 @@ pub fn secondary_button(ui: &mut Ui, label: &str) -> egui::Response {
     draw_cut_paper_button(
         ui,
         label,
-        Palette::BG_ELEVATED,
-        Palette::BG_HOVER,
-        Palette::BG_PANEL_LO,
-        Palette::BORDER_DEFAULT,
-        Palette::TEXT_PRIMARY,
-        32.0,
-        14.0,
-        12.5,
+        CutButtonStyle {
+            face: Palette::BG_ELEVATED,
+            face_hover: Palette::BG_HOVER,
+            shade_lip: Palette::BG_PANEL_LO,
+            top_hi: Palette::BORDER_DEFAULT,
+            text_col: Palette::TEXT_PRIMARY,
+            min_h: 32.0,
+            pad_x: 14.0,
+            font_sz: 12.5,
+        },
     )
 }
 
@@ -485,14 +487,16 @@ pub fn danger_button(ui: &mut Ui, label: &str) -> egui::Response {
     draw_cut_paper_button(
         ui,
         label,
-        Palette::DANGER_BG,
-        Color32::from_rgb(68, 28, 36),
-        Palette::DANGER_SHADE,
-        Palette::DANGER_BORDER,
-        Palette::DANGER_TEXT,
-        32.0,
-        14.0,
-        12.5,
+        CutButtonStyle {
+            face: Palette::DANGER_BG,
+            face_hover: Color32::from_rgb(68, 28, 36),
+            shade_lip: Palette::DANGER_SHADE,
+            top_hi: Palette::DANGER_BORDER,
+            text_col: Palette::DANGER_TEXT,
+            min_h: 32.0,
+            pad_x: 14.0,
+            font_sz: 12.5,
+        },
     )
 }
 
@@ -540,27 +544,31 @@ pub fn table_button(ui: &mut Ui, label: &str, primary: bool) -> egui::Response {
         draw_cut_paper_button(
             ui,
             label,
-            Palette::BLUE_PRIMARY,
-            Palette::BLUE_HOVER,
-            Palette::BLUE_SHADE,
-            Palette::BLUE_BORDER,
-            Palette::TEXT_PRIMARY,
-            26.0,
-            11.0,
-            11.5,
+            CutButtonStyle {
+                face: Palette::BLUE_PRIMARY,
+                face_hover: Palette::BLUE_HOVER,
+                shade_lip: Palette::BLUE_SHADE,
+                top_hi: Palette::BLUE_BORDER,
+                text_col: Palette::TEXT_PRIMARY,
+                min_h: 26.0,
+                pad_x: 11.0,
+                font_sz: 11.5,
+            },
         )
     } else {
         draw_cut_paper_button(
             ui,
             label,
-            Palette::BG_ELEVATED,
-            Palette::BG_HOVER,
-            Palette::BG_PANEL_LO,
-            Palette::BORDER_DEFAULT,
-            Palette::TEXT_SECONDARY,
-            26.0,
-            10.0,
-            11.5,
+            CutButtonStyle {
+                face: Palette::BG_ELEVATED,
+                face_hover: Palette::BG_HOVER,
+                shade_lip: Palette::BG_PANEL_LO,
+                top_hi: Palette::BORDER_DEFAULT,
+                text_col: Palette::TEXT_SECONDARY,
+                min_h: 26.0,
+                pad_x: 10.0,
+                font_sz: 11.5,
+            },
         )
     }
 }

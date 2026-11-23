@@ -7,7 +7,7 @@
 set -euo pipefail
 
 APP_NAME="luatools"
-APP_VERSION="2.0-beta"
+APP_VERSION="2.1.0"
 REPO_URL="https://github.com/subsurfmod/LuaToolsLinux.git"
 SCRIPT_DIR=""
 if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
@@ -199,6 +199,9 @@ install_files() {
         run_privileged install -m 0644 "$tmp_desktop" "${apps_dir}/luatools.desktop"
         rm -f "$tmp_desktop"
         command -v update-desktop-database >/dev/null 2>&1 && run_privileged update-desktop-database "$apps_dir" || true
+        if command -v xdg-mime >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ]; then
+            xdg-mime default luatools.desktop x-scheme-handler/luatools || true
+        fi
         INSTALLED_BIN="${bin_dir}/${APP_NAME}"
     else
         local bin_dir="${HOME}/.local/bin"
@@ -226,19 +229,21 @@ install_files() {
     fi
 
     # Record source repository location for one-click in-app Git updates
-    local meta_dir="${HOME}/.local/share/luatools"
-    mkdir -p "$meta_dir"
-    local git_origin=""
-    if command -v git >/dev/null 2>&1 && [ -d "${SCRIPT_DIR}/.git" ]; then
-        git_origin="$(git -C "${SCRIPT_DIR}" remote get-url origin 2>/dev/null || true)"
-    fi
-    if [ -f "${SCRIPT_DIR}/Cargo.toml" ]; then
-        cat > "${meta_dir}/source_repo.json" <<EOF
+    if [ "$(id -u)" -ne 0 ]; then
+        local meta_dir="${HOME}/.local/share/luatools"
+        mkdir -p "$meta_dir"
+        local git_origin=""
+        if command -v git >/dev/null 2>&1 && [ -d "${SCRIPT_DIR}/.git" ]; then
+            git_origin="$(git -C "${SCRIPT_DIR}" remote get-url origin 2>/dev/null || true)"
+        fi
+        if [ -f "${SCRIPT_DIR}/Cargo.toml" ]; then
+            cat > "${meta_dir}/source_repo.json" <<EOF
 {
   "repo_dir": "${SCRIPT_DIR}",
   "remote_url": "${git_origin}"
 }
 EOF
+        fi
     fi
 
     ok "Installed executable   -> ${INSTALLED_BIN}"

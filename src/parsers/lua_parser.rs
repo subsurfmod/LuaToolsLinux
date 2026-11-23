@@ -57,16 +57,26 @@ impl LuaContents {
 fn add_appid_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r#"(?i)^addappid\s*\(\s*(\d+)\s*(?:,\s*\d+\s*(?:,\s*["']([^"']*)["'])?)?\s*\)\s*;?[ \t]*(?:--[ \t]*(.*?)[ \t]*)?$"#).unwrap()
+        Regex::new(r#"(?i)^addappid\s*\(\s*(\d+)\s*(?:,\s*(?:\d+\s*(?:,\s*["']([^"']*)["'])?|["']([^"']*)["']))?\s*\)\s*;?[ \t]*(?:--[ \t]*(.*?)[ \t]*)?$"#).unwrap()
     })
 }
 
 fn set_manifest_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r#"(?i)^setManifestid\s*\(\s*(\d+)\s*,\s*["'](\d+)["']\s*(?:,\s*(\d+))?\s*\)"#)
+        Regex::new(r#"(?i)^setManifestid\s*\(\s*(\d+)\s*,\s*["']?(\d+)["']?\s*(?:,\s*(\d+))?\s*\)"#)
             .unwrap()
     })
+}
+
+fn comment_pin_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)^(\s*)(setManifestid\s*\()").unwrap())
+}
+
+fn infer_appid_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)addappid\s*\(\s*(\d+)").unwrap())
 }
 
 fn add_token_re() -> &'static Regex {
@@ -168,9 +178,10 @@ impl LuaFileParser {
 
             let key = m
                 .get(2)
+                .or_else(|| m.get(3))
                 .map(|k| k.as_str().to_string())
                 .filter(|k| !k.is_empty());
-            let comment = Self::clean_comment(m.get(3).map(|c| c.as_str()));
+            let comment = Self::clean_comment(m.get(4).map(|c| c.as_str()));
 
             if let Some(c) = comment {
                 let replace = comment_by_id
@@ -242,7 +253,7 @@ impl LuaFileParser {
     }
 
     pub fn comment_out_manifest_pins(lua_text: &str) -> String {
-        let re = Regex::new(r"(?i)^(\s*)(setManifestid\s*\()").unwrap();
+        let re = comment_pin_re();
         let mut out: Vec<String> = Vec::new();
         for line in lua_text.lines() {
             if line.trim_start().starts_with("--") {
@@ -304,7 +315,7 @@ impl LuaFileParser {
     }
 
     pub fn infer_app_id_from_text(lua_text: &str) -> Option<u32> {
-        let re = Regex::new(r"(?i)addappid\s*\(\s*(\d+)").ok()?;
+        let re = infer_appid_re();
         for line in lua_text.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with("--") {
@@ -351,13 +362,14 @@ mod tests {
             addappid(1245621, 1, '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'); -- Core\n\
             setManifestid(1245621, '8888777766665555444', 52428800000)\n\
             addappid(1245622, 1, \"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\")\n\
+            addappid(1245623, \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\")\n\
             -- setManifestid(1245622, \"1111222233334444555\", 2048)\n\
             addappid(2778580) -- DLC\n\
             addtoken(1245620, \"secret_tok\")\n";
 
         let parsed = LuaFileParser::parse_text(sample, 1245620);
         assert_eq!(parsed.base_app_id, 1245620);
-        assert_eq!(parsed.depot_count(), 2);
+        assert_eq!(parsed.depot_count(), 3);
         assert_eq!(parsed.dlc_count(), 1);
         assert_eq!(
             parsed.active_pins.get(&1245621).map(String::as_str),

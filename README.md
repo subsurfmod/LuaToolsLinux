@@ -1,4 +1,4 @@
-# LuaTools Linux v2.0-beta (Native Rust Edition)
+# LuaTools Linux v2.1.0 (Native Rust Edition)
 
 A complete **100% Pure-Rust** ground-up rewrite of LuaTools Linux — engineered for minimal memory footprint (`~25–40 MB` RAM), instant `< 40 ms` startup, zero Python/Qt runtime dependencies, and a tactile **Papercut Monotone-Dark + Deep Sapphire** hardware-accelerated native GUI (`eframe` / `egui`).
 
@@ -33,13 +33,13 @@ cd LuaToolsLinux
 ```
 
 Outputs self-contained distributables into `dist/`:
-- **Fedora / RHEL / openSUSE**: `sudo dnf install ./dist/luatools-linux-2.0-0.1.beta.*.rpm`
-- **Ubuntu / Debian / Pop!_OS**: `sudo apt install ./dist/luatools-linux_2.0-beta_amd64.deb`
-- **Any Linux Distro (No root required)**: extract `dist/luatools-linux-2.0-beta-x86_64.tar.gz` and run `./install.sh --yes --skip-deps`
+- **Fedora / RHEL / openSUSE**: `sudo dnf install ./dist/luatools-linux-2.1.0-1.*.rpm`
+- **Ubuntu / Debian / Pop!_OS**: `sudo apt install ./dist/luatools-linux_2.1.0_amd64.deb`
+- **Any Linux Distro (No root required)**: extract `dist/luatools-linux-2.1.0-x86_64.tar.gz` and run `./install.sh --yes --skip-deps`
 
 ---
 
-## Full v2.0-beta Feature Parity
+## Full v2.1.0 Feature Parity
 
 | Workspace | Capabilities |
 |-----------|--------------|

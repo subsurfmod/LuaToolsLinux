@@ -16,9 +16,15 @@ for arg in "$@"; do
 done
 
 if [ "$SYSTEM_WIDE" -eq 1 ]; then
-    sudo rm -f /usr/local/bin/luatools \
-               /usr/local/share/applications/luatools.desktop \
-               /usr/local/share/icons/hicolor/scalable/apps/luatools.svg
+    if [ "$(id -u)" -eq 0 ]; then
+        rm -f /usr/local/bin/luatools \
+              /usr/local/share/applications/luatools.desktop \
+              /usr/local/share/icons/hicolor/scalable/apps/luatools.svg
+    else
+        sudo rm -f /usr/local/bin/luatools \
+                   /usr/local/share/applications/luatools.desktop \
+                   /usr/local/share/icons/hicolor/scalable/apps/luatools.svg
+    fi
     echo "[OK] Removed system-wide LuaTools Linux files."
 else
     rm -f "${HOME}/.local/bin/luatools" \

@@ -3,7 +3,7 @@
 pub mod api_client;
 pub mod auth_service;
 pub mod caches;
-pub mod cef_injector;
+pub mod cef_bridge;
 pub mod depot_downloader;
 pub mod depot_info;
 pub mod donate_keys;

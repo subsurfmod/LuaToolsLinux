@@ -3,8 +3,24 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use regex::Regex;
+
+fn vdf_path_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#""path"\s+"([^"]+)""#).unwrap())
+}
+
+fn acf_name_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#""name"\s+"([^"]+)""#).unwrap())
+}
+
+fn acf_installdir_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#""installdir"\s+"([^"]+)""#).unwrap())
+}
 
 #[derive(Debug, Clone)]
 pub struct SteamLibrary {
@@ -77,10 +93,10 @@ pub fn discover_libraries(steam_root: &Path) -> Vec<SteamLibrary> {
 
     add_lib(steam_root);
 
-    let vdf_path = steam_root.join("steamapps").join("libraryfolders.vdf");
-    if let Ok(content) = fs::read_to_string(&vdf_path) {
-        if let Ok(re) = Regex::new(r#""path"\s+"([^"]+)""#) {
-            for cap in re.captures_iter(&content) {
+    for rel in ["steamapps/libraryfolders.vdf", "config/libraryfolders.vdf"] {
+        let vdf_path = steam_root.join(rel);
+        if let Ok(content) = fs::read_to_string(&vdf_path) {
+            for cap in vdf_path_re().captures_iter(&content) {
                 if let Some(m) = cap.get(1) {
                     let norm = m.as_str().replace("\\\\", "/");
                     add_lib(Path::new(&norm));
@@ -121,8 +137,8 @@ pub fn get_game_name_from_acf(library: &SteamLibrary, app_id: u32) -> Option<Str
         .steamapps()
         .join(format!("appmanifest_{}.acf", app_id));
     let content = fs::read_to_string(acf).ok()?;
-    let re = Regex::new(r#""name"\s+"([^"]+)""#).ok()?;
-    re.captures(&content)
+    acf_name_re()
+        .captures(&content)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
 }
@@ -132,8 +148,7 @@ pub fn get_install_dir_from_acf(library: &SteamLibrary, app_id: u32) -> Option<P
         .steamapps()
         .join(format!("appmanifest_{}.acf", app_id));
     let content = fs::read_to_string(acf).ok()?;
-    let re = Regex::new(r#""installdir"\s+"([^"]+)""#).ok()?;
-    let dir_name = re.captures(&content)?.get(1)?.as_str();
+    let dir_name = acf_installdir_re().captures(&content)?.get(1)?.as_str();
     let full = library.common().join(dir_name);
     Some(full)
 }

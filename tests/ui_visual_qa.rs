@@ -129,10 +129,10 @@ fn rasterize_primitives(
             continue;
         }
 
-        for tri in mesh.indices.chunks_exact(3) {
-            let v0 = mesh.vertices[tri[0] as usize];
-            let v1 = mesh.vertices[tri[1] as usize];
-            let v2 = mesh.vertices[tri[2] as usize];
+        for &[i0, i1, i2] in mesh.indices.as_chunks::<3>().0 {
+            let v0 = mesh.vertices[i0 as usize];
+            let v1 = mesh.vertices[i1 as usize];
+            let v2 = mesh.vertices[i2 as usize];
 
             let area = edge_fn(v0.pos, v1.pos, v2.pos);
             if area.abs() < 1e-4 {
@@ -215,81 +215,100 @@ fn headless_papercut_views_render_cleanly_at_wide_and_narrow_resolutions() {
         std::fs::create_dir_all(d).unwrap();
     }
 
-    let cases: &[(
-        &str,
-        [usize; 2],
-        ActiveView,
-        Option<DepotsSubTab>,
-        Option<SettingsSubTab>,
-    )] = &[
-        ("01_home.png", [1380, 860], ActiveView::Overview, None, None),
-        (
-            "02_discover.png",
-            [1380, 860],
-            ActiveView::Acquire,
-            None,
-            None,
-        ),
-        (
-            "03_library.png",
-            [1380, 860],
-            ActiveView::Library,
-            None,
-            None,
-        ),
-        (
-            "04_depots_vault.png",
-            [1380, 860],
-            ActiveView::Depots,
-            Some(DepotsSubTab::Declarations),
-            None,
-        ),
-        (
-            "05_depots_editor.png",
-            [1380, 860],
-            ActiveView::Depots,
-            Some(DepotsSubTab::LiveEditor),
-            None,
-        ),
-        (
-            "06_depots_downloader.png",
-            [1380, 860],
-            ActiveView::Depots,
-            Some(DepotsSubTab::DownloadPicker),
-            None,
-        ),
-        ("07_fixes.png", [1380, 860], ActiveView::Fixes, None, None),
-        (
-            "08_settings_account.png",
-            [1380, 860],
-            ActiveView::Settings,
-            None,
-            Some(SettingsSubTab::Account),
-        ),
-        (
-            "09_settings_updates.png",
-            [1380, 860],
-            ActiveView::Settings,
-            None,
-            Some(SettingsSubTab::UpdatesAndTools),
-        ),
-        (
-            "10_narrow_1060x660.png",
-            [1060, 660],
-            ActiveView::Overview,
-            None,
-            None,
-        ),
-        (
-            "11_toast_top_right.png",
-            [1380, 860],
-            ActiveView::Depots,
-            Some(DepotsSubTab::DownloadPicker),
-            None,
-        ),
+    struct QaViewCase {
+        fname: &'static str,
+        size: [usize; 2],
+        view: ActiveView,
+        d_sub: Option<DepotsSubTab>,
+        s_sub: Option<SettingsSubTab>,
+    }
+
+    let cases: &[QaViewCase] = &[
+        QaViewCase {
+            fname: "01_home.png",
+            size: [1380, 860],
+            view: ActiveView::Overview,
+            d_sub: None,
+            s_sub: None,
+        },
+        QaViewCase {
+            fname: "02_discover.png",
+            size: [1380, 860],
+            view: ActiveView::Acquire,
+            d_sub: None,
+            s_sub: None,
+        },
+        QaViewCase {
+            fname: "03_library.png",
+            size: [1380, 860],
+            view: ActiveView::Library,
+            d_sub: None,
+            s_sub: None,
+        },
+        QaViewCase {
+            fname: "04_depots_vault.png",
+            size: [1380, 860],
+            view: ActiveView::Depots,
+            d_sub: Some(DepotsSubTab::Declarations),
+            s_sub: None,
+        },
+        QaViewCase {
+            fname: "05_depots_editor.png",
+            size: [1380, 860],
+            view: ActiveView::Depots,
+            d_sub: Some(DepotsSubTab::LiveEditor),
+            s_sub: None,
+        },
+        QaViewCase {
+            fname: "06_depots_downloader.png",
+            size: [1380, 860],
+            view: ActiveView::Depots,
+            d_sub: Some(DepotsSubTab::DownloadPicker),
+            s_sub: None,
+        },
+        QaViewCase {
+            fname: "07_fixes.png",
+            size: [1380, 860],
+            view: ActiveView::Fixes,
+            d_sub: None,
+            s_sub: None,
+        },
+        QaViewCase {
+            fname: "08_settings_account.png",
+            size: [1380, 860],
+            view: ActiveView::Settings,
+            d_sub: None,
+            s_sub: Some(SettingsSubTab::Account),
+        },
+        QaViewCase {
+            fname: "09_settings_updates.png",
+            size: [1380, 860],
+            view: ActiveView::Settings,
+            d_sub: None,
+            s_sub: Some(SettingsSubTab::UpdatesAndTools),
+        },
+        QaViewCase {
+            fname: "10_narrow_1060x660.png",
+            size: [1060, 660],
+            view: ActiveView::Overview,
+            d_sub: None,
+            s_sub: None,
+        },
+        QaViewCase {
+            fname: "11_toast_top_right.png",
+            size: [1380, 860],
+            view: ActiveView::Depots,
+            d_sub: Some(DepotsSubTab::DownloadPicker),
+            s_sub: None,
+        },
     ];
 
-    for &(fname, [w, h], view, d_sub, s_sub) in cases {
+    for case in cases {
+        let fname = case.fname;
+        let [w, h] = case.size;
+        let view = case.view;
+        let d_sub = case.d_sub;
+        let s_sub = case.s_sub;
         if fname == "11_toast_top_right.png" {
             app.notify(
                 "Saved settings.json and synced Steam configuration",

@@ -1,5 +1,5 @@
 //! ExternalToolsManager — inspects, updates, and launches `DepotDownloaderMod`,
-//! `SteamAutoCrack`, and `Steamless` with Linux `wine` / `dotnet` wrappers.
+//! `SteamAutoPatch`, and `StubRemover` with Linux `wine` / `dotnet` wrappers.
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -42,29 +42,41 @@ pub const TOOLS: &[ExternalToolSpec] = &[
         ],
     },
     ExternalToolSpec {
-        key: "steamautocrack",
-        name: "SteamAutoCrack",
+        key: "steamautopatch",
+        name: "SteamAutoPatch",
         description:
             "Automated Goldberg Steam emulator & configuration applier for game directories.",
         github_repo: "SteamAutoCracks/Steam-auto-crack",
         fallback_repo: None,
         exe_candidates: &[
+            "SteamAutoPatch.CLI",
+            "SteamAutoPatch",
             "SteamAutoCrack.CLI",
             "SteamAutoCrack",
+            "SteamAutoPatch.CLI.dll",
+            "SteamAutoCrack.CLI.dll",
+            "SteamAutoPatch.CLI.exe",
             "SteamAutoCrack.CLI.exe",
+            "SteamAutoPatch.exe",
             "SteamAutoCrack.exe",
         ],
     },
     ExternalToolSpec {
-        key: "steamless",
-        name: "Steamless",
+        key: "stub_remover",
+        name: "StubRemover",
         description: "SteamStub DRM unpacker for protected game executables (.exe via Wine).",
         github_repo: "atom0s/Steamless",
         fallback_repo: None,
         exe_candidates: &[
+            "StubRemover.CLI",
+            "StubRemover",
             "Steamless.CLI",
             "Steamless",
+            "StubRemover.CLI.dll",
+            "Steamless.CLI.dll",
+            "StubRemover.CLI.exe",
             "Steamless.CLI.exe",
+            "StubRemover.exe",
             "Steamless.exe",
         ],
     },
@@ -111,11 +123,20 @@ impl ExternalToolsManager {
         };
 
         let mut search_dirs = vec![self.tools_dir.join(key)];
-        if key == "depotdownloader" {
-            search_dirs.push(default_luatools_data_dir().join("depotdownloader"));
-            if let Some(home) = dirs::home_dir() {
-                search_dirs.push(home.join(".local/share/millennium/plugins/luatools/backend"));
+        match key {
+            "depotdownloader" => {
+                search_dirs.push(default_luatools_data_dir().join("depotdownloader"));
+                if let Some(home) = dirs::home_dir() {
+                    search_dirs.push(home.join(".local/share/millennium/plugins/luatools/backend"));
+                }
             }
+            "steamautopatch" => {
+                search_dirs.push(self.tools_dir.join("steamautocrack"));
+            }
+            "stub_remover" => {
+                search_dirs.push(self.tools_dir.join("steamless"));
+            }
+            _ => {}
         }
 
         let mut version = String::new();
@@ -209,7 +230,11 @@ impl ExternalToolsManager {
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_ascii_lowercase();
-                        n.ends_with(".zip") || n.ends_with(".tar.gz")
+                        (n.ends_with(".zip") || n.ends_with(".tar.gz"))
+                            && !n.contains("osx")
+                            && !n.contains("macos")
+                            && !n.contains("darwin")
+                            && !n.contains("arm")
                     })
                 });
 
@@ -272,25 +297,29 @@ impl ExternalToolsManager {
         ))
     }
 
-    pub fn launch_steamautocrack(&self, app_id: u32, folder: &Path) -> Result<String, String> {
-        let info = self.inspect_tool("steamautocrack");
+    pub fn launch_steamautopatch(&self, app_id: u32, folder: &Path) -> Result<String, String> {
+        let info = self.inspect_tool("steamautopatch");
         let exe = info.exe_path.ok_or_else(|| {
-            "SteamAutoCrack is not installed yet. Click INSTALL / UPDATE first.".to_string()
+            "SteamAutoPatch is not installed yet. Click INSTALL / UPDATE first.".to_string()
         })?;
         let prefix = DepotDownloaderService::build_invocation(&exe)?;
         let mut cmd = Command::new(&prefix[0]);
         for p in &prefix[1..] {
             cmd.arg(p);
         }
-        if exe
+        let fname_lower = exe
             .file_name()
             .and_then(|s| s.to_str())
-            .map(|s| s.to_ascii_lowercase().contains("cli"))
-            .unwrap_or(false)
-            && app_id > 0
-        {
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        if fname_lower.contains("cli") && app_id > 0 {
+            let subcmd = if fname_lower.contains("steamautocrack") {
+                "crack"
+            } else {
+                "patch"
+            };
             cmd.args([
-                "crack",
+                subcmd,
                 &folder.to_string_lossy(),
                 "--appid",
                 &app_id.to_string(),
@@ -300,10 +329,10 @@ impl ExternalToolsManager {
         Ok(format!("Launched {}", exe.display()))
     }
 
-    pub fn launch_steamless(&self, target_exe: &Path) -> Result<String, String> {
-        let info = self.inspect_tool("steamless");
+    pub fn launch_stub_remover(&self, target_exe: &Path) -> Result<String, String> {
+        let info = self.inspect_tool("stub_remover");
         let exe = info.exe_path.ok_or_else(|| {
-            "Steamless is not installed yet. Click INSTALL / UPDATE first.".to_string()
+            "StubRemover is not installed yet. Click INSTALL / UPDATE first.".to_string()
         })?;
         let prefix = DepotDownloaderService::build_invocation(&exe)?;
         let mut cmd = Command::new(&prefix[0]);
@@ -313,7 +342,7 @@ impl ExternalToolsManager {
         cmd.arg(target_exe);
         cmd.spawn().map_err(|e| e.to_string())?;
         Ok(format!(
-            "Launched Steamless on {}",
+            "Launched StubRemover on {}",
             target_exe.file_name().unwrap_or_default().to_string_lossy()
         ))
     }

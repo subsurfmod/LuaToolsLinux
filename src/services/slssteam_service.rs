@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_yml::{Mapping, Value};
 
@@ -65,9 +65,9 @@ impl SlssteamService {
         }
     }
 
-    fn load_from(path: &PathBuf) -> SlssteamConfig {
+    fn load_from(path: &Path) -> SlssteamConfig {
         let mut cfg = SlssteamConfig {
-            path: path.clone(),
+            path: path.to_path_buf(),
             ..Default::default()
         };
         let Ok(raw) = fs::read_to_string(path) else {

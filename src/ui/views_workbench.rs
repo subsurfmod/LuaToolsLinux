@@ -12,7 +12,7 @@ use egui_extras::{Column, Size, StripBuilder, TableBuilder};
 
 use crate::parsers::lua_parser::LuaFileParser;
 use crate::services::api_client::HubcapService;
-use crate::services::cef_injector::CefInjectorService;
+use crate::services::cef_bridge::CefBridgeService;
 use crate::services::depot_downloader::{DepotDownloadOptions, DepotSelection};
 use crate::services::external_tools::TOOLS;
 use crate::services::fixes_service::FixesService;
@@ -297,7 +297,17 @@ impl LuaToolsApp {
 
                         if let Some(h) = apply_hash {
                             if self.lua_vault.apply(app_id, &h) {
+                                let live_txt = self.lua_vault.read_live_text(app_id);
+                                if !live_txt.trim().is_empty() {
+                                    let parsed = LuaFileParser::parse_text(&live_txt, app_id);
+                                    crate::services::lua_installer::LuaInstaller::sync_with_slssteam(
+                                        &mut self.slssteam_service,
+                                        app_id,
+                                        &parsed,
+                                    );
+                                }
                                 self.reload_depots_local(app_id);
+                                self.refresh_all_local_state();
                                 self.notify(
                                     format!("Applied LuaVault variant for AppID {}", app_id),
                                     ToastKind::Success,
@@ -358,6 +368,7 @@ impl LuaToolsApp {
                                     let tpl = LuaFileParser::default_lua_template(app_id, "");
                                     let _ = self.lua_vault.write_live(app_id, &tpl);
                                     self.reload_depots_local(app_id);
+                                    self.refresh_all_local_state();
                                 }
                             });
                             return;
@@ -830,7 +841,9 @@ impl LuaToolsApp {
             custom_tool_path: self.slssteam_service.config.workshop_path.clone(),
             steam_username: self.settings_service.settings.steam_username.clone(),
         };
-        let dd = self.depot_downloader.clone();
+        let mut dd = self.depot_downloader.clone();
+        dd.steam_installation = self.steam_service.installation.clone();
+        dd.slssteam_service = Some(self.slssteam_service.clone());
         let tx = self.msg_tx.clone();
         let ctx_c = ctx.clone();
 
@@ -845,6 +858,12 @@ impl LuaToolsApp {
                 let tx_p = tx.clone();
                 let ctx_p = ctx_c.clone();
                 let label = format!("Depot {}", sel.depot_id);
+                let _ = tx.send(AppMessage::DepotDownloadProgress {
+                    depot_label: label.clone(),
+                    pct: 0.0,
+                    msg: "Preparing depot download…".into(),
+                });
+                ctx_c.request_repaint();
                 let r = dd.download_depot(app_id, &sel, &sub, &dl_opts, move |pct, msg| {
                     let _ = tx_p.send(AppMessage::DepotDownloadProgress {
                         depot_label: label.clone(),
@@ -867,7 +886,7 @@ impl LuaToolsApp {
         section_header(
             ui,
             "FIXES",
-            "Game & Denuvo Fix Catalog",
+            "Game & DRM Fix Catalog",
             "Verified manifests and patches with automatic .luatools-fix SHA-256 backup and clean revert",
             |ui| {
                 if secondary_button(ui, "Refresh Catalog").clicked() {
@@ -1173,10 +1192,10 @@ impl LuaToolsApp {
         if save_all {
             let sls_ok = self.slssteam_service.save();
             let app_ok = self.settings_service.save();
-            if self.settings_service.settings.cef_injector_enabled {
-                self.cef_injector.start();
+            if self.settings_service.settings.cef_bridge_enabled {
+                self.cef_bridge.start();
             } else {
-                self.cef_injector.stop();
+                self.cef_bridge.stop();
             }
             self.detect_steam_and_sync();
             if sls_ok && app_ok {
@@ -1605,8 +1624,8 @@ impl LuaToolsApp {
                     }),
             );
             ui.checkbox(
-                &mut self.settings_service.settings.cef_injector_enabled,
-                "Enable CEF DevTools Store Injector (127.0.0.1:8080 › local RPC :6767)",
+                &mut self.settings_service.settings.cef_bridge_enabled,
+                "Enable CEF DevTools Store Bridge (127.0.0.1:8080 › local RPC :6767)",
             );
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
@@ -1615,7 +1634,7 @@ impl LuaToolsApp {
                 }
                 if secondary_button(ui, "Enable Steam CEF Debugging").clicked() {
                     if let Some(inst) = &self.steam_service.installation {
-                        match CefInjectorService::ensure_cef_debugging_enabled(&inst.root) {
+                        match CefBridgeService::ensure_cef_debugging_enabled(&inst.root) {
                             Ok(m) => self.notify(m, ToastKind::Success),
                             Err(m) => self.notify(m, ToastKind::Warning),
                         }
@@ -1770,28 +1789,29 @@ impl LuaToolsApp {
                         let _ = std::fs::create_dir_all(&d);
                         let _ = Command::new("xdg-open").arg(&d).spawn();
                     }
-                    if spec.key == "steamautocrack"
+                    if spec.key == "steamautopatch"
                         && secondary_button(ui, "Run on Game Folder…").clicked()
                     {
                         let tx = self.msg_tx.clone();
                         let ctx = ui.ctx().clone();
                         thread::spawn(move || {
                             if let Some(dir) =
-                                pick_directory_native("Select Game Directory for SteamAutoCrack")
+                                pick_directory_native("Select Game Directory for SteamAutoPatch")
                             {
                                 let _ = tx.send(AppMessage::FolderPickedForAutoCrack(dir));
                                 ctx.request_repaint();
                             }
                         });
                     }
-                    if spec.key == "steamless" && secondary_button(ui, "Unpack .exe…").clicked() {
+                    if spec.key == "stub_remover" && secondary_button(ui, "Unpack .exe…").clicked()
+                    {
                         let tx = self.msg_tx.clone();
                         let ctx = ui.ctx().clone();
                         thread::spawn(move || {
                             let files =
                                 pick_files_native("Select Executable (.exe)", Some("*.exe"));
                             if let Some(f) = files.into_iter().next() {
-                                let _ = tx.send(AppMessage::FilePickedForSteamless(f));
+                                let _ = tx.send(AppMessage::FilePickedForStubRemover(f));
                                 ctx.request_repaint();
                             }
                         });

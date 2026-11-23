@@ -1,4 +1,4 @@
-//! CefInjectorService — polls Steam CEF CDP on `127.0.0.1:8080/json` and injects
+//! CefBridgeService — polls Steam CEF CDP on `127.0.0.1:8080/json` and injects
 //! `window.Millennium` polyfill + `luatools.js` into store tabs via WebSocket.
 
 use std::collections::HashSet;
@@ -22,7 +22,7 @@ use url::Url;
 
 const CEF_DEBUG_URL: &str = "http://127.0.0.1:8080/json";
 
-pub struct CefInjectorService {
+pub struct CefBridgeService {
     pub steam_root: Option<PathBuf>,
     pub http_port: u16,
     stop_flag: Arc<AtomicBool>,
@@ -30,7 +30,7 @@ pub struct CefInjectorService {
     handle: Option<JoinHandle<()>>,
 }
 
-impl CefInjectorService {
+impl CefBridgeService {
     pub fn new(steam_root: Option<PathBuf>, http_port: u16) -> Self {
         Self {
             steam_root,
@@ -91,10 +91,11 @@ impl CefInjectorService {
                                 let tid = tab.get("id").and_then(|v| v.as_str()).unwrap_or("");
                                 if url.contains("store.steampowered.com") && !ws.is_empty() {
                                     store_count += 1;
-                                    if !tid.is_empty() && !injected_tabs.contains(tid) {
-                                        if inject_ws_tab(ws, port) {
-                                            injected_tabs.insert(tid.to_string());
-                                        }
+                                    if !tid.is_empty()
+                                        && !injected_tabs.contains(tid)
+                                        && bridge_ws_tab(ws, port)
+                                    {
+                                        injected_tabs.insert(tid.to_string());
                                     }
                                 }
                             }
@@ -126,7 +127,7 @@ impl CefInjectorService {
     }
 }
 
-impl Drop for CefInjectorService {
+impl Drop for CefBridgeService {
     fn drop(&mut self) {
         self.stop();
     }
@@ -251,7 +252,7 @@ pub fn connect_ws_local(ws_url: &str) -> Result<WebSocket<TcpStream>, String> {
     ))
 }
 
-fn inject_ws_tab(ws_url: &str, http_port: u16) -> bool {
+fn bridge_ws_tab(ws_url: &str, http_port: u16) -> bool {
     let mut js = build_polyfill_js(http_port);
     if let Some(p) = find_luatools_js() {
         if let Ok(extra) = fs::read_to_string(p) {
@@ -332,7 +333,7 @@ mod tests {
         });
 
         let ws_url = format!("ws://127.0.0.1:{}/devtools/page/TAB1", port);
-        assert!(inject_ws_tab(&ws_url, 6767));
+        assert!(bridge_ws_tab(&ws_url, 6767));
         let received = server.join().unwrap();
         assert!(received.contains("Runtime.evaluate"));
         assert!(received.contains("http://127.0.0.1:6767"));

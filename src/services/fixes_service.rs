@@ -1,4 +1,4 @@
-//! FixesService — Game & Denuvo fixes catalog, `.luatools-fix/` SHA-256 backup, apply & verified revert.
+//! FixesService — Game & DRMFix fixes catalog, `.luatools-fix/` SHA-256 backup, apply & verified revert.
 
 use std::fs::{self, File};
 use std::io;
@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
-use crate::services::api_client::{DenuvoFixItem, LuaToolsApiClient};
+use crate::services::api_client::{DRMFixFixItem, LuaToolsApiClient};
 use crate::services::lua_installer::LuaInstaller;
 use crate::services::settings_service::SettingsService;
 use crate::services::slssteam_service::SlssteamService;
@@ -70,11 +70,11 @@ impl FixesService {
             .exists()
     }
 
-    pub fn apply_denuvo_manifest<F>(
+    pub fn apply_drm_fix_manifest<F>(
         api: &LuaToolsApiClient,
         installer: &LuaInstaller,
         app_id: u32,
-        fix: &DenuvoFixItem,
+        fix: &DRMFixFixItem,
         settings_svc: Option<&mut SettingsService>,
         sls_svc: Option<&mut SlssteamService>,
         progress_cb: F,
@@ -89,7 +89,7 @@ impl FixesService {
             .clone()
             .unwrap_or_else(|| format!("{}.zip", app_id));
 
-        let res = match api.download_denuvo_slot(&fix.id, "manifest", &tmp, &fallback, progress_cb)
+        let res = match api.download_drm_fix_slot(&fix.id, "manifest", &tmp, &fallback, progress_cb)
         {
             Ok(dl_path) => {
                 let inst_res = installer.install_any(
@@ -124,10 +124,10 @@ impl FixesService {
         res
     }
 
-    pub fn apply_denuvo_fix<F>(
+    pub fn apply_drm_fix_fix<F>(
         api: &LuaToolsApiClient,
         app_id: u32,
-        fix: &DenuvoFixItem,
+        fix: &DRMFixFixItem,
         install_dir: &Path,
         progress_cb: F,
     ) -> FixApplicationResult
@@ -153,7 +153,8 @@ impl FixesService {
             .clone()
             .unwrap_or_else(|| format!("{}.zip", fix.id));
 
-        let dl_path = match api.download_denuvo_slot(&fix.id, "fix", &tmp, &fallback, progress_cb) {
+        let dl_path = match api.download_drm_fix_slot(&fix.id, "fix", &tmp, &fallback, progress_cb)
+        {
             Ok(p) => p,
             Err(e) => {
                 let _ = fs::remove_dir_all(&tmp);

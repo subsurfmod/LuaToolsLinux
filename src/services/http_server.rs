@@ -1,6 +1,7 @@
 //! Local HTTP/RPC server (`127.0.0.1:6767`) for injected Steam Store JS & CEF CDP polyfill.
 
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -79,7 +80,7 @@ fn send_json(req: Request, status: u16, payload: Value) {
 
 fn handle_request(
     mut req: Request,
-    stplug_dir: &PathBuf,
+    stplug_dir: &Path,
     event_tx: &Sender<RpcUiEvent>,
     wakeup: &Option<Arc<dyn Fn() + Send + Sync>>,
 ) {
@@ -109,14 +110,14 @@ fn handle_request(
         send_json(
             req,
             200,
-            json!({ "ok": true, "platform": "linux", "version": "2.0.0" }),
+            json!({ "ok": true, "platform": "linux", "version": crate::VERSION }),
         );
         return;
     }
 
     if parts == ["rpc"] && req.method() == &Method::Post {
         let mut raw = String::new();
-        let _ = req.as_reader().read_to_string(&mut raw);
+        let _ = req.as_reader().take(256 * 1024).read_to_string(&mut raw);
         let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
             send_json(
                 req,
