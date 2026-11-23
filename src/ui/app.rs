@@ -1,4 +1,4 @@
-//! Main `LuaToolsApp` state coordinator & architectural window shell (`eframe::App`).
+//! Main `LuaToolsApp` state coordinator & Papercut Monotone-Dark window shell (`eframe::App`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -7,9 +7,11 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use eframe::egui::{
-    self, Align, ColorImage, Frame, Key, KeyboardShortcut, Layout, Margin, Modifiers, RichText,
-    Stroke, TextEdit, TextureHandle, TextureOptions,
+    self, Align, Color32, ColorImage, CornerRadius, CursorIcon, FontFamily, FontId, Frame, Key,
+    KeyboardShortcut, Layout, Margin, Modifiers, Pos2, RichText, Sense, Stroke, TextEdit,
+    TextureHandle, TextureOptions, Vec2,
 };
+use egui_extras::{Size, StripBuilder};
 
 use crate::models::lua_vault::{LuaVariant, LuaVault};
 use crate::parsers::lua_parser::{LuaContents, LuaFileParser};
@@ -38,12 +40,12 @@ use crate::services::steam_service::SteamService;
 use crate::services::update_service::UpdateService;
 use crate::ui::state::{
     AcquireTab, ActiveView, AddByAppIdModal, AppMessage, DepotDetailModal, DepotPickRow,
-    DepotsSubTab, GameDetailModal, LaunchOptionsModal, LibraryRow, TextPromptModal,
-    UpdateBannerState,
+    DepotsSubTab, GameDetailModal, LaunchOptionsModal, LibraryRow, QaCaptureState, SettingsSubTab,
+    TextPromptModal, UpdateBannerState,
 };
 use crate::ui::theme::{
-    apply_sharp_monotone_theme, ghost_button, nav_rail_button, primary_button, status_badge,
-    BadgeTone, Palette,
+    apply_papercut_monotone_theme, display_font, draw_rem_medallion, nav_rail_button,
+    primary_button, semibold_font, Palette,
 };
 use crate::VERSION;
 
@@ -82,10 +84,9 @@ pub struct LuaToolsApp {
     pub millennium_connected: bool,
     pub cover_textures: HashMap<u32, TextureHandle>,
     pub cover_in_flight: HashSet<u32>,
-    pub dropzone_url_input: String,
     pub recent_installed: Vec<(u32, PathBuf)>,
 
-    // Acquire View State
+    // Discover (Acquire) View State
     pub acquire_search_query: String,
     pub acquire_tab: AcquireTab,
     pub featured_top: Vec<SteamFeaturedItem>,
@@ -134,11 +135,10 @@ pub struct LuaToolsApp {
     pub fixes_busy: bool,
     pub fixes_progress: f32,
 
-    // Toolchain View State
+    // Toolchain & Settings State
+    pub settings_subtab: SettingsSubTab,
     pub tool_busy: HashMap<String, bool>,
     pub tool_progress: HashMap<String, f32>,
-
-    // Settings & Self-Updater State
     pub settings_show_hubcap: bool,
     pub settings_hubcap_status: String,
     pub settings_usage_text: String,
@@ -146,19 +146,23 @@ pub struct LuaToolsApp {
     pub settings_update_status: String,
     pub update_banner: UpdateBannerState,
 
-    // Modals
+    // Modals & QA
     pub add_appid_modal: AddByAppIdModal,
     pub game_detail_modal: GameDetailModal,
     pub launch_options_modal: LaunchOptionsModal,
     pub depot_detail_modal: DepotDetailModal,
-    pub local_ctx_initialized: bool,
     pub text_prompt_modal: TextPromptModal,
     pub about_modal_open: bool,
+    pub qa_capture: Option<QaCaptureState>,
 }
 
 impl LuaToolsApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, initial_url: Option<String>) -> Self {
-        apply_sharp_monotone_theme(&cc.egui_ctx);
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        initial_url: Option<String>,
+        qa_screenshots_dir: Option<PathBuf>,
+    ) -> Self {
+        apply_papercut_monotone_theme(&cc.egui_ctx);
 
         let settings_service = SettingsService::default();
         let auth_service = AuthService::default();
@@ -190,6 +194,17 @@ impl LuaToolsApp {
             .to_string_lossy()
             .to_string();
 
+        let is_qa = qa_screenshots_dir.is_some();
+        let qa_capture = qa_screenshots_dir.map(|out_dir| {
+            let _ = fs::create_dir_all(&out_dir);
+            QaCaptureState {
+                out_dir,
+                step: 0,
+                frames_waited: 0,
+                pending_save: None,
+            }
+        });
+
         let mut app = Self {
             settings_service,
             auth_service,
@@ -216,11 +231,10 @@ impl LuaToolsApp {
             active_view: ActiveView::Overview,
             command_input: String::new(),
             focus_command_next: false,
-            status_text: "Initializing LuaTools Linux v2.0...".into(),
+            status_text: "Ready — drop .lua, .manifest, or .zip files anywhere to install".into(),
             millennium_connected: false,
             cover_textures: HashMap::new(),
             cover_in_flight: HashSet::new(),
-            dropzone_url_input: String::new(),
             recent_installed: Vec::new(),
             acquire_search_query: String::new(),
             acquire_tab: AcquireTab::TopSellers,
@@ -263,39 +277,275 @@ impl LuaToolsApp {
             fixes_selected_row: None,
             fixes_busy: false,
             fixes_progress: 0.0,
+            settings_subtab: SettingsSubTab::General,
             tool_busy: HashMap::new(),
             tool_progress: HashMap::new(),
             settings_show_hubcap: false,
             settings_hubcap_status: String::new(),
             settings_usage_text: String::new(),
-            settings_millennium_status: "Click PROBE MILLENNIUM to verify RPC bridge on :38495"
+            settings_millennium_status: "Click Probe Bridge to check Millennium RPC (:38495)"
                 .into(),
-            settings_update_status: "Idle (runs once in background on startup)".into(),
+            settings_update_status: "Checked automatically once on startup".into(),
             update_banner: UpdateBannerState::Hidden,
             add_appid_modal: AddByAppIdModal::default(),
             game_detail_modal: GameDetailModal::default(),
             launch_options_modal: LaunchOptionsModal::default(),
             depot_detail_modal: DepotDetailModal::default(),
-            local_ctx_initialized: false,
             text_prompt_modal: TextPromptModal::default(),
             about_modal_open: false,
+            qa_capture,
         };
 
         app.detect_steam_and_sync();
-        app.probe_bridge_async(&cc.egui_ctx);
-        app.fetch_featured_async(&cc.egui_ctx);
-        app.fetch_fix_listings_async(&cc.egui_ctx);
-        if app.settings_service.settings.check_updates_on_startup {
-            app.check_app_update_once_async(&cc.egui_ctx);
-        }
-        if app.auth_service.is_signed_in() {
-            app.fetch_usage_async(&cc.egui_ctx);
-        }
-        if let Some(url) = initial_url {
-            app.handle_protocol_url(&url, &cc.egui_ctx);
+        if is_qa {
+            app.populate_qa_demo_data();
+        } else {
+            app.probe_bridge_async(&cc.egui_ctx);
+            app.fetch_featured_async(&cc.egui_ctx);
+            app.fetch_fix_listings_async(&cc.egui_ctx);
+            if app.settings_service.settings.check_updates_on_startup {
+                app.check_app_update_once_async(&cc.egui_ctx);
+            }
+            if app.auth_service.is_signed_in() {
+                app.fetch_usage_async(&cc.egui_ctx);
+            }
+            if let Some(url) = initial_url {
+                app.handle_protocol_url(&url, &cc.egui_ctx);
+            }
         }
 
         app
+    }
+
+    /// Headless constructor used by offline visual & layout QA tests (uses `temp_dir` paths only).
+    pub fn new_headless_demo(ctx: &egui::Context, scratch_dir: &Path) -> Self {
+        apply_papercut_monotone_theme(ctx);
+        let _ = fs::create_dir_all(scratch_dir);
+        let settings_service = SettingsService::new(Some(scratch_dir.join("settings.json")));
+        let auth_service = AuthService::new(Some(scratch_dir.join("auth.json")));
+        let steam_service = SteamService::new();
+        let slssteam_service = SlssteamService::new(Some(scratch_dir.join("sls.yaml")));
+        let millennium_service = MillenniumService::default();
+        let api_client = LuaToolsApiClient::new(auth_service.clone());
+        let hubcap_service = HubcapService::new();
+        let app_info_cache = SteamAppInfoCache::new(Some(scratch_dir.join("appinfo")));
+        let applist_cache = SteamAppListCache::new(Some(scratch_dir.join("applist.json")));
+        let cover_cache = CoverCache::new(Some(scratch_dir.join("covers")));
+        let hardware_service = HardwareAppIdService::new(Some(scratch_dir.join("hw.json")));
+        let depot_info_service = SteamDepotInfo::new(Some(scratch_dir.join("depots")));
+        let depot_downloader = DepotDownloaderService::new(Some(scratch_dir.join("dd")));
+        let lua_vault = LuaVault::new(None, Some(scratch_dir.join("vault")));
+        let cef_injector = CefInjectorService::new(None, 6767);
+        let tools_manager = ExternalToolsManager::new(Some(scratch_dir.join("tools")));
+        let (msg_tx, msg_rx) = mpsc::channel();
+        let (rpc_tx, rpc_rx) = mpsc::channel();
+
+        let mut app = Self {
+            settings_service,
+            auth_service,
+            steam_service,
+            slssteam_service,
+            millennium_service,
+            api_client,
+            hubcap_service,
+            app_info_cache,
+            applist_cache,
+            cover_cache,
+            hardware_service,
+            depot_info_service,
+            depot_downloader,
+            lua_vault,
+            lua_installer: None,
+            cef_injector,
+            http_server: None,
+            tools_manager,
+            msg_tx,
+            msg_rx,
+            rpc_tx,
+            rpc_rx,
+            active_view: ActiveView::Overview,
+            command_input: String::new(),
+            focus_command_next: false,
+            status_text: "Ready — drop .lua, .manifest, or .zip files anywhere to install".into(),
+            millennium_connected: false,
+            cover_textures: HashMap::new(),
+            cover_in_flight: HashSet::new(),
+            recent_installed: vec![
+                (1245620, PathBuf::from("1245620.lua")),
+                (1091500, PathBuf::from("1091500.lua")),
+            ],
+            acquire_search_query: String::new(),
+            acquire_tab: AcquireTab::TopSellers,
+            featured_top: Vec::new(),
+            featured_new: Vec::new(),
+            search_results: Vec::new(),
+            acquire_selected_app: None,
+            acquire_details: None,
+            acquire_sources: BTreeMap::new(),
+            acquire_selected_source: None,
+            acquire_dlc_info: None,
+            acquire_busy: false,
+            acquire_progress: 0.0,
+            acquire_status: "AppID 1245620: 2 provider(s) available".into(),
+            library_rows: Vec::new(),
+            library_filter_mode: 0,
+            library_search: String::new(),
+            library_selected_ids: HashSet::new(),
+            depots_app_id: None,
+            depots_jump_input: String::new(),
+            depots_subtab: DepotsSubTab::Declarations,
+            depots_lua: None,
+            depots_info: None,
+            depots_variants: Vec::new(),
+            depots_selected_variant_hash: None,
+            depots_editor_text: String::new(),
+            depots_editing_live: false,
+            depots_picks: Vec::new(),
+            depots_dest_dir: "/home/user/LuaTools Depots".into(),
+            depots_downloading: false,
+            depots_dl_pct: 0.0,
+            depots_dl_status: String::new(),
+            fixes_listings: Vec::new(),
+            fixes_tags: Vec::new(),
+            fixes_selected_tag: None,
+            fixes_search: String::new(),
+            fixes_my_games_only: false,
+            fixes_current_app: None,
+            fixes_items: Vec::new(),
+            fixes_selected_row: None,
+            fixes_busy: false,
+            fixes_progress: 0.0,
+            settings_subtab: SettingsSubTab::General,
+            tool_busy: HashMap::new(),
+            tool_progress: HashMap::new(),
+            settings_show_hubcap: false,
+            settings_hubcap_status: String::new(),
+            settings_usage_text: String::new(),
+            settings_millennium_status: "Click Probe Millennium to check local RPC (:38495)".into(),
+            settings_update_status: "Up to date (v2.0-beta) · Checked once on startup".into(),
+            update_banner: UpdateBannerState::Hidden,
+            add_appid_modal: AddByAppIdModal::default(),
+            game_detail_modal: GameDetailModal::default(),
+            launch_options_modal: LaunchOptionsModal::default(),
+            depot_detail_modal: DepotDetailModal::default(),
+            text_prompt_modal: TextPromptModal::default(),
+            about_modal_open: false,
+            qa_capture: None,
+        };
+        app.populate_qa_demo_data();
+        app.rebuild_depot_picks();
+        app
+    }
+
+    fn populate_qa_demo_data(&mut self) {
+        if self.library_rows.is_empty() {
+            self.library_rows = vec![
+                LibraryRow {
+                    app_id: 1245620,
+                    name: "ELDEN RING".into(),
+                    installed: true,
+                    has_lua: true,
+                    fake_id: Some(480),
+                    has_token: true,
+                    status_label: "Installed + Lua",
+                    install_path: None,
+                },
+                LibraryRow {
+                    app_id: 1091500,
+                    name: "Cyberpunk 2077".into(),
+                    installed: true,
+                    has_lua: true,
+                    fake_id: Some(480),
+                    has_token: false,
+                    status_label: "Installed + Lua",
+                    install_path: None,
+                },
+                LibraryRow {
+                    app_id: 1145360,
+                    name: "Hades".into(),
+                    installed: false,
+                    has_lua: true,
+                    fake_id: None,
+                    has_token: false,
+                    status_label: "Lua Only",
+                    install_path: None,
+                },
+            ];
+        }
+        if self.featured_top.is_empty() {
+            self.featured_top = vec![
+                SteamFeaturedItem {
+                    app_id: 1245620,
+                    name: "ELDEN RING".into(),
+                    large_capsule_image: String::new(),
+                },
+                SteamFeaturedItem {
+                    app_id: 1091500,
+                    name: "Cyberpunk 2077".into(),
+                    large_capsule_image: String::new(),
+                },
+                SteamFeaturedItem {
+                    app_id: 2358720,
+                    name: "Black Myth: Wukong".into(),
+                    large_capsule_image: String::new(),
+                },
+            ];
+            self.acquire_selected_app = Some(1245620);
+            self.acquire_details = Some(GameDetails {
+                app_id: 1245620,
+                name: "ELDEN RING".into(),
+                app_type: "game".into(),
+                base_app_id: None,
+                genres: vec!["Action".into(), "RPG".into()],
+                header_image: String::new(),
+                release_date: "Feb 25, 2022".into(),
+                is_free: false,
+            });
+            self.acquire_sources
+                .insert("morrenus".into(), "available".into());
+            self.acquire_sources
+                .insert("hubcap".into(), "available".into());
+            self.acquire_sources
+                .insert("mirror_eu".into(), "unavailable".into());
+        }
+        self.depots_app_id = Some(1245620);
+        let sample_lua = format!(
+            "addappid(1245620) -- ELDEN RING\naddappid(1245621, 1, \"{}\")\naddappid(2778580) -- Shadow of the Erdtree\nsetManifestid(1245621, \"8492018394810293847\", 52428800000)\n",
+            "a8f4c2e1".repeat(8)
+        );
+        self.depots_lua = Some(LuaFileParser::parse_text(&sample_lua, 1245620));
+        self.depots_editor_text = sample_lua;
+        self.fixes_listings = vec![DenuvoGameListing {
+            app_id: "2358720".into(),
+            name: "Black Myth: Wukong".into(),
+            fix_count: 2,
+            tags: vec![DenuvoTag {
+                id: "online".into(),
+                name: "Online Fix".into(),
+                slug: "online".into(),
+            }],
+        }];
+        self.fixes_tags = vec![DenuvoTag {
+            id: "online".into(),
+            name: "Online Fix".into(),
+            slug: "online".into(),
+        }];
+        self.fixes_current_app = Some(2358720);
+        self.fixes_items = vec![DenuvoFixItem {
+            id: "fx_1".into(),
+            title: "Verified Launch & Offline Bypass Patch".into(),
+            description: "Backs up original binaries with SHA-256 verification before applying."
+                .into(),
+            tags: Vec::new(),
+            has_manifest: true,
+            has_fix: true,
+            manifest_filename: None,
+            fix_filename: None,
+        }];
+        self.update_banner = UpdateBannerState::Available {
+            badge: "⬆ Update v2.0".into(),
+            tooltip: "New commits available on GitHub".into(),
+        };
     }
 
     pub fn detect_steam_and_sync(&mut self) {
@@ -328,7 +578,7 @@ impl LuaToolsApp {
 
             self.refresh_all_local_state();
             self.status_text = format!(
-                "Ready — Steam detected at {} ({} library folder(s))",
+                "Steam connected at {} ({} library folder(s))",
                 inst.root.display(),
                 inst.libraries.len()
             );
@@ -337,7 +587,7 @@ impl LuaToolsApp {
             self.recent_installed.clear();
             self.library_rows.clear();
             self.status_text =
-                "Steam not detected at standard paths. Set an override path in 07 // SYSTEM if needed."
+                "Steam not detected — set your Steam folder in Settings if installed in a custom path."
                     .into();
         }
     }
@@ -393,9 +643,9 @@ impl LuaToolsApp {
                 .or_else(|| self.applist_cache.get_name(aid))
                 .unwrap_or_else(|| format!("App {}", aid));
             let status_label = match (is_inst, has_lua) {
-                (true, true) => "INSTALLED + LUA",
-                (false, true) => "LUA ONLY",
-                _ => "INSTALLED",
+                (true, true) => "Installed + Lua",
+                (false, true) => "Lua Only",
+                _ => "Installed",
             };
             rows.push(LibraryRow {
                 app_id: aid,
@@ -472,10 +722,10 @@ impl LuaToolsApp {
         thread::spawn(move || {
             let mut parts = Vec::new();
             if let Some((u, lim)) = api.get_standard_usage() {
-                parts.push(format!("DAILY QUOTA: {}/{}", u, lim));
+                parts.push(format!("Daily quota: {}/{}", u, lim));
             }
             if let Some(sup) = api.get_supporter_status() {
-                parts.push(format!("SUPPORTER: {}", if sup { "YES" } else { "NO" }));
+                parts.push(format!("Supporter: {}", if sup { "Yes" } else { "No" }));
             }
             let _ = tx.send(AppMessage::UsageLoaded(parts.join("  ·  ")));
             ctx_c.request_repaint();
@@ -523,7 +773,7 @@ impl LuaToolsApp {
             self.open_app_in_acquire(aid, ctx);
             return;
         }
-        self.acquire_status = format!("Searching Steam Store for '{}'...", q);
+        self.acquire_status = format!("Searching Steam Store for '{}'…", q);
         let q_owned = q.to_string();
         let api = self.api_client.clone();
         let hw = self.hardware_service.clone();
@@ -553,10 +803,7 @@ impl LuaToolsApp {
         self.acquire_sources.clear();
         self.acquire_selected_source = None;
         self.acquire_dlc_info = None;
-        self.acquire_status = format!(
-            "Fetching details & manifest sources for AppID {}...",
-            app_id
-        );
+        self.acquire_status = format!("Checking providers for AppID {}…", app_id);
         self.ensure_cover_requested(app_id, None, ctx);
 
         let info_cache = self.app_info_cache.clone();
@@ -610,12 +857,13 @@ impl LuaToolsApp {
         }
         if source != "hubcap" && !self.auth_service.is_signed_in() {
             self.acquire_status =
-                "Sign in with Discord in 07 // SYSTEM first (or use a Hubcap key).".into();
+                "Sign in with Discord in Settings → Account first (or configure a Hubcap key)."
+                    .into();
             return;
         }
         self.acquire_busy = true;
         self.acquire_progress = 0.0;
-        self.acquire_status = format!("Downloading manifest package from {}...", source);
+        self.acquire_status = format!("Downloading manifest package from {}…", source);
 
         let api = self.api_client.clone();
         let hc = self.hubcap_service.clone();
@@ -833,7 +1081,7 @@ impl LuaToolsApp {
         ctx: &egui::Context,
     ) {
         if !self.auth_service.is_signed_in() {
-            self.status_text = "Sign in with Discord in 07 // SYSTEM first.".into();
+            self.status_text = "Sign in with Discord in Settings → Account first.".into();
             return;
         }
         self.fixes_busy = true;
@@ -885,7 +1133,7 @@ impl LuaToolsApp {
         ctx: &egui::Context,
     ) {
         if !self.auth_service.is_signed_in() {
-            self.status_text = "Sign in with Discord in 07 // SYSTEM first.".into();
+            self.status_text = "Sign in with Discord in Settings → Account first.".into();
             return;
         }
         self.fixes_busy = true;
@@ -975,7 +1223,7 @@ impl LuaToolsApp {
         let rem_ov = self.settings_service.settings.git_remote_url.clone();
         let tx = self.msg_tx.clone();
         let ctx_c = ctx.clone();
-        self.settings_update_status = "Checking Git remote for updates...".into();
+        self.settings_update_status = "Checking Git remote for updates…".into();
         thread::spawn(move || {
             let res = UpdateService::check_once(&repo_ov, &rem_ov);
             let _ = tx.send(AppMessage::UpdateCheckFinished(res));
@@ -994,10 +1242,10 @@ impl LuaToolsApp {
 
         self.update_banner = UpdateBannerState::Updating {
             pct: 0.05,
-            step: "Starting Git pull & update...".into(),
+            step: "Starting Git pull & update…".into(),
         };
-        self.status_text = "Updating from Git...".into();
-        self.settings_update_status = "Pulling from Git & rebuilding release binary...".into();
+        self.status_text = "Updating from Git…".into();
+        self.settings_update_status = "Pulling from Git & rebuilding release binary…".into();
 
         thread::spawn(move || {
             let tx_p = tx.clone();
@@ -1015,13 +1263,13 @@ impl LuaToolsApp {
         let m = self.millennium_service.clone();
         let tx = self.msg_tx.clone();
         let ctx_c = ctx.clone();
-        self.status_text = "Sending RestartSteam RPC to Millennium...".into();
+        self.status_text = "Sending RestartSteam RPC to Millennium…".into();
         thread::spawn(move || {
             match m.restart_steam() {
                 Ok(()) => {
                     let _ = tx.send(AppMessage::SteamRestarted {
                         ok: true,
-                        msg: "Restarting Steam...".into(),
+                        msg: "Restarting Steam…".into(),
                     });
                 }
                 Err(e) => {
@@ -1068,9 +1316,9 @@ impl LuaToolsApp {
         }
         self.refresh_all_local_state();
         if ok_count > 0 {
-            self.status_text = format!("Installed {} dropped package(s) into Steam.", ok_count);
+            self.status_text = format!("Installed {} package(s) into Steam.", ok_count);
         } else if let Some(e) = last_err {
-            self.status_text = format!("Drop install error: {}", e);
+            self.status_text = format!("Install error: {}", e);
         }
     }
 
@@ -1094,12 +1342,12 @@ impl LuaToolsApp {
                     self.millennium_connected = available;
                     self.settings_millennium_status = if available {
                         format!(
-                            "CONNECTED :: Millennium v{}  ·  Steam={}",
+                            "Connected · Millennium v{} · Steam={}",
                             version.unwrap_or_else(|| "unknown".into()),
                             steam_path.unwrap_or_else(|| "unknown".into())
                         )
                     } else {
-                        "OFFLINE :: Millennium RPC not reachable on 127.0.0.1:38495".into()
+                        "Offline · Millennium RPC not running on 127.0.0.1:38495".into()
                     };
                 }
                 AppMessage::CoverLoaded {
@@ -1216,14 +1464,14 @@ impl LuaToolsApp {
                     if pct > 0.0 {
                         self.depots_dl_pct = pct;
                     }
-                    self.depots_dl_status = format!("{} :: {:.1}% — {}", depot_label, pct, msg);
+                    self.depots_dl_status = format!("{} · {:.1}% — {}", depot_label, pct, msg);
                 }
                 AppMessage::DepotDownloadFinished { results } => {
                     self.depots_downloading = false;
                     let ok = results.iter().filter(|r| r.ok).count();
                     let total = results.len();
                     self.depots_dl_status =
-                        format!("COMPLETED :: {} / {} depot(s) downloaded", ok, total);
+                        format!("Completed · {} of {} depot(s) downloaded", ok, total);
                     self.status_text = self.depots_dl_status.clone();
                 }
                 AppMessage::FixListingsLoaded { games, tags } => {
@@ -1333,15 +1581,15 @@ impl LuaToolsApp {
                     };
                     if chk.available {
                         let badge = match (&chk.remote_version, chk.commits_behind) {
-                            (Some(v), _) if v != VERSION => format!("⬆ UPDATE v{}", v),
-                            (_, b) if b > 0 => format!("⬆ UPDATE (+{})", b),
-                            _ => "⬆ UPDATE".into(),
+                            (Some(v), _) if v != VERSION => format!("⬆ Update v{}", v),
+                            (_, b) if b > 0 => format!("⬆ Update (+{})", b),
+                            _ => "⬆ Update".into(),
                         };
                         let mut tip = chk.summary.clone();
                         if let Some(c) = &chk.latest_commit {
                             tip.push_str(&format!("\nLatest: {}", c));
                         }
-                        tip.push_str("\nClick to pull latest files from Git and update binary.");
+                        tip.push_str("\nClick to pull latest files from Git and update.");
                         self.update_banner = UpdateBannerState::Available {
                             badge,
                             tooltip: tip,
@@ -1362,7 +1610,7 @@ impl LuaToolsApp {
                 AppMessage::UpdateApplyFinished(outcome) => match outcome {
                     Ok(res) => {
                         let summary = format!(
-                            "Updated to v{} ({}) — click ↻ RESTART in the bottom-right corner to relaunch.",
+                            "Updated to v{} ({}) — click ↻ Restart in the corner to relaunch.",
                             res.new_version, res.commit_info
                         );
                         self.status_text = summary.clone();
@@ -1375,13 +1623,10 @@ impl LuaToolsApp {
                     }
                     Err(err) => {
                         self.status_text = format!("Update failed: {}", err);
-                        self.settings_update_status = format!("ERROR :: {}", err);
+                        self.settings_update_status = format!("Error: {}", err);
                         self.update_banner = UpdateBannerState::Available {
-                            badge: "⬆ RETRY UPDATE".into(),
-                            tooltip: format!(
-                                "Last attempt failed: {}\nClick to retry Git pull & update.",
-                                err
-                            ),
+                            badge: "⬆ Retry Update".into(),
+                            tooltip: format!("Last attempt failed: {}\nClick to retry.", err),
                         };
                     }
                 },
@@ -1416,9 +1661,6 @@ impl LuaToolsApp {
                 self.active_view = ActiveView::Fixes;
             }
             if i.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::Num6)) {
-                self.active_view = ActiveView::Toolchain;
-            }
-            if i.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::Num7)) {
                 self.active_view = ActiveView::Settings;
             }
             if i.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::Q)) {
@@ -1464,7 +1706,7 @@ impl LuaToolsApp {
         }
         if let Some(aid) = SteamLinkParser::app_id_from(&raw) {
             self.open_app_in_acquire(aid, ctx);
-            self.status_text = format!("Opened AppID {} in Acquire Inspector", aid);
+            self.status_text = format!("Opened AppID {} in Discover", aid);
             return;
         }
 
@@ -1472,14 +1714,9 @@ impl LuaToolsApp {
         self.active_view = ActiveView::Acquire;
         self.execute_store_search(&raw, ctx);
     }
-}
 
-impl eframe::App for LuaToolsApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.pump_messages(ctx);
-        self.handle_shortcuts_and_drops(ctx);
-
-        // Auto-populate Depots view with most recent Lua game when visiting Depots
+    /// Renders the complete UI shell into `ctx` (callable both from `eframe::App::update` and headless layout tests).
+    pub fn render_shell(&mut self, ctx: &egui::Context) {
         if self.active_view == ActiveView::Depots && self.depots_app_id.is_none() {
             if let Some((first_aid, _)) = self.recent_installed.first().cloned() {
                 self.open_game_in_depots(first_aid, ctx);
@@ -1488,180 +1725,224 @@ impl eframe::App for LuaToolsApp {
             }
         }
 
-        // 1. Top Command Bar
+        // 1. Top Bar — Strict 3-Column StripBuilder (mathematically zero overlap at any width)
+        let mut run_omnibox = false;
+        let mut click_rescan = false;
+
         egui::TopBottomPanel::top("top_command_bar")
-            .exact_height(48.0)
+            .exact_height(56.0)
             .frame(
                 Frame::new()
                     .fill(Palette::BG_VOID)
-                    .stroke(Stroke::new(1.0_f32, Palette::BORDER_DEFAULT))
-                    .inner_margin(Margin::symmetric(14, 0)),
+                    .stroke(Stroke::new(1.0_f32, Palette::BORDER_SUBTLE))
+                    .inner_margin(Margin::symmetric(16, 0)),
             )
             .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    Frame::new()
-                        .fill(Palette::BLUE_PRIMARY)
-                        .stroke(Stroke::new(1.0_f32, Palette::BLUE_LIGHT))
-                        .inner_margin(Margin::symmetric(6, 3))
-                        .show(ui, |ui| {
+                StripBuilder::new(ui)
+                    .size(Size::exact(196.0))
+                    .size(Size::remainder().at_least(220.0))
+                    .size(Size::exact(156.0))
+                    .cell_layout(Layout::left_to_right(Align::Center))
+                    .horizontal(|mut strip| {
+                        // Left: Cut-Paper Rem Medallion + Rich Display Title
+                        strip.cell(|ui| {
+                            ui.spacing_mut().item_spacing.x = 9.0;
+                            draw_rem_medallion(ui, 30.0);
                             ui.label(
-                                RichText::new("LT")
-                                    .monospace()
-                                    .strong()
-                                    .color(egui::Color32::WHITE),
+                                RichText::new("LuaTools")
+                                    .font(display_font(18.5))
+                                    .color(Palette::TEXT_PRIMARY),
+                            );
+                            ui.label(
+                                RichText::new(VERSION)
+                                    .font(FontId::new(11.0, FontFamily::Monospace))
+                                    .color(Palette::TEXT_MUTED),
                             );
                         });
 
-                    ui.label(
-                        RichText::new("LUATOOLS // LINUX")
-                            .monospace()
-                            .strong()
-                            .size(12.5)
-                            .color(Palette::TEXT_PRIMARY),
-                    );
-                    ui.label(
-                        RichText::new(format!("v{}", VERSION))
-                            .monospace()
-                            .size(10.5)
-                            .color(Palette::TEXT_MUTED),
-                    );
-                    ui.add_space(6.0);
+                        // Center: Single Clean Bounded Omnibox + Go Button
+                        strip.cell(|ui| {
+                            let avail = ui.available_width();
+                            let input_w = (avail - 78.0).clamp(130.0, 480.0);
+                            let pad_left = ((avail - (input_w + 68.0)) * 0.5).max(0.0);
+                            if pad_left > 2.0 {
+                                ui.add_space(pad_left);
+                            }
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            let resp = ui.add_sized(
+                                [input_w, 32.0],
+                                TextEdit::singleline(&mut self.command_input)
+                                    .margin(Margin::symmetric(10, 7))
+                                    .hint_text("Search Store, AppID, or paste Steam URL…  (Ctrl+K)"),
+                            );
+                            if self.focus_command_next {
+                                resp.request_focus();
+                                self.focus_command_next = false;
+                            }
+                            let enter =
+                                resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                            if enter || primary_button(ui, "Search").clicked() {
+                                run_omnibox = true;
+                            }
+                        });
 
-                    let cmd_w = (ui.available_width() - 395.0).max(180.0);
-                    let cmd_resp = ui.add(
-                        TextEdit::singleline(&mut self.command_input)
-                            .hint_text(
-                                "Quick Command [Ctrl+K] — Enter AppID, paste Steam / SteamDB URL, or search Store...",
-                            )
-                            .desired_width(cmd_w),
-                    );
-                    if self.focus_command_next {
-                        cmd_resp.request_focus();
-                        self.focus_command_next = false;
-                    }
-                    let enter = cmd_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                    if enter || primary_button(ui, "EXECUTE").clicked() {
-                        self.execute_quick_command(ctx);
-                    }
-
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ghost_button(ui, "ABOUT").clicked() {
-                            self.about_modal_open = true;
-                        }
-                        if ghost_button(ui, "RESTART STEAM").clicked() {
-                            self.trigger_restart_steam(ctx);
-                        }
-                        if ghost_button(ui, "RESCAN").clicked() {
-                            self.detect_steam_and_sync();
-                        }
-                        if self.steam_service.is_available() {
-                            status_badge(ui, "STEAM ONLINE", BadgeTone::Blue);
-                        } else {
-                            status_badge(ui, "NO STEAM", BadgeTone::Warn);
-                        }
+                        // Right: Single Calm Steam Status Pill (click to rescan)
+                        strip.cell(|ui| {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let online = self.steam_service.is_available();
+                                let (lbl, bg, fg) = if online {
+                                    ("● Steam Ready", Palette::GO_BG, Palette::GO_TEXT)
+                                } else {
+                                    ("○ No Steam", Palette::WARN_BG, Palette::WARN_TEXT)
+                                };
+                                let g = ui.painter().layout_no_wrap(
+                                    lbl.to_string(),
+                                    semibold_font(11.5),
+                                    fg,
+                                );
+                                let sz = Vec2::new(g.size().x + 22.0, 28.0);
+                                let (rect, pill_resp) = ui.allocate_exact_size(sz, Sense::click());
+                                if pill_resp.hovered() {
+                                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                }
+                                if ui.is_rect_visible(rect) {
+                                    ui.painter().rect_filled(
+                                        rect.translate(Vec2::new(0.0, 1.5)),
+                                        CornerRadius::same(4),
+                                        Palette::BG_PANEL_LO,
+                                    );
+                                    ui.painter()
+                                        .rect_filled(rect, CornerRadius::same(4), bg);
+                                    ui.painter().galley(
+                                        Pos2::new(
+                                            rect.center().x - g.size().x * 0.5,
+                                            rect.center().y - g.size().y * 0.5,
+                                        ),
+                                        g,
+                                        fg,
+                                    );
+                                }
+                                let tip = match &self.steam_service.installation {
+                                    Some(i) => format!(
+                                        "Steam root: {}\nLibraries: {}\nClick to rescan",
+                                        i.root.display(),
+                                        i.libraries.len()
+                                    ),
+                                    None => "Steam not detected. Click to rescan or configure path in Settings.".into(),
+                                };
+                                if pill_resp.on_hover_text(tip).clicked() {
+                                    click_rescan = true;
+                                }
+                            });
+                        });
                     });
-                });
             });
 
-        // 2. Bottom Status Strip (with compact bottom-right corner Git Update button)
+        if run_omnibox {
+            self.execute_quick_command(ctx);
+        }
+        if click_rescan {
+            self.detect_steam_and_sync();
+        }
+
+        // 2. Bottom Status Bar — Zero-Overlap Sides + Tactile Corner Git Update Button
         let mut click_start_update = false;
         let mut click_relaunch_exe: Option<PathBuf> = None;
 
         egui::TopBottomPanel::bottom("bottom_status_strip")
-            .exact_height(28.0)
+            .exact_height(32.0)
             .frame(
                 Frame::new()
                     .fill(Palette::BG_VOID)
-                    .stroke(Stroke::new(1.0_f32, Palette::BORDER_DEFAULT))
-                    .inner_margin(Margin::symmetric(14, 0)),
+                    .stroke(Stroke::new(1.0_f32, Palette::BORDER_SUBTLE))
+                    .inner_margin(Margin::symmetric(16, 0)),
             )
             .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.label(
-                        RichText::new(&self.status_text)
-                            .monospace()
-                            .size(10.5)
-                            .color(Palette::TEXT_SECONDARY),
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        match &self.update_banner {
-                            UpdateBannerState::Hidden => {}
-                            UpdateBannerState::Available { badge, tooltip } => {
-                                let btn = egui::Button::new(
-                                    RichText::new(badge)
-                                        .monospace()
-                                        .strong()
-                                        .size(10.5)
-                                        .color(egui::Color32::WHITE),
-                                )
-                                .fill(Palette::BLUE_PRIMARY)
-                                .stroke(Stroke::new(1.0_f32, Palette::BLUE_LIGHT))
-                                .corner_radius(egui::CornerRadius::ZERO)
-                                .min_size(egui::Vec2::new(96.0, 20.0));
-                                let resp = ui.add(btn).on_hover_text(tooltip);
-                                if resp.hovered() {
-                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                }
-                                if resp.clicked() {
-                                    click_start_update = true;
-                                }
-                                ui.add_space(8.0);
+                egui::Sides::new().show(
+                    ui,
+                    |ui| {
+                        ui.horizontal_centered(|ui| {
+                            ui.label(
+                                RichText::new(&self.status_text)
+                                    .size(12.0)
+                                    .color(Palette::TEXT_SECONDARY),
+                            );
+                        });
+                    },
+                    |ui| {
+                        ui.horizontal_centered(|ui| {
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            if let Some(i) = &self.steam_service.installation {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} ({} lib)",
+                                        i.root.display(),
+                                        i.libraries.len()
+                                    ))
+                                    .font(FontId::new(11.0, FontFamily::Monospace))
+                                    .color(Palette::TEXT_MUTED),
+                                );
                             }
-                            UpdateBannerState::Updating { pct, step } => {
-                                let lbl = format!("⟳ UPDATING {:>2.0}%", pct * 100.0);
-                                let btn = egui::Button::new(
-                                    RichText::new(lbl)
-                                        .monospace()
-                                        .strong()
-                                        .size(10.5)
-                                        .color(Palette::BLUE_LIGHT),
-                                )
-                                .fill(Palette::BLUE_SUBTLE)
-                                .stroke(Stroke::new(1.0_f32, Palette::BLUE_BORDER))
-                                .corner_radius(egui::CornerRadius::ZERO)
-                                .min_size(egui::Vec2::new(108.0, 20.0));
-                                ui.add_enabled(false, btn).on_disabled_hover_text(step);
-                                ui.add_space(8.0);
-                            }
-                            UpdateBannerState::ReadyToRestart {
-                                new_version,
-                                exe_path,
-                                summary,
-                            } => {
-                                let btn = egui::Button::new(
-                                    RichText::new(format!("↻ RESTART (v{})", new_version))
-                                        .monospace()
-                                        .strong()
-                                        .size(10.5)
-                                        .color(egui::Color32::WHITE),
-                                )
-                                .fill(Palette::BLUE_HOVER)
-                                .stroke(Stroke::new(1.0_f32, Palette::BLUE_LIGHT))
-                                .corner_radius(egui::CornerRadius::ZERO)
-                                .min_size(egui::Vec2::new(112.0, 20.0));
-                                let resp = ui.add(btn).on_hover_text(summary);
-                                if resp.hovered() {
-                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                }
-                                if resp.clicked() {
-                                    click_relaunch_exe = Some(exe_path.clone());
-                                }
-                                ui.add_space(8.0);
-                            }
-                        }
 
-                        let path_txt = match &self.steam_service.installation {
-                            Some(i) => format!("{}  [{} LIB]", i.root.display(), i.libraries.len()),
-                            None => "STEAM :: NOT DETECTED".into(),
-                        };
-                        ui.label(
-                            RichText::new(path_txt)
-                                .monospace()
-                                .size(10.5)
-                                .color(Palette::TEXT_MUTED),
-                        );
-                    });
-                });
+                            match &self.update_banner {
+                                UpdateBannerState::Hidden => {}
+                                UpdateBannerState::Available { badge, tooltip } => {
+                                    let btn = egui::Button::new(
+                                        RichText::new(badge)
+                                            .font(semibold_font(11.5))
+                                            .color(Palette::TEXT_PRIMARY),
+                                    )
+                                    .fill(Palette::BLUE_PRIMARY)
+                                    .stroke(Stroke::new(1.0_f32, Palette::BLUE_BORDER))
+                                    .corner_radius(CornerRadius::same(4))
+                                    .min_size(Vec2::new(98.0, 22.0));
+                                    let resp = ui.add(btn).on_hover_text(tooltip);
+                                    if resp.hovered() {
+                                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                    }
+                                    if resp.clicked() {
+                                        click_start_update = true;
+                                    }
+                                }
+                                UpdateBannerState::Updating { pct, step } => {
+                                    let lbl = format!("⟳ Updating {:>2.0}%", pct * 100.0);
+                                    let btn = egui::Button::new(
+                                        RichText::new(lbl)
+                                            .font(semibold_font(11.5))
+                                            .color(Palette::BLUE_LIGHT),
+                                    )
+                                    .fill(Palette::BLUE_SUBTLE)
+                                    .stroke(Stroke::new(1.0_f32, Palette::BLUE_BORDER))
+                                    .corner_radius(CornerRadius::same(4))
+                                    .min_size(Vec2::new(112.0, 22.0));
+                                    ui.add_enabled(false, btn).on_disabled_hover_text(step);
+                                }
+                                UpdateBannerState::ReadyToRestart {
+                                    new_version,
+                                    exe_path,
+                                    summary,
+                                } => {
+                                    let btn = egui::Button::new(
+                                        RichText::new(format!("↻ Restart (v{})", new_version))
+                                            .font(semibold_font(11.5))
+                                            .color(Palette::TEXT_PRIMARY),
+                                    )
+                                    .fill(Palette::BLUE_HOVER)
+                                    .stroke(Stroke::new(1.0_f32, Palette::BLUE_LIGHT))
+                                    .corner_radius(CornerRadius::same(4))
+                                    .min_size(Vec2::new(116.0, 22.0));
+                                    let resp = ui.add(btn).on_hover_text(summary);
+                                    if resp.hovered() {
+                                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                    }
+                                    if resp.clicked() {
+                                        click_relaunch_exe = Some(exe_path.clone());
+                                    }
+                                }
+                            }
+                        });
+                    },
+                );
             });
 
         if click_start_update {
@@ -1674,133 +1955,95 @@ impl eframe::App for LuaToolsApp {
             }
         }
 
-        // 3. Left Architectural Navigation Rail
+        // 3. Left Sidebar Rail — Calm, Clean, Spacious
         egui::SidePanel::left("left_nav_rail")
-            .exact_width(218.0)
+            .exact_width(204.0)
             .resizable(false)
             .frame(
                 Frame::new()
                     .fill(Palette::BG_VOID)
-                    .stroke(Stroke::new(1.0_f32, Palette::BORDER_DEFAULT))
+                    .stroke(Stroke::new(1.0_f32, Palette::BORDER_SUBTLE))
                     .inner_margin(Margin::ZERO),
             )
             .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                ui.add_space(10.0);
+                // Dock Settings & Account quietly at the bottom of the rail so they never collide
+                egui::TopBottomPanel::bottom("nav_bottom_section")
+                    .frame(
+                        Frame::new()
+                            .fill(Palette::BG_VOID)
+                            .inner_margin(Margin::symmetric(0, 10)),
+                    )
+                    .show_separator_line(false)
+                    .show_inside(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 4.0;
+                        if nav_rail_button(
+                            ui,
+                            "Settings",
+                            None,
+                            self.active_view == ActiveView::Settings,
+                            204.0,
+                        )
+                        .clicked()
+                        {
+                            self.active_view = ActiveView::Settings;
+                        }
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            let acct = if self.auth_service.is_signed_in() {
+                                format!("● {}", self.auth_service.display_name())
+                            } else {
+                                "○ Guest mode".into()
+                            };
+                            ui.label(RichText::new(acct).size(11.5).color(
+                                if self.auth_service.is_signed_in() {
+                                    Palette::BLUE_LIGHT
+                                } else {
+                                    Palette::TEXT_MUTED
+                                },
+                            ));
+                        });
+                    });
+
+                ui.spacing_mut().item_spacing.y = 4.0;
+                ui.add_space(16.0);
                 ui.horizontal(|ui| {
-                    ui.add_space(14.0);
+                    ui.add_space(22.0);
                     ui.label(
-                        RichText::new("NAVIGATION")
-                            .monospace()
-                            .strong()
-                            .size(10.0)
+                        RichText::new("WORKSPACES")
+                            .font(semibold_font(10.5))
                             .color(Palette::TEXT_MUTED),
                     );
                 });
                 ui.add_space(6.0);
 
-                let lua_n = self.recent_installed.len();
-                let lib_lbl = if lua_n > 0 {
-                    format!("03  LIBRARY  [{}]", lua_n)
-                } else {
-                    "03  LIBRARY".into()
-                };
-
+                let lua_n = self
+                    .library_rows
+                    .iter()
+                    .filter(|r| r.has_lua)
+                    .count()
+                    .max(self.recent_installed.len());
                 let items = [
-                    ("01  OVERVIEW".to_string(), ActiveView::Overview),
-                    ("02  ACQUIRE".to_string(), ActiveView::Acquire),
-                    (lib_lbl, ActiveView::Library),
-                    ("04  DEPOTS & VAULT".to_string(), ActiveView::Depots),
-                    ("05  FIX CATALOG".to_string(), ActiveView::Fixes),
-                    ("06  TOOLCHAIN".to_string(), ActiveView::Toolchain),
-                    ("07  SYSTEM".to_string(), ActiveView::Settings),
+                    ("Home", None, ActiveView::Overview),
+                    ("Discover", None, ActiveView::Acquire),
+                    ("Library", Some(lua_n), ActiveView::Library),
+                    ("Depots & Vault", None, ActiveView::Depots),
+                    ("Game Fixes", None, ActiveView::Fixes),
                 ];
 
-                for (lbl, view) in items {
-                    if nav_rail_button(ui, &lbl, self.active_view == view, 218.0).clicked() {
+                for (lbl, count, view) in items {
+                    if nav_rail_button(ui, lbl, count, self.active_view == view, 204.0).clicked() {
                         self.active_view = view;
                     }
                 }
-
-                // Bottom Telemetry Block
-                ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-                    Frame::new()
-                        .fill(egui::Color32::from_rgb(12, 12, 15))
-                        .stroke(Stroke::new(1.0_f32, Palette::BORDER_SUBTLE))
-                        .inner_margin(Margin::same(12))
-                        .show(ui, |ui| {
-                            ui.set_width(194.0);
-                            ui.vertical(|ui| {
-                                ui.spacing_mut().item_spacing.y = 4.0;
-                                ui.label(
-                                    RichText::new("TELEMETRY")
-                                        .monospace()
-                                        .strong()
-                                        .size(10.0)
-                                        .color(Palette::BLUE_LIGHT),
-                                );
-                                let auth_txt = if self.auth_service.is_signed_in() {
-                                    format!("AUTH     :: {}", self.auth_service.display_name())
-                                } else {
-                                    "AUTH     :: GUEST".into()
-                                };
-                                ui.label(RichText::new(auth_txt).monospace().size(10.0).color(
-                                    if self.auth_service.is_signed_in() {
-                                        Palette::BLUE_LIGHT
-                                    } else {
-                                        Palette::TEXT_MUTED
-                                    },
-                                ));
-                                let sls_txt = if self.slssteam_service.config.exists() {
-                                    format!(
-                                        "SLSSTEAM :: PNO={}",
-                                        if self.slssteam_service.config.play_not_owned {
-                                            "ON"
-                                        } else {
-                                            "OFF"
-                                        }
-                                    )
-                                } else {
-                                    "SLSSTEAM :: UNSET".into()
-                                };
-                                ui.label(
-                                    RichText::new(sls_txt)
-                                        .monospace()
-                                        .size(10.0)
-                                        .color(Palette::TEXT_SECONDARY),
-                                );
-                                let br_txt = if self.millennium_connected {
-                                    "BRIDGE   :: RPC :38495"
-                                } else if self.cef_injector.is_running() {
-                                    "BRIDGE   :: CEF :8080"
-                                } else {
-                                    "BRIDGE   :: DIRECT"
-                                };
-                                ui.label(RichText::new(br_txt).monospace().size(10.0).color(
-                                    if self.millennium_connected {
-                                        Palette::BLUE_LIGHT
-                                    } else {
-                                        Palette::TEXT_MUTED
-                                    },
-                                ));
-                                ui.add_space(4.0);
-                                ui.label(
-                                    RichText::new("DROP .LUA / .ZIP ANYWHERE")
-                                        .monospace()
-                                        .size(9.5)
-                                        .color(Palette::TEXT_MUTED),
-                                );
-                            });
-                        });
-                });
             });
 
-        // 4. Central Workspace Panel
+        // 4. Main Central Desk Canvas (generous 24px margin)
         egui::CentralPanel::default()
             .frame(
                 Frame::new()
                     .fill(Palette::BG_BASE)
-                    .inner_margin(Margin::symmetric(20, 16)),
+                    .inner_margin(Margin::symmetric(24, 20)),
             )
             .show(ctx, |ui| match self.active_view {
                 ActiveView::Overview => self.render_overview(ui),
@@ -1808,11 +2051,10 @@ impl eframe::App for LuaToolsApp {
                 ActiveView::Library => self.render_library(ui),
                 ActiveView::Depots => self.render_depots(ui),
                 ActiveView::Fixes => self.render_fixes(ui),
-                ActiveView::Toolchain => self.render_toolchain(ui),
                 ActiveView::Settings => self.render_settings(ui),
             });
 
-        // 5. Drag-and-Drop Hover Banner
+        // 5. Tactile Drag-and-Drop Overlay
         let hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
         if hovering_files {
             let screen = ctx.screen_rect();
@@ -1822,25 +2064,137 @@ impl eframe::App for LuaToolsApp {
             ));
             painter.rect_filled(
                 screen,
-                egui::CornerRadius::ZERO,
-                egui::Color32::from_rgba_unmultiplied(15, 26, 48, 210),
+                CornerRadius::ZERO,
+                Color32::from_rgba_unmultiplied(12, 16, 26, 215),
             );
             painter.rect_stroke(
-                screen.shrink(12.0),
-                egui::CornerRadius::ZERO,
-                Stroke::new(2.0_f32, Palette::BLUE_HOVER),
+                screen.shrink(20.0),
+                CornerRadius::same(8),
+                Stroke::new(2.0_f32, Palette::BLUE_BORDER),
                 egui::StrokeKind::Inside,
             );
             painter.text(
                 screen.center(),
                 egui::Align2::CENTER_CENTER,
-                "DROP .LUA / .MANIFEST / .ZIP PACKAGE TO INSTALL",
-                egui::FontId::monospace(18.0),
-                Palette::BLUE_LIGHT,
+                "Drop .lua, .manifest, or .zip package to install",
+                display_font(22.0),
+                Palette::TEXT_PRIMARY,
             );
         }
 
-        // 6. Modals
+        // 6. Modal Windows
         self.render_modals(ctx);
+    }
+
+    fn drive_qa_screenshots(&mut self, ctx: &egui::Context) {
+        // Save any screenshot returned by the backend in this frame
+        let captured_img: Option<Arc<ColorImage>> = ctx.input(|i| {
+            i.events.iter().find_map(|ev| match ev {
+                egui::Event::Screenshot { image, .. } => Some(Arc::clone(image)),
+                _ => None,
+            })
+        });
+
+        let Some(ref mut qa) = self.qa_capture else {
+            return;
+        };
+
+        if let (Some(img), Some(fname)) = (captured_img, qa.pending_save.take()) {
+            let w = img.width() as u32;
+            let h = img.height() as u32;
+            let mut raw = Vec::with_capacity((w * h * 4) as usize);
+            for px in &img.pixels {
+                raw.extend_from_slice(&px.to_array());
+            }
+            let out_path = qa.out_dir.join(fname);
+            let _ = image::save_buffer(&out_path, &raw, w, h, image::ColorType::Rgba8);
+            qa.step += 1;
+            qa.frames_waited = 0;
+        }
+
+        let steps: &[(
+            &str,
+            ActiveView,
+            Option<SettingsSubTab>,
+            Option<DepotsSubTab>,
+            Option<[f32; 2]>,
+        )] = &[
+            ("01_home.png", ActiveView::Overview, None, None, None),
+            ("02_discover.png", ActiveView::Acquire, None, None, None),
+            ("03_library.png", ActiveView::Library, None, None, None),
+            (
+                "04_depots_vault.png",
+                ActiveView::Depots,
+                None,
+                Some(DepotsSubTab::Declarations),
+                None,
+            ),
+            (
+                "05_depots_editor.png",
+                ActiveView::Depots,
+                None,
+                Some(DepotsSubTab::LiveEditor),
+                None,
+            ),
+            ("06_fixes.png", ActiveView::Fixes, None, None, None),
+            (
+                "07_settings_general.png",
+                ActiveView::Settings,
+                Some(SettingsSubTab::General),
+                None,
+                None,
+            ),
+            (
+                "08_settings_updates.png",
+                ActiveView::Settings,
+                Some(SettingsSubTab::UpdatesAndTools),
+                None,
+                None,
+            ),
+            (
+                "09_narrow_1060x660.png",
+                ActiveView::Overview,
+                None,
+                None,
+                Some([1060.0, 660.0]),
+            ),
+        ];
+
+        if qa.step >= steps.len() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        let (fname, view, s_tab, d_tab, resize) = steps[qa.step];
+        self.active_view = view;
+        if let Some(st) = s_tab {
+            self.settings_subtab = st;
+        }
+        if let Some(dt) = d_tab {
+            self.depots_subtab = dt;
+        }
+        if qa.frames_waited == 0 {
+            if let Some(sz) = resize {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(sz[0], sz[1])));
+            }
+        }
+
+        qa.frames_waited += 1;
+        if qa.frames_waited == 4 && qa.pending_save.is_none() {
+            qa.pending_save = Some(fname.to_string());
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+        }
+        ctx.request_repaint();
+    }
+}
+
+use std::sync::Arc;
+
+impl eframe::App for LuaToolsApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.pump_messages(ctx);
+        self.handle_shortcuts_and_drops(ctx);
+        self.render_shell(ctx);
+        self.drive_qa_screenshots(ctx);
     }
 }

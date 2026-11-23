@@ -15,9 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Turnkey Installation & Native Linux Packaging**:
   - Universal `install.sh` supporting Fedora/RHEL (`dnf`), Ubuntu/Debian (`apt`), Arch/SteamOS (`pacman`), and openSUSE (`zypper`), automatic `rustup` bootstrap if needed, SVG icon + `.desktop` launcher installation, and `luatools://` `xdg-mime` registration.
   - `packaging/build-packages.sh` & `packaging/luatools-linux.spec` building portable `.tar.gz`, native `.rpm`, and native `.deb` packages.
-- **Sharp 0px Monotone + Cobalt Blue Workstation UI**:
-  - Hardware-accelerated `CornerRadius::ZERO` interface across all 7 views (`01 // Overview`, `02 // Acquire`, `03 // Library`, `04 // Depots & Vault`, `05 // Fix Catalog`, `06 // Toolchain`, `07 // System`) plus modal editors for Game Overrides and binary `appinfo.vdf` (v27/v28/v29) Launch Options.
-  - Global Quick Command Bar (`Ctrl+K` / `Ctrl+L`), `Ctrl+1`…`Ctrl+7` view hotkeys, window-wide `.lua`/`.manifest`/`.zip` drag-and-drop, and Lua syntax highlighting.
+- **Papercut Monotone-Dark UI & Rich Multi-Voice Typography**:
+  - Tactile layered construction-paper monotone dark palette (`#0C0D10` / `#101115` / `#181A20`) with cut-edge highlights, underside paper lips, cast drop shadows, taped bone-paper section tags, and deeper sapphire-navy accents (`#1A3A6B` / `#234B88`).
+  - Rich non-Inter typography pairing `STIX Two Text Bold` editorial serif headings with `Open Sans` (`Semibold` + `Regular`) body copy and `Adwaita Mono` / `JetBrains Mono` / `Hack` code surfaces.
+  - Non-overlapping `StripBuilder` + `egui::Sides` layout across 6 focused workspaces (`Home`, `Discover`, `Library`, `Depots & Vault`, `Game Fixes`, and 4-tab `Settings`), modal editors for Game Overrides and binary `appinfo.vdf` (v27/v28/v29) Launch Options, global Quick Command Bar (`Ctrl+K` / `Ctrl+L`), `Ctrl+1`…`Ctrl+6` hotkeys, `.lua`/`.manifest`/`.zip` drag-and-drop, and headless software rasterizer visual QA (`tests/ui_visual_qa.rs`).
+  - Automatic XWayland (`WINIT_UNIX_BACKEND=x11`) fallback when `DISPLAY` is active to avoid `winit 0.30.13` Wayland `wl_seat` v10 pointer panics and support custom window icons.
 - **Full 100% On-Disk Compatibility with v1.x**:
   - Seamlessly reads/writes `~/.config/luatools/settings.json`, `~/.local/share/luatools/auth.json`, `~/.local/share/luatools/luavault/`, `~/.config/SLSsteam/config.yaml`, `~/.local/share/Steam/config/stplug-in/`, and `.luatools-fix/` SHA-256 backup records.
 

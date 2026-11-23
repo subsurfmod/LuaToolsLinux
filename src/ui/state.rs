@@ -1,4 +1,4 @@
-//! Shared application view models, navigation enum, and async worker messages.
+//! Shared application view models, navigation enums, modal states, and async worker messages.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -38,7 +38,6 @@ pub enum ActiveView {
     Library,
     Depots,
     Fixes,
-    Toolchain,
     Settings,
 }
 
@@ -52,7 +51,16 @@ pub enum AcquireTab {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DepotsSubTab {
     Declarations,
+    LiveEditor,
     DownloadPicker,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsSubTab {
+    General,
+    Account,
+    Integrations,
+    UpdatesAndTools,
 }
 
 #[derive(Debug, Clone)]
@@ -222,21 +230,11 @@ pub struct LaunchOptionsModal {
     pub feedback: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DepotDetailModal {
     pub open: bool,
     pub depot: Option<ContentDepot>,
     pub entry: Option<LuaEntry>,
-}
-
-impl Default for DepotDetailModal {
-    fn default() -> Self {
-        Self {
-            open: false,
-            depot: None,
-            entry: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -247,4 +245,12 @@ pub struct TextPromptModal {
     pub prompt: String,
     pub value: String,
     pub target_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct QaCaptureState {
+    pub out_dir: PathBuf,
+    pub step: usize,
+    pub frames_waited: u32,
+    pub pending_save: Option<String>,
 }

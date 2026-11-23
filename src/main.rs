@@ -1,4 +1,6 @@
-//! Entry point for LuaTools Linux v2.0.0 native desktop application.
+//! Entry point for LuaTools Linux v2.0-beta native desktop application.
+
+use std::path::PathBuf;
 
 use eframe::egui;
 use luatools_linux::services::settings_service::SettingsService;
@@ -10,9 +12,11 @@ use luatools_linux::VERSION;
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut initial_protocol_url: Option<String> = None;
+    let mut qa_screenshots_dir: Option<PathBuf> = None;
 
-    for arg in &args {
-        match arg.as_str() {
+    let mut idx = 0;
+    while idx < args.len() {
+        match args[idx].as_str() {
             "-v" | "--version" => {
                 println!("luatools-linux v{}", VERSION);
                 return Ok(());
@@ -59,6 +63,12 @@ fn main() -> eframe::Result<()> {
                     }
                 }
             }
+            "--qa-screenshots" => {
+                if let Some(dir) = args.get(idx + 1) {
+                    qa_screenshots_dir = Some(PathBuf::from(dir));
+                    idx += 1;
+                }
+            }
             "-h" | "--help" => {
                 println!(
                     "LuaTools Linux v{}\n\nUsage: luatools [OPTIONS] [luatools://...]\n\nOptions:\n  --check      Verify binary and Steam discovery without opening GUI\n  --update     Pull latest source from Git and rebuild/install native binary\n  -v,--version Print version\n  -h,--help    Show help",
@@ -71,15 +81,21 @@ fn main() -> eframe::Result<()> {
             }
             _ => {}
         }
+        idx += 1;
     }
 
     let viewport = egui::ViewportBuilder::default()
-        .with_title(format!("LUATOOLS // LINUX  v{}", VERSION))
+        .with_title(format!("LuaTools  v{}", VERSION))
         .with_app_id("luatools")
-        .with_inner_size([1440.0, 900.0])
+        .with_inner_size([1380.0, 860.0])
         .with_min_inner_size([1060.0, 660.0])
         .with_drag_and_drop(true)
         .with_icon(build_app_icon());
+
+    // Prefer X11/XWayland when DISPLAY is available to avoid winit 0.30's wl_seat v10 pointer panic
+    if std::env::var_os("WINIT_UNIX_BACKEND").is_none() && std::env::var_os("DISPLAY").is_some() {
+        std::env::set_var("WINIT_UNIX_BACKEND", "x11");
+    }
 
     let native_options = eframe::NativeOptions {
         viewport,
@@ -89,7 +105,13 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "LuaTools Linux",
         native_options,
-        Box::new(move |cc| Ok(Box::new(LuaToolsApp::new(cc, initial_protocol_url)))),
+        Box::new(move |cc| {
+            Ok(Box::new(LuaToolsApp::new(
+                cc,
+                initial_protocol_url,
+                qa_screenshots_dir,
+            )))
+        }),
     )
 }
 
@@ -101,31 +123,22 @@ fn build_app_icon() -> egui::IconData {
     for y in 0..h {
         for x in 0..w {
             let idx = (y * w + x) * 4;
-            let mut color = [9u8, 9, 11, 255]; // #09090B void
-            if (2..62).contains(&x) && (2..62).contains(&y) {
-                color = [20, 20, 24, 255]; // #141418 panel
+            let mut color = [12u8, 13, 16, 255]; // #0C0D10 monotone void
+            if (3..61).contains(&x) && (3..61).contains(&y) {
+                color = [24, 26, 32, 255]; // #181A20 paper card
             }
-            if (2..6).contains(&x) && (2..62).contains(&y) {
-                color = [37, 99, 235, 255]; // #2563EB left bar
+            if (3..8).contains(&x) && (3..61).contains(&y) {
+                color = [26, 58, 107, 255]; // #1A3A6B deep sapphire
             }
-            if (6..62).contains(&x) && (2..4).contains(&y) {
-                color = [59, 130, 246, 255]; // #3B82F6 top edge
-            }
-            // Crisp 'L' glyph
-            if ((14..21).contains(&x) && (17..48).contains(&y))
-                || ((14..33).contains(&x) && (41..48).contains(&y))
+            if ((16..23).contains(&x) && (17..48).contains(&y))
+                || ((16..34).contains(&x) && (41..48).contains(&y))
             {
-                color = [244, 244, 246, 255];
+                color = [239, 240, 244, 255];
             }
-            // Crisp 'T' glyph in cobalt blue
-            if ((31..53).contains(&x) && (17..24).contains(&y))
+            if ((32..53).contains(&x) && (17..24).contains(&y))
                 || ((39..46).contains(&x) && (17..48).contains(&y))
             {
-                color = [59, 130, 246, 255];
-            }
-            // Accent corner square
-            if (48..54).contains(&x) && (42..48).contains(&y) {
-                color = [96, 165, 250, 255];
+                color = [118, 162, 230, 255];
             }
             rgba[idx..idx + 4].copy_from_slice(&color);
         }
