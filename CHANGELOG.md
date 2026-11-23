@@ -1,34 +1,70 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+All notable changes to **LuaTools Linux** are documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+---
 
 ## [2.3.1] - 2026-11-23
 
-### Added & Fixed
-- **Wired Suite Native Installer (`WiredService`)**: Native Rust installation & management for **ACCELA** (`~/.local/share/ACCELA` + `ACCELA.conf`) and **SLSsteam** (`~/.local/share/SLSsteam/SLSsteam.so` + `library-inject.so` + `~/.local/bin/steam-sls` `LD_AUDIT` wrapper) directly from `Settings › SLSsteam & Store Bridge` without running untrusted `curl | bash` pipes; supports `.tar.gz`, `.zip` (with ZipSlip protection), `.tar.zst`, and `.7z` release assets with proper GitHub API `User-Agent` headers.
-- **Multi-App `PlayUnownedService` (`play_unowned_games.lua`)**: Synchronizes `stplug-in/play_unowned_games.lua` across all managed `AdditionalApps` with nil-safe `steam_api` guards so enabling a new title never overwrites previously enabled games; controllable globally in `Settings › SLSsteam & Store Bridge` and per-game in `Library › More`.
-- **Steam Library ACF Registration (`SteamLibraryService`)**: One-click **Add to Steam Library** / **Unregister from Steam Library** in `Discover` and `Library › More` writing valid Valve KeyValues `"AppState"` `appmanifest_<appid>.acf` files, creating `steamapps/common/<GameDir>`, cleanly updating `libraryfolders.vdf` `"apps"` blocks, and registering `AdditionalApps` + `FakeAppIds` (`480`) in `SLSsteam`.
-- **`SteamAutoCrackService` (`SteamAutoPatch`) Integration**: Wired `SteamAutoCrackService` through `ExternalToolsManager` (with Linux `dotnet` / `wine` invocation wrappers) in `Library › More › Run SteamAutoPatch` and `Settings › Updates & Toolchain`.
-- **Self-Updater Build Commit SHA Lag Detection**: Embeds `LUATOOLS_BUILD_GIT_SHA` at compile time (`build.rs`) so `UpdateService::check_once` detects when the running executable lags behind local or remote Git `HEAD` even on identical SemVer versions.
+### Added
+- **Native Wired Suite Installer (`WiredService`, `src/services/wired_service.rs`)**:
+  - Installs and manages **ACCELA** (`~/.local/share/ACCELA` + `~/.config/Tachibana Labs/ACCELA.conf`) and **SLSsteam** (`~/.local/share/SLSsteam/SLSsteam.so`, `library-inject.so`, `~/.config/SLSsteam/config.yaml` defaults, and `~/.local/bin/steam-sls` `LD_AUDIT` wrapper) natively in Rust without executing remote `curl | bash` pipes.
+  - Supports upstream `ciscosweater/enter-the-wired` (`deps.tar.gz` / `ACCELAINSTALL` / `.AppImage`) and `AceSLS/SLSsteam` release assets (`.7z` via `7z`/`7zz`/`7za` and `.tar.zst` via `tar --zstd`, plus `.tar.gz` and `.zip`).
+  - Added **Wired Suite (Native ACCELA & SLSsteam Installer)** card in **`Settings › SLSsteam & Store Bridge`** with live installation badges, download/extract progress bar, **Install Both (Wired)**, **Install SLSsteam**, **Install ACCELA**, **Launch ACCELA**, and **Uninstall Wired**.
+- **Steam Library ACF Registration (`SteamLibraryService`, `src/services/steam_library_service.rs`)**:
+  - Added **`+ Add to Steam Library`** in **Discover** and **`Register / Unregister in Steam Library (ACF)`** in **`Library › More`**.
+  - Generates valid Valve KeyValues `"AppState"` `appmanifest_<appid>.acf` manifests (`"Universe" "1"`, `"StateFlags" "4"`), creates `<steamapps>/common/<installdir>`, updates `libraryfolders.vdf` `"apps"` blocks, and registers `AdditionalApps` + `FakeAppId: 480` in `SLSsteam`.
+- **Multi-App `PlayUnownedService` (`src/services/play_unowned_service.rs`)**:
+  - Generates and syncs `~/.local/share/Steam/config/stplug-in/play_unowned_games.lua` across all managed `AdditionalApps` using a multi-app `UNOWNED_APPS` Lua table and nil-safe `type(steam_api) == "table"` guards.
+  - Controllable globally via **`Settings › SLSsteam & Store Bridge › Sync PlayUnowned Plugin Now`** and per-game via **`Library › More › Enable / Disable Play Unowned`**.
+- **`SteamAutoCrackService` (`SteamAutoPatch`) Integration (`src/services/steam_auto_crack_service.rs`)**:
+  - Added per-game **`Run SteamAutoPatch`** action in **`Library › More`** (alongside folder selection in **`Settings › Updates & Toolchain`**), automatically invoking Linux `dotnet` or `wine` wrappers via `ExternalToolsManager`.
+- **Compile-Time Build Commit SHA Lag Detection (`build.rs`, `src/services/update_service.rs`)**:
+  - Embeds `LUATOOLS_BUILD_GIT_SHA` at compile time so `UpdateService::check_once` detects when the running binary is older than local or remote Git `HEAD` (both by SemVer and by `BUILD_GIT_SHA..origin/main` commit distance), even when the local checkout already has `HEAD == origin/main`.
+  - Updated the **Local Repo** input hint in **`Settings › Updates & Toolchain`** to display the actual auto-detected repository path on disk.
+
+### Fixed
+- **Resolved All `beta/v2.2.0-beta` Compilation Errors**:
+  - Removed duplicate `cef_bridge`, `http_server`, and `tools_manager` struct initializers (`E0062`) in `LuaToolsApp::new` (`src/ui/app.rs`).
+  - Fixed undeclared `steam_installation` and `slssteam_service_clone` variables (`E0425`) and missing `wired_service` / `steam_auto_crack` fields (`E0063`) in `LuaToolsApp::new_headless_demo`.
+  - Registered missing `pub mod steam_auto_crack_service;` in `src/services/mod.rs` and fixed calls to non-existent `ExternalToolsManager::get_tool_path` / `launch_steamautocrack` methods.
+- **Eliminated `SLSsteam` `config.yaml` Shared-State Desync**:
+  - Removed isolated `Arc<Mutex<SlssteamService>>` clones inside `PlayUnownedService` and `SteamLibraryService` so all services mutate `&mut app.slssteam_service` directly without overwriting `config.yaml` with stale in-memory copies.
+- **Fixed `WiredService` Upstream Downloads, Extraction & Detection**:
+  - Added mandatory `User-Agent` headers to all GitHub API requests (fixing HTTP `403 Forbidden` responses).
+  - Fixed `AceSLS/SLSsteam` asset selection failing on `.7z` / `.tar.zst` releases, fixed `.tar.bz2`/`.tar.zst` archives previously being fed into `GzDecoder`, fixed `is_accela_installed()` always returning `false`, added ZipSlip path-traversal validation to archive extraction, and isolated unit tests from `$HOME`.
+- **Fixed `SteamLibraryService` VDF/ACF Corruption Bugs**:
+  - Replaced invalid `appmanifest_<appid>\n{` headers (rejected by Steam on startup) with standard `"AppState"` KeyValues format.
+  - Fixed literal `"\\n"` string escape bug in `add_to_library_folders` that prevented `libraryfolders.vdf` `"apps"` insertion or appended invalid top-level blocks, and fixed `read_app_name` regex failing on multi-line `.acf` files.
+- **Fixed `PlayUnownedService` Multi-Game Overwrite & Nil Global Crash**:
+  - Fixed `enable_for_app` overwriting `play_unowned_games.lua` with a single `%APP_ID%` (which previously erased earlier games), removed invalid `addappid(0, 1, "placeholder")` declarations, and guarded `steam_api` indexing for Lua runtimes that only expose `addappid` / `setManifestid`.
+
+---
 
 ## [2.1.0] - 2026-11-23
 
-### Added & Improved
-- **Interactive `How to Use` Workspace (`Ctrl+6` / `F1`)**: Built-in 5-section workstation manual (`Quick Start`, `Adding Games & .lua`, `Depots, Vault & Downloads`, `Fixes, SLSsteam & Launch`, and `Bridge, FAQ & Bug Reports`) with annotated syntax-highlighted `.lua` examples, exact Linux file paths, troubleshooting recipes, and 1-click workspace jump buttons.
-- **Privacy-First Bug-Fixing Telemetry, Consent Popup & Diagnostic Exporter (`TelemetryService`)**:
-  - First-launch privacy & consent popup explaining exactly what is collected and offering immediate 1-click **`Turn Off Telemetry`** or **`Keep Enabled`** controls.
-  - Strictly scrubbed local JSONL ring-buffer (`~/.local/share/luatools/telemetry/events.jsonl`) + chained Rust panic hook (`file:line` crash capture) that automatically redacts usernames in paths (`~`), Hubcap keys, 64-char depot keys, JWT/Bearer tokens, and emails.
-  - Dedicated **`Settings › Telemetry & Logs`** sub-tab with instant opt-out toggle, live event log inspector, 1-click **Report Bug on GitHub** (pre-filled issue), **Copy / Export Diagnostic Markdown**, data wipe, and optional remote HTTPS JSON / Discord webhook collector support.
-- **Depot Decryption Key File Support (`-depotkeys`)**: Automatically resolves per-app `.lua` and `SLSsteam` depot decryption keys into a restricted (`0600`) temporary keys file for `DepotDownloader` / `DepotDownloaderMod` and cleans up after completion, plus `-manifestfile` support when using `DepotDownloaderMod`.
-- **CEF Store Bridge & DRM Fix Refactor**: Renamed `cef_injector` to `cef_bridge` (`CefBridgeService`) with backwards-compatible `settings.json` deserialization (`alias = "cef_injector_enabled"`), and unified neutral toolchain naming (`SteamAutoPatch` / `StubRemover`) with full binary & CLI compatibility for upstream GitHub releases.
+### Added
+- **Interactive `How to Use` Manual Workspace (`src/ui/views_guide.rs`, `Ctrl+6` / `F1`)**:
+  - 5-part interactive guide (`1. Quick Start`, `2. Adding Games & .lua`, `3. Depots, Vault & Downloads`, `4. Fixes, SLSsteam & Launch`, and `5. Bridge, FAQ & Bug Reports`) featuring syntax-highlighted `.lua` directive examples, Linux path reference cards, keyboard shortcuts table, troubleshooting recipes, and 1-click workspace navigation buttons.
+- **Privacy-First Bug-Fixing Telemetry, Consent Popup & Diagnostic Exporter (`src/services/telemetry_service.rs`, `src/ui/dialogs.rs`)**:
+  - **First-Launch Consent Modal**: Explains what diagnostic metadata is collected vs. never collected, with immediate **`Turn Off Telemetry`**, **`Keep Enabled`**, and **`Telemetry Settings ›`** actions.
+  - **Automatic PII Scrubbing**: Redacts `$HOME` and `/home/<user>` paths to `~`, `smm_*` Hubcap API keys, 64-character hex depot decryption keys, JWTs, `Bearer` tokens, and email addresses before writing to disk or exporting.
+  - **Crash & Warning Ring-Buffer**: Stores up to 200 scrubbed events in `~/.local/share/luatools/telemetry/events.jsonl` (`0600` permissions) and installs a chained Rust panic hook (`last_panic.txt`) capturing `file:line:col` crash locations.
+  - **`Settings › Telemetry & Logs` Sub-Tab**: Master opt-out checkbox, **Review Privacy Notice** popup button, **Clear Stored Data**, live event log table, 1-click **Report Bug on GitHub ›** (pre-filled issue), **Copy / Export Diagnostic Markdown** (UTF-8 char-boundary safe), and optional HTTPS JSON / Discord webhook collector URL with **Test Endpoint**.
+- **Depot Decryption Key File Support (`-depotkeys`) & `-manifestfile` (`src/services/depot_downloader.rs`)**:
+  - Automatically collects per-app `.lua` and `SLSsteam` 64-character hex depot keys into a restricted (`0600`) temporary keys file for `DepotDownloader` / `DepotDownloaderMod` and deletes it immediately after download completion.
 
 ### Fixed
-- Restored live `lua.tools` fix catalog/download API endpoints while preserving refactored `DRMFix*` domain types.
-- Wired live `SteamInstallation` and `SlssteamService` state into `DepotDownloaderService`, filtered non-depot DLC entitlement AppIDs out of depot download selections, and normalized progress percentages across tool bootstrap and depot downloads.
-- Fixed short/non-ASCII decryption key preview slicing panic in Depot Details modal, hardened binary `appinfo.vdf` header parsing against unsigned/corrupt entry sizes, synced `SLSsteam` on `LuaVault` variant apply, honored `FastFetch` & `luatools://` source selection, and resolved all Rust `clippy` lints across library, binary, and test targets.
+- Fixed `DepotDownloaderService::build_download_args` unit-test argument mismatch (`E0061`).
+- Restored live `lua.tools` `/api/denuvo/*` fix catalog & download endpoints in `src/services/api_client.rs` (replacing 404 `/api/drm_fix/*` paths while retaining refactored `DRMFix*` domain structs).
+- Wired live `SteamInstallation` and `SlssteamService` state into `DepotDownloaderService`, filtered keyless/manifestless DLC entitlement AppIDs out of depot download selections, and normalized progress percentages across tool updates and depot downloads.
+- Restored `SteamAutoCrack` and `Steamless` executable discovery candidates & legacy tool subdirectories in `ExternalToolsManager` alongside neutral `SteamAutoPatch` / `StubRemover` naming, and added `#[serde(alias = "cef_injector_enabled")]` backwards compatibility in `AppSettings`.
+- Fixed UTF-8 / short-key slice panic in `format_key_preview` (`src/ui/dialogs.rs`), switched binary `appinfo.vdf` entry size parsing from signed `i32` to `u32` (`src/parsers/vdf_binary.rs`), synced `SLSsteam` on `LuaVault` variant apply, honored `FastFetch` and `luatools://` source pre-selection, and resolved all `cargo clippy --all-targets -- -D warnings` lints.
+
+---
 
 ## [2.0-beta] - 2026-11-23 — Complete Native Rust Rewrite (Beta)
 
@@ -36,25 +72,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **100% Native Rust Architecture**: Ground-up rewrite replacing Python 3 + PyQt6 + `httpx` + `PyYAML` + `websockets` + `Pillow` + `vdf` with a single stripped native Rust binary (`eframe`/`egui` + `ureq`/`rustls` + `tungstenite` + `tiny_http`).
 - **One-Shot Background Git Update Check & Corner Self-Updater**:
   - `UpdateService` (`src/services/update_service.rs`) runs a single non-blocking Git remote check on startup against `origin` (`https://github.com/subsurfmod/LuaToolsLinux.git` default).
-  - Displays a compact sharp-edged **`⬆ UPDATE`** button in the **bottom-right corner** when new commits or a newer version are available; clicking pulls from Git, compiles a stripped release binary, atomically replaces the installed executable via `rename()` (avoiding Linux `ETXTBSY`), and switches to a 1-click **`↻ RESTART`** button (also available via `luatools --update`).
+  - Displays a compact **`⬆ Update`** button in the **top-right corner** when new commits or a newer version are available; clicking pulls from Git, compiles a stripped release binary, atomically replaces the installed executable via `rename()` (avoiding Linux `ETXTBSY`), and switches to a 1-click **`↻ Restart`** button (also available via `luatools --update`).
 - **Turnkey Installation & Native Linux Packaging**:
   - Universal `install.sh` supporting Fedora/RHEL (`dnf`), Ubuntu/Debian (`apt`), Arch/SteamOS (`pacman`), and openSUSE (`zypper`), automatic `rustup` bootstrap if needed, SVG icon + `.desktop` launcher installation, and `luatools://` `xdg-mime` registration.
   - `packaging/build-packages.sh` & `packaging/luatools-linux.spec` building portable `.tar.gz`, native `.rpm`, and native `.deb` packages.
 - **Official `SteamRE/DepotDownloader` Crash Hardening (`src/services/depot_downloader.rs`)**:
-  - Removed unsupported CLI flags (`-depotkey` / `-manifestfile` / forced `-username anonymous`), added `.NET` runtime stability guards (`stdin=null`, `DOTNET_EnableWriteXorExecute=0`, `DOTNET_EnableDiagnostics=0`, `DOTNET_DbgEnableMiniDump=0`, `RLIMIT_CORE=0`, `-max-downloads 8`), preferred framework-dependent `DepotDownloader.dll` when host `dotnet` is installed on bleeding-edge `glibc` / `OpenSSL` systems, and added 1-click terminal QR / Steam Guard session login (`-remember-password`).
+  - Removed unsupported CLI flags, added `.NET` runtime stability guards (`stdin=null`, `DOTNET_EnableWriteXorExecute=0`, `DOTNET_EnableDiagnostics=0`, `DOTNET_DbgEnableMiniDump=0`, `RLIMIT_CORE=0`, `-max-downloads 8`), preferred framework-dependent `DepotDownloader.dll` when host `dotnet` is installed on modern `glibc` / `OpenSSL` distros, and added 1-click terminal QR / Steam Guard session login (`-remember-password`).
 - **Papercut Monotone-Dark UI, Top-Right Toast Notifications & Rich Typography**:
-  - Moved transient notifications to non-blocking top-right dismissible toasts, moved the Git `⬆ Update` button to the top-right header corner, and added scrollable containers + bottom breathing room so low-placed text is never obstructed.
-  - Tactile layered construction-paper monotone dark palette (`#0C0D10` / `#101115` / `#181A20`) with cut-edge highlights, underside paper lips, cast drop shadows, taped bone-paper section tags, and deeper sapphire-navy accents (`#1A3A6B` / `#234B88`).
-  - Rich non-Inter typography pairing `STIX Two Text Bold` editorial serif headings with `Open Sans` (`Semibold` + `Regular`) body copy and `Adwaita Mono` / `JetBrains Mono` / `Hack` code surfaces.
-  - Non-overlapping `StripBuilder` + `egui::Sides` layout across 6 focused workspaces (`Home`, `Discover`, `Library`, `Depots & Vault`, `Game Fixes`, and 4-tab `Settings`), modal editors for Game Overrides and binary `appinfo.vdf` (v27/v28/v29) Launch Options, global Quick Command Bar (`Ctrl+K` / `Ctrl+L`), `Ctrl+1`…`Ctrl+6` hotkeys, `.lua`/`.manifest`/`.zip` drag-and-drop, and headless software rasterizer visual QA (`tests/ui_visual_qa.rs`).
-  - Automatic XWayland (`WINIT_UNIX_BACKEND=x11`) fallback when `DISPLAY` is active to avoid `winit 0.30.13` Wayland `wl_seat` v10 pointer panics and support custom window icons.
+  - Non-blocking top-right dismissible toast notifications, tactile layered construction-paper monotone dark palette (`#0C0D10` / `#101115` / `#181A20`), `STIX Two Text Bold` display headings + `Open Sans` body copy + monospace code editors, `StripBuilder` + `egui::Sides` zero-overlap layouts, binary `appinfo.vdf` (v27–v29) Launch Options editor, global Quick Command Bar (`Ctrl+K` / `Ctrl+L`), `.lua`/`.manifest`/`.zip` drag-and-drop, XWayland (`WINIT_UNIX_BACKEND=x11`) stability guard, and headless software rasterizer visual QA (`tests/ui_visual_qa.rs`).
 - **Full 100% On-Disk Compatibility with v1.x**:
-  - Seamlessly reads/writes `~/.config/luatools/settings.json`, `~/.local/share/luatools/auth.json`, `~/.local/share/luatools/luavault/`, `~/.config/SLSsteam/config.yaml`, `~/.local/share/Steam/config/stplug-in/`, and `.luatools-fix/` SHA-256 backup records.
+  - Seamlessly reads and writes `~/.config/luatools/settings.json`, `~/.local/share/luatools/auth.json`, `~/.local/share/luatools/luavault/`, `~/.config/SLSsteam/config.yaml`, `~/.local/share/Steam/config/stplug-in/`, and `.luatools-fix/` SHA-256 backup records.
 
 ### Fixed & Hardened (Carried Forward from v1.1 Audit)
 - Eliminated recursive mutex deadlock in `SteamDepotInfo` using deduplicated `Condvar` flight tracking.
 - Fixed `SteamLinkParser` so numeric words in game titles (e.g. `"Warhammer 40000"`, `"Battlefield 2042"`) trigger Store Search instead of being misparsed as AppIDs.
-- Fixed `SLSsteam` `AdditionalApps` YAML sequence serialization, `libraryfolders.vdf` primary library deduplication, ZipSlip archive traversal protection, and separation of 64-char hex depot decryption keys vs app tokens.
+- Fixed `SLSsteam` `AdditionalApps` YAML sequence serialization, `libraryfolders.vdf` primary library deduplication, ZipSlip archive traversal protection, and separation of 64-char hex depot decryption keys vs. app tokens.
 
 ---
 
