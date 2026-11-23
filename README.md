@@ -4,7 +4,7 @@ A complete rewrite of LuaTools Linux.  (`eframe` / `egui`).
 
 ---
 
-## One-Command Installation (Includes All Dependencies)
+## Installation (Includes All Dependencies)
 
 Run the universal `curl` one-liner — it automatically verifies/installs required Linux graphics & XDG runtime packages (`dnf` / `apt` / `pacman` / `zypper`), clones the repository into `~/.local/share/luatools/repo`, bootstraps `rustup` if needed to compile an LTO-stripped native executable, installs the app icon & desktop launcher, and registers the `luatools://` URI scheme:
 
