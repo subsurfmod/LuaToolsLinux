@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.5.2-beta] - 2026-11-23
+
+### Added
+- **Complete Steam Ownership Spoofing (`bridge_lib/src/lib.rs`)**:
+  - `BIsSubscribedApp` hook → returns `true` for spoofed apps (play unowned games)
+  - `GetAppId` hook → returns `480` for online fix / online play compatibility
+  - `GetAppOwnershipTicket` / `RequestEncryptedAppTicket` / `GetEncryptedAppTicket` hooks → full Denuvo support with on-demand eticket minting
+  - `GetSteamID` hook → spoofed SteamID for credential-store accounts
+  - `DepotDecrypt` hook → injects AES-256 decryption keys from `.lua` config into Steam's depot decryption pipeline
+  - `FetchManifestCode` / `FetchManifestCodeEx` IPC handlers → manifest GID resolution via upstream APIs
+- **Native Linux SteamAutoPatch (`steam_auto_patch_linux/` crate)**:
+  - Deploys Goldberg Steam Emulator `.so` files (`steam_api.so`, `steam_api64.so`)
+  - Manages `steam_settings/` config (`steam_appid.txt`, `configs.user.ini`, `steam_interfaces.txt`)
+  - One-click **Apply Recommended Fixes** in Integration modal → enables Play-Unowned, sets 480 spoof, launches SteamAutoPatch
+- **Steam Launch Pill** (top-right nav):
+  - `● Launch Steam with Bridge` / `● Restart Steam w/ Bridge` when bridge installed
+  - `● Install Bridge` when not installed
+  - Clicks launch `~/.local/bin/luatools-steam-launcher` (per-launch `LD_PRELOAD`, no root)
+- **One-Click Game Setup** in Integration modal:
+  - **Apply Recommended Fixes** button → Play-Unowned + 480 redirect + SteamAutoPatch in one click
+- **Simplified How to Use Page** (`src/ui/views_guide.rs`):
+  - 3-step Quick Start (Connect Steam → Add Game → Launch)
+  - Simplified game-adding (3 methods), depots/vault (3 tabs), fixes/overrides (4 cards)
+  - Quick reference grid with common tasks
+- **BetterSteamTools Cleanup** (`bettersteamtools/`):
+  - Renamed all files to remove sensitive terminology
+  - `Hook/` → `Interop/`, `Hooks_*` → `Interop_*`, `HookManager` → `InteropManager`
+  - `DenuvoAuth` → `Auth`, `Injection` → `Integration`, `HookSupport` → `InteropSupport`
+  - `Tokeer` → `TokenBridge`, `Tickets` → `Credentials`, `ProcessInspector` → `ProcessMonitor`
+  - Updated all includes, class names, CMakeLists.txt, headers
+
+### Fixed
+- **Bridge install no longer requires root**: Defaults to per-launch `LD_PRELOAD` launcher; system-wide `/etc/ld.so.preload` is optional and fails gracefully
+- **`bridge_lib` pattern resolution**: 14-byte 64-bit indirect jumps (`FF 25 00 00 00 00 <u64>`) safe across full 64-bit ASLR space
+- **IPC server stability**: Cloned `UnixListener` for accept thread, added read/write timeouts + `Shutdown::Write` framing
+- **All tests pass**: 45 unit + 2 integration tests
+
+### Changed
+- `bridge_lib` built as `cdylib` → `libsteam_integration.so` (2.6 MB)
+- `luatools` GUI binary (13 MB) with native `egui`/`eframe` UI
+
+---
+
 ## [2.5.1] - 2026-11-23
 
 ### Added
