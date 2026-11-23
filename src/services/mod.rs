@@ -16,4 +16,5 @@ pub mod protocol_service;
 pub mod settings_service;
 pub mod slssteam_service;
 pub mod steam_service;
+pub mod telemetry_service;
 pub mod update_service;

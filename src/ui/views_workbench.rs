@@ -1192,6 +1192,14 @@ impl LuaToolsApp {
         if save_all {
             let sls_ok = self.slssteam_service.save();
             let app_ok = self.settings_service.save();
+            self.telemetry_service
+                .set_enabled(self.settings_service.settings.telemetry_enabled);
+            self.telemetry_service.set_endpoint_url(
+                self.settings_service
+                    .settings
+                    .telemetry_endpoint_url
+                    .clone(),
+            );
             if self.settings_service.settings.cef_bridge_enabled {
                 self.cef_bridge.start();
             } else {
@@ -1212,7 +1220,7 @@ impl LuaToolsApp {
         }
 
         // Clean Sub-Tab Strip
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             if chip_button(
                 ui,
@@ -1250,6 +1258,15 @@ impl LuaToolsApp {
             {
                 self.settings_subtab = SettingsSubTab::UpdatesAndTools;
             }
+            if chip_button(
+                ui,
+                "Telemetry & Logs",
+                self.settings_subtab == SettingsSubTab::Telemetry,
+            )
+            .clicked()
+            {
+                self.settings_subtab = SettingsSubTab::Telemetry;
+            }
         });
 
         ui.add_space(16.0);
@@ -1264,6 +1281,7 @@ impl LuaToolsApp {
                     SettingsSubTab::Account => self.render_settings_account(ui),
                     SettingsSubTab::Integrations => self.render_settings_integrations(ui),
                     SettingsSubTab::UpdatesAndTools => self.render_settings_updates_and_tools(ui),
+                    SettingsSubTab::Telemetry => self.render_settings_telemetry(ui),
                 }
             });
     }
@@ -1828,5 +1846,345 @@ impl LuaToolsApp {
             });
             ui.add_space(10.0);
         }
+    }
+
+    fn render_settings_telemetry(&mut self, ui: &mut egui::Ui) {
+        let mut toggled_telemetry = false;
+        let mut clear_logs = false;
+        let mut reopen_notice = false;
+        let mut copy_md = false;
+        let mut export_md = false;
+        let mut open_gh = false;
+        let mut test_endpoint = false;
+
+        let ev_count = self.telemetry_service.event_count();
+
+        // 1. Master Telemetry Toggle & Privacy Controls
+        paper_card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 10.0;
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    ui.label(
+                        RichText::new("Bug-Fixing Telemetry & Privacy Controls")
+                            .font(display_font(17.5))
+                            .color(Palette::TEXT_PRIMARY),
+                    );
+                },
+                |ui| {
+                    if self.settings_service.settings.telemetry_enabled {
+                        status_badge(
+                            ui,
+                            &format!("Active · {} event(s)", ev_count),
+                            BadgeTone::Ready,
+                        );
+                    } else {
+                        status_badge(ui, "Turned Off", BadgeTone::Muted);
+                    }
+                },
+            );
+
+            ui.label(
+                RichText::new(
+                    "Records scrubbed runtime errors, crash locations, and anonymous Linux/display environment details \
+                     in ~/.local/share/luatools/telemetry/events.jsonl. Usernames, Steam credentials, Discord tokens, \
+                     Hubcap keys, and 64-character depot decryption keys are scrubbed automatically.",
+                )
+                .size(12.5)
+                .color(Palette::TEXT_MUTED),
+            );
+
+            if ui
+                .checkbox(
+                    &mut self.settings_service.settings.telemetry_enabled,
+                    "Enable anonymous diagnostic & crash telemetry for bug fixing",
+                )
+                .changed()
+            {
+                toggled_telemetry = true;
+            }
+
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                if ghost_button(ui, "Review Privacy Popup").clicked() {
+                    reopen_notice = true;
+                }
+                if danger_button(ui, "Clear Collected Data").clicked() {
+                    clear_logs = true;
+                }
+            });
+        });
+
+        if toggled_telemetry {
+            let enabled = self.settings_service.settings.telemetry_enabled;
+            self.settings_service.settings.telemetry_consent_seen = true;
+            if enabled
+                && self
+                    .settings_service
+                    .settings
+                    .telemetry_install_id
+                    .trim()
+                    .is_empty()
+            {
+                self.settings_service.settings.telemetry_install_id =
+                    crate::services::telemetry_service::TelemetryService::generate_install_id();
+            } else if !enabled {
+                self.settings_service.settings.telemetry_install_id.clear();
+            }
+            let _ = self.settings_service.save();
+            self.telemetry_service.set_enabled(enabled);
+            if enabled {
+                self.telemetry_service.record(
+                    "info",
+                    "telemetry",
+                    "telemetry_enabled",
+                    "Telemetry enabled in Settings",
+                );
+                self.notify("Diagnostic telemetry enabled.", ToastKind::Success);
+            } else {
+                self.notify(
+                    "Telemetry turned off — no new diagnostic events will be collected.",
+                    ToastKind::Info,
+                );
+            }
+        }
+        if reopen_notice {
+            self.telemetry_modal_open = true;
+        }
+        if clear_logs {
+            self.telemetry_service.clear_all();
+            self.notify(
+                "Cleared all locally stored telemetry events.",
+                ToastKind::Info,
+            );
+        }
+
+        ui.add_space(16.0);
+
+        // 2. 1-Click Bug Report & Diagnostic Bundle Exporter
+        paper_card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 10.0;
+            ui.label(
+                RichText::new("Share Diagnostics for Bug Fixing")
+                    .font(display_font(17.5))
+                    .color(Palette::TEXT_PRIMARY),
+            );
+            ui.label(
+                RichText::new(
+                    "Generate a clean, PII-scrubbed Markdown summary of your Linux environment and recent errors to attach to a bug report.",
+                )
+                .size(12.5)
+                .color(Palette::TEXT_MUTED),
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                if primary_button(ui, "Report Bug on GitHub ›").clicked() {
+                    open_gh = true;
+                }
+                if secondary_button(ui, "Copy Diagnostic Markdown").clicked() {
+                    copy_md = true;
+                }
+                if secondary_button(ui, "Export Report File…").clicked() {
+                    export_md = true;
+                }
+            });
+        });
+
+        if open_gh {
+            match self.telemetry_service.open_github_bug_report() {
+                Ok(m) => self.notify(m, ToastKind::Info),
+                Err(e) => self.notify(e, ToastKind::Warning),
+            }
+        }
+        if copy_md {
+            let md = self.telemetry_service.build_diagnostic_markdown(60);
+            ui.ctx().copy_text(md);
+            self.notify(
+                "Copied scrubbed diagnostic report to clipboard.",
+                ToastKind::Success,
+            );
+        }
+        if export_md {
+            let tx = self.msg_tx.clone();
+            let ctx = ui.ctx().clone();
+            thread::spawn(move || {
+                if let Some(dir) = pick_directory_native("Select Folder for Diagnostic Report") {
+                    let _ = tx.send(AppMessage::FolderPickedForDiagExport(dir));
+                    ctx.request_repaint();
+                }
+            });
+        }
+
+        ui.add_space(16.0);
+
+        // 3. Optional Remote Collector / Webhook Endpoint
+        paper_card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 10.0;
+            ui.label(
+                RichText::new("Optional Remote Telemetry Collector")
+                    .font(display_font(17.5))
+                    .color(Palette::TEXT_PRIMARY),
+            );
+            ui.label(
+                RichText::new(
+                    "Leave blank to keep telemetry 100% local, or configure an HTTPS JSON collector / Discord webhook URL to receive scrubbed bug events automatically when telemetry is enabled.",
+                )
+                .size(12.5)
+                .color(Palette::TEXT_MUTED),
+            );
+            ui.horizontal(|ui| {
+                let w = (ui.available_width() - 140.0).max(180.0);
+                ui.add_sized(
+                    [w, 30.0],
+                    TextEdit::singleline(
+                        &mut self.settings_service.settings.telemetry_endpoint_url,
+                    )
+                    .margin(Margin::symmetric(10, 6))
+                    .hint_text("https://... (optional JSON endpoint or Discord webhook)"),
+                );
+                if secondary_button(ui, "Test Endpoint").clicked() {
+                    test_endpoint = true;
+                }
+            });
+            if !self.settings_telemetry_status.is_empty() {
+                ui.label(
+                    RichText::new(&self.settings_telemetry_status)
+                        .size(12.0)
+                        .color(Palette::BLUE_LIGHT),
+                );
+            }
+        });
+
+        if test_endpoint {
+            let _ = self.settings_service.save();
+            self.telemetry_service.set_endpoint_url(
+                self.settings_service
+                    .settings
+                    .telemetry_endpoint_url
+                    .clone(),
+            );
+            let tel = self.telemetry_service.clone();
+            let tx = self.msg_tx.clone();
+            let ctx = ui.ctx().clone();
+            self.settings_telemetry_status = "Sending test diagnostic ping…".into();
+            thread::spawn(move || {
+                match tel.send_test_ping() {
+                    Ok(m) => {
+                        let _ = tx.send(AppMessage::TelemetryEndpointTested { ok: true, msg: m });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AppMessage::TelemetryEndpointTested { ok: false, msg: e });
+                    }
+                }
+                ctx.request_repaint();
+            });
+        }
+
+        ui.add_space(16.0);
+
+        // 4. Transparent Local Event Log Viewer
+        let events = self.telemetry_service.recent_events(35);
+        paper_card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 8.0;
+            ui.label(
+                RichText::new("Recorded Telemetry Events (Newest First)")
+                    .font(display_font(17.0))
+                    .color(Palette::TEXT_PRIMARY),
+            );
+            inset_paper_sheet(ui, Margin::same(10), |ui| {
+                ui.set_width(ui.available_width());
+                ui.set_min_height(130.0);
+                if events.is_empty() {
+                    ui.label(
+                        RichText::new("No telemetry events currently stored.")
+                            .size(12.5)
+                            .color(Palette::TEXT_MUTED),
+                    );
+                } else {
+                    ScrollArea::vertical()
+                        .id_salt("telemetry_events_viewer_scroll")
+                        .max_height(220.0)
+                        .show(ui, |ui| {
+                            TableBuilder::new(ui)
+                                .striped(true)
+                                .cell_layout(Layout::left_to_right(Align::Center))
+                                .column(Column::exact(145.0))
+                                .column(Column::exact(72.0))
+                                .column(Column::exact(96.0))
+                                .column(Column::remainder().at_least(220.0))
+                                .header(26.0, |mut h| {
+                                    for lbl in ["Timestamp (UTC)", "Level", "Category", "Event"] {
+                                        h.col(|ui| {
+                                            ui.label(
+                                                RichText::new(lbl)
+                                                    .font(semibold_font(11.5))
+                                                    .color(Palette::TEXT_MUTED),
+                                            );
+                                        });
+                                    }
+                                })
+                                .body(|mut body| {
+                                    for ev in &events {
+                                        body.row(30.0, |mut row| {
+                                            row.col(|ui| {
+                                                let short_ts = ev
+                                                    .timestamp
+                                                    .get(0..19)
+                                                    .unwrap_or(&ev.timestamp)
+                                                    .replace('T', " ");
+                                                ui.label(
+                                                    RichText::new(short_ts)
+                                                        .font(FontId::new(
+                                                            11.0,
+                                                            FontFamily::Monospace,
+                                                        ))
+                                                        .color(Palette::TEXT_MUTED),
+                                                );
+                                            });
+                                            row.col(|ui| {
+                                                let tone = match ev.level.as_str() {
+                                                    "panic" | "error" => BadgeTone::Danger,
+                                                    "warn" => BadgeTone::Warn,
+                                                    _ => BadgeTone::Blue,
+                                                };
+                                                status_badge(
+                                                    ui,
+                                                    &ev.level.to_ascii_uppercase(),
+                                                    tone,
+                                                );
+                                            });
+                                            row.col(|ui| {
+                                                ui.label(
+                                                    RichText::new(&ev.category)
+                                                        .font(FontId::new(
+                                                            11.5,
+                                                            FontFamily::Monospace,
+                                                        ))
+                                                        .color(Palette::TEXT_SECONDARY),
+                                                );
+                                            });
+                                            row.col(|ui| {
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "{} — {}",
+                                                        ev.event, ev.message
+                                                    ))
+                                                    .size(12.0)
+                                                    .color(Palette::TEXT_PRIMARY),
+                                                );
+                                            });
+                                        });
+                                    }
+                                });
+                        });
+                }
+            });
+        });
+
+        ui.add_space(24.0);
     }
 }

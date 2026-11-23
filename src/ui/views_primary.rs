@@ -31,6 +31,7 @@ impl LuaToolsApp {
             .show(ui, |ui| {
                 let mut open_new_lua = false;
                 let mut go_discover = false;
+                let mut go_guide = false;
 
                 section_header(
                     ui,
@@ -38,6 +39,9 @@ impl LuaToolsApp {
                     "Welcome back",
                     "Drop manifest packages onto the sheet below or browse the Steam catalog",
                     |ui| {
+                        if ghost_button(ui, "How to Use").clicked() {
+                            go_guide = true;
+                        }
                         if primary_button(ui, "Browse Catalog").clicked() {
                             go_discover = true;
                         }
@@ -52,6 +56,9 @@ impl LuaToolsApp {
                 }
                 if go_discover {
                     self.active_view = ActiveView::Acquire;
+                }
+                if go_guide {
+                    self.active_view = ActiveView::Guide;
                 }
 
                 // 1. Tactile Cut-Paper Drop Sheet (clean, spacious, zero duplicate URL inputs)

@@ -47,8 +47,9 @@ Outputs self-contained distributables into `dist/`:
 | **Discover** | Unified Steam Store search, Featured (`Top Sellers` / `New Releases`), multi-provider manifest checks, Hubcap integration, FastFetch auto-install, DLC `.lua` generator |
 | **Library** | Multi-library ACF + `stplug-in` scanner, live filter chips (`All`, `Lua Ready`, `Installed`, `Overrides`), bulk `.lua` cleanup, per-game Configure & binary `appinfo.vdf` Launch Options |
 | **Depots & Vault** | Sub-tabbed workspace (`Manifests & Vault`, `Lua Editor`, `Download Depots`) with content-addressed `LuaVault` (`~/.local/share/luatools/luavault` — 100% compatible with v1.x), syntax-highlighted Lua editor, `Pin` / `Unpin` manifest toggling, and crash-hardened official `SteamRE/DepotDownloader` integration with QR/account session sign-in |
-| **Game Fixes** | `lua.tools` game & Denuvo fixes catalog, category filters, SHA-256 `.luatools-fix/` backup & verified revert |
-| **Settings** | 4 focused sub-tabs (`General & Steam`, `Account & Providers`, `SLSsteam & Store Bridge`, `Updates & Toolchain`) covering Discord PKCE OAuth (`:53789`) & Bot Code login, Hubcap API key validator, Steam path override, lossless `SLSsteam` `config.yaml` editor, Millennium `:38495` RPC, Steam CEF `:8080` WebSocket injector, local `:6767` RPC bridge, `luatools://` handler, external tools (`DepotDownloaderMod`, `SteamAutoCrack`, `Steamless`), and **Git Self-Updater** |
+| **Game Fixes** | `lua.tools` game & DRM fixes catalog, category filters, SHA-256 `.luatools-fix/` backup & verified revert |
+| **How to Use** | Interactive 5-part workstation manual covering Quick Start, `.lua`/`.manifest`/`.zip` ingest, annotated `.lua` syntax, `LuaVault` build pinning vs auto-update, `DepotDownloader` QR sessions, `appinfo.vdf` Launch Options, and troubleshooting |
+| **Settings** | 5 focused sub-tabs (`General & Steam`, `Account & Providers`, `SLSsteam & Store Bridge`, `Updates & Toolchain`, `Telemetry & Logs`) covering Discord PKCE OAuth (`:53789`) & Bot Code login, Hubcap API key validator, Steam path override, lossless `SLSsteam` `config.yaml` editor, Millennium `:38495` RPC, Steam CEF `:8080` Store Bridge, local `:6767` RPC bridge, `luatools://` handler, external tools, **Git Self-Updater**, and **Privacy-First Opt-Out Bug Telemetry & Diagnostic Exporter** |
 
 ---
 
@@ -63,5 +64,7 @@ Outputs self-contained distributables into `dist/`:
 ## Keyboard Shortcuts
 
 - **`Ctrl+K` / `Ctrl+L`**: Focus Global Quick Command Bar (AppID, Steam/SteamDB URL, `luatools://`, or Store Search)
-- **`Ctrl+1` … `Ctrl+6`**: Switch directly between `Home`, `Discover`, `Library`, `Depots & Vault`, `Game Fixes`, and `Settings`
+- **`Ctrl+1` … `Ctrl+5`**: Switch between `Home`, `Discover`, `Library`, `Depots & Vault`, and `Game Fixes`
+- **`Ctrl+6` / `F1`**: Open the `How to Use` interactive manual
+- **`Ctrl+7` / `Ctrl+,`**: Open `Settings`
 - **`Ctrl+Q`**: Quit application

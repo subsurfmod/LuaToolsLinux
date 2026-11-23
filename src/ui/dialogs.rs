@@ -6,22 +6,169 @@ use std::thread;
 use eframe::egui::{self, Align, ComboBox, Layout, Margin, RichText, ScrollArea, TextEdit};
 
 use crate::parsers::vdf_binary::{LaunchEntry, LaunchOptionsService};
+use crate::services::telemetry_service::TelemetryService;
 use crate::ui::app::LuaToolsApp;
-use crate::ui::state::ToastKind;
+use crate::ui::state::{ActiveView, SettingsSubTab, ToastKind};
 use crate::ui::theme::{
-    danger_button, display_font, format_bytes, ghost_button, inset_paper_sheet, lua_layouter,
-    primary_button, secondary_button, semibold_font, Palette,
+    danger_button, display_font, draw_rem_medallion, format_bytes, ghost_button, inset_paper_sheet,
+    lua_layouter, primary_button, secondary_button, semibold_font, Palette,
 };
 use crate::VERSION;
 
 impl LuaToolsApp {
     pub fn render_modals(&mut self, ctx: &egui::Context) {
+        self.render_telemetry_consent_modal(ctx);
         self.render_add_by_appid_modal(ctx);
         self.render_game_detail_modal(ctx);
         self.render_launch_options_modal(ctx);
         self.render_depot_detail_modal(ctx);
         self.render_text_prompt_modal(ctx);
         self.render_about_modal(ctx);
+    }
+
+    fn render_telemetry_consent_modal(&mut self, ctx: &egui::Context) {
+        let should_show =
+            !self.settings_service.settings.telemetry_consent_seen || self.telemetry_modal_open;
+        if !should_show {
+            return;
+        }
+
+        let mut act_keep_enabled = false;
+        let mut act_turn_off = false;
+        let mut act_open_settings = false;
+
+        egui::Window::new("Telemetry & Diagnostic Privacy Notice")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .fixed_size([560.0, 355.0])
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 14.0;
+                    draw_rem_medallion(ui, 40.0);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 3.0;
+                        ui.label(
+                            RichText::new("Help Improve LuaTools Linux")
+                                .font(display_font(19.0))
+                                .color(Palette::TEXT_PRIMARY),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "LuaTools can record lightweight, scrubbed diagnostic telemetry to help diagnose bugs and crashes.",
+                            )
+                            .size(12.5)
+                            .color(Palette::TEXT_SECONDARY),
+                        );
+                    });
+                });
+
+                ui.add_space(10.0);
+                inset_paper_sheet(ui, Margin::symmetric(14, 12), |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    ui.label(
+                        RichText::new("• Collected when enabled:")
+                            .font(semibold_font(12.5))
+                            .color(Palette::BLUE_LIGHT),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "  App version, Linux distro & display server (Wayland/X11), scrubbed error codes (DepotDownloader, manifest, fix, or update failures), and panic file:line locations.",
+                        )
+                        .size(12.0)
+                        .color(Palette::TEXT_SECONDARY),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new("• Strictly never collected:")
+                            .font(semibold_font(12.5))
+                            .color(Palette::GO_TEXT),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "  Steam usernames/passwords, Discord tokens, Hubcap API keys, 64-char depot decryption keys, emails, or personal home directory usernames (automatically scrubbed to '~').",
+                        )
+                        .size(12.0)
+                        .color(Palette::TEXT_SECONDARY),
+                    );
+                });
+
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "You can inspect every recorded event, clear stored logs, or turn telemetry off at any time in Settings › Telemetry & Logs.",
+                    )
+                    .size(12.0)
+                    .color(Palette::TEXT_MUTED),
+                );
+
+                ui.add_space(14.0);
+                egui::Sides::new().show(
+                    ui,
+                    |ui| {
+                        if danger_button(ui, "Turn Off Telemetry").clicked() {
+                            act_turn_off = true;
+                        }
+                    },
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        if primary_button(ui, "Keep Enabled").clicked() {
+                            act_keep_enabled = true;
+                        }
+                        if ghost_button(ui, "Telemetry Settings ›").clicked() {
+                            act_open_settings = true;
+                        }
+                    },
+                );
+            });
+
+        if act_turn_off {
+            self.settings_service.settings.telemetry_enabled = false;
+            self.settings_service.settings.telemetry_consent_seen = true;
+            self.settings_service.settings.telemetry_install_id.clear();
+            let _ = self.settings_service.save();
+            self.telemetry_service.set_enabled(false);
+            self.telemetry_service.clear_all();
+            self.telemetry_modal_open = false;
+            self.notify(
+                "Telemetry turned off — no diagnostic events will be collected.",
+                ToastKind::Info,
+            );
+        } else if act_keep_enabled {
+            self.settings_service.settings.telemetry_enabled = true;
+            self.settings_service.settings.telemetry_consent_seen = true;
+            if self
+                .settings_service
+                .settings
+                .telemetry_install_id
+                .trim()
+                .is_empty()
+            {
+                self.settings_service.settings.telemetry_install_id =
+                    TelemetryService::generate_install_id();
+            }
+            let _ = self.settings_service.save();
+            self.telemetry_service.set_enabled(true);
+            self.telemetry_service.record(
+                "info",
+                "telemetry",
+                "consent_accepted",
+                "User confirmed diagnostic telemetry collection",
+            );
+            self.telemetry_modal_open = false;
+            self.notify(
+                "Diagnostic telemetry active — you can turn it off anytime in Settings › Telemetry & Logs.",
+                ToastKind::Success,
+            );
+        } else if act_open_settings {
+            self.settings_service.settings.telemetry_consent_seen = true;
+            let _ = self.settings_service.save();
+            self.telemetry_modal_open = false;
+            self.active_view = ActiveView::Settings;
+            self.settings_subtab = SettingsSubTab::Telemetry;
+        }
     }
 
     fn render_add_by_appid_modal(&mut self, ctx: &egui::Context) {

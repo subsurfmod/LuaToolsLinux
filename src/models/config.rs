@@ -115,6 +115,14 @@ pub struct AppSettings {
     pub update_repo_dir: String,
     #[serde(default)]
     pub steam_username: String,
+    #[serde(default = "default_true")]
+    pub telemetry_enabled: bool,
+    #[serde(default)]
+    pub telemetry_consent_seen: bool,
+    #[serde(default)]
+    pub telemetry_endpoint_url: String,
+    #[serde(default)]
+    pub telemetry_install_id: String,
 }
 
 impl Default for AppSettings {
@@ -134,6 +142,10 @@ impl Default for AppSettings {
             git_remote_url: String::new(),
             update_repo_dir: String::new(),
             steam_username: String::new(),
+            telemetry_enabled: true,
+            telemetry_consent_seen: false,
+            telemetry_endpoint_url: String::new(),
+            telemetry_install_id: String::new(),
         }
     }
 }

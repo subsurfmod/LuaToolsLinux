@@ -4,5 +4,6 @@ pub mod app;
 pub mod dialogs;
 pub mod state;
 pub mod theme;
+pub mod views_guide;
 pub mod views_primary;
 pub mod views_workbench;

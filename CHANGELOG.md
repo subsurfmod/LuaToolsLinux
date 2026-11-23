@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [2.1.0] - 2026-11-23
 
 ### Added & Improved
+- **Interactive `How to Use` Workspace (`Ctrl+6` / `F1`)**: Built-in 5-section workstation manual (`Quick Start`, `Adding Games & .lua`, `Depots, Vault & Downloads`, `Fixes, SLSsteam & Launch`, and `Bridge, FAQ & Bug Reports`) with annotated syntax-highlighted `.lua` examples, exact Linux file paths, troubleshooting recipes, and 1-click workspace jump buttons.
+- **Privacy-First Bug-Fixing Telemetry, Consent Popup & Diagnostic Exporter (`TelemetryService`)**:
+  - First-launch privacy & consent popup explaining exactly what is collected and offering immediate 1-click **`Turn Off Telemetry`** or **`Keep Enabled`** controls.
+  - Strictly scrubbed local JSONL ring-buffer (`~/.local/share/luatools/telemetry/events.jsonl`) + chained Rust panic hook (`file:line` crash capture) that automatically redacts usernames in paths (`~`), Hubcap keys, 64-char depot keys, JWT/Bearer tokens, and emails.
+  - Dedicated **`Settings › Telemetry & Logs`** sub-tab with instant opt-out toggle, live event log inspector, 1-click **Report Bug on GitHub** (pre-filled issue), **Copy / Export Diagnostic Markdown**, data wipe, and optional remote HTTPS JSON / Discord webhook collector support.
 - **Depot Decryption Key File Support (`-depotkeys`)**: Automatically resolves per-app `.lua` and `SLSsteam` depot decryption keys into a restricted (`0600`) temporary keys file for `DepotDownloader` / `DepotDownloaderMod` and cleans up after completion, plus `-manifestfile` support when using `DepotDownloaderMod`.
 - **CEF Store Bridge & DRM Fix Refactor**: Renamed `cef_injector` to `cef_bridge` (`CefBridgeService`) with backwards-compatible `settings.json` deserialization (`alias = "cef_injector_enabled"`), and unified neutral toolchain naming (`SteamAutoPatch` / `StubRemover`) with full binary & CLI compatibility for upstream GitHub releases.
 

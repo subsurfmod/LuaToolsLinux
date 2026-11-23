@@ -53,7 +53,17 @@ pub enum ActiveView {
     Library,
     Depots,
     Fixes,
+    Guide,
     Settings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuideTopic {
+    QuickStart,
+    AddingGames,
+    DepotsAndVault,
+    FixesAndOverrides,
+    Troubleshooting,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +86,7 @@ pub enum SettingsSubTab {
     Account,
     Integrations,
     UpdatesAndTools,
+    Telemetry,
 }
 
 #[derive(Debug, Clone)]
@@ -210,6 +221,11 @@ pub enum AppMessage {
     },
     UpdateApplyFinished(Result<UpdateApplyResult, String>),
     FolderPickedForUpdateRepo(PathBuf),
+    TelemetryEndpointTested {
+        ok: bool,
+        msg: String,
+    },
+    FolderPickedForDiagExport(PathBuf),
 }
 
 // ===== Modal Dialog States =====

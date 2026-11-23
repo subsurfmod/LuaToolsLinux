@@ -301,6 +301,27 @@ fn headless_papercut_views_render_cleanly_at_wide_and_narrow_resolutions() {
             d_sub: Some(DepotsSubTab::DownloadPicker),
             s_sub: None,
         },
+        QaViewCase {
+            fname: "12_how_to_use.png",
+            size: [1380, 860],
+            view: ActiveView::Guide,
+            d_sub: None,
+            s_sub: None,
+        },
+        QaViewCase {
+            fname: "13_telemetry_popup.png",
+            size: [1380, 860],
+            view: ActiveView::Overview,
+            d_sub: None,
+            s_sub: None,
+        },
+        QaViewCase {
+            fname: "14_settings_telemetry.png",
+            size: [1380, 860],
+            view: ActiveView::Settings,
+            d_sub: None,
+            s_sub: Some(SettingsSubTab::Telemetry),
+        },
     ];
 
     for case in cases {
@@ -309,6 +330,7 @@ fn headless_papercut_views_render_cleanly_at_wide_and_narrow_resolutions() {
         let view = case.view;
         let d_sub = case.d_sub;
         let s_sub = case.s_sub;
+        app.telemetry_modal_open = fname == "13_telemetry_popup.png";
         if fname == "11_toast_top_right.png" {
             app.notify(
                 "Saved settings.json and synced Steam configuration",

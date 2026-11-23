@@ -37,11 +37,12 @@ use crate::services::protocol_service::ProtocolService;
 use crate::services::settings_service::SettingsService;
 use crate::services::slssteam_service::SlssteamService;
 use crate::services::steam_service::SteamService;
+use crate::services::telemetry_service::TelemetryService;
 use crate::services::update_service::UpdateService;
 use crate::ui::state::{
     AcquireTab, ActiveView, AddByAppIdModal, AppMessage, DepotDetailModal, DepotPickRow,
-    DepotsSubTab, GameDetailModal, LaunchOptionsModal, LibraryRow, QaCaptureState, SettingsSubTab,
-    TextPromptModal, ToastKind, ToastNotification, UpdateBannerState,
+    DepotsSubTab, GameDetailModal, GuideTopic, LaunchOptionsModal, LibraryRow, QaCaptureState,
+    SettingsSubTab, TextPromptModal, ToastKind, ToastNotification, UpdateBannerState,
 };
 use crate::ui::theme::{
     apply_papercut_monotone_theme, display_font, draw_rem_medallion, nav_rail_button,
@@ -69,6 +70,7 @@ pub struct LuaToolsApp {
     pub cef_bridge: CefBridgeService,
     pub http_server: Option<HttpServerService>,
     pub tools_manager: ExternalToolsManager,
+    pub telemetry_service: TelemetryService,
 
     // Async Channels
     pub egui_ctx: Option<egui::Context>,
@@ -146,7 +148,9 @@ pub struct LuaToolsApp {
     pub settings_usage_text: String,
     pub settings_millennium_status: String,
     pub settings_update_status: String,
+    pub settings_telemetry_status: String,
     pub update_banner: UpdateBannerState,
+    pub guide_topic: GuideTopic,
 
     // Modals & QA
     pub add_appid_modal: AddByAppIdModal,
@@ -155,6 +159,7 @@ pub struct LuaToolsApp {
     pub depot_detail_modal: DepotDetailModal,
     pub text_prompt_modal: TextPromptModal,
     pub about_modal_open: bool,
+    pub telemetry_modal_open: bool,
     pub qa_capture: Option<QaCaptureState>,
 }
 
@@ -166,7 +171,25 @@ impl LuaToolsApp {
     ) -> Self {
         apply_papercut_monotone_theme(&cc.egui_ctx);
 
-        let settings_service = SettingsService::default();
+        let mut settings_service = SettingsService::default();
+        if settings_service.settings.telemetry_enabled
+            && settings_service
+                .settings
+                .telemetry_install_id
+                .trim()
+                .is_empty()
+        {
+            settings_service.settings.telemetry_install_id =
+                TelemetryService::generate_install_id();
+            let _ = settings_service.save();
+        }
+        let telemetry_service = TelemetryService::new(
+            None,
+            settings_service.settings.telemetry_enabled,
+            settings_service.settings.telemetry_endpoint_url.clone(),
+            settings_service.settings.telemetry_install_id.clone(),
+        );
+        telemetry_service.install_panic_hook();
         let auth_service = AuthService::default();
         auth_service.initialize();
 
@@ -225,6 +248,7 @@ impl LuaToolsApp {
             cef_bridge,
             http_server: None,
             tools_manager,
+            telemetry_service,
             egui_ctx: Some(cc.egui_ctx.clone()),
             msg_tx,
             msg_rx,
@@ -289,13 +313,16 @@ impl LuaToolsApp {
             settings_millennium_status: "Click Probe Bridge to check Millennium RPC (:38495)"
                 .into(),
             settings_update_status: "Checked automatically once on startup".into(),
+            settings_telemetry_status: String::new(),
             update_banner: UpdateBannerState::Hidden,
+            guide_topic: GuideTopic::QuickStart,
             add_appid_modal: AddByAppIdModal::default(),
             game_detail_modal: GameDetailModal::default(),
             launch_options_modal: LaunchOptionsModal::default(),
             depot_detail_modal: DepotDetailModal::default(),
             text_prompt_modal: TextPromptModal::default(),
             about_modal_open: false,
+            telemetry_modal_open: false,
             qa_capture,
         };
 
@@ -303,6 +330,12 @@ impl LuaToolsApp {
         if is_qa {
             app.populate_qa_demo_data();
         } else {
+            app.telemetry_service.record(
+                "info",
+                "startup",
+                "app_start",
+                "LuaTools Linux desktop session initialized",
+            );
             app.probe_bridge_async(&cc.egui_ctx);
             app.fetch_featured_async(&cc.egui_ctx);
             app.fetch_fix_listings_async(&cc.egui_ctx);
@@ -340,6 +373,12 @@ impl LuaToolsApp {
         let lua_vault = LuaVault::new(None, Some(scratch_dir.join("vault")));
         let cef_bridge = CefBridgeService::new(None, 6767);
         let tools_manager = ExternalToolsManager::new(Some(scratch_dir.join("tools")));
+        let telemetry_service = TelemetryService::new(
+            Some(scratch_dir.join("telemetry")),
+            true,
+            String::new(),
+            "0102030405060708".into(),
+        );
         let (msg_tx, msg_rx) = mpsc::channel();
         let (rpc_tx, rpc_rx) = mpsc::channel();
 
@@ -362,6 +401,7 @@ impl LuaToolsApp {
             cef_bridge,
             http_server: None,
             tools_manager,
+            telemetry_service,
             egui_ctx: Some(ctx.clone()),
             msg_tx,
             msg_rx,
@@ -427,14 +467,17 @@ impl LuaToolsApp {
             settings_hubcap_status: String::new(),
             settings_usage_text: String::new(),
             settings_millennium_status: "Click Probe Millennium to check local RPC (:38495)".into(),
-            settings_update_status: "Up to date (v2.0-beta) · Checked once on startup".into(),
+            settings_update_status: format!("Up to date (v{}) · Checked once on startup", VERSION),
+            settings_telemetry_status: String::new(),
             update_banner: UpdateBannerState::Hidden,
+            guide_topic: GuideTopic::QuickStart,
             add_appid_modal: AddByAppIdModal::default(),
             game_detail_modal: GameDetailModal::default(),
             launch_options_modal: LaunchOptionsModal::default(),
             depot_detail_modal: DepotDetailModal::default(),
             text_prompt_modal: TextPromptModal::default(),
             about_modal_open: false,
+            telemetry_modal_open: false,
             qa_capture: None,
         };
         app.populate_qa_demo_data();
@@ -443,6 +486,19 @@ impl LuaToolsApp {
     }
 
     fn populate_qa_demo_data(&mut self) {
+        self.settings_service.settings.telemetry_consent_seen = true;
+        self.telemetry_service.record(
+            "info",
+            "startup",
+            "app_start",
+            "Steam connected (2 libraries) · SLSsteam synced",
+        );
+        self.telemetry_service.record(
+            "warn",
+            "depot_dl",
+            "session_hint",
+            "Depot 1245621 requires cached QR session (-remember-password)",
+        );
         if self.library_rows.is_empty() {
             self.library_rows = vec![
                 LibraryRow {
@@ -625,6 +681,11 @@ impl LuaToolsApp {
     pub fn refresh_all_local_state(&mut self) {
         self.slssteam_service.reload();
         self.depot_downloader.slssteam_service = Some(self.slssteam_service.clone());
+        self.telemetry_service.update_runtime_context(
+            self.steam_service.is_available(),
+            self.steam_service.libraries().len(),
+            self.slssteam_service.config.exists(),
+        );
         if let Some(installer) = &self.lua_installer {
             self.recent_installed = installer.enumerate_installed();
         }
@@ -702,6 +763,10 @@ impl LuaToolsApp {
     /// Shows a non-blocking top-right toast notification (never placed at the bottom).
     pub fn notify(&mut self, msg: impl Into<String>, kind: ToastKind) {
         let text = msg.into();
+        if kind == ToastKind::Warning {
+            self.telemetry_service
+                .record("warn", "diagnostic", "warning_toast", &text);
+        }
         self.status_text = text.clone();
         self.active_toast = Some(ToastNotification {
             text,
@@ -1743,6 +1808,31 @@ impl LuaToolsApp {
                     self.settings_service.settings.update_repo_dir =
                         dir.to_string_lossy().to_string();
                 }
+                AppMessage::TelemetryEndpointTested { ok, msg } => {
+                    self.settings_telemetry_status = msg.clone();
+                    self.notify(
+                        msg,
+                        if ok {
+                            ToastKind::Success
+                        } else {
+                            ToastKind::Warning
+                        },
+                    );
+                }
+                AppMessage::FolderPickedForDiagExport(dir) => {
+                    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+                    let dest = dir.join(format!("luatools-diagnostics-{}.md", ts));
+                    match self.telemetry_service.export_report(&dest) {
+                        Ok(p) => self.notify(
+                            format!("Exported diagnostic report to {}", p.display()),
+                            ToastKind::Success,
+                        ),
+                        Err(e) => self.notify(
+                            format!("Failed to export diagnostic report: {}", e),
+                            ToastKind::Warning,
+                        ),
+                    }
+                }
             }
         }
     }
@@ -1769,7 +1859,14 @@ impl LuaToolsApp {
             if i.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::Num5)) {
                 self.active_view = ActiveView::Fixes;
             }
-            if i.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::Num6)) {
+            if i.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::Num6))
+                || i.consume_shortcut(&KeyboardShortcut::new(Modifiers::NONE, Key::F1))
+            {
+                self.active_view = ActiveView::Guide;
+            }
+            if i.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::Num7))
+                || i.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::Comma))
+            {
                 self.active_view = ActiveView::Settings;
             }
             if i.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::Q)) {
@@ -2104,6 +2201,7 @@ impl LuaToolsApp {
                     ("Library", Some(lua_n), ActiveView::Library),
                     ("Depots & Vault", None, ActiveView::Depots),
                     ("Game Fixes", None, ActiveView::Fixes),
+                    ("How to Use", None, ActiveView::Guide),
                 ];
 
                 for (lbl, count, view) in items {
@@ -2126,6 +2224,7 @@ impl LuaToolsApp {
                 ActiveView::Library => self.render_library(ui),
                 ActiveView::Depots => self.render_depots(ui),
                 ActiveView::Fixes => self.render_fixes(ui),
+                ActiveView::Guide => self.render_guide(ui),
                 ActiveView::Settings => self.render_settings(ui),
             });
 
