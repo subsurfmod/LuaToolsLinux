@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           luatools-linux
-Version:        2.5.1
+Version:        2.6.0
 Release:        1%{?dist}
 Summary:        Native Rust workstation for Steam stplug-in lua manifests, depots, and fixes
 License:        MIT
@@ -15,6 +15,9 @@ Requires:       libxkbcommon
 Requires:       libX11
 Requires:       xdg-utils
 Recommends:     zenity
+Recommends:     zstd
+Recommends:     bzip2
+Recommends:     p7zip
 
 %description
 LuaTools Linux v2.0.0 is a lightweight, zero-Python native Rust rewrite of LuaTools
@@ -37,5 +40,7 @@ install -m 0644 %{_sourcedir}/luatools.desktop %{buildroot}%{_datadir}/applicati
 %{_datadir}/icons/hicolor/scalable/apps/luatools.svg
 
 %changelog
+* Mon Nov 23 2026 LuaTools Linux Contributors <noreply@lua.tools> - 2.6.0-1
+- Release v2.6.0: Native Linux SteamAutoPatch (Goldberg .so/.dll deployment & ELF/PE interface generator), complete Steam Inlibrary Fix, one-click recommended fixes, and illustrated How to Use manual
 * Mon Nov 23 2026 LuaTools Linux Contributors <noreply@lua.tools> - 2.0-0.1.beta
 - Complete native Rust rewrite (v2.0-beta) with sharp monotone + cobalt blue UI and Git self-updater

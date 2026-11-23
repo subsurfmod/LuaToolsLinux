@@ -1,6 +1,6 @@
 //! Configuration management for SteamAutoPatch
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -27,16 +27,16 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn data_dir(&self) -> &PathBuf {
+    pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
 
-    pub fn temp_dir(&self) -> &PathBuf {
+    pub fn temp_dir(&self) -> &Path {
         &self.temp_dir
     }
 
-    pub fn steam_root(&self) -> Option<&PathBuf> {
-        self.steam_root.as_ref()
+    pub fn steam_root(&self) -> Option<&Path> {
+        self.steam_root.as_deref()
     }
 }
 

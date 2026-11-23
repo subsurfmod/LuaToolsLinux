@@ -466,7 +466,7 @@ impl LuaToolsApp {
                                     let is_sel = self.depots_selected_variant_hash.as_deref()
                                         == Some(v.hash.as_str());
                                     let meta = if is_live {
-                                        "● Live".to_string()
+                                        "Live".to_string()
                                     } else if v.is_pinned() {
                                         format!("{} pinned", v.manifest_ids.len())
                                     } else {
@@ -2713,9 +2713,9 @@ impl LuaToolsApp {
                         status_badge(ui, "Not Installed", BadgeTone::Muted);
                     }
                     if st.steam_detected {
-                        status_badge(ui, "● Steam Detected", BadgeTone::Ready);
+                        status_badge(ui, "Steam Detected", BadgeTone::Ready);
                     } else {
-                        status_badge(ui, "○ No Steam", BadgeTone::Warn);
+                        status_badge(ui, "No Steam", BadgeTone::Warn);
                     }
                 },
             );
@@ -2878,9 +2878,9 @@ impl LuaToolsApp {
                 },
                 |ui| {
                     if hr_running {
-                        status_badge(ui, "● Watcher Running", BadgeTone::Ready);
+                        status_badge(ui, "Watcher Running", BadgeTone::Ready);
                     } else {
-                        status_badge(ui, "○ Watcher Stopped", BadgeTone::Muted);
+                        status_badge(ui, "Watcher Stopped", BadgeTone::Muted);
                     }
                 },
             );

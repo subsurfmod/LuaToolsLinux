@@ -12,7 +12,7 @@ use eframe::egui::{
 };
 
 use luatools_linux::ui::app::LuaToolsApp;
-use luatools_linux::ui::state::{ActiveView, DepotsSubTab, SettingsSubTab, ToastKind};
+use luatools_linux::ui::state::{ActiveView, DepotsSubTab, GuideTopic, SettingsSubTab, ToastKind};
 
 struct SoftAtlas {
     width: usize,
@@ -343,7 +343,26 @@ fn headless_papercut_views_render_cleanly_at_wide_and_narrow_resolutions() {
             d_sub: Some(DepotsSubTab::ManifestBinding),
             s_sub: None,
         },
+        QaViewCase {
+            fname: "18_library_integration_modal.png",
+            size: [1380, 860],
+            view: ActiveView::Library,
+            d_sub: None,
+            s_sub: None,
+        },
+        QaViewCase {
+            fname: "19_how_to_use_steam_interop.png",
+            size: [1380, 860],
+            view: ActiveView::Guide,
+            d_sub: None,
+            s_sub: None,
+        },
     ];
+
+    let guide_out_opt = std::env::var("LUATOOLS_GUIDE_OUT").ok().map(PathBuf::from);
+    if let Some(ref gd) = guide_out_opt {
+        std::fs::create_dir_all(gd).unwrap();
+    }
 
     for case in cases {
         let fname = case.fname;
@@ -352,6 +371,24 @@ fn headless_papercut_views_render_cleanly_at_wide_and_narrow_resolutions() {
         let d_sub = case.d_sub;
         let s_sub = case.s_sub;
         app.telemetry_modal_open = fname == "13_telemetry_popup.png";
+        app.guide_topic = if fname == "19_how_to_use_steam_interop.png" {
+            GuideTopic::SteamInterop
+        } else {
+            GuideTopic::QuickStart
+        };
+        if fname == "18_library_integration_modal.png" {
+            app.open_integration_modal(1245620, "ELDEN RING".into(), None);
+        } else {
+            app.integration_modal.open = false;
+        }
+        if fname == "09_settings_updates.png" {
+            app.update_banner = luatools_linux::ui::state::UpdateBannerState::Available {
+                badge: "Update v2.6.0".into(),
+                tooltip: "New commits available on GitHub".into(),
+            };
+        } else {
+            app.update_banner = luatools_linux::ui::state::UpdateBannerState::Hidden;
+        }
         if fname == "11_toast_top_right.png" {
             app.notify(
                 "Saved settings.json and synced Steam configuration",
@@ -399,6 +436,30 @@ fn headless_papercut_views_render_cleanly_at_wide_and_narrow_resolutions() {
                 image::ColorType::Rgba8,
             )
             .unwrap();
+        }
+
+        if let Some(ref guide_dir) = guide_out_opt {
+            let guide_target = match fname {
+                "01_home.png" => Some("01_home_overview.png"),
+                "02_discover.png" => Some("02_discover_store.png"),
+                "04_depots_vault.png" => Some("03_depots_vault_binding.png"),
+                "18_library_integration_modal.png" => Some("04_library_integration_modal.png"),
+                "16_settings_steam_integration.png" => Some("05_settings_steam_integration.png"),
+                "15_settings_integrations_wired.png" => Some("06_settings_wired_cloud.png"),
+                _ => None,
+            };
+            if let Some(out_name) = guide_target {
+                let rgba = rasterize_primitives(w, h, &prims, &textures);
+                let src_img =
+                    image::RgbaImage::from_raw(w as u32, h as u32, rgba).expect("valid rgba");
+                let resized = image::imageops::resize(
+                    &src_img,
+                    960,
+                    598,
+                    image::imageops::FilterType::Lanczos3,
+                );
+                resized.save(guide_dir.join(out_name)).unwrap();
+            }
         }
     }
 }

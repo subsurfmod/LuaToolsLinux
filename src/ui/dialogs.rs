@@ -19,6 +19,29 @@ use crate::VERSION;
 
 impl LuaToolsApp {
     pub fn render_modals(&mut self, ctx: &egui::Context) {
+        let any_modal_open = !self.settings_service.settings.telemetry_consent_seen
+            || self.telemetry_modal_open
+            || self.add_appid_modal.open
+            || self.game_detail_modal.open
+            || self.integration_modal.open
+            || self.launch_options_modal.open
+            || self.depot_detail_modal.open
+            || self.text_prompt_modal.open
+            || self.about_modal_open
+            || self.guide_zoom_screenshot.is_some();
+        if any_modal_open {
+            let screen = ctx.screen_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Middle,
+                egui::Id::new("modal_backdrop_scrim"),
+            ));
+            painter.rect_filled(
+                screen,
+                egui::CornerRadius::ZERO,
+                egui::Color32::from_rgba_unmultiplied(6, 8, 12, 185),
+            );
+        }
+
         self.render_telemetry_consent_modal(ctx);
         self.render_add_by_appid_modal(ctx);
         self.render_game_detail_modal(ctx);
@@ -27,6 +50,7 @@ impl LuaToolsApp {
         self.render_depot_detail_modal(ctx);
         self.render_text_prompt_modal(ctx);
         self.render_about_modal(ctx);
+        self.render_guide_zoom_modal(ctx);
     }
 
     fn render_telemetry_consent_modal(&mut self, ctx: &egui::Context) {
@@ -41,6 +65,7 @@ impl LuaToolsApp {
         let mut act_open_settings = false;
 
         egui::Window::new("Telemetry & Diagnostic Privacy Notice")
+            .order(egui::Order::Foreground)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -182,6 +207,7 @@ impl LuaToolsApp {
         let mut create = false;
 
         egui::Window::new("Create stplug-in .lua by AppID")
+            .order(egui::Order::Foreground)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -305,6 +331,7 @@ impl LuaToolsApp {
             "Configure {} (#{})",
             self.game_detail_modal.game_name, app_id
         ))
+        .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(true)
         .default_size([620.0, 470.0])
@@ -463,6 +490,7 @@ impl LuaToolsApp {
             "Launch Options — {} (#{})",
             self.launch_options_modal.game_name, app_id
         ))
+        .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(true)
         .default_size([680.0, 460.0])
@@ -611,6 +639,7 @@ impl LuaToolsApp {
         let mut close = false;
 
         egui::Window::new("Depot Declaration Details")
+            .order(egui::Order::Foreground)
             .collapsible(false)
             .resizable(false)
             .fixed_size([460.0, 250.0])
@@ -672,6 +701,7 @@ impl LuaToolsApp {
         let mut cancel = false;
 
         egui::Window::new(self.text_prompt_modal.title.clone())
+            .order(egui::Order::Foreground)
             .collapsible(false)
             .resizable(false)
             .fixed_size([400.0, 145.0])
@@ -761,6 +791,7 @@ impl LuaToolsApp {
         }
         let mut close = false;
         egui::Window::new(format!("About LuaTools Linux v{}", VERSION))
+            .order(egui::Order::Foreground)
             .collapsible(false)
             .resizable(false)
             .fixed_size([490.0, 275.0])
@@ -888,6 +919,7 @@ impl LuaToolsApp {
             "Integration & Process Controls — {} (#{})",
             game_name, app_id
         ))
+        .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(true)
         .default_size([650.0, 560.0])
@@ -902,11 +934,15 @@ impl LuaToolsApp {
                     // 0. One-Click Quick Setup (Recommended)
                     inset_paper_sheet(ui, Margin::same(12), |ui| {
                         ui.set_width(ui.available_width());
-                        ui.label(
-                            RichText::new("⚡ Quick Setup: Apply Recommended Fixes")
-                                .font(semibold_font(13.5))
-                                .color(Palette::TEXT_PRIMARY),
-                        );
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            status_badge(ui, "RECOMMENDED", BadgeTone::Blue);
+                            ui.label(
+                                RichText::new("Quick Setup: Apply Recommended Fixes")
+                                    .font(semibold_font(13.5))
+                                    .color(Palette::TEXT_PRIMARY),
+                            );
+                        });
                         ui.add_space(4.0);
                         ui.label(
                             RichText::new("Automatically applies all recommended settings:")
@@ -915,24 +951,25 @@ impl LuaToolsApp {
                         );
                         ui.add_space(2.0);
                         ui.label(
-                            RichText::new("• Add to Play-Unowned (ownership redirect)")
-                                .size(11.0)
+                            RichText::new("- Add to Play-Unowned (Steam Inlibrary Fix)")
+                                .size(11.5)
                                 .color(Palette::TEXT_MUTED),
                         );
                         ui.label(
-                            RichText::new("• Set AppID redirect to 480 (online compatibility)")
-                                .size(11.0)
+                            RichText::new("- Set AppID redirect to 480 (online compatibility)")
+                                .size(11.5)
                                 .color(Palette::TEXT_MUTED),
                         );
                         ui.label(
-                            RichText::new("• Run SteamAutoPatch if game is installed")
-                                .size(11.0)
-                                .color(Palette::TEXT_MUTED),
+                            RichText::new(
+                                "- Apply native SteamAutoPatch (Goldberg) when game is installed",
+                            )
+                            .size(11.5)
+                            .color(Palette::TEXT_MUTED),
                         );
                         ui.add_space(8.0);
                         if primary_button(ui, "Apply Recommended Fixes Now").clicked() {
-                            self.integration_modal.feedback = 
-                                format!("Applying recommended fixes for {}...", game_name);
+                            apply_quick_setup = true;
                         }
                     });
                     ui.add_space(8.0);
@@ -1062,7 +1099,7 @@ impl LuaToolsApp {
                         for (k, v) in &cur_stats {
                             ui.horizontal(|ui| {
                                 ui.label(
-                                    RichText::new(format!("• {} = {}", k, v))
+                                    RichText::new(format!("- {} = {}", k, v))
                                         .size(12.0)
                                         .color(Palette::TEXT_SECONDARY),
                                 );
@@ -1313,7 +1350,8 @@ impl LuaToolsApp {
                     Err(e) => applied.push(format!("SteamAutoPatch failed: {}", e)),
                 }
             } else {
-                applied.push("Game install path not found - run SteamAutoPatch manually".to_string());
+                applied
+                    .push("Game install path not found - run SteamAutoPatch manually".to_string());
             }
 
             self.integration_modal.feedback = format!(
@@ -1321,6 +1359,7 @@ impl LuaToolsApp {
                 game_name,
                 applied.join(", ")
             );
+            self.notify(self.integration_modal.feedback.clone(), ToastKind::Success);
             self.refresh_all_local_state();
         }
         if close {

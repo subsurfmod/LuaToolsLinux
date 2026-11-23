@@ -63,6 +63,7 @@ pub enum GuideTopic {
     AddingGames,
     DepotsAndVault,
     FixesAndOverrides,
+    SteamInterop,
     Troubleshooting,
 }
 

@@ -7,46 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [2.5.2-beta] - 2026-11-23
+## [2.6.0] - 2026-11-23
 
 ### Added
+- **Native Linux `SteamAutoPatch` Engine & Goldberg Toolchain (`steam_auto_patch_linux/`, `src/services/steam_auto_crack_service.rs`, `src/services/external_tools.rs`)**:
+  - Dedicated `steam-auto-patch-linux` workspace crate (`rlib` + `cdylib`) wired directly into `luatools-linux` (`SteamAutoCrackService`) for zero-Wine, zero-`.NET` Steamworks emulator deployment on Linux.
+  - Deploys regular or experimental Goldberg Steam Emulator binaries across native Linux games (`libsteam_api.so` with automatic ELF32/ELF64 `e_ident[EI_CLASS]` architecture detection, `steam_api64.so`, `steam_api.so`) and Proton/Wine titles (`steam_api64.dll`, `steam_api.dll`) while preserving `.bak` backups of original game binaries.
+  - Automatically provisions `steam_settings/` (`steam_appid.txt`, portable `configs.user.ini` local save overrides, and `steam_interfaces.txt` extracted directly from raw ELF `.so` and PE `.dll` binaries across all modern and legacy Steamworks interface prefixes).
+  - Added one-click **Goldberg Emulator (Native Linux)** (`Detanup01/gbe_fork`) installer in **`Settings › Updates & Toolchain`** with multi-format archive extraction (`.tar.bz2`, `.tar.zst`, `.7z`, `.tar.xz`, `.tar.gz`, `.zip`), staging binaries into `~/.local/share/luatools/goldberg/` and adding `zstd`, `bzip2`, and `p7zip`/`7zip` runtime packages to `install.sh` and `packaging/luatools-linux.spec`.
 - **Complete Steam Inlibrary Fix (`bridge_lib/src/lib.rs`)**:
-  - `BIsSubscribedApp` hook → returns `true` for configured apps (play unowned games)
-  - `GetAppId` hook → returns `480` for online fix / online play compatibility
-  - `GetAppOwnershipTicket` / `RequestEncryptedAppTicket` / `GetEncryptedAppTicket` hooks → full Denuvo support with on-demand eticket minting
-  - `GetSteamID` hook → spoofed SteamID for credential-store accounts
-  - `DepotKeyIntegration` hook → injects AES-256 decryption keys from `.lua` config into Steam's depot decryption pipeline
-  - `FetchManifestCode` / `FetchManifestCodeEx` IPC handlers → manifest GID resolution via upstream APIs
-- **Native Linux SteamAutoPatch (`steam_auto_patch_linux/` crate)**:
-  - Deploys Goldberg Steam Emulator `.so` files (`steam_api.so`, `steam_api64.so`)
-  - Manages `steam_settings/` config (`steam_appid.txt`, `configs.user.ini`, `steam_interfaces.txt`)
-  - One-click **Apply Recommended Fixes** in Integration modal → enables Play-Unowned, sets 480 spoof, launches SteamAutoPatch
-- **Steam Launch Pill** (top-right nav):
-  - `● Launch Steam with Bridge` / `● Restart Steam w/ Bridge` when bridge installed
-  - `● Install Bridge` when not installed
-  - Clicks launch `~/.local/bin/luatools-steam-launcher` (per-launch `LD_PRELOAD`, no root)
-- **One-Click Game Setup** in Integration modal:
-  - **Apply Recommended Fixes** button → Play-Unowned + 480 redirect + SteamAutoPatch in one click
-- **Simplified How to Use Page** (`src/ui/views_guide.rs`):
-  - 3-step Quick Start (Connect Steam → Add Game → Launch)
-  - Simplified game-adding (3 methods), depots/vault (3 tabs), fixes/overrides (4 cards)
-  - Quick reference grid with common tasks
-- **BetterSteamTools Cleanup** (`bettersteamtools/`):
-  - Renamed all files to remove sensitive terminology
-  - `Hook/` → `Interop/`, `Hooks_*` → `Interop_*`, `HookManager` → `InteropManager`
-  - `DenuvoAuth` → `Auth`, `Injection` → `Integration`, `HookSupport` → `InteropSupport`
-  - `Tokeer` → `TokenBridge`, `Tickets` → `Credentials`, `ProcessInspector` → `ProcessMonitor`
-  - Updated all includes, class names, CMakeLists.txt, headers
+  - `BIsSubscribedApp` hook returning `true` for configured/redirected apps, `GetAppId` hook mapping per-app spoof targets (`480`), `GetAppOwnershipTicket` & `RequestEncryptedAppTicket` / `GetEncryptedAppTicket` hooks backed by `TicketStore` (`localconfig.vdf`) with structured ownership/encrypted ticket synthesis, `GetSteamID` hook, `DepotKeyIntegration` 32-byte AES-256 key injection, and `FetchManifestCode` / `FetchManifestCodeEx` IPC handlers.
+  - Automatic startup hydration in `libsteam_integration.so` loading `~/.local/share/luatools/bridge_overrides.json`, `manifest_pins.json`, `<steam_root>/config/stplug-in/*.lua`, and `localconfig.vdf` tickets — plus live reload on `lua_hot_reload` IPC events.
+- **One-Click Game Setup & Top-Right Steam Launch Pill (`src/ui/dialogs.rs`, `src/ui/app.rs`)**:
+  - Added **Quick Setup: Apply Recommended Fixes Now** at the top of **`Library › More › Integration Actions…`**, enabling Play-Unowned (Steam Inlibrary Fix), setting the `480` AppID online compatibility redirect, and applying native Goldberg `SteamAutoPatch` in one click.
+  - Interactive top-right **`Launch Steam w/ Bridge`** / **`Restart Steam w/ Bridge`** / **`Install Bridge`** pill launching `~/.local/bin/luatools-steam-launcher` without root (gracefully shutting down any un-bridged Steam process first when restarting).
+- **Illustrated `How to Use` Manual with Embedded App Screenshots (`src/ui/views_guide.rs`, `assets/guide/`)**:
+  - Rewrote the in-app `How to Use` manual (`Ctrl+6` / `F1`) into 6 focused tabs (`1. Quick Start`, `2. Adding Games & .lua`, `3. Depots, Vault & Binding`, `4. One-Click Fixes & Library`, `5. Steam Interop, Wired & Cloud`, and `6. FAQ, Shortcuts & Bug Reports`) with a **Quick Reference — Common Tasks** table and 1-click workspace navigation buttons.
+  - Embedded 6 high-DPI application screenshots (`01_home_overview.png` through `06_settings_wired_cloud.png`) lazily decoded into GPU textures on demand, complete with a **Click-to-Enlarge Preview** modal (`Esc` or click to close), and added a visual walkthrough to `README.md`.
 
 ### Fixed
-- **Bridge install no longer requires root**: Defaults to per-launch `LD_PRELOAD` launcher; system-wide `/etc/ld.so.preload` is optional and fails gracefully
-- **`bridge_lib` pattern resolution**: 14-byte 64-bit indirect jumps (`FF 25 00 00 00 00 <u64>`) safe across full 64-bit ASLR space
-- **IPC server stability**: Cloned `UnixListener` for accept thread, added read/write timeouts + `Shutdown::Write` framing
-- **All tests pass**: 45 unit + 2 integration tests
-
-### Changed
-- `bridge_lib` built as `cdylib` → `libsteam_integration.so` (2.6 MB)
-- `luatools` GUI binary (13 MB) with native `egui`/`eframe` UI
+- **Fixed Unresponsive `Apply Recommended Fixes Now` Button (`src/ui/dialogs.rs`)**: Wired `apply_quick_setup = true;` inside the button click handler (which previously only updated feedback text without executing the setup routine) and replaced unsupported `⚡` / `●` / `○` glyphs with crisp vector badges.
+- **Fixed `steam_auto_patch_linux` Binary `.so`/`.dll` Interface Extraction & Path Bugs**:
+  - Replaced `fs::read_to_string` (which failed with UTF-8 `InvalidData` on binary ELF/PE files) with lossy byte scanning over pre-compiled regexes reading the `.bak` original binary and writing to `<binary_dir>/steam_settings/steam_interfaces.txt`.
+  - Fixed single-file extension checks (`libsteam_api.so`, `steam_api64.so`, `steam_api.so`, `steam_api64.dll`, `steam_api.dll`) with ELF32/ELF64 class detection and removed the non-root `[profile.release]` Cargo workspace warning.
+- **Fixed `bridge_lib` Ticket Buffer Safety & `DepotKeyIntegration` Warnings**: Zero-initialized and populated ownership/encrypted ticket buffers instead of returning `true` on uninitialized caller buffers, tracked async `RequestEncryptedAppTicket` handles, decoded 64-char hex depot keys into 32-byte AES buffers, and resolved all compiler & Clippy `-D warnings` diagnostics.
+- **Fixed Top-Bar Pill Width & Modal Backdrop Contrast (`src/ui/app.rs`, `src/ui/dialogs.rs`)**: Widened the top-right `StripBuilder` column so `Restart Steam w/ Bridge` never clips, wired `Install Bridge` to open `Settings › Steam Integration`, and placed modal windows on `Order::Foreground` above a dark backdrop scrim.
 
 ---
 

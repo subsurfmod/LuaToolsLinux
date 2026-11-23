@@ -227,9 +227,9 @@ impl LuaToolsApp {
                         |ui| {
                             ui.spacing_mut().item_spacing.x = 10.0;
                             if hr_running {
-                                status_badge(ui, "● Hot-Reload Watching", BadgeTone::Ready);
+                                status_badge(ui, "Hot-Reload Watching", BadgeTone::Ready);
                             } else {
-                                status_badge(ui, "○ Hot-Reload Paused", BadgeTone::Muted);
+                                status_badge(ui, "Hot-Reload Paused", BadgeTone::Muted);
                             }
                             if bridge_st.integration_active {
                                 status_badge(ui, "Steam Bridge Active", BadgeTone::Blue);

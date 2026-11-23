@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "bridge_lib"
-version = "2.5.1"
+version = "2.6.0"
 dependencies = [
  "ctor",
  "dirs",
@@ -1520,7 +1520,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "luatools-linux"
-version = "2.5.1"
+version = "2.6.0"
 dependencies = [
  "base64",
  "chrono",
@@ -1539,6 +1539,7 @@ dependencies = [
  "serde_yml",
  "sha1",
  "sha2",
+ "steam-auto-patch-linux",
  "tar",
  "tempfile",
  "thiserror 2.0.21",
@@ -2757,13 +2758,12 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "steam-auto-patch-linux"
-version = "0.1.0"
+version = "2.6.0"
 dependencies = [
  "anyhow",
  "configparser",
  "dirs",
  "lazy_static",
- "log",
  "regex",
  "serde",
  "tempfile",

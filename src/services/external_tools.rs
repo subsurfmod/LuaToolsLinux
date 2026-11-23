@@ -1,19 +1,18 @@
 //! ExternalToolsManager — inspects, updates, and launches `DepotDownloaderMod`,
-//! `SteamAutoPatch`, and `StubRemover` with Linux `wine` / `dotnet` wrappers.
+//! `Goldberg Emulator`, `SteamAutoPatch`, and `StubRemover` with Linux `wine` / `dotnet` wrappers.
 
-use std::fs::{self, File};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use flate2::read::GzDecoder;
 use serde_json::{json, Value};
-use tar::Archive;
-use zip::ZipArchive;
+use walkdir_lite::collect_files_recursive;
 
 use crate::models::config::default_luatools_data_dir;
 use crate::services::api_client::stream_response_to_file;
 use crate::services::depot_downloader::{which_in_path, DepotDownloaderService};
+use crate::services::wired_service::extract_archive;
 
 #[derive(Debug, Clone)]
 pub struct ExternalToolSpec {
@@ -39,6 +38,21 @@ pub const TOOLS: &[ExternalToolSpec] = &[
             "DepotDownloaderMod.dll",
             "DepotDownloader.dll",
             "DepotDownloaderMod.exe",
+        ],
+    },
+    ExternalToolSpec {
+        key: "goldberg",
+        name: "Goldberg Emulator (Native Linux)",
+        description:
+            "Native Linux & Proton Steamworks API replacement libraries (libsteam_api.so / steam_api64.dll) used by native SteamAutoPatch.",
+        github_repo: "Detanup01/gbe_fork",
+        fallback_repo: None,
+        exe_candidates: &[
+            "libsteam_api.so",
+            "steam_api64.so",
+            "steam_api.so",
+            "steam_api64.dll",
+            "steam_api.dll",
         ],
     },
     ExternalToolSpec {
@@ -108,6 +122,13 @@ impl ExternalToolsManager {
         Self { tools_dir: dir }
     }
 
+    pub fn goldberg_root(&self) -> PathBuf {
+        self.tools_dir
+            .parent()
+            .map(|p| p.join("goldberg"))
+            .unwrap_or_else(|| self.tools_dir.join("goldberg"))
+    }
+
     pub fn spec(key: &str) -> Option<&'static ExternalToolSpec> {
         TOOLS.iter().find(|t| t.key == key)
     }
@@ -129,6 +150,9 @@ impl ExternalToolsManager {
                 if let Some(home) = dirs::home_dir() {
                     search_dirs.push(home.join(".local/share/millennium/plugins/luatools/backend"));
                 }
+            }
+            "goldberg" => {
+                search_dirs.push(self.goldberg_root());
             }
             "steamautopatch" => {
                 search_dirs.push(self.tools_dir.join("steamautocrack"));
@@ -189,15 +213,12 @@ impl ExternalToolsManager {
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(90))
             .build();
+        let ua = format!("LuaToolsLinux/{}", crate::VERSION);
 
         for repo in repos {
             progress_cb(0.05, format!("Querying GitHub releases ({})...", repo));
             let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
-            let Ok(resp) = agent
-                .get(&url)
-                .set("User-Agent", "LuaToolsLinux/2.0")
-                .call()
-            else {
+            let Ok(resp) = agent.get(&url).set("User-Agent", &ua).call() else {
                 continue;
             };
             let Ok(rel) = resp.into_json::<Value>() else {
@@ -211,6 +232,16 @@ impl ExternalToolsManager {
                 continue;
             };
 
+            let is_supported_archive = |n: &str| {
+                n.ends_with(".zip")
+                    || n.ends_with(".tar.gz")
+                    || n.ends_with(".tgz")
+                    || n.ends_with(".tar.bz2")
+                    || n.ends_with(".tar.xz")
+                    || n.ends_with(".tar.zst")
+                    || n.ends_with(".7z")
+            };
+
             let chosen = assets
                 .iter()
                 .find(|a| {
@@ -219,9 +250,10 @@ impl ExternalToolsManager {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_ascii_lowercase();
-                    (n.ends_with(".zip") || n.ends_with(".tar.gz"))
+                    is_supported_archive(&n)
                         && n.contains("linux")
                         && !n.contains("arm")
+                        && !n.contains("debug")
                 })
                 .or_else(|| {
                     assets.iter().find(|a| {
@@ -230,11 +262,12 @@ impl ExternalToolsManager {
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_ascii_lowercase();
-                        (n.ends_with(".zip") || n.ends_with(".tar.gz"))
+                        is_supported_archive(&n)
                             && !n.contains("osx")
                             && !n.contains("macos")
                             && !n.contains("darwin")
                             && !n.contains("arm")
+                            && !n.contains("debug")
                     })
                 });
 
@@ -251,41 +284,40 @@ impl ExternalToolsManager {
             let archive_path = tool_dir.join(aname);
 
             progress_cb(0.1, format!("Downloading {} {}...", spec.name, tag));
-            let Ok(dl_resp) = agent.get(dl_url).call() else {
+            let Ok(dl_resp) = agent.get(dl_url).set("User-Agent", &ua).call() else {
                 continue;
             };
             stream_response_to_file(dl_resp, &archive_path, &mut progress_cb)?;
 
             progress_cb(0.9, "Extracting archive...".into());
-            if aname.to_ascii_lowercase().ends_with(".zip") {
-                let zf = File::open(&archive_path).map_err(|e| e.to_string())?;
-                let mut archive = ZipArchive::new(zf).map_err(|e| e.to_string())?;
-                archive.extract(&tool_dir).map_err(|e| e.to_string())?;
-            } else {
-                let tf = File::open(&archive_path).map_err(|e| e.to_string())?;
-                let gz = GzDecoder::new(tf);
-                let mut archive = Archive::new(gz);
-                archive.unpack(&tool_dir).map_err(|e| e.to_string())?;
-            }
+            let extract_res = extract_archive(&archive_path, &tool_dir);
             let _ = fs::remove_file(&archive_path);
+            extract_res?;
+
+            if key == "goldberg" {
+                stage_goldberg_layout(&tool_dir, &self.goldberg_root());
+            }
 
             let info = self.inspect_tool(key);
             if let Some(exe) = info.exe_path {
-                let _ = DepotDownloaderService::build_invocation(&exe);
+                if key != "goldberg" {
+                    let _ = DepotDownloaderService::build_invocation(&exe);
+                }
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                let _ = fs::write(
-                    tool_dir.join("meta.json"),
-                    serde_json::to_string_pretty(&json!({
-                        "version": tag,
-                        "repo": repo,
-                        "last_check": now,
-                        "exe_path": exe,
-                    }))
-                    .unwrap_or_default(),
-                );
+                let meta_json = serde_json::to_string_pretty(&json!({
+                    "version": tag,
+                    "repo": repo,
+                    "last_check": now,
+                    "exe_path": exe,
+                }))
+                .unwrap_or_default();
+                let _ = fs::write(tool_dir.join("meta.json"), &meta_json);
+                if key == "goldberg" {
+                    let _ = fs::write(self.goldberg_root().join("meta.json"), &meta_json);
+                }
                 progress_cb(1.0, format!("{} {} installed", spec.name, tag));
                 return Ok(exe);
             }
@@ -300,7 +332,7 @@ impl ExternalToolsManager {
     pub fn launch_steamautopatch(&self, app_id: u32, folder: &Path) -> Result<String, String> {
         let info = self.inspect_tool("steamautopatch");
         let exe = info.exe_path.ok_or_else(|| {
-            "SteamAutoPatch is not installed yet. Click INSTALL / UPDATE first.".to_string()
+            "SteamAutoPatch is not installed yet. Install Goldberg Emulator (Native Linux) or SteamAutoPatch in Settings › Updates & Toolchain.".to_string()
         })?;
         let prefix = DepotDownloaderService::build_invocation(&exe)?;
         let mut cmd = Command::new(&prefix[0]);
@@ -348,6 +380,74 @@ impl ExternalToolsManager {
     }
 }
 
+fn stage_goldberg_layout(extracted: &Path, goldberg_root: &Path) {
+    let reg_x64 = goldberg_root.join("regular/x64");
+    let reg_x86 = goldberg_root.join("regular/x86");
+    let exp_x64 = goldberg_root.join("experimental/x64");
+    let exp_x86 = goldberg_root.join("experimental/x86");
+    for d in [&reg_x64, &reg_x86, &exp_x64, &exp_x86] {
+        let _ = fs::create_dir_all(d);
+    }
+
+    for path in collect_files_recursive(extracted) {
+        let Some(fname) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let full_lower = path.to_string_lossy().to_ascii_lowercase();
+        let is_exp = full_lower.contains("experimental");
+        let is_x86 =
+            full_lower.contains("/x32/") || full_lower.contains("/x86/") || fname == "steam_api.so";
+
+        match fname {
+            "libsteam_api.so" | "steam_api64.so" | "steam_api.so" => {
+                let dst_dir = match (is_x86, is_exp) {
+                    (false, false) => &reg_x64,
+                    (false, true) => &exp_x64,
+                    (true, false) => &reg_x86,
+                    (true, true) => &exp_x86,
+                };
+                let target_name = if is_x86 {
+                    "steam_api.so"
+                } else {
+                    "steam_api64.so"
+                };
+                let _ = fs::copy(&path, dst_dir.join(target_name));
+                let _ = fs::copy(&path, dst_dir.join("libsteam_api.so"));
+            }
+            "steam_api64.dll" => {
+                let dst_dir = if is_exp { &exp_x64 } else { &reg_x64 };
+                let _ = fs::copy(&path, dst_dir.join("steam_api64.dll"));
+            }
+            "steam_api.dll" => {
+                let dst_dir = if is_exp { &exp_x86 } else { &reg_x86 };
+                let _ = fs::copy(&path, dst_dir.join("steam_api.dll"));
+            }
+            _ => {}
+        }
+    }
+}
+
+mod walkdir_lite {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    pub fn collect_files_recursive(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let Ok(entries) = fs::read_dir(dir) else {
+            return out;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(collect_files_recursive(&p));
+            } else if p.is_file() {
+                out.push(p);
+            }
+        }
+        out
+    }
+}
+
 fn find_candidate_recursive(dir: &Path, candidates: &[&str]) -> Option<PathBuf> {
     if !dir.exists() {
         return None;
@@ -378,6 +478,7 @@ fn runtime_note_for(exe: &Path) -> String {
         .to_ascii_lowercase()
         .as_str()
     {
+        "so" => "Native Linux (.so)".into(),
         "exe" => {
             if which_in_path("wine").is_some() {
                 "Wine ready".into()
@@ -386,7 +487,14 @@ fn runtime_note_for(exe: &Path) -> String {
             }
         }
         "dll" => {
-            if which_in_path("dotnet").is_some() {
+            let fname = exe
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if fname.starts_with("steam_api") {
+                "Proton / Wine DLL".into()
+            } else if which_in_path("dotnet").is_some() {
                 ".NET ready".into()
             } else {
                 "Requires dotnet".into()

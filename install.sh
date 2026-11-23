@@ -7,7 +7,7 @@
 set -euo pipefail
 
 APP_NAME="luatools"
-APP_VERSION="2.5.1"
+APP_VERSION="2.6.0"
 REPO_URL="https://github.com/subsurfmod/LuaToolsLinux.git"
 SCRIPT_DIR=""
 if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
@@ -99,20 +99,20 @@ install_system_dependencies() {
 
     info "Installing missing system dependencies via native package manager..."
     if command -v dnf >/dev/null 2>&1; then
-        local pkgs=(gcc git mesa-libEGL mesa-libGL libwayland-client libxkbcommon libX11 libXcursor libXi libXrandr fontconfig xdg-utils zenity curl)
+        local pkgs=(gcc git mesa-libEGL mesa-libGL libwayland-client libxkbcommon libX11 libXcursor libXi libXrandr fontconfig xdg-utils zenity curl zstd bzip2 p7zip p7zip-plugins)
         [ "$WITH_WINE" -eq 1 ] && pkgs+=(wine dotnet-runtime-8.0)
         run_privileged dnf install -y "${pkgs[@]}"
     elif command -v apt-get >/dev/null 2>&1; then
-        local pkgs=(build-essential git libegl1 libgl1 libwayland-client0 libxkbcommon0 libx11-6 libxcursor1 libxi6 libxrandr2 libfontconfig1 xdg-utils zenity curl ca-certificates)
+        local pkgs=(build-essential git libegl1 libgl1 libwayland-client0 libxkbcommon0 libx11-6 libxcursor1 libxi6 libxrandr2 libfontconfig1 xdg-utils zenity curl ca-certificates zstd bzip2 p7zip-full)
         [ "$WITH_WINE" -eq 1 ] && pkgs+=(wine)
         run_privileged apt-get update
         run_privileged apt-get install -y "${pkgs[@]}"
     elif command -v pacman >/dev/null 2>&1; then
-        local pkgs=(base-devel git mesa wayland libxkbcommon libx11 libxcursor libxi libxrandr fontconfig xdg-utils zenity curl)
+        local pkgs=(base-devel git mesa wayland libxkbcommon libx11 libxcursor libxi libxrandr fontconfig xdg-utils zenity curl zstd bzip2 7zip)
         [ "$WITH_WINE" -eq 1 ] && pkgs+=(wine dotnet-runtime)
         run_privileged pacman -Sy --needed --noconfirm "${pkgs[@]}"
     elif command -v zypper >/dev/null 2>&1; then
-        local pkgs=(gcc git Mesa-libEGL1 Mesa-libGL1 libwayland-client0 libxkbcommon0 libX11-6 fontconfig xdg-utils zenity curl)
+        local pkgs=(gcc git Mesa-libEGL1 Mesa-libGL1 libwayland-client0 libxkbcommon0 libX11-6 fontconfig xdg-utils zenity curl zstd bzip2 7zip)
         [ "$WITH_WINE" -eq 1 ] && pkgs+=(wine)
         run_privileged zypper --non-interactive install "${pkgs[@]}"
     else
@@ -180,6 +180,10 @@ ensure_binary() {
     if [ -f "${SCRIPT_DIR}/target/release/libsteam_integration.so" ]; then
         install -m 0755 "${SCRIPT_DIR}/target/release/libsteam_integration.so" "${SCRIPT_DIR}/dist/libsteam_integration.so"
         install -m 0755 "${SCRIPT_DIR}/target/release/libsteam_integration.so" "${HOME}/.local/lib/luatools/libsteam_integration.so"
+    fi
+    if [ -f "${SCRIPT_DIR}/target/release/libsteam_auto_patch_linux.so" ]; then
+        install -m 0755 "${SCRIPT_DIR}/target/release/libsteam_auto_patch_linux.so" "${SCRIPT_DIR}/dist/libsteam_auto_patch_linux.so"
+        install -m 0755 "${SCRIPT_DIR}/target/release/libsteam_auto_patch_linux.so" "${HOME}/.local/lib/luatools/libsteam_auto_patch_linux.so"
     fi
     ok "Built stripped native binary ($(du -h "${BIN_SOURCE}" | awk '{print $1}')) -> ${BIN_SOURCE}"
 }

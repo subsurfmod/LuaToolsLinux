@@ -180,6 +180,8 @@ pub struct LuaToolsApp {
     pub cloud_app_input: String,
     pub update_banner: UpdateBannerState,
     pub guide_topic: GuideTopic,
+    pub guide_textures: HashMap<&'static str, TextureHandle>,
+    pub guide_zoom_screenshot: Option<(&'static str, &'static str)>,
 
     // Modals & QA
     pub add_appid_modal: AddByAppIdModal,
@@ -373,6 +375,8 @@ impl LuaToolsApp {
             cloud_app_input: String::new(),
             update_banner: UpdateBannerState::Hidden,
             guide_topic: GuideTopic::QuickStart,
+            guide_textures: HashMap::new(),
+            guide_zoom_screenshot: None,
             add_appid_modal: AddByAppIdModal::default(),
             game_detail_modal: GameDetailModal::default(),
             integration_modal: IntegrationModal::default(),
@@ -418,11 +422,26 @@ impl LuaToolsApp {
     pub fn new_headless_demo(ctx: &egui::Context, scratch_dir: &Path) -> Self {
         apply_papercut_monotone_theme(ctx);
         let _ = fs::create_dir_all(scratch_dir);
+        let mock_steam_root = scratch_dir.join("Steam");
+        let _ = fs::create_dir_all(mock_steam_root.join("config/stplug-in"));
+        let _ = fs::create_dir_all(mock_steam_root.join("steamapps/common"));
+        let _ = fs::write(mock_steam_root.join("steam.sh"), "#!/bin/sh\n");
+        let mock_inst = crate::models::steam::SteamInstallation {
+            root: mock_steam_root.clone(),
+            libraries: vec![
+                crate::models::steam::SteamLibrary::new(mock_steam_root.clone()),
+                crate::models::steam::SteamLibrary::new(scratch_dir.join("SteamGamesNVMe")),
+            ],
+            config_path: mock_steam_root.join("config"),
+            stplug_in_path: mock_steam_root.join("config/stplug-in"),
+        };
+
         let settings_service = SettingsService::new(Some(scratch_dir.join("settings.json")));
         let auth_service = AuthService::new(Some(scratch_dir.join("auth.json")));
-        let steam_service = SteamService::new();
+        let mut steam_service = SteamService::new();
+        steam_service.installation = Some(mock_inst.clone());
         let steam_bridge_service =
-            SteamBridgeService::with_paths(None, Some(scratch_dir.join("bridge")));
+            SteamBridgeService::with_paths(Some(mock_inst), Some(scratch_dir.join("bridge")));
         let slssteam_service = SlssteamService::new(Some(scratch_dir.join("sls.yaml")));
         let millennium_service = MillenniumService::default();
         let api_client = LuaToolsApiClient::new(auth_service.clone());
@@ -470,7 +489,7 @@ impl LuaToolsApp {
                 scratch_dir.join("pins.json"),
             )),
             hot_reload_service: HotReloadService::new()
-                .set_watch_dir(scratch_dir.join("stplug-in")),
+                .set_watch_dir(PathBuf::from("~/.local/share/Steam/config/stplug-in")),
             cloud_redirect_service: CloudRedirectService::with_path(
                 scratch_dir.join("cloudredirect"),
             ),
@@ -562,6 +581,8 @@ impl LuaToolsApp {
             cloud_app_input: String::new(),
             update_banner: UpdateBannerState::Hidden,
             guide_topic: GuideTopic::QuickStart,
+            guide_textures: HashMap::new(),
+            guide_zoom_screenshot: None,
             add_appid_modal: AddByAppIdModal::default(),
             game_detail_modal: GameDetailModal::default(),
             integration_modal: IntegrationModal::default(),
@@ -666,6 +687,16 @@ impl LuaToolsApp {
             "addappid(1245620) -- ELDEN RING\naddappid(1245621, 1, \"{}\")\naddappid(2778580) -- Shadow of the Erdtree\nsetManifestid(1245621, \"8492018394810293847\", 52428800000)\n",
             "a8f4c2e1".repeat(8)
         );
+        let _ = self
+            .lua_vault
+            .save_text(1245620, &sample_lua, Some("Patch 1.16 (Pinned)"));
+        self.depots_variants = self.lua_vault.get_variants(1245620);
+        let _ = self.manifest_binding_service.set_pin(
+            1245620,
+            1245621,
+            "8492018394810293847".into(),
+            52_428_800_000,
+        );
         self.depots_lua = Some(LuaFileParser::parse_text(&sample_lua, 1245620));
         self.depots_editor_text = sample_lua;
         self.fixes_listings = vec![DRMFixGameListing {
@@ -695,10 +726,33 @@ impl LuaToolsApp {
             manifest_filename: None,
             fix_filename: None,
         }];
-        self.update_banner = UpdateBannerState::Available {
-            badge: "⬆ Update v2.0".into(),
-            tooltip: "New commits available on GitHub".into(),
-        };
+        self.update_banner = UpdateBannerState::Hidden;
+        self.slssteam_service.config.play_not_owned = true;
+        self.slssteam_service.config.additional_apps = vec![1091500, 1145360, 1245620];
+        self.slssteam_service
+            .set_depot_key(1245621, "a8f4c2e1".repeat(8));
+        let _ = self.slssteam_service.save();
+        {
+            let mut st = self.steam_bridge_service.status.lock().unwrap();
+            st.steam_detected = true;
+            st.steam_root = Some(PathBuf::from("~/.local/share/Steam"));
+            st.steam_pid = Some(48120);
+            st.integration_lib_installed = true;
+            st.launcher_installed = true;
+            st.integration_active = true;
+            st.patterns_loaded = true;
+            st.steam_client_found = true;
+            st.steam_ui_found = true;
+            st.steam_client_sha256 =
+                Some("9f4a81c0e72b3d19a4f06b82c71e5509d38a42f1c6e09b71834d2a15e8f03c91".into());
+            st.steam_client_patterns = Some(
+                "bis_subscribed_app, get_app_id, get_app_ownership_ticket, request_encrypted_app_ticket, get_steam_id, depot_key_integration".into(),
+            );
+            st.steam_ui_sha256 =
+                Some("4c18b902f3e67a1180d52b49e1a37c68f2049d81a73e5c10b9248f716d3e9a04".into());
+            st.steam_ui_patterns = Some("library_play_state, store_bridge_rpc".into());
+            st.apps_with_tickets = vec![1245620, 1091500];
+        }
         self.manifest_binding_service.set_pin(
             1245620,
             1245621,
@@ -1530,7 +1584,7 @@ impl LuaToolsApp {
 
     /// Launch (or restart) Steam using the bridge launcher (~/.local/bin/luatools-steam-launcher)
     /// which preloads libsteam_integration.so into the Steam client process. No root required.
-    pub fn launch_steam_with_bridge(&mut self, _ctx: &egui::Context) {
+    pub fn launch_steam_with_bridge(&mut self, ctx: &egui::Context) {
         let launcher = dirs::home_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join(".local/bin/luatools-steam-launcher");
@@ -1540,24 +1594,51 @@ impl LuaToolsApp {
                 "Bridge launcher not found. Install it first in Settings › Steam Integration.",
                 ToastKind::Warning,
             );
+            self.active_view = ActiveView::Settings;
+            self.settings_subtab = SettingsSubTab::SteamIntegration;
             return;
         }
 
-        self.status_text = "Launching Steam with integration bridge…".into();
-        match std::process::Command::new(&launcher).spawn() {
-            Ok(_) => {
-                self.notify(
-                    "Steam is starting with the integration bridge.",
-                    ToastKind::Success,
-                );
+        let st = self.steam_bridge_service.status();
+        let needs_restart = st.steam_pid.is_some();
+        self.status_text = if needs_restart {
+            "Restarting Steam with integration bridge…".into()
+        } else {
+            "Launching Steam with integration bridge…".into()
+        };
+
+        let tx = self.msg_tx.clone();
+        let ctx_c = ctx.clone();
+        thread::spawn(move || {
+            if needs_restart {
+                let _ = std::process::Command::new("steam")
+                    .arg("-shutdown")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                for _ in 0..14 {
+                    if crate::steam_bridge::preload_loader::find_steam_pid().is_none() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
             }
-            Err(e) => {
-                self.notify(
-                    format!("Failed to launch Steam with bridge: {}", e),
-                    ToastKind::Warning,
-                );
+            match std::process::Command::new(&launcher).spawn() {
+                Ok(_) => {
+                    let _ = tx.send(AppMessage::SteamRestarted {
+                        ok: true,
+                        msg: "Steam started with libsteam_integration.so loaded.".into(),
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(AppMessage::SteamRestarted {
+                        ok: false,
+                        msg: format!("Failed to launch Steam with bridge: {}", e),
+                    });
+                }
             }
-        }
+            ctx_c.request_repaint();
+        });
     }
 
     pub fn trigger_wired_action(&mut self, action: &'static str, ctx: &egui::Context) {
@@ -2218,13 +2299,14 @@ impl LuaToolsApp {
         //    Houses Brand (left), Omnibox (center), and Steam status + corner Git Update button (top-right).
         let mut run_omnibox = false;
         let mut click_rescan = false;
+        let mut click_open_bridge_settings = false;
         let mut click_start_update = false;
         let mut click_launch_bridge = false;
         let mut click_relaunch_exe: Option<PathBuf> = None;
         let right_col_w = if matches!(self.update_banner, UpdateBannerState::Hidden) {
-            156.0
+            228.0
         } else {
-            288.0
+            356.0
         };
 
         egui::TopBottomPanel::top("top_command_bar")
@@ -2238,7 +2320,7 @@ impl LuaToolsApp {
             .show(ctx, |ui| {
                 StripBuilder::new(ui)
                     .size(Size::exact(196.0))
-                    .size(Size::remainder().at_least(210.0))
+                    .size(Size::remainder().at_least(180.0))
                     .size(Size::exact(right_col_w))
                     .cell_layout(Layout::left_to_right(Align::Center))
                     .horizontal(|mut strip| {
@@ -2295,18 +2377,40 @@ impl LuaToolsApp {
                                     || bridge_st.launcher_installed
                                     || bridge_st.system_preload_enabled;
 
-                                let (lbl, bg, fg, tip) = if bridge_installed && steam_online {
-                                    ("● Restart Steam w/ Bridge", Palette::GO_BG, Palette::GO_TEXT,
-                                    "Restart Steam with the integration bridge loaded. This applies LD_PRELOAD patches to the running Steam client.")
+                                let (lbl, bg, fg, dot_col, tip) = if bridge_installed
+                                    && steam_online
+                                {
+                                    (
+                                        "Restart Steam w/ Bridge",
+                                        Palette::GO_BG,
+                                        Palette::GO_TEXT,
+                                        Palette::GO_TEXT,
+                                        "Restart Steam with libsteam_integration.so loaded via ~/.local/bin/luatools-steam-launcher (no root required).",
+                                    )
                                 } else if bridge_installed {
-                                    ("● Launch Steam w/ Bridge", Palette::BLUE_PRIMARY, Palette::TEXT_PRIMARY,
-                                    "Launch Steam with the integration bridge loaded via ~/.local/bin/luatools-steam-launcher (no root required).")
+                                    (
+                                        "Launch Steam w/ Bridge",
+                                        Palette::BLUE_PRIMARY,
+                                        Palette::TEXT_PRIMARY,
+                                        Palette::BLUE_LIGHT,
+                                        "Launch Steam with libsteam_integration.so loaded via ~/.local/bin/luatools-steam-launcher (no root required).",
+                                    )
                                 } else if steam_online {
-                                    ("○ Install Bridge", Palette::WARN_BG, Palette::WARN_TEXT,
-                                    "Steam is running but the integration bridge is not installed. Go to Settings › Steam Integration to install it.")
+                                    (
+                                        "Install Bridge",
+                                        Palette::WARN_BG,
+                                        Palette::WARN_TEXT,
+                                        Palette::WARN_TEXT,
+                                        "Steam is detected, but the integration bridge is not installed yet. Click to open Settings › Steam Integration.",
+                                    )
                                 } else {
-                                    ("○ No Steam", Palette::WARN_BG, Palette::WARN_TEXT,
-                                    "Steam not detected. Install Steam first, then click here to rescan.")
+                                    (
+                                        "No Steam",
+                                        Palette::WARN_BG,
+                                        Palette::WARN_TEXT,
+                                        Palette::WARN_TEXT,
+                                        "Steam not detected. Install Steam first, then click here to rescan.",
+                                    )
                                 };
 
                                 let g = ui.painter().layout_no_wrap(
@@ -2314,7 +2418,7 @@ impl LuaToolsApp {
                                     semibold_font(11.5),
                                     fg,
                                 );
-                                let sz = Vec2::new(g.size().x + 22.0, 28.0);
+                                let sz = Vec2::new(g.size().x + 34.0, 28.0);
                                 let (rect, pill_resp) = ui.allocate_exact_size(sz, Sense::click());
                                 if pill_resp.hovered() {
                                     ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
@@ -2327,9 +2431,19 @@ impl LuaToolsApp {
                                     );
                                     ui.painter()
                                         .rect_filled(rect, CornerRadius::same(4), bg);
+                                    let dot_pos = Pos2::new(rect.left() + 12.0, rect.center().y);
+                                    if bridge_installed && steam_online {
+                                        ui.painter().circle_filled(dot_pos, 3.6, dot_col);
+                                    } else {
+                                        ui.painter().circle_stroke(
+                                            dot_pos,
+                                            3.4,
+                                            Stroke::new(1.5_f32, dot_col),
+                                        );
+                                    }
                                     ui.painter().galley(
                                         Pos2::new(
-                                            rect.center().x - g.size().x * 0.5,
+                                            rect.left() + 21.0,
                                             rect.center().y - g.size().y * 0.5,
                                         ),
                                         g,
@@ -2339,6 +2453,8 @@ impl LuaToolsApp {
                                 if pill_resp.on_hover_text(tip).clicked() {
                                     if bridge_installed {
                                         click_launch_bridge = true;
+                                    } else if steam_online {
+                                        click_open_bridge_settings = true;
                                     } else {
                                         click_rescan = true;
                                     }
@@ -2410,6 +2526,10 @@ impl LuaToolsApp {
         }
         if click_rescan {
             self.detect_steam_and_sync();
+        }
+        if click_open_bridge_settings {
+            self.active_view = ActiveView::Settings;
+            self.settings_subtab = SettingsSubTab::SteamIntegration;
         }
         if click_launch_bridge {
             self.launch_steam_with_bridge(ctx);
