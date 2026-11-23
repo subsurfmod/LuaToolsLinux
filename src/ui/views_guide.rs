@@ -131,15 +131,15 @@ impl LuaToolsApp {
         guide_step_card(
             ui,
             "STEP 01",
-            "Verify Steam & SLSsteam Connection",
-            "Check the top-right status pill ('● Steam Ready'). If your Steam installation lives on an external drive or custom prefix, \
-             set the path in Settings › General & Steam. Under Settings › SLSsteam & Store Bridge, enable 'PlayNotOwnedGames' so SLSsteam \
-             exposes configured titles in your Steam Library.",
+            "Verify Steam & Wired / SLSsteam Connection",
+            "Check the top-right status pill ('● Steam Ready'). Under Settings › SLSsteam & Store Bridge, you can install \
+             SLSsteam (~/.local/share/SLSsteam + ~/.local/bin/steam-sls) and ACCELA natively via the Wired Suite card, and enable \
+             'PlayNotOwnedGames' (syncing play_unowned_games.lua) so unowned titles appear and launch in your Steam Library.",
             |ui| {
                 if secondary_button(ui, "Open Steam Settings ›").clicked() {
                     nav_target = Some((ActiveView::Settings, Some(SettingsSubTab::General)));
                 }
-                if ghost_button(ui, "SLSsteam Config ›").clicked() {
+                if ghost_button(ui, "Wired & SLSsteam ›").clicked() {
                     nav_target = Some((ActiveView::Settings, Some(SettingsSubTab::Integrations)));
                 }
             },
@@ -374,13 +374,14 @@ impl LuaToolsApp {
         guide_step_card(
             ui,
             "OVERRIDES",
-            "Library Configure & Binary appinfo.vdf Launch Options",
-            "In Library (Ctrl+3), every installed or configured game offers:\n\
-             • Configure: Edit SLSsteam FakeAppId (commonly 480 for Spacewar entitlement/online wrapper), set an AppToken, \
-             or edit the game's stplug-in .lua directly.\n\
-             • More › Launch Options…: Directly parses and writes binary Steam appcache/appinfo.vdf (v27, v28, and v29 with SHA-1 \
-             re-hashing and automatic appinfo.vdf.luatools.bak backup).\n\
-             IMPORTANT: Always close Steam completely before clicking 'Write to appinfo.vdf' so Steam does not overwrite your edits on exit.",
+            "Library Registration (ACF), PlayUnowned & appinfo.vdf Launch Options",
+            "In Library (Ctrl+3), every game offers:\n\
+             • Configure: Edit SLSsteam FakeAppId (commonly 480 for Spacewar wrapper), set an AppToken, or edit stplug-in .lua.\n\
+             • More › Register in Steam Library (ACF): Creates a valid \"AppState\" appmanifest_<appid>.acf, updates libraryfolders.vdf, \
+             and syncs SLSsteam so 'Lua Only' games appear directly in your Steam Library.\n\
+             • More › Enable Play Unowned / Run SteamAutoPatch: Syncs play_unowned_games.lua or launches Goldberg SteamAutoPatch.\n\
+             • More › Launch Options…: Parses and writes binary Steam appcache/appinfo.vdf (v27–v29 with SHA-1 re-hashing and backup).\n\
+             IMPORTANT: Always close Steam completely before writing appinfo.vdf or appmanifest_<appid>.acf files.",
             |ui| {
                 if secondary_button(ui, "Open Library ›").clicked() {
                     go_library = true;

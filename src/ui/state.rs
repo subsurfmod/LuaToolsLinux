@@ -226,6 +226,14 @@ pub enum AppMessage {
         msg: String,
     },
     FolderPickedForDiagExport(PathBuf),
+    WiredProgress {
+        pct: f32,
+        msg: String,
+    },
+    WiredFinished {
+        ok: bool,
+        msg: String,
+    },
 }
 
 // ===== Modal Dialog States =====

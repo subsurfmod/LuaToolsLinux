@@ -1207,6 +1207,9 @@ impl LuaToolsApp {
                 self.cef_bridge.stop();
             }
             self.detect_steam_and_sync();
+            let _ = self
+                .play_unowned_service
+                .sync_plugin_file(&self.slssteam_service);
             if sls_ok && app_ok {
                 self.notify(
                     "Saved settings.json and SLSsteam config.yaml",
@@ -1343,6 +1346,9 @@ impl LuaToolsApp {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 if secondary_button(ui, "Rescan Steam").clicked() {
                     self.detect_steam_and_sync();
+                    let _ = self
+                        .play_unowned_service
+                        .sync_plugin_file(&self.slssteam_service);
                 }
                 if secondary_button(ui, "Donate Keys Now").clicked() {
                     self.trigger_donate_keys(ui.ctx());
@@ -1574,13 +1580,28 @@ impl LuaToolsApp {
     }
 
     fn render_settings_integrations(&mut self, ui: &mut egui::Ui) {
+        let mut sync_play_unowned = false;
+        let plugin_installed = self.play_unowned_service.is_installed();
+
         paper_card(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 10.0;
-            ui.label(
-                RichText::new("SLSsteam Unlocker (~/.config/SLSsteam/config.yaml)")
-                    .font(display_font(17.5))
-                    .color(Palette::TEXT_PRIMARY),
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    ui.label(
+                        RichText::new("SLSsteam Unlocker (~/.config/SLSsteam/config.yaml)")
+                            .font(display_font(17.5))
+                            .color(Palette::TEXT_PRIMARY),
+                    );
+                },
+                |ui| {
+                    if plugin_installed {
+                        status_badge(ui, "PlayUnowned .lua Synced", BadgeTone::Ready);
+                    } else {
+                        status_badge(ui, "PlayUnowned .lua Inactive", BadgeTone::Muted);
+                    }
+                },
             );
             let cfg = &mut self.slssteam_service.config;
             ui.label(
@@ -1596,7 +1617,7 @@ impl LuaToolsApp {
             );
             ui.checkbox(
                 &mut cfg.play_not_owned,
-                "Allow playing unowned games (PlayNotOwnedGames: true)",
+                "Allow playing unowned games (PlayNotOwnedGames: true + play_unowned_games.lua)",
             );
             ui.checkbox(
                 &mut cfg.limit_downloads,
@@ -1621,7 +1642,127 @@ impl LuaToolsApp {
                     });
                 }
             });
+            if secondary_button(ui, "Sync PlayUnowned Plugin Now").clicked() {
+                sync_play_unowned = true;
+            }
         });
+
+        if sync_play_unowned {
+            let enabled = self.slssteam_service.config.play_not_owned;
+            match self
+                .play_unowned_service
+                .set_enabled(enabled, &mut self.slssteam_service)
+            {
+                Ok(()) => self.notify(
+                    if enabled {
+                        "Synced play_unowned_games.lua and SLSsteam config.yaml."
+                    } else {
+                        "Disabled PlayNotOwnedGames and removed play_unowned_games.lua."
+                    },
+                    ToastKind::Success,
+                ),
+                Err(e) => self.notify(e, ToastKind::Warning),
+            }
+        }
+
+        ui.add_space(16.0);
+
+        // Native Wired Suite (ACCELA + SLSsteam) Installer Card
+        let wired_st = self.wired_service.status();
+        let mut wired_act: Option<&'static str> = None;
+        let mut launch_accela = false;
+        let mut uninstall_wired = false;
+
+        paper_card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 10.0;
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    ui.label(
+                        RichText::new("Wired Suite (Native ACCELA & SLSsteam Installer)")
+                            .font(display_font(17.5))
+                            .color(Palette::TEXT_PRIMARY),
+                    );
+                },
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if wired_st.slssteam_installed {
+                        status_badge(ui, "SLSsteam.so Ready", BadgeTone::Ready);
+                    } else {
+                        status_badge(ui, "SLSsteam Missing", BadgeTone::Muted);
+                    }
+                    if wired_st.accela_installed {
+                        status_badge(ui, "ACCELA Ready", BadgeTone::Ready);
+                    } else {
+                        status_badge(ui, "ACCELA Missing", BadgeTone::Muted);
+                    }
+                },
+            );
+            ui.label(
+                RichText::new(
+                    "Installs ACCELA (~/.local/share/ACCELA) and SLSsteam (~/.local/share/SLSsteam + ~/.local/bin/steam-sls LD_AUDIT launcher) natively in Rust without piping remote shell scripts.",
+                )
+                .size(12.5)
+                .color(Palette::TEXT_MUTED),
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.add_enabled_ui(!self.wired_busy, |ui| {
+                    if primary_button(ui, "Install Both (Wired)").clicked() {
+                        wired_act = Some("all");
+                    }
+                    if secondary_button(ui, "Install SLSsteam").clicked() {
+                        wired_act = Some("slssteam");
+                    }
+                    if secondary_button(ui, "Install ACCELA").clicked() {
+                        wired_act = Some("accela");
+                    }
+                    if wired_st.accela_installed && secondary_button(ui, "Launch ACCELA").clicked()
+                    {
+                        launch_accela = true;
+                    }
+                    if (wired_st.accela_installed || wired_st.slssteam_installed)
+                        && danger_button(ui, "Uninstall Wired").clicked()
+                    {
+                        uninstall_wired = true;
+                    }
+                });
+            });
+            if self.wired_busy {
+                ui.add(
+                    ProgressBar::new(self.wired_progress)
+                        .show_percentage()
+                        .corner_radius(CornerRadius::same(3)),
+                );
+            }
+            if !self.wired_status_text.is_empty() {
+                ui.label(
+                    RichText::new(&self.wired_status_text)
+                        .size(12.0)
+                        .color(Palette::BLUE_LIGHT),
+                );
+            }
+        });
+
+        if let Some(act) = wired_act {
+            self.trigger_wired_action(act, ui.ctx());
+        }
+        if launch_accela {
+            match self.wired_service.launch_accela() {
+                Ok(m) => self.notify(m, ToastKind::Info),
+                Err(e) => self.notify(e, ToastKind::Warning),
+            }
+        }
+        if uninstall_wired {
+            match self.wired_service.uninstall_all() {
+                Ok(()) => {
+                    self.wired_status_text = "Uninstalled ACCELA and SLSsteam.".into();
+                    self.notify("Uninstalled ACCELA and SLSsteam.", ToastKind::Info);
+                }
+                Err(e) => self.notify(e, ToastKind::Warning),
+            }
+        }
 
         ui.add_space(16.0);
 

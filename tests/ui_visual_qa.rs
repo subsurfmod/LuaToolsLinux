@@ -322,6 +322,13 @@ fn headless_papercut_views_render_cleanly_at_wide_and_narrow_resolutions() {
             d_sub: None,
             s_sub: Some(SettingsSubTab::Telemetry),
         },
+        QaViewCase {
+            fname: "15_settings_integrations_wired.png",
+            size: [1380, 860],
+            view: ActiveView::Settings,
+            d_sub: None,
+            s_sub: Some(SettingsSubTab::Integrations),
+        },
     ];
 
     for case in cases {

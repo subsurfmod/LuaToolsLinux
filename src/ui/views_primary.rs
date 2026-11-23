@@ -3,6 +3,7 @@
 //! Designed with Papercut layered construction-paper cards, generous 8pt spacing,
 //! rich serif display titles, and `StripBuilder` / `Sides` zero-overlap layouts.
 
+use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 
@@ -637,6 +638,39 @@ impl LuaToolsApp {
                                             self.open_game_in_depots(aid, ui.ctx());
                                         }
 
+                                        if self.steam_service.is_available()
+                                            && !self.steam_library_service.is_game_in_library(aid)
+                                            && secondary_button(ui, "+ Add to Steam Library")
+                                                .clicked()
+                                        {
+                                            let gname = self
+                                                .acquire_details
+                                                .as_ref()
+                                                .map(|d| d.name.clone())
+                                                .unwrap_or_else(|| self.resolve_game_title(aid));
+                                            match self.steam_library_service.add_game_to_library(
+                                                aid,
+                                                &gname,
+                                                None,
+                                                &mut self.slssteam_service,
+                                            ) {
+                                                Ok(_) => {
+                                                    let _ = self
+                                                        .play_unowned_service
+                                                        .sync_plugin_file(&self.slssteam_service);
+                                                    self.refresh_all_local_state();
+                                                    self.notify(
+                                                        format!(
+                                                            "Added {} (#{}) to Steam Library",
+                                                            gname, aid
+                                                        ),
+                                                        ToastKind::Success,
+                                                    );
+                                                }
+                                                Err(e) => self.notify(e, ToastKind::Warning),
+                                            }
+                                        }
+
                                         if let Some(dlc) = &self.acquire_dlc_info {
                                             if dlc.missing_count > 0
                                                 && secondary_button(
@@ -839,6 +873,10 @@ impl LuaToolsApp {
         let mut act_launch: Option<(u32, String)> = None;
         let mut act_fixes: Option<u32> = None;
         let mut act_delete: Option<u32> = None;
+        let mut act_add_lib: Option<(u32, String)> = None;
+        let mut act_rem_lib: Option<u32> = None;
+        let mut act_toggle_unowned: Option<(u32, bool)> = None;
+        let mut act_autopatch: Option<(u32, PathBuf)> = None;
 
         paper_card_padded(ui, Margin::symmetric(14, 10), |ui| {
             let table_h = (ui.available_height() - 12.0).max(220.0);
@@ -945,7 +983,7 @@ impl LuaToolsApp {
                                     act_config = Some((r.app_id, r.name.clone()));
                                 }
                                 ui.menu_button("More", |ui| {
-                                    ui.set_min_width(150.0);
+                                    ui.set_min_width(190.0);
                                     if ui.button("Launch Options…").clicked() {
                                         act_launch = Some((r.app_id, r.name.clone()));
                                         ui.close_menu();
@@ -954,7 +992,35 @@ impl LuaToolsApp {
                                         act_fixes = Some(r.app_id);
                                         ui.close_menu();
                                     }
+                                    if !r.installed {
+                                        if ui.button("Register in Steam Library (ACF)").clicked() {
+                                            act_add_lib = Some((r.app_id, r.name.clone()));
+                                            ui.close_menu();
+                                        }
+                                    } else if ui
+                                        .button("Unregister from Steam Library (ACF)")
+                                        .clicked()
+                                    {
+                                        act_rem_lib = Some(r.app_id);
+                                        ui.close_menu();
+                                    }
+                                    let is_unowned_on = self
+                                        .play_unowned_service
+                                        .is_app_enabled(r.app_id, &self.slssteam_service);
+                                    let unowned_lbl = if is_unowned_on {
+                                        "Disable Play Unowned"
+                                    } else {
+                                        "Enable Play Unowned"
+                                    };
+                                    if ui.button(unowned_lbl).clicked() {
+                                        act_toggle_unowned = Some((r.app_id, !is_unowned_on));
+                                        ui.close_menu();
+                                    }
                                     if let Some(ref p) = r.install_path {
+                                        if ui.button("Run SteamAutoPatch").clicked() {
+                                            act_autopatch = Some((r.app_id, p.clone()));
+                                            ui.close_menu();
+                                        }
                                         if ui.button("Open Game Folder").clicked() {
                                             let _ = Command::new("xdg-open").arg(p).spawn();
                                             ui.close_menu();
@@ -997,6 +1063,73 @@ impl LuaToolsApp {
                 let _ = installer.uninstall_lua(aid, false, Some(&mut self.slssteam_service));
                 self.refresh_all_local_state();
                 self.notify(format!("Removed {}.lua", aid), ToastKind::Info);
+            }
+        }
+        if let Some((aid, gname)) = act_add_lib {
+            match self.steam_library_service.add_game_to_library(
+                aid,
+                &gname,
+                None,
+                &mut self.slssteam_service,
+            ) {
+                Ok(_) => {
+                    let _ = self
+                        .play_unowned_service
+                        .sync_plugin_file(&self.slssteam_service);
+                    self.refresh_all_local_state();
+                    self.notify(
+                        format!("Registered {} (#{}) in Steam Library", gname, aid),
+                        ToastKind::Success,
+                    );
+                }
+                Err(e) => self.notify(e, ToastKind::Warning),
+            }
+        }
+        if let Some(aid) = act_rem_lib {
+            match self
+                .steam_library_service
+                .remove_game_from_library(aid, &mut self.slssteam_service)
+            {
+                Ok(()) => {
+                    let _ = self
+                        .play_unowned_service
+                        .sync_plugin_file(&self.slssteam_service);
+                    self.refresh_all_local_state();
+                    self.notify(
+                        format!("Removed AppID {} ACF registration from Steam Library", aid),
+                        ToastKind::Info,
+                    );
+                }
+                Err(e) => self.notify(e, ToastKind::Warning),
+            }
+        }
+        if let Some((aid, enable)) = act_toggle_unowned {
+            let res = if enable {
+                self.play_unowned_service
+                    .enable_for_app(aid, &mut self.slssteam_service)
+            } else {
+                self.play_unowned_service
+                    .disable_for_app(aid, &mut self.slssteam_service)
+            };
+            match res {
+                Ok(()) => {
+                    self.refresh_all_local_state();
+                    self.notify(
+                        if enable {
+                            format!("Enabled Play Unowned for AppID {}", aid)
+                        } else {
+                            format!("Disabled Play Unowned for AppID {}", aid)
+                        },
+                        ToastKind::Success,
+                    );
+                }
+                Err(e) => self.notify(e, ToastKind::Warning),
+            }
+        }
+        if let Some((aid, dir)) = act_autopatch {
+            match self.steam_auto_crack.launch_for_app(aid, &dir) {
+                Ok(m) => self.notify(m, ToastKind::Info),
+                Err(e) => self.notify(e, ToastKind::Warning),
             }
         }
     }

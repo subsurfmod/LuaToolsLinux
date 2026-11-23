@@ -33,12 +33,16 @@ use crate::services::fixes_service::FixesService;
 use crate::services::http_server::{HttpServerService, RpcUiEvent};
 use crate::services::lua_installer::LuaInstaller;
 use crate::services::millennium_service::MillenniumService;
+use crate::services::play_unowned_service::PlayUnownedService;
 use crate::services::protocol_service::ProtocolService;
 use crate::services::settings_service::SettingsService;
 use crate::services::slssteam_service::SlssteamService;
+use crate::services::steam_auto_crack_service::SteamAutoCrackService;
+use crate::services::steam_library_service::SteamLibraryService;
 use crate::services::steam_service::SteamService;
 use crate::services::telemetry_service::TelemetryService;
 use crate::services::update_service::UpdateService;
+use crate::services::wired_service::WiredService;
 use crate::ui::state::{
     AcquireTab, ActiveView, AddByAppIdModal, AppMessage, DepotDetailModal, DepotPickRow,
     DepotsSubTab, GameDetailModal, GuideTopic, LaunchOptionsModal, LibraryRow, QaCaptureState,
@@ -67,6 +71,10 @@ pub struct LuaToolsApp {
     pub depot_downloader: DepotDownloaderService,
     pub lua_vault: LuaVault,
     pub lua_installer: Option<LuaInstaller>,
+    pub play_unowned_service: PlayUnownedService,
+    pub steam_library_service: SteamLibraryService,
+    pub wired_service: WiredService,
+    pub steam_auto_crack: SteamAutoCrackService,
     pub cef_bridge: CefBridgeService,
     pub http_server: Option<HttpServerService>,
     pub tools_manager: ExternalToolsManager,
@@ -149,6 +157,9 @@ pub struct LuaToolsApp {
     pub settings_millennium_status: String,
     pub settings_update_status: String,
     pub settings_telemetry_status: String,
+    pub wired_busy: bool,
+    pub wired_progress: f32,
+    pub wired_status_text: String,
     pub update_banner: UpdateBannerState,
     pub guide_topic: GuideTopic,
 
@@ -229,6 +240,8 @@ impl LuaToolsApp {
             }
         });
 
+        let steam_installation = steam_service.installation.clone();
+        let steam_auto_crack = SteamAutoCrackService::new(tools_manager.clone());
         let mut app = Self {
             settings_service,
             auth_service,
@@ -245,6 +258,10 @@ impl LuaToolsApp {
             depot_downloader,
             lua_vault,
             lua_installer: None,
+            play_unowned_service: PlayUnownedService::new(steam_installation.clone()),
+            steam_library_service: SteamLibraryService::new(steam_installation),
+            wired_service: WiredService::new(None),
+            steam_auto_crack,
             cef_bridge,
             http_server: None,
             tools_manager,
@@ -314,6 +331,9 @@ impl LuaToolsApp {
                 .into(),
             settings_update_status: "Checked automatically once on startup".into(),
             settings_telemetry_status: String::new(),
+            wired_busy: false,
+            wired_progress: 0.0,
+            wired_status_text: String::new(),
             update_banner: UpdateBannerState::Hidden,
             guide_topic: GuideTopic::QuickStart,
             add_appid_modal: AddByAppIdModal::default(),
@@ -382,6 +402,8 @@ impl LuaToolsApp {
         let (msg_tx, msg_rx) = mpsc::channel();
         let (rpc_tx, rpc_rx) = mpsc::channel();
 
+        let steam_installation = steam_service.installation.clone();
+        let steam_auto_crack = SteamAutoCrackService::new(tools_manager.clone());
         let mut app = Self {
             settings_service,
             auth_service,
@@ -398,6 +420,10 @@ impl LuaToolsApp {
             depot_downloader,
             lua_vault,
             lua_installer: None,
+            play_unowned_service: PlayUnownedService::new(steam_installation.clone()),
+            steam_library_service: SteamLibraryService::new(steam_installation),
+            wired_service: WiredService::new(Some(scratch_dir.join("wired"))),
+            steam_auto_crack,
             cef_bridge,
             http_server: None,
             tools_manager,
@@ -469,6 +495,9 @@ impl LuaToolsApp {
             settings_millennium_status: "Click Probe Millennium to check local RPC (:38495)".into(),
             settings_update_status: format!("Up to date (v{}) · Checked once on startup", VERSION),
             settings_telemetry_status: String::new(),
+            wired_busy: false,
+            wired_progress: 0.0,
+            wired_status_text: String::new(),
             update_banner: UpdateBannerState::Hidden,
             guide_topic: GuideTopic::QuickStart,
             add_appid_modal: AddByAppIdModal::default(),
@@ -618,6 +647,15 @@ impl LuaToolsApp {
             let installer = LuaInstaller::new(inst.clone(), self.lua_vault.clone());
             self.lua_installer = Some(installer);
 
+            self.play_unowned_service.steam_installation = Some(inst.clone());
+            self.steam_library_service.steam_installation = Some(inst.clone());
+            self.wired_service.steam_root = Some(inst.root.clone());
+            if self.slssteam_service.config.play_not_owned {
+                let _ = self
+                    .play_unowned_service
+                    .sync_plugin_file(&self.slssteam_service);
+            }
+
             self.cef_bridge.steam_root = Some(inst.root.clone());
             if self.settings_service.settings.cef_bridge_enabled {
                 self.cef_bridge.start();
@@ -667,6 +705,9 @@ impl LuaToolsApp {
         } else {
             self.lua_installer = None;
             self.depot_downloader.steam_installation = None;
+            self.play_unowned_service.steam_installation = None;
+            self.steam_library_service.steam_installation = None;
+            self.wired_service.steam_root = None;
             if let Some(mut srv) = self.http_server.take() {
                 srv.stop();
             }
@@ -1399,6 +1440,52 @@ impl LuaToolsApp {
         });
     }
 
+    pub fn trigger_wired_action(&mut self, action: &'static str, ctx: &egui::Context) {
+        if self.wired_busy {
+            return;
+        }
+        self.wired_busy = true;
+        self.wired_progress = 0.02;
+        self.wired_status_text = format!("Starting Wired ({})…", action);
+
+        let wired = self.wired_service.clone();
+        let tx = self.msg_tx.clone();
+        let ctx_c = ctx.clone();
+        thread::spawn(move || {
+            let tx_p = tx.clone();
+            let ctx_p = ctx_c.clone();
+            let res: Result<String, String> = match action {
+                "accela" => wired
+                    .install_accela(|pct, msg| {
+                        let _ = tx_p.send(AppMessage::WiredProgress { pct, msg });
+                        ctx_p.request_repaint();
+                    })
+                    .map(|p| format!("ACCELA installed at {}", p.display())),
+                "slssteam" => wired
+                    .install_slssteam(|pct, msg| {
+                        let _ = tx_p.send(AppMessage::WiredProgress { pct, msg });
+                        ctx_p.request_repaint();
+                    })
+                    .map(|p| format!("SLSsteam installed ({})", p.display())),
+                _ => wired
+                    .install_all(|pct, msg| {
+                        let _ = tx_p.send(AppMessage::WiredProgress { pct, msg });
+                        ctx_p.request_repaint();
+                    })
+                    .map(|()| "Installed ACCELA + SLSsteam (Wired Suite ready)".into()),
+            };
+            match res {
+                Ok(m) => {
+                    let _ = tx.send(AppMessage::WiredFinished { ok: true, msg: m });
+                }
+                Err(e) => {
+                    let _ = tx.send(AppMessage::WiredFinished { ok: false, msg: e });
+                }
+            }
+            ctx_c.request_repaint();
+        });
+    }
+
     pub fn handle_protocol_url(&mut self, url: &str, ctx: &egui::Context) {
         let Some(act) = ProtocolService::parse(url) else {
             return;
@@ -1739,8 +1826,14 @@ impl LuaToolsApp {
                 }
                 AppMessage::FolderPickedForAutoCrack(dir) => {
                     let aid = self.depots_app_id.unwrap_or(0);
-                    match self.tools_manager.launch_steamautopatch(aid, &dir) {
-                        Ok(m) | Err(m) => self.status_text = m,
+                    let res = if aid > 0 {
+                        self.steam_auto_crack.launch_for_app(aid, &dir)
+                    } else {
+                        self.steam_auto_crack.launch_for_folder(&dir)
+                    };
+                    match res {
+                        Ok(m) => self.notify(m, ToastKind::Info),
+                        Err(e) => self.notify(e, ToastKind::Warning),
                     }
                 }
                 AppMessage::FilePickedForStubRemover(exe) => {
@@ -1832,6 +1925,24 @@ impl LuaToolsApp {
                             ToastKind::Warning,
                         ),
                     }
+                }
+                AppMessage::WiredProgress { pct, msg } => {
+                    self.wired_progress = pct;
+                    self.wired_status_text = msg.clone();
+                    self.status_text = msg;
+                }
+                AppMessage::WiredFinished { ok, msg } => {
+                    self.wired_busy = false;
+                    self.wired_status_text = msg.clone();
+                    self.refresh_all_local_state();
+                    self.notify(
+                        msg,
+                        if ok {
+                            ToastKind::Success
+                        } else {
+                            ToastKind::Warning
+                        },
+                    );
                 }
             }
         }

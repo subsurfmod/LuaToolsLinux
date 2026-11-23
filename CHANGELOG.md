@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.1] - 2026-11-23
+
+### Added & Fixed
+- **Wired Suite Native Installer (`WiredService`)**: Native Rust installation & management for **ACCELA** (`~/.local/share/ACCELA` + `ACCELA.conf`) and **SLSsteam** (`~/.local/share/SLSsteam/SLSsteam.so` + `library-inject.so` + `~/.local/bin/steam-sls` `LD_AUDIT` wrapper) directly from `Settings › SLSsteam & Store Bridge` without running untrusted `curl | bash` pipes; supports `.tar.gz`, `.zip` (with ZipSlip protection), `.tar.zst`, and `.7z` release assets with proper GitHub API `User-Agent` headers.
+- **Multi-App `PlayUnownedService` (`play_unowned_games.lua`)**: Synchronizes `stplug-in/play_unowned_games.lua` across all managed `AdditionalApps` with nil-safe `steam_api` guards so enabling a new title never overwrites previously enabled games; controllable globally in `Settings › SLSsteam & Store Bridge` and per-game in `Library › More`.
+- **Steam Library ACF Registration (`SteamLibraryService`)**: One-click **Add to Steam Library** / **Unregister from Steam Library** in `Discover` and `Library › More` writing valid Valve KeyValues `"AppState"` `appmanifest_<appid>.acf` files, creating `steamapps/common/<GameDir>`, cleanly updating `libraryfolders.vdf` `"apps"` blocks, and registering `AdditionalApps` + `FakeAppIds` (`480`) in `SLSsteam`.
+- **`SteamAutoCrackService` (`SteamAutoPatch`) Integration**: Wired `SteamAutoCrackService` through `ExternalToolsManager` (with Linux `dotnet` / `wine` invocation wrappers) in `Library › More › Run SteamAutoPatch` and `Settings › Updates & Toolchain`.
+- **Self-Updater Build Commit SHA Lag Detection**: Embeds `LUATOOLS_BUILD_GIT_SHA` at compile time (`build.rs`) so `UpdateService::check_once` detects when the running executable lags behind local or remote Git `HEAD` even on identical SemVer versions.
+
 ## [2.1.0] - 2026-11-23
 
 ### Added & Improved
