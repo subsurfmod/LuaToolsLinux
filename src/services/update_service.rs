@@ -653,7 +653,7 @@ impl UpdateService {
 
         let built_bin = if let Some(cargo) = Self::find_cargo_bin() {
             let out = Command::new(cargo)
-                .args(["build", "--release", "-j", "2"])
+                .args(["build", "--workspace", "--release", "-j", "2"])
                 .current_dir(&crate_dir)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -664,6 +664,13 @@ impl UpdateService {
                 let tail = stderr.lines().rev().take(6).collect::<Vec<_>>();
                 let msg: Vec<_> = tail.into_iter().rev().collect();
                 return Err(format!("Cargo build failed: {}", msg.join(" | ")));
+            }
+            let built_so = crate_dir.join("target/release/libsteam_integration.so");
+            if built_so.is_file() {
+                if let Some(home) = dirs::home_dir() {
+                    let lib_dst = home.join(".local/lib/luatools/libsteam_integration.so");
+                    let _ = Self::atomic_replace_executable(&built_so, &lib_dst);
+                }
             }
             crate_dir.join("target/release/luatools")
         } else {

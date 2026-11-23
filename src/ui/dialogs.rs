@@ -6,12 +6,14 @@ use std::thread;
 use eframe::egui::{self, Align, ComboBox, Layout, Margin, RichText, ScrollArea, TextEdit};
 
 use crate::parsers::vdf_binary::{LaunchEntry, LaunchOptionsService};
+use crate::services::game_process_injection_service::InjectionConfig;
 use crate::services::telemetry_service::TelemetryService;
 use crate::ui::app::LuaToolsApp;
-use crate::ui::state::{ActiveView, SettingsSubTab, ToastKind};
+use crate::ui::state::{ActiveView, AppMessage, SettingsSubTab, ToastKind};
 use crate::ui::theme::{
     danger_button, display_font, draw_rem_medallion, format_bytes, ghost_button, inset_paper_sheet,
-    lua_layouter, primary_button, secondary_button, semibold_font, Palette,
+    lua_layouter, pick_files_native, primary_button, secondary_button, semibold_font, status_badge,
+    BadgeTone, Palette,
 };
 use crate::VERSION;
 
@@ -20,6 +22,7 @@ impl LuaToolsApp {
         self.render_telemetry_consent_modal(ctx);
         self.render_add_by_appid_modal(ctx);
         self.render_game_detail_modal(ctx);
+        self.render_integration_modal(ctx);
         self.render_launch_options_modal(ctx);
         self.render_depot_detail_modal(ctx);
         self.render_text_prompt_modal(ctx);
@@ -796,6 +799,448 @@ impl LuaToolsApp {
             });
         if close {
             self.about_modal_open = false;
+        }
+    }
+
+    pub fn open_integration_modal(
+        &mut self,
+        app_id: u32,
+        game_name: String,
+        install_path: Option<std::path::PathBuf>,
+    ) {
+        let spoof = self
+            .steam_bridge_service
+            .get_app_id_spoof(app_id)
+            .or_else(|| self.slssteam_service.get_fake_app_id(app_id))
+            .unwrap_or(480)
+            .to_string();
+        let cd_key = self
+            .steam_bridge_service
+            .get_legacy_cd_key(app_id)
+            .unwrap_or_default();
+        let existing_inj = self.game_injection_service.get_config(app_id);
+        let proc_enabled = existing_inj.is_some();
+        let proc_lib = existing_inj
+            .as_ref()
+            .map(|c| c.library_path.to_string_lossy().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                self.game_injection_service
+                    .default_library()
+                    .to_string_lossy()
+                    .to_string()
+            });
+        let proc_args = existing_inj
+            .as_ref()
+            .map(|c| c.launch_args.join(" "))
+            .unwrap_or_default();
+
+        self.integration_modal.open = true;
+        self.integration_modal.app_id = app_id;
+        self.integration_modal.game_name = game_name;
+        self.integration_modal.install_path = install_path;
+        self.integration_modal.spoof_id_input = spoof;
+        self.integration_modal.cd_key_input = cd_key;
+        self.integration_modal.depot_id_input = (app_id + 1).to_string();
+        self.integration_modal.depot_key_input.clear();
+        self.integration_modal.stat_name_input.clear();
+        self.integration_modal.stat_value_input.clear();
+        self.integration_modal.proc_enabled = proc_enabled;
+        self.integration_modal.proc_lib_input = proc_lib;
+        self.integration_modal.proc_args_input = proc_args;
+        self.integration_modal.feedback.clear();
+    }
+
+    fn render_integration_modal(&mut self, ctx: &egui::Context) {
+        if !self.integration_modal.open {
+            return;
+        }
+        let app_id = self.integration_modal.app_id;
+        let game_name = self.integration_modal.game_name.clone();
+        let install_path = self.integration_modal.install_path.clone();
+
+        let is_redirect = self.steam_bridge_service.is_redirect_app(app_id)
+            || self
+                .play_unowned_service
+                .is_app_enabled(app_id, &self.slssteam_service);
+        let cur_spoof = self
+            .steam_bridge_service
+            .get_app_id_spoof(app_id)
+            .or_else(|| self.slssteam_service.get_fake_app_id(app_id));
+        let cur_cdkey = self.steam_bridge_service.get_legacy_cd_key(app_id);
+        let cur_stats = self.steam_bridge_service.get_stats(app_id);
+
+        let mut close = false;
+        let mut toggle_redirect: Option<bool> = None;
+        let mut set_spoof = false;
+        let mut rem_spoof = false;
+        let mut set_cdkey = false;
+        let mut rem_cdkey = false;
+        let mut set_depot_key = false;
+        let mut rem_depot_key = false;
+        let mut set_stat = false;
+        let mut rem_stat: Option<String> = None;
+        let mut save_proc = false;
+        let mut launch_proc = false;
+
+        egui::Window::new(format!(
+            "Integration & Process Controls — {} (#{})",
+            game_name, app_id
+        ))
+        .collapsible(false)
+        .resizable(true)
+        .default_size([650.0, 560.0])
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ScrollArea::vertical()
+                .id_salt("integration_modal_scroll")
+                .max_height(485.0)
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 10.0;
+
+                    // 1. Play-Unowned Redirect Set & AppID Spoof (480)
+                    inset_paper_sheet(ui, Margin::same(12), |ui| {
+                        ui.set_width(ui.available_width());
+                        egui::Sides::new().show(
+                            ui,
+                            |ui| {
+                                ui.label(
+                                    RichText::new(
+                                        "1. Ownership & AppID Redirect (Bridge + SLSsteam)",
+                                    )
+                                    .font(semibold_font(13.5))
+                                    .color(Palette::TEXT_PRIMARY),
+                                );
+                            },
+                            |ui| {
+                                if is_redirect {
+                                    status_badge(ui, "In Redirect Set", BadgeTone::Ready);
+                                } else {
+                                    status_badge(ui, "Standard", BadgeTone::Muted);
+                                }
+                            },
+                        );
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            if !is_redirect {
+                                if primary_button(ui, "Add to Redirect Set (Play Unowned)")
+                                    .clicked()
+                                {
+                                    toggle_redirect = Some(true);
+                                }
+                            } else if danger_button(ui, "Remove from Redirect Set").clicked() {
+                                toggle_redirect = Some(false);
+                            }
+                        });
+
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("AppID Redirect (Spoof):");
+                            ui.add_sized(
+                                [110.0, 28.0],
+                                TextEdit::singleline(&mut self.integration_modal.spoof_id_input)
+                                    .hint_text("480"),
+                            );
+                            if secondary_button(ui, "Set Redirect").clicked() {
+                                set_spoof = true;
+                            }
+                            if cur_spoof.is_some() && ghost_button(ui, "Remove Redirect").clicked()
+                            {
+                                rem_spoof = true;
+                            }
+                        });
+                    });
+
+                    // 2. Legacy CD Key & Depot Decryption Key
+                    inset_paper_sheet(ui, Margin::same(12), |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            RichText::new("2. Legacy CD Key & Depot Decryption Key")
+                                .font(semibold_font(13.5))
+                                .color(Palette::TEXT_PRIMARY),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label("CD Key:");
+                            ui.add_sized(
+                                [260.0, 28.0],
+                                TextEdit::singleline(&mut self.integration_modal.cd_key_input)
+                                    .hint_text("XXXX-YYYY-ZZZZ-WWWW"),
+                            );
+                            if secondary_button(ui, "Set Key").clicked() {
+                                set_cdkey = true;
+                            }
+                            if cur_cdkey.is_some() && ghost_button(ui, "Remove").clicked() {
+                                rem_cdkey = true;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Depot ID:");
+                            ui.add_sized(
+                                [95.0, 28.0],
+                                TextEdit::singleline(&mut self.integration_modal.depot_id_input)
+                                    .hint_text("Depot"),
+                            );
+                            ui.label("Hex Key:");
+                            ui.add_sized(
+                                [225.0, 28.0],
+                                TextEdit::singleline(&mut self.integration_modal.depot_key_input)
+                                    .hint_text("64-char hex AES-256 key"),
+                            );
+                            if secondary_button(ui, "Set").clicked() {
+                                set_depot_key = true;
+                            }
+                            if ghost_button(ui, "Remove").clicked() {
+                                rem_depot_key = true;
+                            }
+                        });
+                    });
+
+                    // 3. Steam Stat Overrides
+                    inset_paper_sheet(ui, Margin::same(12), |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            RichText::new("3. Steam Stat / Achievement Overrides")
+                                .font(semibold_font(13.5))
+                                .color(Palette::TEXT_PRIMARY),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label("Stat:");
+                            ui.add_sized(
+                                [165.0, 28.0],
+                                TextEdit::singleline(&mut self.integration_modal.stat_name_input)
+                                    .hint_text("stat_name"),
+                            );
+                            ui.label("Value:");
+                            ui.add_sized(
+                                [165.0, 28.0],
+                                TextEdit::singleline(&mut self.integration_modal.stat_value_input)
+                                    .hint_text("value"),
+                            );
+                            if secondary_button(ui, "Set Stat").clicked() {
+                                set_stat = true;
+                            }
+                        });
+                        for (k, v) in &cur_stats {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!("• {} = {}", k, v))
+                                        .size(12.0)
+                                        .color(Palette::TEXT_SECONDARY),
+                                );
+                                if ghost_button(ui, "Remove").clicked() {
+                                    rem_stat = Some(k.clone());
+                                }
+                            });
+                        }
+                    });
+
+                    // 4. Game Process LD_PRELOAD Integration
+                    inset_paper_sheet(ui, Margin::same(12), |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            RichText::new("4. Game Process Integration (LD_PRELOAD)")
+                                .font(semibold_font(13.5))
+                                .color(Palette::TEXT_PRIMARY),
+                        );
+                        ui.checkbox(
+                            &mut self.integration_modal.proc_enabled,
+                            "Enable per-app LD_PRELOAD shared library integration",
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label("Library (.so):");
+                            let w = (ui.available_width() - 105.0).max(160.0);
+                            ui.add_sized(
+                                [w, 28.0],
+                                TextEdit::singleline(&mut self.integration_modal.proc_lib_input)
+                                    .hint_text("~/.local/lib/luatools/libsteam_integration.so"),
+                            );
+                            if secondary_button(ui, "Browse…").clicked() {
+                                let tx = self.msg_tx.clone();
+                                let ctx_c = ctx.clone();
+                                thread::spawn(move || {
+                                    let files = pick_files_native(
+                                        "Select Shared Library (.so)",
+                                        Some("*.so"),
+                                    );
+                                    if let Some(f) = files.into_iter().next() {
+                                        let _ =
+                                            tx.send(AppMessage::FilePickedForGameInjectionSo(f));
+                                        ctx_c.request_repaint();
+                                    }
+                                });
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Launch Args:");
+                            let w = (ui.available_width() - 16.0).max(160.0);
+                            ui.add_sized(
+                                [w, 28.0],
+                                TextEdit::singleline(&mut self.integration_modal.proc_args_input)
+                                    .hint_text("Optional extra CLI arguments…"),
+                            );
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            if secondary_button(ui, "Save Process Config").clicked() {
+                                save_proc = true;
+                            }
+                            if primary_button(ui, "Launch with Integration").clicked() {
+                                save_proc = true;
+                                launch_proc = true;
+                            }
+                        });
+                    });
+                });
+
+            if !self.integration_modal.feedback.is_empty() {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(&self.integration_modal.feedback)
+                        .size(12.0)
+                        .color(Palette::BLUE_LIGHT),
+                );
+            }
+
+            ui.add_space(8.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if primary_button(ui, "Done").clicked() {
+                    close = true;
+                }
+            });
+        });
+
+        if let Some(enable) = toggle_redirect {
+            if enable {
+                self.steam_bridge_service.add_redirect_app(app_id);
+                let _ = self
+                    .play_unowned_service
+                    .enable_for_app(app_id, &mut self.slssteam_service);
+                self.integration_modal.feedback =
+                    format!("Added AppID {} to play-unowned redirect set.", app_id);
+            } else {
+                self.steam_bridge_service.remove_redirect_app(app_id);
+                let _ = self
+                    .play_unowned_service
+                    .disable_for_app(app_id, &mut self.slssteam_service);
+                self.integration_modal.feedback =
+                    format!("Removed AppID {} from redirect set.", app_id);
+            }
+            self.refresh_all_local_state();
+        }
+        if set_spoof {
+            if let Ok(sid) = self.integration_modal.spoof_id_input.trim().parse::<u32>() {
+                self.steam_bridge_service.set_app_id_spoof(app_id, sid);
+                self.slssteam_service.set_fake_app_id(app_id, sid);
+                let _ = self.slssteam_service.save();
+                self.refresh_all_local_state();
+                self.integration_modal.feedback =
+                    format!("Set AppID redirect {} → {}.", app_id, sid);
+            } else {
+                self.integration_modal.feedback = "Enter a valid numeric spoof AppID.".into();
+            }
+        }
+        if rem_spoof {
+            self.steam_bridge_service.remove_app_id_spoof(app_id);
+            self.slssteam_service.remove_fake_app_id(app_id);
+            let _ = self.slssteam_service.save();
+            self.refresh_all_local_state();
+            self.integration_modal.feedback = format!("Removed AppID redirect for {}.", app_id);
+        }
+        if set_cdkey {
+            let k = self.integration_modal.cd_key_input.trim().to_string();
+            if !k.is_empty() {
+                self.steam_bridge_service.set_legacy_cd_key(app_id, k);
+                self.integration_modal.feedback = "Saved legacy CD key.".into();
+            }
+        }
+        if rem_cdkey {
+            self.steam_bridge_service.remove_legacy_cd_key(app_id);
+            self.integration_modal.cd_key_input.clear();
+            self.integration_modal.feedback = "Removed legacy CD key.".into();
+        }
+        if set_depot_key {
+            let did_opt = self
+                .integration_modal
+                .depot_id_input
+                .trim()
+                .parse::<u32>()
+                .ok();
+            let hex = self.integration_modal.depot_key_input.trim().to_string();
+            if let Some(did) = did_opt {
+                if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                    self.steam_bridge_service.set_depot_key(did, hex.clone());
+                    self.slssteam_service.config.depot_keys.insert(did, hex);
+                    let _ = self.slssteam_service.save();
+                    self.integration_modal.depot_key_input.clear();
+                    self.integration_modal.feedback =
+                        format!("Stored decryption key for Depot {}.", did);
+                } else {
+                    self.integration_modal.feedback =
+                        "Depot key must be 64 hexadecimal characters.".into();
+                }
+            }
+        }
+        if rem_depot_key {
+            if let Ok(did) = self.integration_modal.depot_id_input.trim().parse::<u32>() {
+                self.steam_bridge_service.remove_depot_key(did);
+                self.slssteam_service.config.depot_keys.remove(&did);
+                let _ = self.slssteam_service.save();
+                self.integration_modal.feedback =
+                    format!("Removed decryption key for Depot {}.", did);
+            }
+        }
+        if set_stat {
+            let sname = self.integration_modal.stat_name_input.trim().to_string();
+            let sval = self.integration_modal.stat_value_input.trim().to_string();
+            if !sname.is_empty() {
+                self.steam_bridge_service
+                    .set_stat(app_id, sname.clone(), sval);
+                self.integration_modal.stat_name_input.clear();
+                self.integration_modal.stat_value_input.clear();
+                self.integration_modal.feedback = format!("Set stat '{}'.", sname);
+            }
+        }
+        if let Some(sname) = rem_stat {
+            self.steam_bridge_service.remove_stat(app_id, &sname);
+            self.integration_modal.feedback = format!("Removed stat '{}'.", sname);
+        }
+        if save_proc {
+            if self.integration_modal.proc_enabled {
+                let args: Vec<String> = self
+                    .integration_modal
+                    .proc_args_input
+                    .split_whitespace()
+                    .map(ToString::to_string)
+                    .collect();
+                self.game_injection_service.configure(
+                    app_id,
+                    InjectionConfig {
+                        app_id,
+                        library_path: std::path::PathBuf::from(
+                            self.integration_modal.proc_lib_input.trim(),
+                        ),
+                        env_vars: Default::default(),
+                        launch_args: args,
+                    },
+                );
+                self.integration_modal.feedback =
+                    "Saved per-app LD_PRELOAD process integration config.".into();
+            } else {
+                self.game_injection_service.unconfigure(app_id);
+                self.integration_modal.feedback = "Disabled per-app process integration.".into();
+            }
+        }
+        if launch_proc {
+            match self
+                .game_injection_service
+                .launch_with_integration(app_id, install_path.as_deref())
+            {
+                Ok(m) => self.notify(m, ToastKind::Success),
+                Err(e) => self.notify(e, ToastKind::Warning),
+            }
+        }
+        if close {
+            self.integration_modal.open = false;
         }
     }
 }

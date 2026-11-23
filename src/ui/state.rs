@@ -78,6 +78,7 @@ pub enum DepotsSubTab {
     Declarations,
     LiveEditor,
     DownloadPicker,
+    ManifestBinding,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +86,7 @@ pub enum SettingsSubTab {
     General,
     Account,
     Integrations,
+    SteamIntegration,
     UpdatesAndTools,
     Telemetry,
 }
@@ -234,6 +236,11 @@ pub enum AppMessage {
         ok: bool,
         msg: String,
     },
+    BridgeActionFinished {
+        ok: bool,
+        msg: String,
+    },
+    FilePickedForGameInjectionSo(PathBuf),
 }
 
 // ===== Modal Dialog States =====
@@ -256,6 +263,24 @@ pub struct GameDetailModal {
     pub token_input: String,
     pub show_token: bool,
     pub quick_depot_input: String,
+    pub feedback: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct IntegrationModal {
+    pub open: bool,
+    pub app_id: u32,
+    pub game_name: String,
+    pub install_path: Option<PathBuf>,
+    pub spoof_id_input: String,
+    pub cd_key_input: String,
+    pub depot_id_input: String,
+    pub depot_key_input: String,
+    pub stat_name_input: String,
+    pub stat_value_input: String,
+    pub proc_enabled: bool,
+    pub proc_lib_input: String,
+    pub proc_args_input: String,
     pub feedback: String,
 }
 

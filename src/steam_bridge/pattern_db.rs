@@ -106,7 +106,10 @@ impl PatternDb {
         let agent = ureq::AgentBuilder::new()
             .timeout(std::time::Duration::from_secs(15))
             .build();
-        Self { cache_dir, http_agent: agent }
+        Self {
+            cache_dir,
+            http_agent: agent,
+        }
     }
 
     pub fn cache_dir(&self) -> &Path {
@@ -119,15 +122,18 @@ impl PatternDb {
         channel: PatternChannel,
         sha256_hex: &str,
     ) -> Result<PatternFile, PatternError> {
-        let cache_name =
-            format!("{}_{}_{}.toml", channel.as_str(), component.as_str(), sha256_hex);
+        let cache_name = format!(
+            "{}_{}_{}.toml",
+            channel.as_str(),
+            component.as_str(),
+            sha256_hex
+        );
         let cache_path = self.cache_dir.join(&cache_name);
 
         if cache_path.exists() {
             let content = fs::read_to_string(&cache_path)?;
-            let parsed: PatternFile = toml::from_str(&content).map_err(|e| {
-                PatternError::Parse(e.to_string())
-            })?;
+            let parsed: PatternFile =
+                toml::from_str(&content).map_err(|e| PatternError::Parse(e.to_string()))?;
             return Ok(parsed);
         }
 
@@ -152,17 +158,13 @@ impl PatternDb {
                 self.fetch_url(&fb_url)
             })
             .map_err(|_e| {
-                PatternError::NotFound(
-                    component.as_str().to_string(),
-                    sha256_hex.to_string(),
-                )
+                PatternError::NotFound(component.as_str().to_string(), sha256_hex.to_string())
             })?;
 
         let _ = fs::write(&cache_path, &content);
 
-        let parsed: PatternFile = toml::from_str(&content).map_err(|e| {
-            PatternError::Parse(e.to_string())
-        })?;
+        let parsed: PatternFile =
+            toml::from_str(&content).map_err(|e| PatternError::Parse(e.to_string()))?;
         Ok(parsed)
     }
 
@@ -170,12 +172,14 @@ impl PatternDb {
         let resp = self
             .http_agent
             .get(url)
+            .set("User-Agent", &format!("LuaToolsLinux/{}", crate::VERSION))
             .call()
             .map_err(|e| PatternError::Http(e.to_string()))?;
         if resp.status() != 200 {
             return Err(PatternError::Http(format!("HTTP {}", resp.status())));
         }
-        resp.into_string().map_err(|e| PatternError::Http(e.to_string()))
+        resp.into_string()
+            .map_err(|e| PatternError::Http(e.to_string()))
     }
 
     pub fn get_pattern(
@@ -189,12 +193,7 @@ impl PatternDb {
         file.patterns
             .get(pattern_name)
             .cloned()
-            .ok_or_else(|| {
-                PatternError::NotFound(
-                    pattern_name.to_string(),
-                    sha256_hex.to_string(),
-                )
-            })
+            .ok_or_else(|| PatternError::NotFound(pattern_name.to_string(), sha256_hex.to_string()))
     }
 
     pub fn lookup_by_binary(

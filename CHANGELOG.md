@@ -7,77 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [2.4.0-beta] - 2026-11-23
+## [2.5.1] - 2026-11-23
 
 ### Added
-- **Steam Client Interop Layer (`src/steam_bridge/`)**:
-  - **`binary_reader.rs`**: ELF64 parser for Steam Linux binaries (`steamclient.so`, `steamui.so`); reads section headers, symbol tables, dynamic symbols, and computes SHA-256 hashes for build-compatibility pattern lookup.
-  - **`memory_patch.rs`**: x86-64 inline memory patching via trampolines (`mprotect` + relative jump + jump-back trampoline) for safe runtime code redirection.
-  - **`preload_loader.rs`**: `LD_PRELOAD`-based injection of the integration shared library into the Steam client process; generates launcher scripts, manages `/etc/ld.so.preload` entries, and detects running Steam PIDs.
-  - **`ticket_store.rs`**: Steam ticket store backed by `localconfig.vdf`; reads/writes `AppTicket`, `ETicket`, and `SteamID` per app ID.
-  - **`pattern_db.rs`**: Steam build compatibility lookup from the upstream pattern tracker (GitHub raw → jsDelivr CDN fallback → local cache); matches SHA-256 hashes to pattern TOML files.
-  - **`ipc.rs`**: Unix domain socket IPC between the GUI and the integration library running inside Steam; supports typed messages for ping, tickets, play-unowned apps, stats, legacy CD keys, depot keys, manifest codes, app ID redirects, and manifest pins.
-- **`bridge_lib/`** (`bridge_lib/Cargo.toml`, `bridge_lib/src/lib.rs`):
-  - New `cdylib` crate built as `libsteam_integration.so` for `LD_PRELOAD` injection into Steam.
-  - Constructor initializes at Steam load, scans Steam binaries, resolves byte patterns via `pattern_db`, installs memory patches, and starts the IPC server.
-  - **`BIsSubscribedApp` redirect**: Installs a memory patch on the Steam client ownership-check function; apps in the redirect set report as owned.
-  - **`GetAppId` redirect**: Installs a memory patch on the Steam client app-ID query function; returns configured redirect IDs (e.g. 480 for online-play compatibility).
-  - IPC message handlers for tickets, play-unowned apps, stats, legacy CD keys, depot keys, manifest codes, app ID redirects, and manifest pins.
-- **`SteamBridgeService` (`src/services/steam_bridge_service.rs`)**:
-  - High-level service connecting the bridge layer to the GUI; detects Steam, scans binaries, loads patterns, installs the integration library, manages tickets, and sends IPC messages.
-  - Exposes `install_integration()`, `uninstall_integration()`, `scan_and_load_patterns()`, `get/set/remove_tickets()`, `send_ipc_message()`, and `status()`.
-- **Manifest Binding Service (`src/services/manifest_binding_service.rs`)**:
-  - Tracks manifest pins per app+depot; `set_pin()`, `remove_pin()`, `get_pin()`, `get_pins_for_app()`, `list_pinned_depots()`.
-  - IPC messages: `SetManifestPin`, `RemoveManifestPin`, `ManifestBound`.
-- **Hot-Reload Service (`src/services/hot_reload_service.rs`)**:
-  - `inotify`-based watcher on the Steam `stplug-in/` directory; detects CREATE/MODIFY/DELETE/MOVE events on `.lua` files; runs in a background thread and notifies the bridge via IPC.
-- **Cloud Redirect Service (`src/services/cloud_redirect_service.rs`)**:
-  - Detects CloudRedirect installation (`~/.local/share/Steam/config/cloudredirect`); per-app cloud enable/disable; `sync_to_cloudredirect()` writes `cloudredirect.conf`; status tracking (`NotInstalled` → `Installed` → `Active`).
-- **Game Process Integration Service (`src/services/game_process_injection_service.rs`)**:
-  - Per-app integration configuration (library path, env vars, launch args); `build_launch_command()` constructs a `Command` with `LD_PRELOAD` set for game-process integration; ptrace-based running-process injection prototype; status tracking (`NotInjected` → `Injected` → `Failed`).
+- **Complete GUI Integration for the Steam Client Interop Layer**:
+  - **`Settings › Steam Integration` Sub-Tab (`src/ui/views_workbench.rs`)**: Live Steam process & IPC detection badges, one-click `libsteam_integration.so` staging/build & `luatools-steam-launcher` generation, `LD_PRELOAD` mode toggle (per-launch wrapper vs. system-wide `/etc/ld.so.preload`), ELF64 `steamclient.so` / `steamui.so` SHA-256 & pattern scanner card, and `inotify` `stplug-in/` Hot-Reload controls + event log.
+  - **`Library › More › Integration Actions…` & Process Integration Modal (`src/ui/dialogs.rs`)**: Per-game Play-Unowned redirect set toggle, AppID redirect (`480` spoof) editor, legacy CD key & 64-char hex depot decryption key controls, Steam stat overrides, and per-app `LD_PRELOAD` Game Process Integration (enable/disable, `.so` library file picker, custom launch args, and **Launch with Integration**).
+  - **`Depots & Vault › Manifest Binding` Sub-Tab (`src/ui/views_workbench.rs`)**: Lists pinned depot manifests (auto-imported from `.lua` `setManifestid` directives + manual pins), adds/removes pins, re-syncs pins over Unix socket IPC, and displays live **`Active (Bound)`** vs. **`Pending (Saved)`** status badges.
+  - **Home Hot-Reload & Bridge Status Strip (`src/ui/views_primary.rs`)**: Live `inotify` watcher running/paused badge, latest `.lua` file change readout, and 1-click Start/Stop toggle on Home.
+  - **Cloud Redirect Revival Card (`Settings › SLSsteam & Store Bridge`)**: Live `CloudRedirect` status badge (`Active` / `Installed` / `Not Installed`), quick AppID adder, per-game cloud sync checkboxes, and **Sync to CloudRedirect** (`cloudredirect.conf` writer + IPC notification).
+- **Automatic `libsteam_integration.so` Workspace Build & Staging**:
+  - `install.sh`, `UpdateService::pull_and_update`, and `SteamBridgeService::ensure_integration_lib_staged` now build the full Cargo workspace (`luatools` + `bridge_lib`) and stage `libsteam_integration.so` into `~/.local/lib/luatools/libsteam_integration.so` automatically.
+- **Steam Client Interop Layer (`src/steam_bridge/` & `bridge_lib/`)** (from `2.4.0-beta`, hardened for `2.5.1`):
+  - **`binary_reader.rs`**: ELF64 section, symbol, dynamic-symbol, and SHA-256 reader for `steamclient.so` and `steamui.so`.
+  - **`memory_patch.rs`**: 14-byte 64-bit RIP-relative indirect jump trampolines (`FF 25 00 00 00 00 <u64>`) safe across full 64-bit ASLR address space.
+  - **`preload_loader.rs`**, **`ticket_store.rs`**, **`pattern_db.rs`**, **`ipc.rs`**, and **`bridge_lib`** (`cdylib` hooking `BIsSubscribedApp` & `GetAppId` and serving Unix socket IPC).
 
-### Changed
-- **Cargo workspace**: Root `Cargo.toml` converted to a workspace with members `.` and `bridge_lib`; version bumped to `2.4.0`.
-- **`src/lib.rs`**: Registered `pub mod steam_bridge;`
-- **`src/services/mod.rs`**: Registered `steam_bridge_service`, `manifest_binding_service`, `hot_reload_service`, `cloud_redirect_service`, `game_process_injection_service`.
-- **`src/ui/app.rs`**: Added `steam_bridge_service: SteamBridgeService` field to `LuaToolsApp` in both `new()` and `new_headless_demo()` constructors.
-- **`Cargo.toml`**: Added dependencies `thiserror`, `toml`, `libc`, `inotify`.
-
-### Known Limitations / Prototype Notes
-- **`bridge_lib`** is built as a separate `cdylib` and must be placed at `~/.local/lib/luatools/libsteam_integration.so` before `install_integration()` can register it.
-- **Memory patches** are installed at Steam startup via `LD_PRELOAD` constructor; pattern addresses depend on the upstream pattern tracker publishing matching TOML files for the running Steam build.
-- **ptrace running-process injection** is prototype-level and requires `CAP_SYS_PTRACE` and a permissive Yama ptrace scope; `LD_PRELOAD` launch is the recommended path.
-- **Manifest binding enforcement** stores pins and signals via IPC; Steam-side manifest interception requires additional pattern patches for the current Steam build.
-
-### GUI Changes Needed (not yet implemented)
-The following GUI integration work remains for the 2.4.0 release:
-
-- **Settings › Steam Integration** tab:
-  - Steam detection status indicator
-  - Integration library install/uninstall buttons
-  - Pattern load status (steamclient / steamui SHA-256 + pattern matches)
-  - LD_PRELOAD toggle (system-wide vs per-launch)
-- **Library › More › Integration Actions** per game:
-  - Add/Remove from redirect set (play unowned)
-  - Set/Remove app ID redirect (480 spoof)
-  - Set/Remove legacy CD key
-  - Set/Remove depot decryption key
-  - Set/Remove stat value
-- **Depots › Manifest Binding** sub-tab:
-  - List pinned manifests per depot
-  - Add/Remove manifest pins
-  - Show bind status (active / pending)
-- **Hot-Reload status** in Home or Settings:
-  - Watcher running/stopped indicator
-  - Last file change event log
-- **Cloud Redirect** status in Settings › SLSsteam & Store Bridge:
-  - Installed/Not installed indicator
-  - Per-app cloud enable/disable toggles
-  - Sync button
-- **Game Process Integration** in Library › More:
-  - Per-app integration enable/disable
-  - Library path selector
-  - Launch with integration button
+### Fixed
+- **Fixed `memory_patch.rs` Double-Install & 32-bit ASLR Relocation Overflow**: Replaced `0xE9` signed 32-bit displacements (which overflow > ±2 GiB between `mmap` trampolines and shared libraries under Linux ASLR) with 14-byte 64-bit indirect jumps, and removed the duplicate `patch.install(14)` call in `bridge_lib` after `patch_by_offset` had already installed the patch.
+- **Fixed `IpcServer::start` `EADDRINUSE` Crash (`src/steam_bridge/ipc.rs`)**: Cloned the bound `UnixListener` into the accept thread instead of re-binding the already-bound Unix socket path, added read/write timeouts + `Shutdown::Write` framing, and added `RemoveStat`, `RemoveLegacyCdKey`, and `RemoveDepotKey` IPC messages.
+- **Fixed `BinaryFile` Section Name Indexing & Slice Bounds (`src/steam_bridge/binary_reader.rs`)**: Indexed `section_names` by section table index rather than `.shstrtab` byte offset (`name_offset`) so named section scans resolve `.text`/`.rodata` accurately, and clamped section ranges against truncated/`SHT_NOBITS` sections.
+- **Fixed Stubbed IPC & Persistence in Services**:
+  - `ManifestBindingService` now sends `SetManifestPin` / `RemoveManifestPin` (instead of `Ping`), tracks `ManifestBound` confirmation, imports `.lua` `setManifestid` entries, and persists pins to `manifest_pins.json`.
+  - `HotReloadService` uses non-blocking `inotify` polling so `stop()` exits cleanly within 150 ms instead of blocking indefinitely, maintains a 30-event ring buffer, and emits `lua_hot_reload` IPC events.
+  - `CloudRedirectService` and `GameProcessInjectionService` now persist configurations across restarts and isolate unit tests from `$HOME`.
+- **Resolved All 18 Workspace Compiler / Clippy Errors & Cargo Profile Warning**: Cleaned up unused imports/variables, `missing_safety_doc`, `type_complexity`, `new_without_default`, `manual_strip`, `collapsible_if`, and non-root `[profile.release]` workspace warning across `luatools-linux` and `bridge_lib`.
 
 ---
 

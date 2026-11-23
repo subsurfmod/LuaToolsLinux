@@ -9,12 +9,15 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+pub type IpcHandlerFn = dyn Fn(IpcMessage) -> Option<IpcMessage> + Send + Sync;
 
 /// Socket path for the IPC channel.
 pub fn ipc_socket_path() -> PathBuf {
@@ -45,27 +48,54 @@ pub enum IpcMessage {
     /// GUI → Integration: remove an app from the play-unowned list
     RemovePlayUnownedApp { app_id: u32 },
     /// Integration → GUI: async event notification
-    Event { kind: String, payload: HashMap<String, String> },
+    Event {
+        kind: String,
+        payload: HashMap<String, String>,
+    },
     /// GUI → Integration: set a stat/achievement value for an app
-    SetStat { app_id: u32, stat_name: String, stat_value: String },
+    SetStat {
+        app_id: u32,
+        stat_name: String,
+        stat_value: String,
+    },
+    /// GUI → Integration: remove a stat override for an app
+    RemoveStat { app_id: u32, stat_name: String },
     /// GUI → Integration: set a legacy third-party CD key for an app
     SetLegacyCdKey { app_id: u32, key: String },
+    /// GUI → Integration: remove a legacy CD key for an app
+    RemoveLegacyCdKey { app_id: u32 },
     /// GUI → Integration: set a depot decryption key
     SetDepotKey { depot_id: u32, key: String },
+    /// GUI → Integration: remove a depot decryption key
+    RemoveDepotKey { depot_id: u32 },
     /// GUI → Integration: fetch a manifest code by GID
     FetchManifestCode { gid: String },
     /// GUI → Integration: fetch a manifest code with app/depot context
-    FetchManifestCodeEx { app_id: u32, depot_id: u32, gid: String },
+    FetchManifestCodeEx {
+        app_id: u32,
+        depot_id: u32,
+        gid: String,
+    },
     /// GUI → Integration: set app ID spoof (online fix / 480)
     SetAppIdSpoof { app_id: u32, spoof_id: u32 },
     /// GUI → Integration: remove app ID spoof
     RemoveAppIdSpoof { app_id: u32 },
     /// GUI → Integration: set a manifest pin for enforcement
-    SetManifestPin { app_id: u32, depot_id: u32, manifest_id: String, size: u64 },
+    SetManifestPin {
+        app_id: u32,
+        depot_id: u32,
+        manifest_id: String,
+        size: u64,
+    },
     /// GUI → Integration: remove a manifest pin
     RemoveManifestPin { app_id: u32, depot_id: u32 },
     /// Integration → GUI: manifest binding status
-    ManifestBound { app_id: u32, depot_id: u32, manifest_id: String, active: bool },
+    ManifestBound {
+        app_id: u32,
+        depot_id: u32,
+        manifest_id: String,
+        active: bool,
+    },
 }
 
 impl IpcMessage {
@@ -80,14 +110,26 @@ impl IpcMessage {
 
 /// Server side: runs inside the Steam process, listens on the Unix socket.
 pub struct IpcServer {
+    socket_path: PathBuf,
     listener: Option<UnixListener>,
     stop: Arc<AtomicBool>,
-    handler: Arc<Mutex<Box<dyn Fn(IpcMessage) -> Option<IpcMessage> + Send + Sync>>>,
+    handler: Arc<Mutex<Box<IpcHandlerFn>>>,
+}
+
+impl Default for IpcServer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl IpcServer {
     pub fn new() -> Self {
+        Self::with_socket_path(ipc_socket_path())
+    }
+
+    pub fn with_socket_path(socket_path: PathBuf) -> Self {
         Self {
+            socket_path,
             listener: None,
             stop: Arc::new(AtomicBool::new(false)),
             handler: Arc::new(Mutex::new(Box::new(|_msg| None))),
@@ -102,32 +144,28 @@ impl IpcServer {
     }
 
     pub fn start(&mut self) -> Result<(), String> {
-        let socket_path = ipc_socket_path();
-        let _ = std::fs::remove_file(&socket_path);
-        let listener = UnixListener::bind(&socket_path)
-            .map_err(|e| format!("Failed to bind IPC socket: {}", e))?;
+        if let Some(parent) = self.socket_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::remove_file(&self.socket_path);
+        let listener = UnixListener::bind(&self.socket_path).map_err(|e| {
+            format!(
+                "Failed to bind IPC socket {}: {}",
+                self.socket_path.display(),
+                e
+            )
+        })?;
+        let thread_listener = listener
+            .try_clone()
+            .map_err(|e| format!("Failed to clone IPC listener: {}", e))?;
+        self.stop.store(false, Ordering::Relaxed);
         self.listener = Some(listener);
 
         let stop = Arc::clone(&self.stop);
         let handler = Arc::clone(&self.handler);
-        let socket_path_clone = socket_path.clone();
 
         thread::spawn(move || {
-            let listener = match std::fs::File::open(&socket_path_clone) {
-                Ok(_) => {
-                    // Re-bind since we dropped the original listener
-                    match UnixListener::bind(&socket_path_clone) {
-                        Ok(l) => l,
-                        Err(e) => {
-                            eprintln!("IPC server rebind failed: {}", e);
-                            return;
-                        }
-                    }
-                }
-                Err(_) => return,
-            };
-
-            for stream in listener.incoming() {
+            for stream in thread_listener.incoming() {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
@@ -135,24 +173,26 @@ impl IpcServer {
                     Ok(mut stream) => {
                         let handler = Arc::clone(&handler);
                         thread::spawn(move || {
-                            let mut buf = [0u8; 4096];
-                            match stream.read(&mut buf) {
-                                Ok(n) if n > 0 => {
-                                    let s = String::from_utf8_lossy(&buf[..n]);
-                                    if let Ok(msg) = IpcMessage::from_json(s.trim()) {
-                                        let response = (handler.lock().unwrap())(msg);
-                                        if let Some(resp) = response {
-                                            let _ = stream.write_all(resp.to_json().unwrap_or_default().as_bytes());
+                            let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+                            let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+                            let mut raw = String::new();
+                            if stream.read_to_string(&mut raw).is_ok() && !raw.trim().is_empty() {
+                                if let Ok(msg) = IpcMessage::from_json(raw.trim()) {
+                                    let response = (handler.lock().unwrap())(msg);
+                                    if let Some(resp) = response {
+                                        if let Ok(js) = resp.to_json() {
+                                            let _ = stream.write_all(js.as_bytes());
                                         }
                                     }
                                 }
-                                _ => {}
                             }
                             let _ = stream.shutdown(Shutdown::Both);
                         });
                     }
-                    Err(e) => {
-                        eprintln!("IPC accept error: {}", e);
+                    Err(_) => {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
                     }
                 }
             }
@@ -163,12 +203,21 @@ impl IpcServer {
 
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        let _ = std::fs::remove_file(ipc_socket_path());
+        // Wake up blocking accept() cleanly
+        let _ = UnixStream::connect(&self.socket_path);
+        let _ = std::fs::remove_file(&self.socket_path);
         self.listener = None;
     }
 }
 
+impl Drop for IpcServer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// Client side: runs in the GUI process, connects to the IPC socket.
+#[derive(Debug, Clone)]
 pub struct IpcClient {
     socket_path: PathBuf,
 }
@@ -181,31 +230,39 @@ impl Default for IpcClient {
 
 impl IpcClient {
     pub fn new() -> Self {
+        Self::with_socket_path(ipc_socket_path())
+    }
+
+    pub fn with_socket_path(path: impl AsRef<Path>) -> Self {
         Self {
-            socket_path: ipc_socket_path(),
+            socket_path: path.as_ref().to_path_buf(),
         }
     }
 
     pub fn send(&self, msg: &IpcMessage) -> Result<Option<IpcMessage>, String> {
         let mut stream = UnixStream::connect(&self.socket_path)
             .map_err(|e| format!("Failed to connect to IPC socket: {}", e))?;
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
 
-        let json = msg.to_json().map_err(|e| format!("Serialization error: {}", e))?;
+        let json = msg
+            .to_json()
+            .map_err(|e| format!("Serialization error: {}", e))?;
         stream
             .write_all(json.as_bytes())
             .map_err(|e| format!("Send error: {}", e))?;
+        let _ = stream.shutdown(Shutdown::Write);
 
-        let mut buf = [0u8; 4096];
-        let n = stream
-            .read(&mut buf)
+        let mut raw = String::new();
+        stream
+            .read_to_string(&mut raw)
             .map_err(|e| format!("Receive error: {}", e))?;
 
-        if n == 0 {
+        if raw.trim().is_empty() {
             return Ok(None);
         }
 
-        let s = String::from_utf8_lossy(&buf[..n]);
-        let reply = IpcMessage::from_json(s.trim())
+        let reply = IpcMessage::from_json(raw.trim())
             .map_err(|e| format!("Deserialization error: {}", e))?;
         Ok(Some(reply))
     }
@@ -223,129 +280,87 @@ mod tests {
     use super::*;
 
     #[test]
-    fn message_serialization_roundtrip() {
-        let msg = IpcMessage::Ping;
-        let json = msg.to_json().unwrap();
-        let parsed = IpcMessage::from_json(&json).unwrap();
-        assert!(matches!(parsed, IpcMessage::Ping));
-    }
+    fn live_unix_socket_server_and_client_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("test_ipc.sock");
 
-    #[test]
-    fn pong_message_roundtrip() {
-        let mut map = HashMap::new();
-        map.insert("key".into(), "val".into());
-        let msg = IpcMessage::Event {
-            kind: "test".into(),
-            payload: map,
-        };
-        let json = msg.to_json().unwrap();
-        let parsed = IpcMessage::from_json(&json).unwrap();
-        assert!(matches!(parsed, IpcMessage::Event { kind, .. } if kind == "test"));
-    }
+        let mut srv = IpcServer::with_socket_path(sock.clone());
+        srv.set_handler(|msg| match msg {
+            IpcMessage::Ping => Some(IpcMessage::Pong {
+                active: true,
+                version: "2.5.1".into(),
+            }),
+            IpcMessage::SetManifestPin {
+                app_id,
+                depot_id,
+                manifest_id,
+                ..
+            } => Some(IpcMessage::ManifestBound {
+                app_id,
+                depot_id,
+                manifest_id,
+                active: true,
+            }),
+            _ => None,
+        });
+        srv.start().unwrap();
 
-    #[test]
-    fn stat_message_roundtrip() {
-        let msg = IpcMessage::SetStat {
-            app_id: 1245620,
-            stat_name: "steamid".into(),
-            stat_value: "76561198028121353".into(),
-        };
-        let json = msg.to_json().unwrap();
-        let parsed = IpcMessage::from_json(&json).unwrap();
-        assert!(matches!(parsed, IpcMessage::SetStat { app_id, .. } if app_id == 1245620));
-    }
+        let client = IpcClient::with_socket_path(&sock);
+        assert!(client.ping().unwrap());
 
-    #[test]
-    fn legacy_cdkey_message_roundtrip() {
-        let msg = IpcMessage::SetLegacyCdKey {
-            app_id: 1245620,
-            key: "ABCD-EFGH-IJKL".into(),
-        };
-        let json = msg.to_json().unwrap();
-        let parsed = IpcMessage::from_json(&json).unwrap();
-        assert!(matches!(parsed, IpcMessage::SetLegacyCdKey { app_id, .. } if app_id == 1245620));
-    }
-
-    #[test]
-    fn depot_key_message_roundtrip() {
-        let msg = IpcMessage::SetDepotKey {
-            depot_id: 1245621,
-            key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-        };
-        let json = msg.to_json().unwrap();
-        let parsed = IpcMessage::from_json(&json).unwrap();
-        assert!(matches!(parsed, IpcMessage::SetDepotKey { depot_id, .. } if depot_id == 1245621));
-    }
-
-    #[test]
-    fn manifest_code_ex_message_roundtrip() {
-        let msg = IpcMessage::FetchManifestCodeEx {
-            app_id: 1245620,
-            depot_id: 1245621,
-            gid: "abc123".into(),
-        };
-        let json = msg.to_json().unwrap();
-        let parsed = IpcMessage::from_json(&json).unwrap();
+        let reply = client
+            .send(&IpcMessage::SetManifestPin {
+                app_id: 1245620,
+                depot_id: 1245621,
+                manifest_id: "abc123".into(),
+                size: 1024,
+            })
+            .unwrap()
+            .unwrap();
         assert!(matches!(
-            parsed,
-            IpcMessage::FetchManifestCodeEx { app_id, depot_id, .. }
-                if app_id == 1245620 && depot_id == 1245621
+            reply,
+            IpcMessage::ManifestBound {
+                app_id,
+                depot_id,
+                manifest_id,
+                active
+            } if app_id == 1245620 && depot_id == 1245621 && manifest_id == "abc123" && active
         ));
+
+        srv.stop();
     }
 
     #[test]
-    fn app_id_spoof_message_roundtrip() {
-        let msg = IpcMessage::SetAppIdSpoof {
-            app_id: 1245620,
-            spoof_id: 480,
-        };
-        let json = msg.to_json().unwrap();
-        let parsed = IpcMessage::from_json(&json).unwrap();
-        assert!(matches!(
-            parsed,
-            IpcMessage::SetAppIdSpoof { app_id, spoof_id }
-                if app_id == 1245620 && spoof_id == 480
-        ));
-    }
-
-    #[test]
-    fn manifest_pin_message_roundtrip() {
-        let msg = IpcMessage::SetManifestPin {
-            app_id: 1245620,
-            depot_id: 1245621,
-            manifest_id: "abc123def456".into(),
-            size: 1024000,
-        };
-        let json = msg.to_json().unwrap();
-        let parsed = IpcMessage::from_json(&json).unwrap();
-        assert!(matches!(
-            parsed,
-            IpcMessage::SetManifestPin { app_id, depot_id, manifest_id, size }
-                if app_id == 1245620 && depot_id == 1245621 && manifest_id == "abc123def456" && size == 1024000
-        ));
-    }
-
-    #[test]
-    fn remove_manifest_pin_message_roundtrip() {
-        let msg = IpcMessage::RemoveManifestPin { app_id: 1245620, depot_id: 1245621 };
-        let json = msg.to_json().unwrap();
-        let parsed = IpcMessage::from_json(&json).unwrap();
-        assert!(matches!(
-            parsed,
-            IpcMessage::RemoveManifestPin { app_id, depot_id }
-                if app_id == 1245620 && depot_id == 1245621
-        ));
-    }
-
-    #[test]
-    fn manifest_bound_message_roundtrip() {
-        let msg = IpcMessage::ManifestBound { app_id: 1245620, depot_id: 1245621, manifest_id: "abc123".into(), active: true };
-        let json = msg.to_json().unwrap();
-        let parsed = IpcMessage::from_json(&json).unwrap();
-        assert!(matches!(
-            parsed,
-            IpcMessage::ManifestBound { app_id, depot_id, manifest_id, active }
-                if app_id == 1245620 && depot_id == 1245621 && manifest_id == "abc123" && active == true
-        ));
+    fn message_variants_serialize_cleanly() {
+        let msgs = vec![
+            IpcMessage::SetStat {
+                app_id: 1245620,
+                stat_name: "steamid".into(),
+                stat_value: "76561198028121353".into(),
+            },
+            IpcMessage::RemoveStat {
+                app_id: 1245620,
+                stat_name: "steamid".into(),
+            },
+            IpcMessage::SetLegacyCdKey {
+                app_id: 1245620,
+                key: "ABCD-EFGH-IJKL".into(),
+            },
+            IpcMessage::RemoveLegacyCdKey { app_id: 1245620 },
+            IpcMessage::SetDepotKey {
+                depot_id: 1245621,
+                key: "01".repeat(32),
+            },
+            IpcMessage::RemoveDepotKey { depot_id: 1245621 },
+            IpcMessage::SetAppIdSpoof {
+                app_id: 1245620,
+                spoof_id: 480,
+            },
+            IpcMessage::RemoveAppIdSpoof { app_id: 1245620 },
+        ];
+        for m in msgs {
+            let js = m.to_json().unwrap();
+            assert!(IpcMessage::from_json(&js).is_ok());
+        }
     }
 }

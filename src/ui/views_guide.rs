@@ -380,6 +380,8 @@ impl LuaToolsApp {
              • More › Register in Steam Library (ACF): Creates a valid \"AppState\" appmanifest_<appid>.acf, updates libraryfolders.vdf, \
              and syncs SLSsteam so 'Lua Only' games appear directly in your Steam Library.\n\
              • More › Enable Play Unowned / Run SteamAutoPatch: Syncs play_unowned_games.lua or launches Goldberg SteamAutoPatch.\n\
+             • More › Integration Actions…: Manage Play-Unowned redirects, 480 AppID spoofing, legacy CD keys, depot decryption keys, \
+             Steam stats, and per-game LD_PRELOAD process integration.\n\
              • More › Launch Options…: Parses and writes binary Steam appcache/appinfo.vdf (v27–v29 with SHA-1 re-hashing and backup).\n\
              IMPORTANT: Always close Steam completely before writing appinfo.vdf or appmanifest_<appid>.acf files.",
             |ui| {

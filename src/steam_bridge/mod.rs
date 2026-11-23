@@ -7,9 +7,9 @@
 pub mod binary_reader;
 pub mod ipc;
 pub mod memory_patch;
+pub mod pattern_db;
 pub mod preload_loader;
 pub mod ticket_store;
-pub mod pattern_db;
 
 use std::sync::OnceLock;
 
@@ -34,5 +34,8 @@ pub fn set_integrated() {
 
 /// Check if integration is active.
 pub fn is_integrated() -> bool {
-    BRIDGE_STATE.get().map(|s| s.integration_active).unwrap_or(false)
+    BRIDGE_STATE
+        .get()
+        .map(|s| s.integration_active)
+        .unwrap_or(false)
 }

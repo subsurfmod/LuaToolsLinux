@@ -1,20 +1,17 @@
-//! CloudRedirectService — Steam Cloud revival integration.
+//! CloudRedirectService — Steam Cloud revival integration (`CloudRedirect`).
 //!
-//! Coordinates with the CloudRedirect project
-//! (https://github.com/Selectively11/CloudRedirect) to restore Steam Cloud
-//! functionality for games managed through LuaTools.
-//!
-//! This is a prototype implementation that:
-//! - Detects CloudRedirect installation
-//! - Syncs cloud-enabled app IDs between LuaTools and CloudRedirect
-//! - Provides IPC messaging to the bridge_lib for cloud state coordination
+//! Detects local `CloudRedirect` installations, persists per-app cloud sync flags in
+//! `cloudredirect.conf`, and notifies `bridge_lib` via Unix socket IPC.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::steam_bridge::ipc::{IpcClient, IpcMessage};
+
 /// Status of CloudRedirect integration.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloudRedirectStatus {
     NotInstalled,
     Installed,
@@ -46,11 +43,37 @@ impl Default for CloudRedirectService {
 
 impl CloudRedirectService {
     pub fn new() -> Self {
-        let redirect_path = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".local/share/Steam/config/cloudredirect");
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let candidates = [
+            home.join(".local/share/Steam/config/cloudredirect"),
+            home.join(".local/share/CloudRedirect"),
+            home.join(".var/app/com.valvesoftware.Steam/.local/share/CloudRedirect"),
+        ];
+        let chosen = candidates
+            .iter()
+            .find(|p| p.exists())
+            .cloned()
+            .unwrap_or_else(|| candidates[0].clone());
+        Self::with_path(chosen)
+    }
 
-        let status = if redirect_path.exists() {
+    pub fn with_path(redirect_path: PathBuf) -> Self {
+        let mut apps = HashSet::new();
+        let conf_path = Self::conf_path_for(&redirect_path);
+        if let Ok(raw) = fs::read_to_string(&conf_path) {
+            for line in raw.lines() {
+                if let Some(rhs) = line.trim().strip_prefix("appid") {
+                    let val = rhs.trim().trim_start_matches('=').trim();
+                    if let Ok(aid) = val.parse::<u32>() {
+                        apps.insert(aid);
+                    }
+                }
+            }
+        }
+
+        let status = if conf_path.is_file() && !apps.is_empty() {
+            CloudRedirectStatus::Active
+        } else if redirect_path.exists() {
             CloudRedirectStatus::Installed
         } else {
             CloudRedirectStatus::NotInstalled
@@ -58,85 +81,84 @@ impl CloudRedirectService {
 
         Self {
             status: Arc::new(Mutex::new(status)),
-            cloud_apps: Arc::new(Mutex::new(HashSet::new())),
+            cloud_apps: Arc::new(Mutex::new(apps)),
             redirect_path,
         }
     }
 
-    /// Check if CloudRedirect is installed.
+    fn conf_path_for(redirect_path: &Path) -> PathBuf {
+        redirect_path
+            .parent()
+            .unwrap_or(redirect_path)
+            .join("cloudredirect.conf")
+    }
+
     pub fn is_installed(&self) -> bool {
         self.redirect_path.exists()
     }
 
-    /// Get current status.
     pub fn status(&self) -> CloudRedirectStatus {
         self.status.lock().unwrap().clone()
     }
 
-    /// Enable cloud sync for an app.
     pub fn enable_cloud_for_app(&self, app_id: u32) {
         self.cloud_apps.lock().unwrap().insert(app_id);
+        let _ = self.notify_bridge(app_id, true);
     }
 
-    /// Disable cloud sync for an app.
     pub fn disable_cloud_for_app(&self, app_id: u32) {
         self.cloud_apps.lock().unwrap().remove(&app_id);
+        let _ = self.notify_bridge(app_id, false);
     }
 
-    /// Check if an app has cloud sync enabled.
     pub fn is_cloud_enabled(&self, app_id: u32) -> bool {
         self.cloud_apps.lock().unwrap().contains(&app_id)
     }
 
-    /// List all cloud-enabled apps.
     pub fn list_cloud_apps(&self) -> Vec<u32> {
         let mut apps: Vec<u32> = self.cloud_apps.lock().unwrap().iter().copied().collect();
         apps.sort_unstable();
         apps
     }
 
-    /// Get the CloudRedirect config path.
     pub fn redirect_path(&self) -> &Path {
         &self.redirect_path
     }
 
-    /// Sync cloud apps to CloudRedirect config file.
-    pub fn sync_to_cloudredirect(&self) -> Result<(), String> {
-        if !self.is_installed() {
-            return Err("CloudRedirect not installed".into());
+    /// Writes `cloudredirect.conf` (creating `redirect_path` if needed so users can initialize CloudRedirect).
+    pub fn sync_to_cloudredirect(&self) -> Result<PathBuf, String> {
+        fs::create_dir_all(&self.redirect_path).map_err(|e| e.to_string())?;
+        let apps = self.list_cloud_apps();
+        let config_path = Self::conf_path_for(&self.redirect_path);
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
 
-        let apps = self.list_cloud_apps();
-        let config_dir = self.redirect_path.parent().unwrap_or(self.redirect_path.as_path());
-        std::fs::create_dir_all(config_dir).map_err(|e| e.to_string())?;
-
-        let config_path = config_dir.join("cloudredirect.conf");
         let mut content = String::from("# CloudRedirect config — generated by LuaTools Linux\n");
         for app_id in &apps {
             content.push_str(&format!("appid = {}\n", app_id));
         }
-
-        std::fs::write(&config_path, content).map_err(|e| e.to_string())?;
+        fs::write(&config_path, content).map_err(|e| e.to_string())?;
 
         let mut status = self.status.lock().unwrap();
-        *status = CloudRedirectStatus::Active;
-        Ok(())
+        *status = if apps.is_empty() {
+            CloudRedirectStatus::Installed
+        } else {
+            CloudRedirectStatus::Active
+        };
+        Ok(config_path)
     }
 
-    /// Notify the bridge_lib about cloud state changes via IPC.
     pub fn notify_bridge(&self, app_id: u32, cloud_enabled: bool) -> Result<(), String> {
-        use crate::steam_bridge::ipc::IpcClient;
-
+        let mut payload = HashMap::new();
+        payload.insert("app_id".into(), app_id.to_string());
+        payload.insert("cloud_enabled".into(), cloud_enabled.to_string());
         let client = IpcClient::new();
-        let _ = client.send(&crate::steam_bridge::ipc::IpcMessage::Ping);
-        let _ = (app_id, cloud_enabled);
+        let _ = client.send(&IpcMessage::Event {
+            kind: "cloud_redirect".into(),
+            payload,
+        });
         Ok(())
-    }
-}
-
-impl Drop for CloudRedirectService {
-    fn drop(&mut self) {
-        let _ = self.sync_to_cloudredirect();
     }
 }
 
@@ -145,21 +167,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn service_defaults() {
-        let svc = CloudRedirectService::new();
+    fn service_defaults_and_syncs_in_isolated_tempdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cr_dir = tmp.path().join("config/cloudredirect");
+        let svc = CloudRedirectService::with_path(cr_dir.clone());
         assert_eq!(svc.status(), CloudRedirectStatus::NotInstalled);
         assert!(svc.list_cloud_apps().is_empty());
-    }
 
-    #[test]
-    fn enable_disable_cloud_app() {
-        let svc = CloudRedirectService::new();
         svc.enable_cloud_for_app(1245620);
         assert!(svc.is_cloud_enabled(1245620));
-        assert_eq!(svc.list_cloud_apps(), vec![1245620]);
+        let conf = svc.sync_to_cloudredirect().unwrap();
+        assert!(conf.is_file());
+        assert_eq!(svc.status(), CloudRedirectStatus::Active);
 
-        svc.disable_cloud_for_app(1245620);
-        assert!(!svc.is_cloud_enabled(1245620));
-        assert!(svc.list_cloud_apps().is_empty());
+        let reloaded = CloudRedirectService::with_path(cr_dir);
+        assert!(reloaded.is_cloud_enabled(1245620));
+
+        reloaded.disable_cloud_for_app(1245620);
+        assert!(!reloaded.is_cloud_enabled(1245620));
     }
 }

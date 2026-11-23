@@ -161,8 +161,9 @@ impl BinaryFile {
 
         let section_names = if (header.shstrndx as usize) < sections.len() {
             let strtab_sec = &sections[header.shstrndx as usize];
-            let strtab_data =
-                &raw[strtab_sec.offset as usize..(strtab_sec.offset + strtab_sec.size) as usize];
+            let start = (strtab_sec.offset as usize).min(raw.len());
+            let end = (strtab_sec.offset.saturating_add(strtab_sec.size) as usize).min(raw.len());
+            let strtab_data = &raw[start..end];
             Self::read_section_names(&sections, strtab_data, &raw)
         } else {
             Vec::new()
@@ -176,7 +177,9 @@ impl BinaryFile {
                 let strtab_link = sec.link as usize;
                 let strtab_data = if strtab_link < sections.len() {
                     let st = &sections[strtab_link];
-                    &raw[st.offset as usize..(st.offset + st.size) as usize]
+                    let start = (st.offset as usize).min(raw.len());
+                    let end = (st.offset.saturating_add(st.size) as usize).min(raw.len());
+                    &raw[start..end]
                 } else {
                     &[]
                 };
@@ -229,11 +232,7 @@ impl BinaryFile {
         })
     }
 
-    fn read_section_names(
-        sections: &[SectionHeader64],
-        strtab: &[u8],
-        _raw: &[u8],
-    ) -> Vec<String> {
+    fn read_section_names(sections: &[SectionHeader64], strtab: &[u8], _raw: &[u8]) -> Vec<String> {
         let mut names = Vec::new();
         for sec in sections {
             let name = Self::read_null_str(strtab, sec.name_offset as usize);
@@ -279,12 +278,14 @@ impl BinaryFile {
     ) -> Option<u64> {
         let (start, end) = match section {
             Some(name) => {
-                let sec = self.sections.iter().find(|s| {
-                    self.section_names
-                        .get(s.name_offset as usize)
-                        .map_or(false, |n| n == name)
-                })?;
-                (sec.offset as usize, (sec.offset + sec.size) as usize)
+                let (_, sec) = self
+                    .sections
+                    .iter()
+                    .enumerate()
+                    .find(|(idx, _)| self.section_names.get(*idx).is_some_and(|n| n == name))?;
+                let s = (sec.offset as usize).min(self.raw_bytes.len());
+                let e = (sec.offset.saturating_add(sec.size) as usize).min(self.raw_bytes.len());
+                (s, e)
             }
             None => (0, self.raw_bytes.len()),
         };
@@ -300,13 +301,21 @@ impl BinaryFile {
         pattern: &[u8],
         mask: Option<&[u8]>,
     ) -> Option<usize> {
-        let sec = self.sections.iter().find(|s| {
-            self.section_names
-                .get(s.name_offset as usize)
-                .map_or(false, |n| n == section_name)
-        });
+        let sec = self
+            .sections
+            .iter()
+            .enumerate()
+            .find(|(idx, _)| {
+                self.section_names
+                    .get(*idx)
+                    .is_some_and(|n| n == section_name)
+            })
+            .map(|(_, s)| s);
         let (start, end) = match sec {
-            Some(s) => (s.offset as usize, (s.offset + s.size) as usize),
+            Some(s) => (
+                (s.offset as usize).min(self.raw_bytes.len()),
+                (s.offset.saturating_add(s.size) as usize).min(self.raw_bytes.len()),
+            ),
             None => (0, self.raw_bytes.len()),
         };
         self.scan_range(&self.raw_bytes[start..end], pattern, mask)
@@ -341,9 +350,7 @@ impl BinaryFile {
 
     pub fn file_offset_to_vaddr(&self, file_offset: usize) -> Option<u64> {
         for sec in &self.sections {
-            if (file_offset as u64) >= sec.offset
-                && (file_offset as u64) < sec.offset + sec.size
-            {
+            if (file_offset as u64) >= sec.offset && (file_offset as u64) < sec.offset + sec.size {
                 return Some(sec.addr + (file_offset as u64 - sec.offset));
             }
         }
@@ -357,12 +364,7 @@ impl BinaryFile {
 
 pub fn scan_steam_binaries(steam_root: &Path) -> Vec<BinaryFile> {
     let mut out = Vec::new();
-    let candidates = [
-        "steamclient.so",
-        "steamui.so",
-        "steam",
-        "steam.sh",
-    ];
+    let candidates = ["steamclient.so", "steamui.so", "steam", "steam.sh"];
     let search_dirs = [
         steam_root.to_path_buf(),
         steam_root.join("bin"),

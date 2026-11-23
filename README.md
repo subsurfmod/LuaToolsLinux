@@ -1,4 +1,4 @@
-# LuaTools Linux v2.3.1 (Native Rust Edition)
+# LuaTools Linux v2.5.1 (Native Rust Edition)
 
 A complete rewrite of LuaTools Linux.  (`eframe` / `egui`).
 
@@ -33,23 +33,23 @@ cd LuaToolsLinux
 ```
 
 Outputs self-contained distributables into `dist/`:
-- **Fedora / RHEL / openSUSE**: `sudo dnf install ./dist/luatools-linux-2.3.1-1.*.rpm`
-- **Ubuntu / Debian / Pop!_OS**: `sudo apt install ./dist/luatools-linux_2.3.1_amd64.deb`
-- **Any Linux Distro (No root required)**: extract `dist/luatools-linux-2.3.1-x86_64.tar.gz` and run `./install.sh --yes --skip-deps`
+- **Fedora / RHEL / openSUSE**: `sudo dnf install ./dist/luatools-linux-2.5.1-1.*.rpm`
+- **Ubuntu / Debian / Pop!_OS**: `sudo apt install ./dist/luatools-linux_2.5.1_amd64.deb`
+- **Any Linux Distro (No root required)**: extract `dist/luatools-linux-2.5.1-x86_64.tar.gz` and run `./install.sh --yes --skip-deps`
 
 ---
 
-## Full v2.3.1 Feature Parity
+## Full v2.5.1 Feature Parity
 
 | Workspace | Capabilities |
 |-----------|--------------|
-| **Home** | Taped overview header, Rem Drop Sheet drag-and-drop ingest (`lua`/`manifest`/`zip`), 3-column live status summary (`Steam Engine`, `Manifest Providers`, `SLSsteam & Bridge`), recent configured titles with Steam cover art |
+| **Home** | Taped overview header, Rem Drop Sheet drag-and-drop ingest (`lua`/`manifest`/`zip`), 3-column live status summary, live **`stplug-in/` Hot-Reload Watcher & Steam Bridge** status bar, recent configured titles with Steam cover art |
 | **Discover** | Unified Steam Store search, Featured (`Top Sellers` / `New Releases`), multi-provider manifest checks, Hubcap integration, FastFetch auto-install, DLC `.lua` generator, 1-click **Add to Steam Library** (`appmanifest_<appid>.acf`) |
-| **Library** | Multi-library ACF + `stplug-in` scanner, live filter chips (`All`, `Configured`, `Installed`, `Overrides`), bulk `.lua` cleanup, per-game Configure, binary `appinfo.vdf` Launch Options, **Steam Library ACF Registration**, **Play Unowned (`play_unowned_games.lua`)**, and **SteamAutoPatch** launcher |
-| **Depots & Vault** | Sub-tabbed workspace (`Manifests & Vault`, `Lua Editor`, `Download Depots`) with content-addressed `LuaVault` (`~/.local/share/luatools/luavault` — 100% compatible with v1.x), syntax-highlighted Lua editor, `Pin` / `Unpin` manifest toggling, and crash-hardened official `SteamRE/DepotDownloader` integration with `-depotkeys` & QR/account session sign-in |
+| **Library** | Multi-library ACF + `stplug-in` scanner, live filter chips, bulk `.lua` cleanup, per-game Configure, **Integration Actions** (Redirect Set, `480` AppID Spoof, Legacy CD Keys, Depot Keys, Steam Stats, and per-game `LD_PRELOAD` Process Integration), binary `appinfo.vdf` Launch Options, **Steam Library ACF Registration**, **Play Unowned**, and **SteamAutoPatch** |
+| **Depots & Vault** | 4-tab workspace (`Manifests & Vault`, `Lua Editor`, `Download Depots`, **`Manifest Binding`**) with content-addressed `LuaVault`, syntax-highlighted Lua editor, `Pin` / `Unpin` manifest toggling, IPC **Manifest Binding** enforcement, and crash-hardened `DepotDownloader` with `-depotkeys` & QR sign-in |
 | **Game Fixes** | `lua.tools` game & DRM fixes catalog, category filters, SHA-256 `.luatools-fix/` backup & verified revert |
-| **How to Use** | Interactive 5-part workstation manual covering Quick Start, `.lua`/`.manifest`/`.zip` ingest, annotated `.lua` syntax, `LuaVault` build pinning vs auto-update, `DepotDownloader` QR sessions, Wired (`ACCELA` + `SLSsteam`) setup, `appinfo.vdf` Launch Options, and troubleshooting |
-| **Settings** | 5 focused sub-tabs (`General & Steam`, `Account & Providers`, `SLSsteam & Store Bridge`, `Updates & Toolchain`, `Telemetry & Logs`) covering Discord PKCE OAuth (`:53789`) & Bot Code login, Hubcap API key validator, Steam path override, **Wired Suite (`ACCELA` + `SLSsteam` native installer)**, lossless `SLSsteam` `config.yaml` + `PlayUnowned` sync, Millennium `:38495` RPC, Steam CEF `:8080` Store Bridge, local `:6767` RPC bridge, `luatools://` handler, external tools (`DepotDownloaderMod`, `SteamAutoPatch`, `StubRemover`), **Git Self-Updater** (with build commit SHA lag detection), and **Privacy-First Opt-Out Bug Telemetry & Diagnostic Exporter** |
+| **How to Use** | Interactive 5-part workstation manual covering Quick Start, `.lua`/`.manifest`/`.zip` ingest, annotated `.lua` syntax, `LuaVault` & Manifest Binding, `DepotDownloader` QR sessions, Wired/Steam Integration setup, `appinfo.vdf` Launch Options, and troubleshooting |
+| **Settings** | 6 focused sub-tabs (`General & Steam`, `Account & Providers`, `SLSsteam & Store Bridge`, **`Steam Integration`**, `Updates & Toolchain`, `Telemetry & Logs`) covering Discord OAuth & Bot Code login, Hubcap API key validator, **Wired Suite (`ACCELA` + `SLSsteam`)**, **Cloud Redirect**, **`libsteam_integration.so` ELF64/Pattern/IPC Interop + `inotify` Hot-Reload**, external tools, **Git Self-Updater**, and **Privacy-First Opt-Out Bug Telemetry** |
 
 ---
 

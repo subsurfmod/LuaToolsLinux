@@ -13,6 +13,7 @@ use egui_extras::{Column, Size, StripBuilder, TableBuilder};
 use crate::parsers::lua_parser::LuaFileParser;
 use crate::services::api_client::HubcapService;
 use crate::services::cef_bridge::CefBridgeService;
+use crate::services::cloud_redirect_service::CloudRedirectStatus;
 use crate::services::depot_downloader::{DepotDownloadOptions, DepotSelection};
 use crate::services::external_tools::TOOLS;
 use crate::services::fixes_service::FixesService;
@@ -113,6 +114,15 @@ impl LuaToolsApp {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     if chip_button(
                         ui,
+                        "Manifest Binding",
+                        cur_subtab == DepotsSubTab::ManifestBinding,
+                    )
+                    .clicked()
+                    {
+                        new_subtab = Some(DepotsSubTab::ManifestBinding);
+                    }
+                    if chip_button(
+                        ui,
                         "Download Depots",
                         cur_subtab == DepotsSubTab::DownloadPicker,
                     )
@@ -179,6 +189,218 @@ impl LuaToolsApp {
             DepotsSubTab::Declarations => self.render_depots_declarations_tab(ui, app_id),
             DepotsSubTab::LiveEditor => self.render_depots_editor_tab(ui, app_id),
             DepotsSubTab::DownloadPicker => self.render_depots_downloader_tab(ui, app_id),
+            DepotsSubTab::ManifestBinding => self.render_depots_manifest_binding_tab(ui, app_id),
+        }
+    }
+
+    fn render_depots_manifest_binding_tab(&mut self, ui: &mut egui::Ui, app_id: u32) {
+        let pins = self.manifest_binding_service.get_pins_for_app(app_id);
+        let active_n = pins.iter().filter(|p| p.active_in_bridge).count();
+        let mut do_resync = false;
+        let mut do_add_pin = false;
+        let mut do_remove_depot: Option<u32> = None;
+
+        paper_card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 10.0;
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("Depot Manifest Binding & Enforcement")
+                                .font(display_font(17.5))
+                                .color(Palette::TEXT_PRIMARY),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "{} pinned depot(s) for AppID {}  ·  {} active in Steam bridge, {} pending Steam launch",
+                                pins.len(),
+                                app_id,
+                                active_n,
+                                pins.len().saturating_sub(active_n)
+                            ))
+                            .size(12.5)
+                            .color(Palette::TEXT_MUTED),
+                        );
+                    });
+                },
+                |ui| {
+                    if secondary_button(ui, "Re-Sync Pins to Bridge").clicked() {
+                        do_resync = true;
+                    }
+                },
+            );
+
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label("Depot ID:");
+                ui.add_sized(
+                    [110.0, 30.0],
+                    TextEdit::singleline(&mut self.binding_depot_input)
+                        .margin(Margin::symmetric(8, 6))
+                        .hint_text(format!("{}", app_id + 1)),
+                );
+                ui.label("Manifest GID:");
+                ui.add_sized(
+                    [230.0, 30.0],
+                    TextEdit::singleline(&mut self.binding_gid_input)
+                        .margin(Margin::symmetric(8, 6))
+                        .hint_text("19-digit Steam manifest GID"),
+                );
+                ui.label("Size:");
+                ui.add_sized(
+                    [125.0, 30.0],
+                    TextEdit::singleline(&mut self.binding_size_input)
+                        .margin(Margin::symmetric(8, 6))
+                        .hint_text("Bytes (optional)"),
+                );
+                if primary_button(ui, "+ Add Manifest Pin").clicked() {
+                    do_add_pin = true;
+                }
+            });
+        });
+
+        if do_resync {
+            let bound = self.manifest_binding_service.resync_all_to_bridge();
+            self.notify(
+                format!(
+                    "Synced stored manifest pins to Steam IPC ({} active in bridge).",
+                    bound
+                ),
+                ToastKind::Info,
+            );
+        }
+        if do_add_pin {
+            let depot_opt = self.binding_depot_input.trim().parse::<u32>().ok();
+            let gid = self.binding_gid_input.trim().to_string();
+            let sz = self.binding_size_input.trim().parse::<u64>().unwrap_or(0);
+            if let Some(did) = depot_opt {
+                if !gid.is_empty() {
+                    let active =
+                        self.manifest_binding_service
+                            .set_pin(app_id, did, gid.clone(), sz);
+                    self.binding_depot_input.clear();
+                    self.binding_gid_input.clear();
+                    self.binding_size_input.clear();
+                    self.notify(
+                        format!(
+                            "Pinned Depot {} → {} ({})",
+                            did,
+                            gid,
+                            if active {
+                                "Active in Steam"
+                            } else {
+                                "Pending / Saved"
+                            }
+                        ),
+                        ToastKind::Success,
+                    );
+                } else {
+                    self.notify("Enter a Manifest GID to pin.", ToastKind::Warning);
+                }
+            } else {
+                self.notify("Enter a valid numeric Depot ID.", ToastKind::Warning);
+            }
+        }
+
+        ui.add_space(14.0);
+
+        paper_card_padded(ui, Margin::symmetric(14, 12), |ui| {
+            ui.set_width(ui.available_width());
+            let table_h = (ui.available_height() - 16.0).max(200.0);
+            ui.set_min_height(table_h);
+
+            let cur_pins = self.manifest_binding_service.get_pins_for_app(app_id);
+            if cur_pins.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(44.0);
+                    ui.label(
+                        RichText::new("No manifest pins registered for this game")
+                            .font(semibold_font(14.0))
+                            .color(Palette::TEXT_PRIMARY),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Add a pin above or enable setManifestid(...) in Manifests & Vault.",
+                        )
+                        .size(12.5)
+                        .color(Palette::TEXT_MUTED),
+                    );
+                });
+            } else {
+                TableBuilder::new(ui)
+                    .striped(true)
+                    .cell_layout(Layout::left_to_right(Align::Center))
+                    .column(Column::exact(115.0))
+                    .column(Column::remainder().at_least(210.0))
+                    .column(Column::exact(120.0))
+                    .column(Column::exact(165.0))
+                    .column(Column::exact(110.0))
+                    .header(30.0, |mut h| {
+                        for col in ["Depot ID", "Pinned Manifest GID", "Size", "Bind Status", ""] {
+                            h.col(|ui| {
+                                ui.label(
+                                    RichText::new(col)
+                                        .font(semibold_font(12.0))
+                                        .color(Palette::TEXT_MUTED),
+                                );
+                            });
+                        }
+                    })
+                    .body(|mut body| {
+                        for pin in &cur_pins {
+                            body.row(38.0, |mut row| {
+                                row.col(|ui| {
+                                    ui.label(
+                                        RichText::new(pin.depot_id.to_string())
+                                            .font(FontId::new(12.5, FontFamily::Monospace))
+                                            .color(Palette::TEXT_PRIMARY),
+                                    );
+                                });
+                                row.col(|ui| {
+                                    ui.label(
+                                        RichText::new(&pin.manifest_id)
+                                            .font(FontId::new(12.5, FontFamily::Monospace))
+                                            .color(Palette::BLUE_LIGHT),
+                                    );
+                                });
+                                row.col(|ui| {
+                                    let sz_lbl = if pin.size > 0 {
+                                        format_bytes(pin.size)
+                                    } else {
+                                        "—".into()
+                                    };
+                                    ui.label(
+                                        RichText::new(sz_lbl)
+                                            .size(12.0)
+                                            .color(Palette::TEXT_SECONDARY),
+                                    );
+                                });
+                                row.col(|ui| {
+                                    if pin.active_in_bridge {
+                                        status_badge(ui, "Active (Bound)", BadgeTone::Ready);
+                                    } else {
+                                        status_badge(ui, "Pending (Saved)", BadgeTone::Neutral);
+                                    }
+                                });
+                                row.col(|ui| {
+                                    if table_button(ui, "Remove Pin", false).clicked() {
+                                        do_remove_depot = Some(pin.depot_id);
+                                    }
+                                });
+                            });
+                        }
+                    });
+            }
+        });
+
+        if let Some(did) = do_remove_depot {
+            self.manifest_binding_service.remove_pin(app_id, did);
+            self.notify(
+                format!("Removed manifest pin for Depot {}.", did),
+                ToastKind::Info,
+            );
         }
     }
 
@@ -1255,6 +1477,15 @@ impl LuaToolsApp {
             }
             if chip_button(
                 ui,
+                "Steam Integration",
+                self.settings_subtab == SettingsSubTab::SteamIntegration,
+            )
+            .clicked()
+            {
+                self.settings_subtab = SettingsSubTab::SteamIntegration;
+            }
+            if chip_button(
+                ui,
                 "Updates & Toolchain",
                 self.settings_subtab == SettingsSubTab::UpdatesAndTools,
             )
@@ -1284,6 +1515,7 @@ impl LuaToolsApp {
                     SettingsSubTab::General => self.render_settings_general(ui),
                     SettingsSubTab::Account => self.render_settings_account(ui),
                     SettingsSubTab::Integrations => self.render_settings_integrations(ui),
+                    SettingsSubTab::SteamIntegration => self.render_settings_steam_integration(ui),
                     SettingsSubTab::UpdatesAndTools => self.render_settings_updates_and_tools(ui),
                     SettingsSubTab::Telemetry => self.render_settings_telemetry(ui),
                 }
@@ -1760,6 +1992,121 @@ impl LuaToolsApp {
                     self.wired_status_text = "Uninstalled ACCELA and SLSsteam.".into();
                     self.notify("Uninstalled ACCELA and SLSsteam.", ToastKind::Info);
                 }
+                Err(e) => self.notify(e, ToastKind::Warning),
+            }
+        }
+
+        ui.add_space(16.0);
+
+        // Cloud Redirect Revival Card
+        let cr_status = self.cloud_redirect_service.status();
+        let cloud_apps = self.cloud_redirect_service.list_cloud_apps();
+        let mut sync_cloud = false;
+        let mut add_cloud_app: Option<u32> = None;
+        let mut toggle_cloud: Option<(u32, bool)> = None;
+
+        paper_card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 10.0;
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    ui.label(
+                        RichText::new("Cloud Redirect (Steam Cloud Revival)")
+                            .font(display_font(17.5))
+                            .color(Palette::TEXT_PRIMARY),
+                    );
+                },
+                |ui| match &cr_status {
+                    CloudRedirectStatus::Active => {
+                        status_badge(ui, "CloudRedirect Active", BadgeTone::Ready);
+                    }
+                    CloudRedirectStatus::Installed => {
+                        status_badge(ui, "Installed", BadgeTone::Blue);
+                    }
+                    CloudRedirectStatus::NotInstalled => {
+                        status_badge(ui, "Not Installed", BadgeTone::Muted);
+                    }
+                    CloudRedirectStatus::Error(_) => {
+                        status_badge(ui, "Error", BadgeTone::Warn);
+                    }
+                },
+            );
+            ui.label(
+                RichText::new(format!(
+                    "Config path: {}  ·  {} cloud-synced app(s)",
+                    self.cloud_redirect_service.redirect_path().display(),
+                    cloud_apps.len()
+                ))
+                .size(12.0)
+                .color(Palette::TEXT_MUTED),
+            );
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [150.0, 28.0],
+                    TextEdit::singleline(&mut self.cloud_app_input)
+                        .margin(Margin::symmetric(8, 5))
+                        .hint_text("AppID (e.g. 1245620)"),
+                );
+                if secondary_button(ui, "+ Enable Cloud App").clicked() {
+                    if let Ok(aid) = self.cloud_app_input.trim().parse::<u32>() {
+                        add_cloud_app = Some(aid);
+                    }
+                }
+                if primary_button(ui, "Sync to CloudRedirect").clicked() {
+                    sync_cloud = true;
+                }
+            });
+
+            // Per-app Cloud toggles across Library + currently enabled Cloud apps
+            let mut candidate_ids: Vec<(u32, String)> = self
+                .library_rows
+                .iter()
+                .map(|r| (r.app_id, r.name.clone()))
+                .collect();
+            for &cid in &cloud_apps {
+                if !candidate_ids.iter().any(|(id, _)| *id == cid) {
+                    candidate_ids.push((cid, self.resolve_game_title(cid)));
+                }
+            }
+            if !candidate_ids.is_empty() {
+                inset_paper_sheet(ui, Margin::symmetric(10, 8), |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(14.0, 6.0);
+                        for (aid, name) in candidate_ids.iter().take(12) {
+                            let mut enabled = self.cloud_redirect_service.is_cloud_enabled(*aid);
+                            let lbl = format!("{} (#{})", name, aid);
+                            if ui.checkbox(&mut enabled, lbl).changed() {
+                                toggle_cloud = Some((*aid, enabled));
+                            }
+                        }
+                    });
+                });
+            }
+        });
+
+        if let Some(aid) = add_cloud_app {
+            self.cloud_redirect_service.enable_cloud_for_app(aid);
+            self.cloud_app_input.clear();
+            self.notify(
+                format!("Enabled CloudRedirect sync for AppID {}.", aid),
+                ToastKind::Info,
+            );
+        }
+        if let Some((aid, on)) = toggle_cloud {
+            if on {
+                self.cloud_redirect_service.enable_cloud_for_app(aid);
+            } else {
+                self.cloud_redirect_service.disable_cloud_for_app(aid);
+            }
+        }
+        if sync_cloud {
+            match self.cloud_redirect_service.sync_to_cloudredirect() {
+                Ok(p) => self.notify(
+                    format!("Synced CloudRedirect config to {}", p.display()),
+                    ToastKind::Success,
+                ),
                 Err(e) => self.notify(e, ToastKind::Warning),
             }
         }
@@ -2329,6 +2676,273 @@ impl LuaToolsApp {
                 }
             });
         });
+
+        ui.add_space(24.0);
+    }
+}
+
+impl LuaToolsApp {
+    fn render_settings_steam_integration(&mut self, ui: &mut egui::Ui) {
+        let st = self.steam_bridge_service.status();
+        let mut do_install = false;
+        let mut do_uninstall = false;
+        let mut do_scan = false;
+        let mut do_refresh = false;
+        let mut toggle_hr = false;
+
+        // 1. Steam Detection, Integration Library & LD_PRELOAD Mode
+        paper_card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 10.0;
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    ui.label(
+                        RichText::new("Steam Client Interop (libsteam_integration.so)")
+                            .font(display_font(17.5))
+                            .color(Palette::TEXT_PRIMARY),
+                    );
+                },
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if st.integration_active {
+                        status_badge(ui, "IPC Active in Steam", BadgeTone::Ready);
+                    } else if st.integration_lib_installed {
+                        status_badge(ui, "Library Staged", BadgeTone::Blue);
+                    } else {
+                        status_badge(ui, "Not Installed", BadgeTone::Muted);
+                    }
+                    if st.steam_detected {
+                        status_badge(ui, "● Steam Detected", BadgeTone::Ready);
+                    } else {
+                        status_badge(ui, "○ No Steam", BadgeTone::Warn);
+                    }
+                },
+            );
+
+            let root_txt = st
+                .steam_root
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "Not detected".into());
+            let pid_txt = st
+                .steam_pid
+                .map(|p| format!("Running (PID {})", p))
+                .unwrap_or_else(|| "Not running".into());
+            ui.label(
+                RichText::new(format!(
+                    "Steam root: {}  ·  Process: {}  ·  Ticketed apps: {}",
+                    root_txt,
+                    pid_txt,
+                    st.apps_with_tickets.len()
+                ))
+                .size(12.5)
+                .color(Palette::TEXT_MUTED),
+            );
+
+            ui.checkbox(
+                &mut self.bridge_system_preload,
+                "Enable system-wide LD_PRELOAD in /etc/ld.so.preload (requires root; leave unchecked for per-launch ~/.local/bin/luatools-steam-launcher)",
+            );
+
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.add_enabled_ui(!self.bridge_busy, |ui| {
+                    if primary_button(ui, "Install Integration").clicked() {
+                        do_install = true;
+                    }
+                    if (st.integration_lib_installed
+                        || st.launcher_installed
+                        || st.system_preload_enabled)
+                        && danger_button(ui, "Uninstall Integration").clicked()
+                    {
+                        do_uninstall = true;
+                    }
+                    if secondary_button(ui, "Refresh Status").clicked() {
+                        do_refresh = true;
+                    }
+                });
+            });
+
+            if !self.bridge_status_msg.is_empty() {
+                ui.label(
+                    RichText::new(&self.bridge_status_msg)
+                        .size(12.0)
+                        .color(Palette::BLUE_LIGHT),
+                );
+            }
+        });
+
+        if do_refresh {
+            self.steam_bridge_service.refresh_steam_detection();
+            self.bridge_status_msg = "Refreshed Steam process & IPC detection.".into();
+        }
+        if do_install {
+            self.trigger_bridge_action_async("install", ui.ctx());
+        }
+        if do_uninstall {
+            self.trigger_bridge_action_async("uninstall", ui.ctx());
+        }
+
+        ui.add_space(16.0);
+
+        // 2. ELF64 Binary & Pattern Database Status
+        paper_card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 10.0;
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    ui.label(
+                        RichText::new("ELF64 Binary & Pattern Tracker Status")
+                            .font(display_font(17.5))
+                            .color(Palette::TEXT_PRIMARY),
+                    );
+                },
+                |ui| {
+                    if st.patterns_loaded {
+                        status_badge(ui, "Patterns Matched", BadgeTone::Ready);
+                    } else if st.steam_client_found || st.steam_ui_found {
+                        status_badge(ui, "ELF Scanned", BadgeTone::Blue);
+                    } else {
+                        status_badge(ui, "Not Scanned", BadgeTone::Muted);
+                    }
+                },
+            );
+
+            inset_paper_sheet(ui, Margin::symmetric(12, 10), |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 4.0;
+                let sc_sha = st.steam_client_sha256.as_deref().unwrap_or("—");
+                let sc_pat = st.steam_client_patterns.as_deref().unwrap_or("None loaded");
+                let su_sha = st.steam_ui_sha256.as_deref().unwrap_or("—");
+                let su_pat = st.steam_ui_patterns.as_deref().unwrap_or("None loaded");
+
+                ui.label(
+                    RichText::new(format!("steamclient.so SHA-256: {}", sc_sha))
+                        .font(FontId::new(11.5, FontFamily::Monospace))
+                        .color(Palette::TEXT_SECONDARY),
+                );
+                ui.label(
+                    RichText::new(format!("  Matched patterns: {}", sc_pat))
+                        .size(12.0)
+                        .color(Palette::BLUE_LIGHT),
+                );
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new(format!("steamui.so     SHA-256: {}", su_sha))
+                        .font(FontId::new(11.5, FontFamily::Monospace))
+                        .color(Palette::TEXT_SECONDARY),
+                );
+                ui.label(
+                    RichText::new(format!("  Matched patterns: {}", su_pat))
+                        .size(12.0)
+                        .color(Palette::BLUE_LIGHT),
+                );
+            });
+
+            ui.add_enabled_ui(!self.bridge_busy, |ui| {
+                if secondary_button(ui, "Scan Binaries & Load Patterns").clicked() {
+                    do_scan = true;
+                }
+            });
+        });
+
+        if do_scan {
+            self.trigger_bridge_action_async("scan", ui.ctx());
+        }
+
+        ui.add_space(16.0);
+
+        // 3. Hot-Reload Service (inotify stplug-in/ watcher + event log)
+        let hr_running = self.hot_reload_service.is_running();
+        let hr_events = self.hot_reload_service.recent_events();
+
+        paper_card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 10.0;
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    ui.label(
+                        RichText::new("Live stplug-in/ Hot-Reload Watcher (inotify)")
+                            .font(display_font(17.5))
+                            .color(Palette::TEXT_PRIMARY),
+                    );
+                },
+                |ui| {
+                    if hr_running {
+                        status_badge(ui, "● Watcher Running", BadgeTone::Ready);
+                    } else {
+                        status_badge(ui, "○ Watcher Stopped", BadgeTone::Muted);
+                    }
+                },
+            );
+
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                let btn_lbl = if hr_running {
+                    "Stop Hot-Reload Watcher"
+                } else {
+                    "Start Hot-Reload Watcher"
+                };
+                if secondary_button(ui, btn_lbl).clicked() {
+                    toggle_hr = true;
+                }
+                ui.label(
+                    RichText::new(format!(
+                        "Watching: {}",
+                        self.hot_reload_service.watch_dir().display()
+                    ))
+                    .size(12.0)
+                    .color(Palette::TEXT_MUTED),
+                );
+            });
+
+            inset_paper_sheet(ui, Margin::same(10), |ui| {
+                ui.set_width(ui.available_width());
+                ui.set_min_height(96.0);
+                if hr_events.is_empty() {
+                    ui.label(
+                        RichText::new("No .lua file events observed in this session yet.")
+                            .size(12.0)
+                            .color(Palette::TEXT_MUTED),
+                    );
+                } else {
+                    ScrollArea::vertical()
+                        .id_salt("hot_reload_events_scroll")
+                        .max_height(150.0)
+                        .show(ui, |ui| {
+                            for ev in &hr_events {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "[{}] {:<8} {}",
+                                        ev.timestamp,
+                                        ev.event_type.as_str(),
+                                        ev.path.display()
+                                    ))
+                                    .font(FontId::new(11.5, FontFamily::Monospace))
+                                    .color(Palette::TEXT_SECONDARY),
+                                );
+                            }
+                        });
+                }
+            });
+        });
+
+        if toggle_hr {
+            if hr_running {
+                self.hot_reload_service.stop();
+                self.notify("Stopped stplug-in/ hot-reload watcher.", ToastKind::Info);
+            } else {
+                match self.hot_reload_service.start() {
+                    Ok(()) => {
+                        self.notify("Started stplug-in/ hot-reload watcher.", ToastKind::Success)
+                    }
+                    Err(e) => self.notify(e, ToastKind::Warning),
+                }
+            }
+        }
 
         ui.add_space(24.0);
     }

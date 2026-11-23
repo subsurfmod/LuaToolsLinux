@@ -211,6 +211,87 @@ impl LuaToolsApp {
                     },
                 );
 
+                ui.add_space(12.0);
+
+                // Compact Live Hot-Reload & Steam Bridge Status Strip
+                let hr_running = self.hot_reload_service.is_running();
+                let hr_events = self.hot_reload_service.recent_events();
+                let bridge_st = self.steam_bridge_service.status();
+                let mut toggle_hr = false;
+                let mut open_bridge_tab = false;
+
+                paper_card_padded(ui, Margin::symmetric(16, 10), |ui| {
+                    ui.set_width(ui.available_width());
+                    egui::Sides::new().show(
+                        ui,
+                        |ui| {
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            if hr_running {
+                                status_badge(ui, "● Hot-Reload Watching", BadgeTone::Ready);
+                            } else {
+                                status_badge(ui, "○ Hot-Reload Paused", BadgeTone::Muted);
+                            }
+                            if bridge_st.integration_active {
+                                status_badge(ui, "Steam Bridge Active", BadgeTone::Blue);
+                            } else if bridge_st.integration_lib_installed {
+                                status_badge(ui, "Bridge Library Staged", BadgeTone::Neutral);
+                            }
+                            let last_note = hr_events
+                                .first()
+                                .map(|ev| {
+                                    let fname = ev
+                                        .path
+                                        .file_name()
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("file.lua");
+                                    format!(
+                                        "Last event: {} {} ({})",
+                                        ev.event_type.as_str(),
+                                        fname,
+                                        ev.timestamp
+                                    )
+                                })
+                                .unwrap_or_else(|| {
+                                    format!(
+                                        "stplug-in watcher: {}",
+                                        self.hot_reload_service.watch_dir().display()
+                                    )
+                                });
+                            ui.label(
+                                RichText::new(last_note)
+                                    .size(12.0)
+                                    .color(Palette::TEXT_MUTED),
+                            );
+                        },
+                        |ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            if ghost_button(ui, "Steam Integration ›").clicked() {
+                                open_bridge_tab = true;
+                            }
+                            let lbl = if hr_running {
+                                "Stop Watcher"
+                            } else {
+                                "Start Watcher"
+                            };
+                            if secondary_button(ui, lbl).clicked() {
+                                toggle_hr = true;
+                            }
+                        },
+                    );
+                });
+
+                if toggle_hr {
+                    if hr_running {
+                        self.hot_reload_service.stop();
+                    } else if let Err(e) = self.hot_reload_service.start() {
+                        self.notify(e, ToastKind::Warning);
+                    }
+                }
+                if open_bridge_tab {
+                    self.active_view = ActiveView::Settings;
+                    self.settings_subtab = crate::ui::state::SettingsSubTab::SteamIntegration;
+                }
+
                 ui.add_space(22.0);
 
                 // 3. Recently Configured Titles
@@ -877,6 +958,8 @@ impl LuaToolsApp {
         let mut act_rem_lib: Option<u32> = None;
         let mut act_toggle_unowned: Option<(u32, bool)> = None;
         let mut act_autopatch: Option<(u32, PathBuf)> = None;
+        let mut act_integration: Option<(u32, String, Option<PathBuf>)> = None;
+        let mut act_launch_integrated: Option<(u32, Option<PathBuf>)> = None;
 
         paper_card_padded(ui, Margin::symmetric(14, 10), |ui| {
             let table_h = (ui.available_height() - 12.0).max(220.0);
@@ -983,7 +1066,21 @@ impl LuaToolsApp {
                                     act_config = Some((r.app_id, r.name.clone()));
                                 }
                                 ui.menu_button("More", |ui| {
-                                    ui.set_min_width(190.0);
+                                    ui.set_min_width(210.0);
+                                    if ui.button("Integration Actions…").clicked() {
+                                        act_integration = Some((
+                                            r.app_id,
+                                            r.name.clone(),
+                                            r.install_path.clone(),
+                                        ));
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("Launch with Integration").clicked() {
+                                        act_launch_integrated =
+                                            Some((r.app_id, r.install_path.clone()));
+                                        ui.close_menu();
+                                    }
+                                    ui.separator();
                                     if ui.button("Launch Options…").clicked() {
                                         act_launch = Some((r.app_id, r.name.clone()));
                                         ui.close_menu();
@@ -1129,6 +1226,18 @@ impl LuaToolsApp {
         if let Some((aid, dir)) = act_autopatch {
             match self.steam_auto_crack.launch_for_app(aid, &dir) {
                 Ok(m) => self.notify(m, ToastKind::Info),
+                Err(e) => self.notify(e, ToastKind::Warning),
+            }
+        }
+        if let Some((aid, gname, path)) = act_integration {
+            self.open_integration_modal(aid, gname, path);
+        }
+        if let Some((aid, path)) = act_launch_integrated {
+            match self
+                .game_injection_service
+                .launch_with_integration(aid, path.as_deref())
+            {
+                Ok(m) => self.notify(m, ToastKind::Success),
                 Err(e) => self.notify(e, ToastKind::Warning),
             }
         }

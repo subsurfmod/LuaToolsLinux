@@ -25,29 +25,34 @@ use crate::services::caches::{
     CoverCache, GameDetails, HardwareAppIdService, SteamAppInfoCache, SteamAppListCache,
 };
 use crate::services::cef_bridge::CefBridgeService;
+use crate::services::cloud_redirect_service::CloudRedirectService;
 use crate::services::depot_downloader::DepotDownloaderService;
 use crate::services::depot_info::{AppDepotInfo, ContentDepot, SteamDepotInfo};
 use crate::services::donate_keys::DonateKeysService;
 use crate::services::external_tools::ExternalToolsManager;
 use crate::services::fixes_service::FixesService;
+use crate::services::game_process_injection_service::GameProcessInjectionService;
+use crate::services::hot_reload_service::{FileChangeType, HotReloadService};
 use crate::services::http_server::{HttpServerService, RpcUiEvent};
 use crate::services::lua_installer::LuaInstaller;
+use crate::services::manifest_binding_service::ManifestBindingService;
 use crate::services::millennium_service::MillenniumService;
 use crate::services::play_unowned_service::PlayUnownedService;
 use crate::services::protocol_service::ProtocolService;
 use crate::services::settings_service::SettingsService;
 use crate::services::slssteam_service::SlssteamService;
 use crate::services::steam_auto_crack_service::SteamAutoCrackService;
-use crate::services::steam_library_service::SteamLibraryService;
 use crate::services::steam_bridge_service::SteamBridgeService;
+use crate::services::steam_library_service::SteamLibraryService;
 use crate::services::steam_service::SteamService;
 use crate::services::telemetry_service::TelemetryService;
 use crate::services::update_service::UpdateService;
 use crate::services::wired_service::WiredService;
 use crate::ui::state::{
     AcquireTab, ActiveView, AddByAppIdModal, AppMessage, DepotDetailModal, DepotPickRow,
-    DepotsSubTab, GameDetailModal, GuideTopic, LaunchOptionsModal, LibraryRow, QaCaptureState,
-    SettingsSubTab, TextPromptModal, ToastKind, ToastNotification, UpdateBannerState,
+    DepotsSubTab, GameDetailModal, GuideTopic, IntegrationModal, LaunchOptionsModal, LibraryRow,
+    QaCaptureState, SettingsSubTab, TextPromptModal, ToastKind, ToastNotification,
+    UpdateBannerState,
 };
 use crate::ui::theme::{
     apply_papercut_monotone_theme, display_font, draw_rem_medallion, nav_rail_button,
@@ -75,6 +80,10 @@ pub struct LuaToolsApp {
     pub lua_installer: Option<LuaInstaller>,
     pub play_unowned_service: PlayUnownedService,
     pub steam_library_service: SteamLibraryService,
+    pub manifest_binding_service: ManifestBindingService,
+    pub hot_reload_service: HotReloadService,
+    pub cloud_redirect_service: CloudRedirectService,
+    pub game_injection_service: GameProcessInjectionService,
     pub wired_service: WiredService,
     pub steam_auto_crack: SteamAutoCrackService,
     pub cef_bridge: CefBridgeService,
@@ -136,6 +145,9 @@ pub struct LuaToolsApp {
     pub depots_downloading: bool,
     pub depots_dl_pct: f32,
     pub depots_dl_status: String,
+    pub binding_depot_input: String,
+    pub binding_gid_input: String,
+    pub binding_size_input: String,
 
     // Fixes View State
     pub fixes_listings: Vec<DRMFixGameListing>,
@@ -162,12 +174,17 @@ pub struct LuaToolsApp {
     pub wired_busy: bool,
     pub wired_progress: f32,
     pub wired_status_text: String,
+    pub bridge_system_preload: bool,
+    pub bridge_busy: bool,
+    pub bridge_status_msg: String,
+    pub cloud_app_input: String,
     pub update_banner: UpdateBannerState,
     pub guide_topic: GuideTopic,
 
     // Modals & QA
     pub add_appid_modal: AddByAppIdModal,
     pub game_detail_modal: GameDetailModal,
+    pub integration_modal: IntegrationModal,
     pub launch_options_modal: LaunchOptionsModal,
     pub depot_detail_modal: DepotDetailModal,
     pub text_prompt_modal: TextPromptModal,
@@ -245,6 +262,11 @@ impl LuaToolsApp {
 
         let steam_installation = steam_service.installation.clone();
         let steam_auto_crack = SteamAutoCrackService::new(tools_manager.clone());
+        let ctx_for_hr = cc.egui_ctx.clone();
+        let hot_reload_service = HotReloadService::new().on_change(move |_| {
+            ctx_for_hr.request_repaint();
+        });
+        let sys_preload = steam_bridge_service.status().system_preload_enabled;
         let mut app = Self {
             settings_service,
             auth_service,
@@ -264,6 +286,10 @@ impl LuaToolsApp {
             lua_installer: None,
             play_unowned_service: PlayUnownedService::new(steam_installation.clone()),
             steam_library_service: SteamLibraryService::new(steam_installation),
+            manifest_binding_service: ManifestBindingService::default(),
+            hot_reload_service,
+            cloud_redirect_service: CloudRedirectService::default(),
+            game_injection_service: GameProcessInjectionService::default(),
             wired_service: WiredService::new(None),
             steam_auto_crack,
             cef_bridge,
@@ -315,6 +341,9 @@ impl LuaToolsApp {
             depots_downloading: false,
             depots_dl_pct: 0.0,
             depots_dl_status: String::new(),
+            binding_depot_input: String::new(),
+            binding_gid_input: String::new(),
+            binding_size_input: String::new(),
             fixes_listings: Vec::new(),
             fixes_tags: Vec::new(),
             fixes_selected_tag: None,
@@ -338,10 +367,15 @@ impl LuaToolsApp {
             wired_busy: false,
             wired_progress: 0.0,
             wired_status_text: String::new(),
+            bridge_system_preload: sys_preload,
+            bridge_busy: false,
+            bridge_status_msg: String::new(),
+            cloud_app_input: String::new(),
             update_banner: UpdateBannerState::Hidden,
             guide_topic: GuideTopic::QuickStart,
             add_appid_modal: AddByAppIdModal::default(),
             game_detail_modal: GameDetailModal::default(),
+            integration_modal: IntegrationModal::default(),
             launch_options_modal: LaunchOptionsModal::default(),
             depot_detail_modal: DepotDetailModal::default(),
             text_prompt_modal: TextPromptModal::default(),
@@ -360,6 +394,9 @@ impl LuaToolsApp {
                 "app_start",
                 "LuaTools Linux desktop session initialized",
             );
+            if app.steam_service.is_available() {
+                let _ = app.hot_reload_service.start();
+            }
             app.probe_bridge_async(&cc.egui_ctx);
             app.fetch_featured_async(&cc.egui_ctx);
             app.fetch_fix_listings_async(&cc.egui_ctx);
@@ -384,7 +421,8 @@ impl LuaToolsApp {
         let settings_service = SettingsService::new(Some(scratch_dir.join("settings.json")));
         let auth_service = AuthService::new(Some(scratch_dir.join("auth.json")));
         let steam_service = SteamService::new();
-        let steam_bridge_service = SteamBridgeService::new();
+        let steam_bridge_service =
+            SteamBridgeService::with_paths(None, Some(scratch_dir.join("bridge")));
         let slssteam_service = SlssteamService::new(Some(scratch_dir.join("sls.yaml")));
         let millennium_service = MillenniumService::default();
         let api_client = LuaToolsApiClient::new(auth_service.clone());
@@ -428,6 +466,17 @@ impl LuaToolsApp {
             lua_installer: None,
             play_unowned_service: PlayUnownedService::new(steam_installation.clone()),
             steam_library_service: SteamLibraryService::new(steam_installation),
+            manifest_binding_service: ManifestBindingService::with_storage(Some(
+                scratch_dir.join("pins.json"),
+            )),
+            hot_reload_service: HotReloadService::new()
+                .set_watch_dir(scratch_dir.join("stplug-in")),
+            cloud_redirect_service: CloudRedirectService::with_path(
+                scratch_dir.join("cloudredirect"),
+            ),
+            game_injection_service: GameProcessInjectionService::with_storage(Some(
+                scratch_dir.join("injections.json"),
+            )),
             wired_service: WiredService::new(Some(scratch_dir.join("wired"))),
             steam_auto_crack,
             cef_bridge,
@@ -482,6 +531,9 @@ impl LuaToolsApp {
             depots_downloading: false,
             depots_dl_pct: 0.0,
             depots_dl_status: String::new(),
+            binding_depot_input: String::new(),
+            binding_gid_input: String::new(),
+            binding_size_input: String::new(),
             fixes_listings: Vec::new(),
             fixes_tags: Vec::new(),
             fixes_selected_tag: None,
@@ -504,10 +556,15 @@ impl LuaToolsApp {
             wired_busy: false,
             wired_progress: 0.0,
             wired_status_text: String::new(),
+            bridge_system_preload: false,
+            bridge_busy: false,
+            bridge_status_msg: String::new(),
+            cloud_app_input: String::new(),
             update_banner: UpdateBannerState::Hidden,
             guide_topic: GuideTopic::QuickStart,
             add_appid_modal: AddByAppIdModal::default(),
             game_detail_modal: GameDetailModal::default(),
+            integration_modal: IntegrationModal::default(),
             launch_options_modal: LaunchOptionsModal::default(),
             depot_detail_modal: DepotDetailModal::default(),
             text_prompt_modal: TextPromptModal::default(),
@@ -642,6 +699,23 @@ impl LuaToolsApp {
             badge: "⬆ Update v2.0".into(),
             tooltip: "New commits available on GitHub".into(),
         };
+        self.manifest_binding_service.set_pin(
+            1245620,
+            1245621,
+            "8492018394810293847".into(),
+            52_428_800_000,
+        );
+        self.manifest_binding_service.set_pin(
+            1245620,
+            1245622,
+            "3319482710493827162".into(),
+            512_000_000,
+        );
+        self.hot_reload_service.push_synthetic_event(
+            PathBuf::from("~/.local/share/Steam/config/stplug-in/1245620.lua"),
+            FileChangeType::Modified,
+        );
+        self.cloud_redirect_service.enable_cloud_for_app(1245620);
     }
 
     pub fn detect_steam_and_sync(&mut self) {
@@ -655,6 +729,10 @@ impl LuaToolsApp {
 
             self.play_unowned_service.steam_installation = Some(inst.clone());
             self.steam_library_service.steam_installation = Some(inst.clone());
+            self.steam_bridge_service
+                .set_steam_installation(Some(inst.clone()));
+            self.hot_reload_service
+                .update_watch_dir(&inst.stplug_in_path);
             self.wired_service.steam_root = Some(inst.root.clone());
             if self.slssteam_service.config.play_not_owned {
                 let _ = self
@@ -713,6 +791,7 @@ impl LuaToolsApp {
             self.depot_downloader.steam_installation = None;
             self.play_unowned_service.steam_installation = None;
             self.steam_library_service.steam_installation = None;
+            self.steam_bridge_service.set_steam_installation(None);
             self.wired_service.steam_root = None;
             if let Some(mut srv) = self.http_server.take() {
                 srv.stop();
@@ -1134,6 +1213,9 @@ impl LuaToolsApp {
         let live_text = self.lua_vault.read_live_text(app_id);
         self.depots_lua =
             (!live_text.trim().is_empty()).then(|| LuaFileParser::parse_text(&live_text, app_id));
+        if let Some(ref lua) = self.depots_lua {
+            self.manifest_binding_service.sync_from_lua(app_id, lua);
+        }
         if !self.depots_editing_live {
             self.depots_editor_text = live_text;
         }
@@ -1480,12 +1562,49 @@ impl LuaToolsApp {
                     })
                     .map(|()| "Installed ACCELA + SLSsteam (Wired Suite ready)".into()),
             };
-            match res {
-                Ok(m) => {
-                    let _ = tx.send(AppMessage::WiredFinished { ok: true, msg: m });
+            let _ = tx.send(AppMessage::WiredFinished {
+                ok: res.is_ok(),
+                msg: res.unwrap_or_else(|e| e),
+            });
+            ctx_c.request_repaint();
+        });
+    }
+
+    pub fn trigger_bridge_action_async(&mut self, action: &'static str, ctx: &egui::Context) {
+        if self.bridge_busy {
+            return;
+        }
+        self.bridge_busy = true;
+        self.bridge_status_msg = match action {
+            "scan" => "Scanning Steam ELF64 binaries & querying pattern tracker…".into(),
+            "uninstall" => "Removing Steam LD_PRELOAD integration…".into(),
+            _ => "Staging libsteam_integration.so & generating launcher…".into(),
+        };
+
+        let mut bridge = self.steam_bridge_service.clone();
+        let sys_preload = self.bridge_system_preload;
+        let tx = self.msg_tx.clone();
+        let ctx_c = ctx.clone();
+        thread::spawn(move || {
+            let outcome: Result<String, String> = match action {
+                "scan" => bridge.scan_and_load_patterns().map(|r| r.message),
+                "uninstall" => bridge
+                    .uninstall_integration()
+                    .map(|()| "Uninstalled Steam integration library and launcher.".into()),
+                _ => bridge.install_integration(sys_preload).and_then(|r| {
+                    if r.success {
+                        Ok(r.message)
+                    } else {
+                        Err(r.message)
+                    }
+                }),
+            };
+            match outcome {
+                Ok(msg) => {
+                    let _ = tx.send(AppMessage::BridgeActionFinished { ok: true, msg });
                 }
-                Err(e) => {
-                    let _ = tx.send(AppMessage::WiredFinished { ok: false, msg: e });
+                Err(msg) => {
+                    let _ = tx.send(AppMessage::BridgeActionFinished { ok: false, msg });
                 }
             }
             ctx_c.request_repaint();
@@ -1949,6 +2068,21 @@ impl LuaToolsApp {
                             ToastKind::Warning
                         },
                     );
+                }
+                AppMessage::BridgeActionFinished { ok, msg } => {
+                    self.bridge_busy = false;
+                    self.bridge_status_msg = msg.clone();
+                    self.notify(
+                        msg,
+                        if ok {
+                            ToastKind::Success
+                        } else {
+                            ToastKind::Warning
+                        },
+                    );
+                }
+                AppMessage::FilePickedForGameInjectionSo(path) => {
+                    self.integration_modal.proc_lib_input = path.to_string_lossy().to_string();
                 }
             }
         }

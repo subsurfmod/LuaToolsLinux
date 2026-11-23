@@ -1,19 +1,17 @@
-//! Memory patching via trampolines.
+//! Memory patching via 64-bit absolute indirect trampolines (`FF 25 00 00 00 00 <u64>`).
 //!
-//! On Linux x86-64 we overwrite the first bytes of a target function with a
-//! relative jump to our replacement, copy the overwritten bytes into a
-//! trampoline buffer (with a jump back appended), and call the trampoline to
-//! reach the original code.
-//!
-//! This is intended to be installed at process startup via the preload loader.
+//! On Linux x86-64, ASLR places `mmap` regions and shared objects > 2 GiB apart, so 32-bit
+//! `E9` relative jumps can overflow. We use a 14-byte RIP-relative indirect jump
+//! (`jmp qword ptr [rip + 0]` followed by an 8-byte 64-bit target address) which reaches
+//! any 64-bit virtual address cleanly.
 
 use std::arch::x86_64::_mm_mfence;
 use std::ptr;
 
-const JMP_REL32_LEN: usize = 14;
-const TRAMPOLINE_SIZE: usize = 32;
+pub const JMP_ABS64_LEN: usize = 14;
+const TRAMPOLINE_SIZE: usize = 64;
 
-/// Represents an installed memory patch.
+/// Represents an installed inline memory patch.
 #[derive(Debug)]
 pub struct MemoryPatch {
     pub target: *mut u8,
@@ -36,12 +34,31 @@ impl MemoryPatch {
         }
     }
 
+    /// Writes a 14-byte x86-64 absolute jump (`FF 25 00 00 00 00` + 8-byte address) at `dst`.
+    ///
+    /// # Safety
+    /// `dst` must point to at least 14 bytes of writable memory.
+    unsafe fn write_abs_jmp64(dst: *mut u8, target_addr: usize) {
+        let stub: [u8; 6] = [0xFF, 0x25, 0x00, 0x00, 0x00, 0x00];
+        ptr::copy_nonoverlapping(stub.as_ptr(), dst, stub.len());
+        ptr::copy_nonoverlapping(target_addr.to_le_bytes().as_ptr(), dst.add(stub.len()), 8);
+    }
+
+    /// Installs the trampoline and overwrites `target` with a jump to `replacement`.
+    ///
+    /// # Safety
+    /// `self.target` must point to valid mapped executable instructions of at least
+    /// `min_orig_bytes.max(14)` bytes on an instruction boundary, and `self.replacement`
+    /// must be a valid function pointer with a compatible ABI.
     pub unsafe fn install(&mut self, min_orig_bytes: usize) -> Result<(), String> {
         if self.active {
             return Err("patch already installed".into());
         }
 
-        let overwrite_len = JMP_REL32_LEN.max(min_orig_bytes);
+        let overwrite_len = JMP_ABS64_LEN.max(min_orig_bytes);
+        if overwrite_len + JMP_ABS64_LEN > TRAMPOLINE_SIZE {
+            return Err("overwrite_len exceeds trampoline capacity".into());
+        }
 
         let orig_slice = std::slice::from_raw_parts(self.target, overwrite_len);
         self.original_bytes = orig_slice.to_vec();
@@ -50,19 +67,13 @@ impl MemoryPatch {
         let trampoline = Self::allocate_trampoline(TRAMPOLINE_SIZE)?;
         self.trampoline = trampoline;
 
-        let ret_addr = self.target.add(overwrite_len);
-        let back_disp = (ret_addr as isize) - (trampoline as isize) - JMP_REL32_LEN as isize;
-
+        let ret_addr = self.target.add(overwrite_len) as usize;
         ptr::copy_nonoverlapping(self.target, trampoline, overwrite_len);
-        let tramp_jmp_ptr = trampoline.add(overwrite_len);
-        tramp_jmp_ptr.write(0xE9);
-        let disp_ptr = tramp_jmp_ptr.add(1) as *mut i32;
-        disp_ptr.write(back_disp as i32);
+        Self::write_abs_jmp64(trampoline.add(overwrite_len), ret_addr);
 
         let page_size = 4096usize;
         let page_start = (self.target as usize) & !(page_size - 1);
-        let page_end =
-            ((self.target as usize) + overwrite_len + page_size - 1) & !(page_size - 1);
+        let page_end = ((self.target as usize) + overwrite_len + page_size - 1) & !(page_size - 1);
         let page_len = page_end - page_start;
 
         if libc::mprotect(
@@ -74,12 +85,8 @@ impl MemoryPatch {
             return Err(format!("mprotect failed for target at {:p}", self.target));
         }
 
-        let disp = (self.replacement as isize) - (self.target as isize) - JMP_REL32_LEN as isize;
-        self.target.write(0xE9);
-        let disp_ptr = self.target.add(1) as *mut i32;
-        disp_ptr.write(disp as i32);
-
-        for i in 5..overwrite_len {
+        Self::write_abs_jmp64(self.target, self.replacement as usize);
+        for i in JMP_ABS64_LEN..overwrite_len {
             self.target.add(i).write(0x90);
         }
 
@@ -88,6 +95,11 @@ impl MemoryPatch {
         Ok(())
     }
 
+    /// Restores the original bytes at `self.target`.
+    ///
+    /// # Safety
+    /// `self.target` must still be mapped in the current address space and no thread
+    /// may be concurrently executing mid-stub at `self.target`.
     pub unsafe fn uninstall(&mut self) -> Result<(), String> {
         if !self.active {
             return Err("patch not installed".into());
@@ -107,12 +119,17 @@ impl MemoryPatch {
         }
 
         ptr::copy_nonoverlapping(self.original_bytes.as_ptr(), self.target, self.orig_len);
+        _mm_mfence();
         self.active = false;
         Ok(())
     }
 
+    /// Invokes the saved trampoline as a `void(void)` C function.
+    ///
+    /// # Safety
+    /// The patch must be active and the patched function must accept zero arguments.
     pub unsafe fn call_original_void(&self) {
-        let tramp: extern "C" fn() = std::mem::transmute(self.trampoline);
+        let tramp: unsafe extern "C" fn() = std::mem::transmute(self.trampoline);
         tramp()
     }
 
@@ -137,7 +154,6 @@ impl MemoryPatch {
 }
 
 unsafe impl Send for MemoryPatch {}
-
 unsafe impl Sync for MemoryPatch {}
 
 impl Drop for MemoryPatch {
@@ -148,6 +164,11 @@ impl Drop for MemoryPatch {
     }
 }
 
+/// Creates and installs an inline patch at `base + offset` redirecting to `replacement`.
+///
+/// # Safety
+/// `(base + offset)` must point to valid executable instructions of at least 14 bytes,
+/// and `replacement` must be a valid function pointer with matching calling convention.
 pub unsafe fn patch_by_offset(
     base: u64,
     offset: u64,
@@ -155,6 +176,6 @@ pub unsafe fn patch_by_offset(
 ) -> Result<MemoryPatch, String> {
     let target = (base as *mut u8).add(offset as usize);
     let mut patch = MemoryPatch::new(target, replacement);
-    patch.install(0)?;
+    patch.install(JMP_ABS64_LEN)?;
     Ok(patch)
 }

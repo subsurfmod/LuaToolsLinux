@@ -329,6 +329,20 @@ fn headless_papercut_views_render_cleanly_at_wide_and_narrow_resolutions() {
             d_sub: None,
             s_sub: Some(SettingsSubTab::Integrations),
         },
+        QaViewCase {
+            fname: "16_settings_steam_integration.png",
+            size: [1380, 860],
+            view: ActiveView::Settings,
+            d_sub: None,
+            s_sub: Some(SettingsSubTab::SteamIntegration),
+        },
+        QaViewCase {
+            fname: "17_depots_manifest_binding.png",
+            size: [1380, 860],
+            view: ActiveView::Depots,
+            d_sub: Some(DepotsSubTab::ManifestBinding),
+            s_sub: None,
+        },
     ];
 
     for case in cases {

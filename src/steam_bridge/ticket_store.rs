@@ -67,7 +67,10 @@ impl TicketStore {
         let app_blocks = Self::extract_app_blocks(&content);
         for (appid_str, block) in app_blocks {
             if let Ok(app_id) = appid_str.parse::<u32>() {
-                let mut data = AppTicketData { app_id, ..Default::default() };
+                let mut data = AppTicketData {
+                    app_id,
+                    ..Default::default()
+                };
                 for line in block.lines() {
                     let line = line.trim();
                     if let Some((key, val)) = Self::split_kv(line) {
@@ -115,27 +118,25 @@ impl TicketStore {
 
             if depth == 1 {
                 if let Some(appid) = Self::extract_quoted_number(trimmed) {
-                    if current_appid.is_some() {
-                        blocks.push((current_appid.unwrap(), current_block.clone()));
+                    if let Some(prev) = current_appid.replace(appid) {
+                        blocks.push((prev, current_block.clone()));
                     }
-                    current_appid = Some(appid);
                     current_block = String::new();
                     continue;
                 }
             }
 
-            if depth >= 2 {
-                if current_appid.is_some() {
-                    current_block.push_str(trimmed);
-                    current_block.push('\n');
-                }
+            if depth >= 2 && current_appid.is_some() {
+                current_block.push_str(trimmed);
+                current_block.push('\n');
             }
 
-            if depth == 0 && in_apps && current_appid.is_some() {
-                blocks.push((current_appid.unwrap(), current_block.clone()));
-                current_appid = None;
-                current_block.clear();
-                in_apps = false;
+            if depth == 0 && in_apps {
+                if let Some(prev) = current_appid.take() {
+                    blocks.push((prev, current_block.clone()));
+                    current_block.clear();
+                    in_apps = false;
+                }
             }
         }
 
@@ -166,9 +167,9 @@ impl TicketStore {
         let key_end = line[1..].find('"')? + 1;
         let key = &line[1..key_end];
         let rest = line[key_end..].trim();
-        let val = if rest.starts_with('"') {
-            let v_end = rest[1..].find('"')? + 1;
-            rest[1..v_end].to_string()
+        let val = if let Some(stripped) = rest.strip_prefix('"') {
+            let v_end = stripped.find('"')?;
+            stripped[..v_end].to_string()
         } else {
             rest.split_whitespace().next().unwrap_or("").to_string()
         };
@@ -186,7 +187,7 @@ impl TicketStore {
         self.cache
             .get(&app_id)
             .cloned()
-            .ok_or_else(|| TicketError::NotFound(app_id))
+            .ok_or(TicketError::NotFound(app_id))
     }
 
     pub fn set(&mut self, data: AppTicketData) -> Result<(), TicketError> {
@@ -200,19 +201,25 @@ impl TicketStore {
     }
 
     pub fn has_app_ticket(&mut self, app_id: u32) -> bool {
-        self.get(app_id).map(|d| d.app_ticket.is_some()).unwrap_or(false)
+        self.get(app_id)
+            .map(|d| d.app_ticket.is_some())
+            .unwrap_or(false)
     }
 
     pub fn has_e_ticket(&mut self, app_id: u32) -> bool {
-        self.get(app_id).map(|d| d.e_ticket.is_some()).unwrap_or(false)
+        self.get(app_id)
+            .map(|d| d.e_ticket.is_some())
+            .unwrap_or(false)
     }
 
     fn _persist_app(&self, data: AppTicketData) -> Result<(), TicketError> {
+        fs::create_dir_all(&self.config_dir)?;
         let vdf_path = self.config_dir.join("localconfig.vdf");
-        if !vdf_path.exists() {
-            return Err(TicketError::NotFound(data.app_id));
-        }
-        let content = fs::read_to_string(&vdf_path)?;
+        let content = if vdf_path.exists() {
+            fs::read_to_string(&vdf_path)?
+        } else {
+            String::from("\"UserLocalConfigStore\"\n{\n    \"Software\"\n    {\n        \"Valve\"\n        {\n            \"Steam\"\n            {\n                \"apps\"\n                {\n                }\n            }\n        }\n    }\n}\n")
+        };
         let new_content = Self::upsert_app_block(&content, data.app_id, &data);
         fs::write(&vdf_path, new_content)?;
         Ok(())
@@ -286,11 +293,9 @@ impl TicketStore {
                 }
             }
 
-            if depth >= 2 {
-                if current_appid.as_deref() == Some(&appid_str) {
-                    skip_current = true;
-                    continue;
-                }
+            if depth >= 2 && current_appid.as_deref() == Some(&appid_str) {
+                skip_current = true;
+                continue;
             }
 
             if !skip_current {
