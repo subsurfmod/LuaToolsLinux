@@ -871,6 +871,7 @@ impl LuaToolsApp {
         let cur_stats = self.steam_bridge_service.get_stats(app_id);
 
         let mut close = false;
+        let mut apply_quick_setup = false;
         let mut toggle_redirect: Option<bool> = None;
         let mut set_spoof = false;
         let mut rem_spoof = false;
@@ -897,6 +898,44 @@ impl LuaToolsApp {
                 .max_height(485.0)
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 10.0;
+
+                    // 0. One-Click Quick Setup (Recommended)
+                    inset_paper_sheet(ui, Margin::same(12), |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            RichText::new("⚡ Quick Setup: Apply Recommended Fixes")
+                                .font(semibold_font(13.5))
+                                .color(Palette::TEXT_PRIMARY),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new("Automatically applies all recommended settings:")
+                                .size(12.0)
+                                .color(Palette::TEXT_SECONDARY),
+                        );
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new("• Add to Play-Unowned (ownership redirect)")
+                                .size(11.0)
+                                .color(Palette::TEXT_MUTED),
+                        );
+                        ui.label(
+                            RichText::new("• Set AppID redirect to 480 (online compatibility)")
+                                .size(11.0)
+                                .color(Palette::TEXT_MUTED),
+                        );
+                        ui.label(
+                            RichText::new("• Run SteamAutoPatch if game is installed")
+                                .size(11.0)
+                                .color(Palette::TEXT_MUTED),
+                        );
+                        ui.add_space(8.0);
+                        if primary_button(ui, "Apply Recommended Fixes Now").clicked() {
+                            self.integration_modal.feedback = 
+                                format!("Applying recommended fixes for {}...", game_name);
+                        }
+                    });
+                    ui.add_space(8.0);
 
                     // 1. Play-Unowned Redirect Set & AppID Spoof (480)
                     inset_paper_sheet(ui, Margin::same(12), |ui| {
@@ -1238,6 +1277,51 @@ impl LuaToolsApp {
                 Ok(m) => self.notify(m, ToastKind::Success),
                 Err(e) => self.notify(e, ToastKind::Warning),
             }
+        }
+        if apply_quick_setup {
+            let mut applied = Vec::<String>::new();
+
+            // 1. Add to redirect set (play unowned)
+            let is_redirect = self.steam_bridge_service.is_redirect_app(app_id)
+                || self
+                    .play_unowned_service
+                    .is_app_enabled(app_id, &self.slssteam_service);
+            if !is_redirect {
+                self.steam_bridge_service.add_redirect_app(app_id);
+                let _ = self
+                    .play_unowned_service
+                    .enable_for_app(app_id, &mut self.slssteam_service);
+                applied.push("Added to Play-Unowned redirect set".to_string());
+            }
+
+            // 2. Set AppID redirect to 480
+            let cur_spoof = self
+                .steam_bridge_service
+                .get_app_id_spoof(app_id)
+                .or_else(|| self.slssteam_service.get_fake_app_id(app_id));
+            if cur_spoof != Some(480) {
+                self.steam_bridge_service.set_app_id_spoof(app_id, 480);
+                self.slssteam_service.set_fake_app_id(app_id, 480);
+                let _ = self.slssteam_service.save();
+                applied.push("Set AppID redirect to 480".to_string());
+            }
+
+            // 3. Run SteamAutoPatch if game is installed
+            if let Some(path) = install_path {
+                match self.steam_auto_crack.launch_for_app(app_id, &path) {
+                    Ok(_) => applied.push("Launched SteamAutoPatch for game".to_string()),
+                    Err(e) => applied.push(format!("SteamAutoPatch failed: {}", e)),
+                }
+            } else {
+                applied.push("Game install path not found - run SteamAutoPatch manually".to_string());
+            }
+
+            self.integration_modal.feedback = format!(
+                "Applied recommended fixes for {}: {}",
+                game_name,
+                applied.join(", ")
+            );
+            self.refresh_all_local_state();
         }
         if close {
             self.integration_modal.open = false;

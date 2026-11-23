@@ -382,29 +382,39 @@ impl SteamBridgeService {
         preload_loader::generate_ld_preload_launcher(&steam_exe, &lib_path, &self.launcher_path)
             .map_err(|e| format!("Failed to generate launcher: {}", e))?;
 
+        let mut preload_ok = false;
         if enable_system_preload {
-            preload_loader::enable_system_preload(&lib_path).map_err(|e| {
-                format!(
-                    "Launcher created at {}, but /etc/ld.so.preload requires root privileges: {}",
-                    self.launcher_path.display(),
-                    e
-                )
-            })?;
+            match preload_loader::enable_system_preload(&lib_path) {
+                Ok(()) => preload_ok = true,
+                Err(e) => {
+                    // Non-fatal: per-launch launcher still works without root.
+                    // We continue and tell the user system-wide preload needs admin.
+                    let _ = e;
+                }
+            }
         }
 
         let mut status = self.status.lock().unwrap();
         status.integration_lib_installed = true;
         status.integration_lib_path = Some(lib_path);
         status.launcher_installed = self.launcher_path.is_file();
-        status.system_preload_enabled = is_in_ld_so_preload(&self.lib_target_path);
+        status.system_preload_enabled = preload_ok;
         status.integration_active = check_ipc_or_maps_active();
+
+        let preload_note = if enable_system_preload && !preload_ok {
+            " (system ld.so.preload needs administrator/root — using per-launch launcher instead)"
+        } else if preload_ok {
+            " (system ld.so.preload enabled)"
+        } else {
+            " (per-launch launcher, no root required)"
+        };
 
         Ok(BridgeInstallResult {
             success: true,
             message: format!(
-                "Installed Steam integration launcher at {} (system ld.so.preload: {})",
+                "Installed Steam integration launcher at {}{}",
                 self.launcher_path.display(),
-                enable_system_preload
+                preload_note
             ),
             steam_client_patterns: None,
             steam_ui_patterns: None,

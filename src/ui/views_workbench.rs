@@ -2742,13 +2742,19 @@ impl LuaToolsApp {
 
             ui.checkbox(
                 &mut self.bridge_system_preload,
-                "Enable system-wide LD_PRELOAD in /etc/ld.so.preload (requires root; leave unchecked for per-launch ~/.local/bin/luatools-steam-launcher)",
+                "Enable system-wide LD_PRELOAD in /etc/ld.so.preload (requires administrator/root; optional — per-launch launcher works without it)",
+            );
+            ui.label(
+                RichText::new("Recommended: leave unchecked. Use ~/.local/bin/luatools-steam-launcher to start Steam instead.")
+                    .size(11.0)
+                    .color(Palette::TEXT_MUTED),
             );
 
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 ui.add_enabled_ui(!self.bridge_busy, |ui| {
-                    if primary_button(ui, "Install Integration").clicked() {
+                    if primary_button(ui, "Install Integration (No Root)").clicked() {
+                        self.bridge_system_preload = false;
                         do_install = true;
                     }
                     if (st.integration_lib_installed

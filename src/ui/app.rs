@@ -1528,6 +1528,38 @@ impl LuaToolsApp {
         });
     }
 
+    /// Launch (or restart) Steam using the bridge launcher (~/.local/bin/luatools-steam-launcher)
+    /// which preloads libsteam_integration.so into the Steam client process. No root required.
+    pub fn launch_steam_with_bridge(&mut self, _ctx: &egui::Context) {
+        let launcher = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".local/bin/luatools-steam-launcher");
+
+        if !launcher.exists() {
+            self.notify(
+                "Bridge launcher not found. Install it first in Settings › Steam Integration.",
+                ToastKind::Warning,
+            );
+            return;
+        }
+
+        self.status_text = "Launching Steam with integration bridge…".into();
+        match std::process::Command::new(&launcher).spawn() {
+            Ok(_) => {
+                self.notify(
+                    "Steam is starting with the integration bridge.",
+                    ToastKind::Success,
+                );
+            }
+            Err(e) => {
+                self.notify(
+                    format!("Failed to launch Steam with bridge: {}", e),
+                    ToastKind::Warning,
+                );
+            }
+        }
+    }
+
     pub fn trigger_wired_action(&mut self, action: &'static str, ctx: &egui::Context) {
         if self.wired_busy {
             return;
@@ -2187,6 +2219,7 @@ impl LuaToolsApp {
         let mut run_omnibox = false;
         let mut click_rescan = false;
         let mut click_start_update = false;
+        let mut click_launch_bridge = false;
         let mut click_relaunch_exe: Option<PathBuf> = None;
         let right_col_w = if matches!(self.update_banner, UpdateBannerState::Hidden) {
             156.0
@@ -2251,17 +2284,31 @@ impl LuaToolsApp {
                             }
                         });
 
-                        // Right: Steam Status Pill + Corner Git Update Button (never placed at the bottom!)
+                        // Right: Steam Launch Pill + Corner Git Update Button (never placed at the bottom!)
                         strip.cell(|ui| {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 ui.spacing_mut().item_spacing.x = 8.0;
 
-                                let online = self.steam_service.is_available();
-                                let (lbl, bg, fg) = if online {
-                                    ("● Steam Ready", Palette::GO_BG, Palette::GO_TEXT)
+                                let bridge_st = self.steam_bridge_service.status();
+                                let steam_online = self.steam_service.is_available();
+                                let bridge_installed = bridge_st.integration_lib_installed
+                                    || bridge_st.launcher_installed
+                                    || bridge_st.system_preload_enabled;
+
+                                let (lbl, bg, fg, tip) = if bridge_installed && steam_online {
+                                    ("● Restart Steam w/ Bridge", Palette::GO_BG, Palette::GO_TEXT,
+                                    "Restart Steam with the integration bridge loaded. This applies LD_PRELOAD patches to the running Steam client.")
+                                } else if bridge_installed {
+                                    ("● Launch Steam w/ Bridge", Palette::BLUE_PRIMARY, Palette::TEXT_PRIMARY,
+                                    "Launch Steam with the integration bridge loaded via ~/.local/bin/luatools-steam-launcher (no root required).")
+                                } else if steam_online {
+                                    ("○ Install Bridge", Palette::WARN_BG, Palette::WARN_TEXT,
+                                    "Steam is running but the integration bridge is not installed. Go to Settings › Steam Integration to install it.")
                                 } else {
-                                    ("○ No Steam", Palette::WARN_BG, Palette::WARN_TEXT)
+                                    ("○ No Steam", Palette::WARN_BG, Palette::WARN_TEXT,
+                                    "Steam not detected. Install Steam first, then click here to rescan.")
                                 };
+
                                 let g = ui.painter().layout_no_wrap(
                                     lbl.to_string(),
                                     semibold_font(11.5),
@@ -2289,16 +2336,12 @@ impl LuaToolsApp {
                                         fg,
                                     );
                                 }
-                                let tip = match &self.steam_service.installation {
-                                    Some(i) => format!(
-                                        "Steam root: {}\nLibraries: {}\nClick to rescan",
-                                        i.root.display(),
-                                        i.libraries.len()
-                                    ),
-                                    None => "Steam not detected. Click to rescan or configure path in Settings.".into(),
-                                };
                                 if pill_resp.on_hover_text(tip).clicked() {
-                                    click_rescan = true;
+                                    if bridge_installed {
+                                        click_launch_bridge = true;
+                                    } else {
+                                        click_rescan = true;
+                                    }
                                 }
 
                                 match &self.update_banner {
@@ -2367,6 +2410,9 @@ impl LuaToolsApp {
         }
         if click_rescan {
             self.detect_steam_and_sync();
+        }
+        if click_launch_bridge {
+            self.launch_steam_with_bridge(ctx);
         }
         if click_start_update {
             self.trigger_git_self_update(ctx);

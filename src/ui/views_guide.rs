@@ -152,9 +152,9 @@ impl LuaToolsApp {
             "STEP 02",
             "Add Your First Game Manifest",
             "You can add a game in three ways:\n\
-             • Drag and drop any .zip, .lua, or .manifest file directly onto the window (or click 'Select Files…' on Home).\n\
-             • Open Discover (Ctrl+2), search a Steam title or paste a Store/SteamDB URL, sign in via Discord or Hubcap key, and click 'Install Manifest'.\n\
-             • Click '+ Create by AppID' to generate a clean starter .lua from a template.",
+             - Drag and drop any .zip, .lua, or .manifest file directly onto the window (or click 'Select Files…' on Home).\n\
+             - Open Discover (Ctrl+2), search a Steam title or paste a Store/SteamDB URL, sign in via Discord or Hubcap key, and click 'Install Manifest'.\n\
+             - Click '+ Create by AppID' to generate a clean starter .lua from a template.",
             |ui| {
                 if primary_button(ui, "Browse Discover ›").clicked() {
                     nav_target = Some((ActiveView::Acquire, None));
@@ -307,9 +307,9 @@ impl LuaToolsApp {
             "Switching Game Builds & Saving Presets",
             "Every time a .lua file is installed or a <appid>_<buildid>.lua file is found in stplug-in/, LuaVault stores a \
              content-addressed SHA-256 copy under ~/.local/share/luatools/luavault/<appid>/.\n\
-             • In Depots & Vault › Manifests & Vault, select any stored variant on the left and click 'Apply Selected Variant' \
+             - In Depots & Vault › Manifests & Vault, select any stored variant on the left and click 'Apply Selected Variant' \
              (or right-click to Apply, Rename, or Delete).\n\
-             • Click '+ Save Preset' to snapshot your current configuration before experimenting with edits or downgrades.",
+             - Click '+ Save Preset' to snapshot your current configuration before experimenting with edits or downgrades.",
             |ui| {
                 if secondary_button(ui, "Open Manifests & Vault ›").clicked() {
                     go_depots = Some(DepotsSubTab::Declarations);
@@ -323,12 +323,12 @@ impl LuaToolsApp {
             ui,
             "PINNING",
             "Pinned Builds vs Auto-Updating Games",
-            "• Pinned (setManifestid active): Locks a depot to a specific manifest GID — ideal when a mod, translation, or game fix \
+            "- Pinned (setManifestid active): Locks a depot to a specific manifest GID — ideal when a mod, translation, or game fix \
              requires a specific game patch.\n\
-             • Auto-Update (-- setManifestid commented out): Lets Steam update to the newest public manifest. When 'Auto-update apps' \
+             - Auto-Update (-- setManifestid commented out): Lets Steam update to the newest public manifest. When 'Auto-update apps' \
              is enabled in Settings, standard installs comment out pins automatically while build-specific (<appid>_<buildid>.lua) \
              and fix manifests keep their pins locked.\n\
-             • Toggle any individual depot pin in one click using the 'Pin' / 'Unpin' button in the Depot Declarations table.",
+             - Toggle any individual depot pin in one click using the 'Pin' / 'Unpin' button in the Depot Declarations table.",
             |ui| {
                 if ghost_button(ui, "Open Live Lua Editor ›").clicked() {
                     go_depots = Some(DepotsSubTab::LiveEditor);
@@ -376,13 +376,13 @@ impl LuaToolsApp {
             "OVERRIDES",
             "Library Registration (ACF), PlayUnowned & appinfo.vdf Launch Options",
             "In Library (Ctrl+3), every game offers:\n\
-             • Configure: Edit SLSsteam FakeAppId (commonly 480 for Spacewar wrapper), set an AppToken, or edit stplug-in .lua.\n\
-             • More › Register in Steam Library (ACF): Creates a valid \"AppState\" appmanifest_<appid>.acf, updates libraryfolders.vdf, \
+             - Configure: Edit SLSsteam FakeAppId (commonly 480 for Spacewar wrapper), set an AppToken, or edit stplug-in .lua.\n\
+             - More › Register in Steam Library (ACF): Creates a valid \"AppState\" appmanifest_<appid>.acf, updates libraryfolders.vdf, \
              and syncs SLSsteam so 'Lua Only' games appear directly in your Steam Library.\n\
-             • More › Enable Play Unowned / Run SteamAutoPatch: Syncs play_unowned_games.lua or launches Goldberg SteamAutoPatch.\n\
-             • More › Integration Actions…: Manage Play-Unowned redirects, 480 AppID spoofing, legacy CD keys, depot decryption keys, \
+             - More › Enable Play Unowned / Run SteamAutoPatch: Syncs play_unowned_games.lua or launches Goldberg SteamAutoPatch.\n\
+             - More › Integration Actions…: Manage Play-Unowned redirects, 480 AppID spoofing, legacy CD keys, depot decryption keys, \
              Steam stats, and per-game LD_PRELOAD process integration.\n\
-             • More › Launch Options…: Parses and writes binary Steam appcache/appinfo.vdf (v27–v29 with SHA-1 re-hashing and backup).\n\
+             - More › Launch Options…: Parses and writes binary Steam appcache/appinfo.vdf (v27–v29 with SHA-1 re-hashing and backup).\n\
              IMPORTANT: Always close Steam completely before writing appinfo.vdf or appmanifest_<appid>.acf files.",
             |ui| {
                 if secondary_button(ui, "Open Library ›").clicked() {
@@ -398,10 +398,10 @@ impl LuaToolsApp {
             "GAME FIXES",
             "Applying & Cleanly Reverting Game Fixes",
             "In Game Fixes (Ctrl+5), browse verified fixes by category or filter to 'Configured only':\n\
-             • Install Manifest: Downloads and installs the build-locked manifest required by the fix.\n\
-             • Apply Fix: Before touching any file in your game directory, LuaTools hashes existing files with SHA-256 and backs \
+             - Install Manifest: Downloads and installs the build-locked manifest required by the fix.\n\
+             - Apply Fix: Before touching any file in your game directory, LuaTools hashes existing files with SHA-256 and backs \
              them up into <GameDir>/.luatools-fix/backups/<fix_id>/ alongside a JSON ledger.\n\
-             • Revert: Verifies post-apply SHA-256 hashes (preventing accidental corruption if another patch was layered on top), \
+             - Revert: Verifies post-apply SHA-256 hashes (preventing accidental corruption if another patch was layered on top), \
              deletes newly added fix files, and restores every original binary byte-for-byte.",
             |ui| {
                 if primary_button(ui, "Browse Game Fixes ›").clicked() {
@@ -417,9 +417,9 @@ impl LuaToolsApp {
             "TOOLCHAIN",
             "External Tools (DepotDownloaderMod, SteamAutoPatch & StubRemover)",
             "Under Settings › Updates & Toolchain, click 'Install / Update' on any external tool to download the latest release from GitHub:\n\
-             • DepotDownloaderMod: Supports offline .manifest files (-manifestfile) paired with depot decryption keys.\n\
-             • SteamAutoPatch (SteamAutoCrack): Applies Goldberg Steam emulator configurations to a selected game directory.\n\
-             • StubRemover (Steamless): Unpacks SteamStub-protected .exe binaries via Wine (install Wine + .NET via ./install.sh --with-wine).",
+             - DepotDownloaderMod: Supports offline .manifest files (-manifestfile) paired with depot decryption keys.\n\
+             - SteamAutoPatch (SteamAutoCrack): Applies Goldberg Steam emulator configurations to a selected game directory.\n\
+             - StubRemover (Steamless): Unpacks SteamStub-protected .exe binaries via Wine (install Wine + .NET via ./install.sh --with-wine).",
             |ui| {
                 if secondary_button(ui, "Open Toolchain ›").clicked() {
                     go_tools = true;
