@@ -291,6 +291,8 @@ impl SteamLibraryService {
                     } else if let Err(e) = fs::copy(&path, &target_path) {
                         return Err(format!("Failed to migrate '{}': {}", name, e));
                     } else {
+                        // LT-34: Remove source manifest after verified copy
+                        let _ = fs::remove_file(&path);
                         res.migrated_count += 1;
                         res.migrated_files.push(name.to_string());
                     }
@@ -396,10 +398,14 @@ mod tests {
         assert!(target.join("1245621_11111111.manifest").exists());
         assert!(target.join("1245622_22222222.manifest").exists());
         assert!(!target.join("other.txt").exists());
+        // Source files were cleanly moved/removed
+        assert!(!legacy.join("1245621_11111111.manifest").exists());
+        assert!(!legacy.join("1245622_22222222.manifest").exists());
 
-        // Re-run migration: existing manifests must be counted as skipped
+        // If duplicate manifests appear in legacy again, they are skipped
+        fs::write(legacy.join("1245621_11111111.manifest"), b"MANIFEST_1_DUP").unwrap();
         let res2 = SteamLibraryService::migrate_depotcache_dir(&legacy, &target).unwrap();
         assert_eq!(res2.migrated_count, 0);
-        assert_eq!(res2.skipped_count, 2);
+        assert_eq!(res2.skipped_count, 1);
     }
 }

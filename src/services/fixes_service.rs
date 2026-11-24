@@ -569,24 +569,29 @@ impl FixesService {
             .and_then(|p| p.parent())
             .map(|p| p.join("compatdata").join(app_id.to_string()).join("pfx/user.reg"));
         if let Some(reg_path) = pfx_reg {
-            if reg_path.is_file() {
-                if let Ok(content) = fs::read_to_string(&reg_path) {
-                    let mut new_content = content.clone();
-                    let section = "[Software\\\\Wine\\\\DllOverrides]";
-                    if !new_content.contains(section) {
-                        new_content.push_str(&format!("\n{}\n", section));
-                    }
-                    for dll in dlls {
-                        let entry = format!("\"{}\"=\"native,builtin\"", dll);
-                        if !new_content.contains(&entry) {
-                            if let Some(pos) = new_content.find(section) {
-                                let insert_pos = pos + section.len();
-                                new_content.insert_str(insert_pos, &format!("\n{}", entry));
-                            }
+            if !reg_path.is_file() {
+                if let Some(parent) = reg_path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let initial = format!("WINE REGISTRY Version 2\n;; All keys relative to \\User\\...\n\n[Software\\\\Wine\\\\DllOverrides]\n\n");
+                let _ = fs::write(&reg_path, initial);
+            }
+            if let Ok(content) = fs::read_to_string(&reg_path) {
+                let mut new_content = content.clone();
+                let section_prefix = "[Software\\Wine\\DllOverrides]";
+                if !new_content.contains(section_prefix) {
+                    new_content.push_str(&format!("\n{}\n", section_prefix));
+                }
+                for dll in dlls {
+                    let entry = format!("\"{}\"= \"native,builtin\"", dll);
+                    if !new_content.contains(&entry) {
+                        if let Some(pos) = new_content.find(section_prefix) {
+                            let line_end = new_content[pos..].find('\n').map(|p| pos + p + 1).unwrap_or(pos + section_prefix.len());
+                            new_content.insert_str(line_end, &format!("{}\n", entry));
                         }
                     }
-                    let _ = fs::write(&reg_path, new_content);
                 }
+                let _ = fs::write(&reg_path, new_content);
             }
         }
     }
@@ -763,5 +768,144 @@ mod tests {
         assert!(!env_file.exists());
         assert!(!game_dir.join("winmm.dll").exists());
         assert!(!FixesService::is_fix_applied(&game_dir, online_fix_id));
+    }
+}
+
+// ============================================================================
+// LT-76: AppliedFixIndexService Central Registry (applied-fixes.json)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppliedFixIndexEntry {
+    pub app_id: u32,
+    pub fix_id: String,
+    pub game_dir: PathBuf,
+    pub applied_at: String,
+    pub files_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AppliedFixIndex {
+    pub entries: Vec<AppliedFixIndexEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AppliedFixIndexService {
+    path: PathBuf,
+}
+
+impl Default for AppliedFixIndexService {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+impl AppliedFixIndexService {
+    pub fn new(custom_path: Option<PathBuf>) -> Self {
+        let path = custom_path.unwrap_or_else(|| {
+            dirs::config_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("luatools/applied-fixes.json")
+        });
+        Self { path }
+    }
+
+    pub fn load_index(&self) -> AppliedFixIndex {
+        if !self.path.exists() {
+            return AppliedFixIndex::default();
+        }
+        let Ok(raw) = fs::read_to_string(&self.path) else {
+            return AppliedFixIndex::default();
+        };
+        serde_json::from_str::<AppliedFixIndex>(&raw).unwrap_or_default()
+    }
+
+    pub fn record_fix_applied(
+        &self,
+        app_id: u32,
+        fix_id: &str,
+        game_dir: &Path,
+        files_count: usize,
+    ) -> Result<(), String> {
+        let mut index = self.load_index();
+        index.entries.retain(|e| !(e.app_id == app_id && e.fix_id == fix_id));
+        index.entries.push(AppliedFixIndexEntry {
+            app_id,
+            fix_id: fix_id.to_string(),
+            game_dir: game_dir.to_path_buf(),
+            applied_at: chrono::Utc::now().to_rfc3339(),
+            files_count,
+        });
+        self.persist(&index)
+    }
+
+    pub fn record_fix_reverted(&self, app_id: u32, fix_id: &str) -> Result<(), String> {
+        let mut index = self.load_index();
+        let orig_len = index.entries.len();
+        index.entries.retain(|e| !(e.app_id == app_id && e.fix_id == fix_id));
+        if index.entries.len() != orig_len {
+            self.persist(&index)?;
+        }
+        Ok(())
+    }
+
+    pub fn list_verified_entries(&self) -> Vec<AppliedFixIndexEntry> {
+        let index = self.load_index();
+        let mut live = Vec::new();
+        let mut changed = false;
+
+        for entry in index.entries {
+            if FixesService::is_fix_applied(&entry.game_dir, &entry.fix_id) {
+                live.push(entry);
+            } else {
+                changed = true;
+            }
+        }
+
+        if changed {
+            let _ = self.persist(&AppliedFixIndex {
+                entries: live.clone(),
+            });
+        }
+        live
+    }
+
+    fn persist(&self, index: &AppliedFixIndex) -> Result<(), String> {
+        if let Some(parent) = self.path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let json = serde_json::to_string_pretty(index).map_err(|e| e.to_string())?;
+        let tmp = self.path.with_extension("tmp");
+        fs::write(&tmp, json).map_err(|e| e.to_string())?;
+        if self.path.exists() {
+            let _ = fs::copy(&self.path, self.path.with_extension("bak"));
+        }
+        fs::rename(&tmp, &self.path).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests_applied_fixes_index {
+    use super::*;
+
+    #[test]
+    fn test_applied_fix_index_service_lifecycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index_path = tmp.path().join("applied-fixes.json");
+        let svc = AppliedFixIndexService::new(Some(index_path));
+
+        let game_dir = tmp.path().join("elden_ring");
+        fs::create_dir_all(&game_dir).unwrap();
+
+        svc.record_fix_applied(1245620, "fix:seamless", &game_dir, 3).unwrap();
+        let idx = svc.load_index();
+        assert_eq!(idx.entries.len(), 1);
+        assert_eq!(idx.entries[0].app_id, 1245620);
+        assert_eq!(idx.entries[0].fix_id, "fix:seamless");
+
+        svc.record_fix_reverted(1245620, "fix:seamless").unwrap();
+        let idx2 = svc.load_index();
+        assert_eq!(idx2.entries.len(), 0);
     }
 }

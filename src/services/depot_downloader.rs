@@ -20,6 +20,8 @@ use zip::ZipArchive;
 use crate::models::config::default_luatools_data_dir;
 use crate::models::steam::SteamInstallation;
 use crate::parsers::lua_parser::LuaFileParser;
+use crate::services::donate_keys::DonateKeysService;
+use crate::services::api_client::HubcapService;
 use crate::services::api_client::stream_response_to_file;
 use crate::services::slssteam_service::SlssteamService;
 
@@ -67,6 +69,7 @@ pub struct DepotRunResult {
 pub struct DepotDownloadOptions {
     pub custom_tool_path: String,
     pub steam_username: String,
+    pub hubcap_api_key: Option<String>,
 }
 
 const DEPOTDOWNLOADER_REPO: &str = "SteamRE/DepotDownloader";
@@ -297,7 +300,7 @@ impl DepotDownloaderService {
             args.push("-manifest".to_string());
             args.push(gid.to_string());
         }
-        if is_mod || selection.manifest_path.is_some() {
+        if is_mod {
             if let Some(mp) = selection
                 .manifest_path
                 .as_deref()
@@ -323,8 +326,8 @@ impl DepotDownloaderService {
         if !clean_user.is_empty() && !clean_user.eq_ignore_ascii_case("anonymous") {
             args.push("-username".to_string());
             args.push(clean_user.to_string());
-            args.push("-remember-password".to_string());
         }
+        args.push("-remember-password".to_string());
         args
     }
 
@@ -519,6 +522,16 @@ impl DepotDownloaderService {
             }
         }
         if let Some(inst) = steam_inst {
+            let config_vdf = inst.root.join("config/config.vdf");
+            if config_vdf.is_file() {
+                for (did, k) in DonateKeysService::extract_keys_from_vdf(&config_vdf) {
+                    if let Ok(depot_id_u32) = did.parse::<u32>() {
+                        if is_valid_depot_key(&k) {
+                            keys.insert(depot_id_u32, k.trim().to_ascii_lowercase());
+                        }
+                    }
+                }
+            }
             let lua_path = inst.stplug_in_path.join(format!("{}.lua", app_id));
             if let Some(lua) = LuaFileParser::parse_file(&lua_path, app_id) {
                 for e in lua.entries {
@@ -554,6 +567,28 @@ impl DepotDownloaderService {
         if fs::write(&file_path, content).is_ok() {
             let _ = fs::set_permissions(&file_path, fs::Permissions::from_mode(0o600));
             Some(file_path)
+        } else {
+            None
+        }
+    }
+
+    /// Resolves or downloads the manifest for a depot (LT-44).
+    pub fn resolve_manifests(
+        steam_inst: Option<&SteamInstallation>,
+        depot_id: u32,
+        manifest_id: &str,
+        hubcap_api_key: Option<&str>,
+    ) -> Option<PathBuf> {
+        if let Some(existing) = Self::resolve_manifest_path(steam_inst, depot_id, manifest_id) {
+            return Some(existing);
+        }
+        let inst = steam_inst?;
+        let clean_gid = manifest_id.trim();
+        let gid: u64 = clean_gid.parse().ok()?;
+        let target_dir = inst.root.join("depotcache");
+        let dest = target_dir.join(format!("{}_{}.manifest", depot_id, clean_gid));
+        if HubcapService::download_raw_manifest_to_file(depot_id, gid, &dest, hubcap_api_key).is_ok() {
+            Some(dest)
         } else {
             None
         }
@@ -688,7 +723,19 @@ impl DepotDownloaderService {
             };
         }
 
-        let target_app = selection.from_app_id.unwrap_or(app_id);
+        let mut effective_selection = selection.clone();
+        if effective_selection.manifest_path.is_none() {
+            if let Some(ref gid) = effective_selection.manifest_id {
+                let resolved = Self::resolve_manifests(
+                    self.steam_installation.as_ref(),
+                    effective_selection.depot_id,
+                    gid,
+                    opts.hubcap_api_key.as_deref(),
+                );
+                effective_selection.manifest_path = resolved;
+            }
+        }
+        let target_app = effective_selection.from_app_id.unwrap_or(app_id);
         let depot_keys = {
             let bridge = self
                 .bridge_service
@@ -707,7 +754,7 @@ impl DepotDownloaderService {
         let is_mod = Self::is_mod_binary(&exe);
         let dl_args = Self::build_download_args_for_tool(
             target_app,
-            selection,
+            &effective_selection,
             download_dir,
             &opts.steam_username,
             keys_guard.as_ref().map(|g| g.0.as_path()),
@@ -934,6 +981,7 @@ mod tests {
             .windows(2)
             .any(|w| w == ["-manifestfile", "/tmp/3321461_1669007755731719796.manifest"]));
         assert!(!args.iter().any(|a| a == "-username"));
+        assert!(args.iter().any(|a| a == "-remember-password"));
         assert!(args.windows(2).any(|w| w == ["-max-downloads", "8"]));
         assert!(args
             .windows(2)

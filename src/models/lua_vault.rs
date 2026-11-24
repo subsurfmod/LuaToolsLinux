@@ -157,6 +157,16 @@ impl LuaVault {
                 return idx;
             }
         }
+        // LT-36: Fall back to index.bak when index.json is corrupt or unreadable
+        let bak = path.with_extension("bak");
+        if let Ok(raw) = fs::read_to_string(&bak) {
+            if let Ok(mut idx) = serde_json::from_str::<VaultIndex>(&raw) {
+                if idx.app_id == 0 {
+                    idx.app_id = app_id;
+                }
+                return idx;
+            }
+        }
         VaultIndex {
             app_id,
             variants: Vec::new(),
@@ -509,5 +519,30 @@ mod tests {
         assert_eq!(variants[0].hash, updated.hash);
         assert!(!vault.variant_path(1245620, &h1).exists());
         assert!(vault.variant_path(1245620, &updated.hash).exists());
+    }
+
+    #[test]
+    fn test_load_index_falls_back_to_backup_when_corrupted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = LuaVault::new(None, Some(tmp.path().join("vault")));
+
+        let v1 = vault
+            .save_text(1245620, "addappid(1245620)\n", Some("Initial"))
+            .unwrap();
+        let _v2 = vault
+            .save_text(1245620, "addappid(1245620)\naddappid(2)\n", Some("Second"))
+            .unwrap();
+
+        let index_path = vault.index_path(1245620);
+        let bak_path = index_path.with_extension("bak");
+        assert!(bak_path.exists());
+
+        // Corrupt main index
+        fs::write(&index_path, b"NOT_VALID_JSON{").unwrap();
+
+        // Reading variants must fall back to .bak seamlessly
+        let recovered = vault.get_variants(1245620);
+        assert!(!recovered.is_empty());
+        assert_eq!(recovered[0].hash, v1.hash);
     }
 }

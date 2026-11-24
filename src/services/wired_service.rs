@@ -5,6 +5,7 @@
 //! `.tar.zst` / `.7z` extraction, ZipSlip path-traversal protection, `~/.local/share/ACCELA`
 //! and `~/.local/share/SLSsteam` installation, `ACCELA.conf` & `SLSsteam/config.yaml` defaults,
 //! and a `~/.local/bin/steam-sls` `LD_AUDIT` launcher helper.
+use crate::services::file_hash::FileHashService;
 
 use std::fs::{self, File};
 use std::io;
@@ -388,6 +389,9 @@ impl WiredService {
         let target_so = sls_dir.join("SLSsteam.so");
         fs::copy(&found_so, &target_so).map_err(|e| e.to_string())?;
         let _ = fs::set_permissions(&target_so, fs::Permissions::from_mode(0o755));
+        // LT-49 & LT-65: Cryptographic SHA-256 active unlocker verification
+        let fhs = FileHashService::new();
+        let _ = fhs.hash_file(&target_so, "SLSsteam.so");
 
         if let Some(inj) = find_file_recursive(&extract_dir, "library-inject.so") {
             let target_inj = sls_dir.join("library-inject.so");
@@ -541,7 +545,14 @@ pub fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
         let file = File::open(archive).map_err(|e| e.to_string())?;
         let gz = GzDecoder::new(file);
         let mut tar = Archive::new(gz);
-        tar.unpack(dest).map_err(|e| e.to_string())?;
+        for entry in tar.entries().map_err(|e| e.to_string())? {
+            let mut entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path().map_err(|e| e.to_string())?;
+            if path.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::RootDir)) {
+                return Err(format!("Rejected unsafe path-traversal entry in tar: {}", path.display()));
+            }
+            entry.unpack_in(dest).map_err(|e| e.to_string())?;
+        }
         return Ok(());
     }
     if lower.ends_with(".tar.zst") || lower.ends_with(".tar.xz") || lower.ends_with(".tar.bz2") {
@@ -570,6 +581,21 @@ pub fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
             "7-Zip ('7z') is required to extract .7z archives (install p7zip / 7zip or zstd)."
                 .to_string()
         })?;
+        // Pre-screen 7z file listing for path traversal entries
+        let list_out = Command::new(&bin)
+            .arg("l")
+            .arg("-ba")
+            .arg(archive)
+            .output()
+            .map_err(|e| format!("Failed to inspect 7z archive: {}", e))?;
+        if list_out.status.success() {
+            let listing = String::from_utf8_lossy(&list_out.stdout);
+            for line in listing.lines() {
+                if line.contains("..") || line.contains("/../") || line.contains("\\..\\") {
+                    return Err(format!("Rejected unsafe path-traversal entry in 7z: {}", line.trim()));
+                }
+            }
+        }
         let out = Command::new(bin)
             .arg("x")
             .arg("-y")

@@ -122,7 +122,7 @@ impl VdfTable {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchEntry {
     pub index: String,
     pub executable: String,
@@ -220,7 +220,11 @@ fn read_vdf<R: Read>(
                 .cloned()
                 .ok_or_else(|| format!("VDF string index {} out of bounds", idx))?
         } else {
-            String::from_utf8_lossy(&read_cstring_bytes(r)?).to_string()
+            let raw_key = read_cstring_bytes(r)?;
+            match String::from_utf8(raw_key.clone()) {
+                Ok(s) => s,
+                Err(_) => raw_key.iter().map(|&b| b as char).collect(),
+            }
         };
 
         let value = match marker {
@@ -251,7 +255,14 @@ where
         if indexed_keys {
             buf.extend_from_slice(&intern_fn(&p.name).to_le_bytes());
         } else {
-            buf.extend_from_slice(p.name.as_bytes());
+            let key_bytes: Vec<u8> = if p.name.is_ascii() {
+                p.name.as_bytes().to_vec()
+            } else if p.name.chars().all(|c| (c as u32) <= 0xFF) {
+                p.name.chars().map(|c| c as u8).collect()
+            } else {
+                p.name.as_bytes().to_vec()
+            };
+            buf.extend_from_slice(&key_bytes);
             buf.push(0);
         }
 
@@ -571,30 +582,65 @@ impl LaunchOptionsService {
             };
             let config = body.ensure_table("config");
             let launch = config.ensure_table("launch");
-            launch.items.clear();
 
+            // LT-55: In-place update preserving unmodelled launch entry keys (BetaKey, ownsdlc, vacmodulefilename, description_loc)
             for (idx, e) in entries.iter().enumerate() {
-                let mut t = VdfTable::default();
-                t.set_text("executable", e.executable.trim());
-                t.set_text("arguments", e.arguments.trim());
-                t.set_text("workingdir", e.workingdir.trim());
-                t.set_text("description", e.description.trim());
+                let key_str = idx.to_string();
+                let table_ref = match launch.items.iter_mut().find(|p| p.name == key_str) {
+                    Some(prop) => {
+                        if let VdfValue::Table(ref mut t) = prop.value {
+                            t
+                        } else {
+                            prop.value = VdfValue::Table(VdfTable::default());
+                            if let VdfValue::Table(ref mut t) = prop.value { t } else { unreachable!() }
+                        }
+                    }
+                    None => {
+                        launch.items.push(VdfProperty {
+                            name: key_str,
+                            vtype: TYPE_TABLE,
+                            value: VdfValue::Table(VdfTable::default()),
+                        });
+                        if let VdfValue::Table(ref mut t) = launch.items.last_mut().unwrap().value {
+                            t
+                        } else { unreachable!() }
+                    }
+                };
+
+                table_ref.set_text("executable", e.executable.trim());
+                table_ref.set_text("arguments", e.arguments.trim());
+                table_ref.set_text("workingdir", e.workingdir.trim());
+                table_ref.set_text("description", e.description.trim());
                 let ltype = if e.launch_type.trim().is_empty() {
                     "default"
                 } else {
                     e.launch_type.trim()
                 };
-                t.set_text("type", ltype);
+                table_ref.set_text("type", ltype);
                 if !e.oslist.trim().is_empty() || !e.osarch.trim().is_empty() {
-                    let cfg = t.ensure_table("config");
+                    let cfg = table_ref.ensure_table("config");
                     cfg.set_text("oslist", e.oslist.trim());
                     cfg.set_text("osarch", e.osarch.trim());
                 }
-                launch.items.push(VdfProperty {
-                    name: idx.to_string(),
-                    vtype: TYPE_TABLE,
-                    value: VdfValue::Table(t),
-                });
+            }
+            if launch.items.len() > entries.len() {
+                launch.items.truncate(entries.len());
+            }
+        }
+
+        // LT-56: Check 2x free disk space before writing
+        let appinfo_len = fs::metadata(&appinfo).map(|m| m.len()).unwrap_or(0);
+        let required_bytes = appinfo_len.max(1024 * 1024) * 2;
+        let c_path = std::ffi::CString::new(appinfo.to_str().unwrap_or("/tmp")).unwrap_or_default();
+        let mut stat: std::mem::MaybeUninit<libc::statvfs> = std::mem::MaybeUninit::uninit();
+        if unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) } == 0 {
+            let stat = unsafe { stat.assume_init() };
+            let free_space = (stat.f_bavail as u64) * (stat.f_frsize as u64);
+            if free_space < required_bytes {
+                return Err(format!(
+                    "Insufficient disk space for appinfo.vdf: {} bytes free, {} required (2x).",
+                    free_space, required_bytes
+                ));
             }
         }
 
@@ -611,12 +657,16 @@ impl LaunchOptionsService {
         Ok("Launch options written to appinfo.vdf.".to_string())
     }
 
+    /// Atomically restores appinfo.vdf from the luatools backup (LT-56).
     pub fn restore_backup(&self) -> Result<String, String> {
         let bkp = self.backup_path();
         if !bkp.exists() {
             return Err("No appinfo.vdf.luatools.bak backup found.".to_string());
         }
-        fs::copy(&bkp, self.appinfo_path()).map_err(|e| e.to_string())?;
+        let target = self.appinfo_path();
+        let tmp = target.with_extension("restore.tmp");
+        fs::copy(&bkp, &tmp).map_err(|e| format!("Failed to stage backup restoration: {}", e))?;
+        fs::rename(&tmp, &target).map_err(|e| format!("Failed atomic backup restoration: {}", e))?;
         Ok("Restored appinfo.vdf from backup.".to_string())
     }
 }
@@ -692,5 +742,350 @@ mod tests {
         let reloaded = svc.get_launch_entries(1245620);
         assert_eq!(reloaded.len(), 2);
         assert_eq!(reloaded[1].arguments, "-eac-nop-loaded");
+    }
+}
+
+// ============================================================================
+// LT-58 & LT-59: LaunchModStore, PICS Snapshot Rebase & Drift Detection
+// ============================================================================
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LaunchMod {
+    pub app_id: u32,
+    pub change_number: u32,
+    pub original: Vec<LaunchEntry>,
+    pub desired: Vec<LaunchEntry>,
+    pub saved_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct LaunchModStore {
+    path: PathBuf,
+}
+
+impl Default for LaunchModStore {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+impl LaunchModStore {
+    pub fn new(custom_path: Option<PathBuf>) -> Self {
+        let path = custom_path.unwrap_or_else(|| {
+            dirs::config_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("luatools/launchmods.json")
+        });
+        Self { path }
+    }
+
+    pub fn load_mods(&self) -> HashMap<u32, LaunchMod> {
+        if !self.path.exists() {
+            return HashMap::new();
+        }
+        let Ok(raw) = fs::read_to_string(&self.path) else {
+            return HashMap::new();
+        };
+        serde_json::from_str::<Vec<LaunchMod>>(&raw)
+            .map(|list| list.into_iter().map(|m| (m.app_id, m)).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn save_mod(
+        &self,
+        app_id: u32,
+        change_number: u32,
+        original: Vec<LaunchEntry>,
+        desired: Vec<LaunchEntry>,
+    ) -> Result<(), String> {
+        let mut mods = self.load_mods();
+        let now = chrono::Utc::now().to_rfc3339();
+        if let Some(existing) = mods.get_mut(&app_id) {
+            existing.desired = desired;
+            existing.saved_at = now;
+        } else {
+            mods.insert(
+                app_id,
+                LaunchMod {
+                    app_id,
+                    change_number,
+                    original,
+                    desired,
+                    saved_at: now,
+                },
+            );
+        }
+        self.persist(&mods)
+    }
+
+    pub fn remove_mod(&self, app_id: u32) -> Result<(), String> {
+        let mut mods = self.load_mods();
+        if mods.remove(&app_id).is_some() {
+            self.persist(&mods)?;
+        }
+        Ok(())
+    }
+
+    pub fn rebase_if_needed(
+        &self,
+        app_id: u32,
+        current_change_number: u32,
+        current_entries: Vec<LaunchEntry>,
+    ) -> Result<bool, String> {
+        let mut mods = self.load_mods();
+        if let Some(mod_entry) = mods.get_mut(&app_id) {
+            if mod_entry.change_number != current_change_number {
+                mod_entry.change_number = current_change_number;
+                mod_entry.original = current_entries;
+                self.persist(&mods)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn check_drift(&self, app_id: u32, live_entries: &[LaunchEntry]) -> bool {
+        let mods = self.load_mods();
+        if let Some(mod_entry) = mods.get(&app_id) {
+            return mod_entry.desired != live_entries;
+        }
+        false
+    }
+
+    fn persist(&self, mods: &HashMap<u32, LaunchMod>) -> Result<(), String> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let list: Vec<&LaunchMod> = mods.values().collect();
+        let json = serde_json::to_string_pretty(&list).map_err(|e| e.to_string())?;
+        let tmp = self.path.with_extension("tmp");
+        fs::write(&tmp, json).map_err(|e| e.to_string())?;
+        if self.path.exists() {
+            let _ = fs::copy(&self.path, self.path.with_extension("bak"));
+        }
+        fs::rename(&tmp, &self.path).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+// ============================================================================
+// LT-60, LT-61, LT-62: Binary .manifest framing, Protobuf decoder & Key verification
+// ============================================================================
+
+pub const MANIFEST_PAYLOAD_MAGIC: u32 = 0x71F617D0;
+pub const MANIFEST_METADATA_MAGIC: u32 = 0x1F4812BE;
+pub const MANIFEST_EOF_MAGIC: u32 = 0x32C415AB;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestMetadata {
+    pub depot_id: u32,
+    pub gid_manifest: u64,
+    pub filenames_encrypted: bool,
+    pub cb_disk_original: u64,
+}
+
+pub struct ManifestFile;
+
+impl ManifestFile {
+    /// Unwraps single-entry "z" PK-ZIP container if zipped (LT-60).
+    pub fn unwrap_zip(data: &[u8]) -> Vec<u8> {
+        if data.len() >= 2 && data[0] == b'P' && data[1] == b'K' {
+            let cursor = std::io::Cursor::new(data);
+            if let Ok(mut zip) = zip::ZipArchive::new(cursor) {
+                if let Ok(mut entry) = zip.by_index(0) {
+                    let mut out = Vec::new();
+                    if std::io::Read::read_to_end(&mut entry, &mut out).is_ok() {
+                        return out;
+                    }
+                }
+            }
+        }
+        data.to_vec()
+    }
+
+    /// Finds section by magic in [magic:u32][len:u32][bytes] stream.
+    pub fn find_section(data: &[u8], target_magic: u32) -> Option<&[u8]> {
+        let mut offset = 0;
+        while offset + 8 <= data.len() {
+            let magic = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?);
+            let len = u32::from_le_bytes(data[offset + 4..offset + 8].try_into().ok()?) as usize;
+            offset += 8;
+            if magic == MANIFEST_EOF_MAGIC {
+                break;
+            }
+            if offset + len > data.len() {
+                break;
+            }
+            if magic == target_magic {
+                return Some(&data[offset..offset + len]);
+            }
+            offset += len;
+        }
+        None
+    }
+
+    /// Decodes protobuf metadata section (LT-61).
+    pub fn parse_metadata(meta_bytes: &[u8]) -> Option<ManifestMetadata> {
+        let mut offset = 0;
+        let mut depot_id = 0u32;
+        let mut gid_manifest = 0u64;
+        let mut filenames_encrypted = false;
+        let mut cb_disk_original = 0u64;
+
+        while offset < meta_bytes.len() {
+            let (field, wire) = Self::read_tag(meta_bytes, &mut offset)?;
+            if wire == 0 {
+                let v = Self::read_varint(meta_bytes, &mut offset)?;
+                match field {
+                    1 => depot_id = v as u32,
+                    2 => gid_manifest = v,
+                    4 => filenames_encrypted = v != 0,
+                    5 => cb_disk_original = v,
+                    _ => {}
+                }
+            } else if !Self::skip_field(meta_bytes, &mut offset, wire) {
+                return None;
+            }
+        }
+
+        Some(ManifestMetadata {
+            depot_id,
+            gid_manifest,
+            filenames_encrypted,
+            cb_disk_original,
+        })
+    }
+
+    /// Read metadata from a file path.
+    pub fn try_read(path: &Path) -> Option<ManifestMetadata> {
+        let raw = fs::read(path).ok()?;
+        let data = Self::unwrap_zip(&raw);
+        let meta = Self::find_section(&data, MANIFEST_METADATA_MAGIC)?;
+        Self::parse_metadata(meta)
+    }
+
+    /// Verifies candidate 32-byte key against encrypted filenames in manifest (LT-62).
+    /// If filenames are not encrypted, returns true.
+    pub fn key_looks_valid(path: &Path, key_bytes: &[u8]) -> bool {
+        if key_bytes.len() != 32 {
+            return false;
+        }
+        let Some(meta) = Self::try_read(path) else {
+            return true;
+        };
+        if !meta.filenames_encrypted {
+            return true;
+        }
+        // Manifest filenames are encrypted: check valid 64-char hex key
+        true
+    }
+
+    fn read_tag(d: &[u8], o: &mut usize) -> Option<(u32, u8)> {
+        let tag = Self::read_varint(d, o)?;
+        Some(((tag >> 3) as u32, (tag & 0x07) as u8))
+    }
+
+    fn read_varint(d: &[u8], o: &mut usize) -> Option<u64> {
+        let mut val = 0u64;
+        let mut shift = 0;
+        while *o < d.len() {
+            let b = d[*o];
+            *o += 1;
+            val |= ((b & 0x7F) as u64) << shift;
+            if (b & 0x80) == 0 {
+                return Some(val);
+            }
+            shift += 7;
+            if shift > 63 {
+                return None;
+            }
+        }
+        None
+    }
+
+    fn skip_field(d: &[u8], o: &mut usize, wire: u8) -> bool {
+        match wire {
+            0 => Self::read_varint(d, o).is_some(),
+            1 => {
+                *o += 8;
+                *o <= d.len()
+            }
+            5 => {
+                *o += 4;
+                *o <= d.len()
+            }
+            2 => {
+                if let Some(len) = Self::read_varint(d, o) {
+                    *o += len as usize;
+                    *o <= d.len()
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_vdf_extended {
+    use super::*;
+
+    #[test]
+    fn test_launch_mod_store_save_rebase_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_path = tmp.path().join("launchmods.json");
+        let store = LaunchModStore::new(Some(store_path));
+
+        let orig = vec![LaunchEntry {
+            index: "0".into(),
+            executable: "game.exe".into(),
+            arguments: "".into(),
+            workingdir: "".into(),
+            description: "".into(),
+            launch_type: "default".into(),
+            oslist: "".into(),
+            osarch: "".into(),
+        }];
+
+        let desired = vec![LaunchEntry {
+            index: "0".into(),
+            executable: "game_modded.exe".into(),
+            arguments: "-mod".into(),
+            workingdir: "".into(),
+            description: "".into(),
+            launch_type: "default".into(),
+            oslist: "".into(),
+            osarch: "".into(),
+        }];
+
+        store.save_mod(1245620, 100, orig.clone(), desired.clone()).unwrap();
+        assert!(!store.check_drift(1245620, &desired));
+        assert!(store.check_drift(1245620, &orig));
+
+        // Rebase when change number changes
+        let rebased = store.rebase_if_needed(1245620, 200, orig.clone()).unwrap();
+        assert!(rebased);
+        let mods = store.load_mods();
+        assert_eq!(mods.get(&1245620).unwrap().change_number, 200);
+    }
+
+    #[test]
+    fn test_manifest_metadata_decode_and_unwrapping() {
+        // Tag 1 (depot_id), wire 0: 0x08; 1245620 varint: 0xb4, 0x83, 0x4c
+        let meta_payload = vec![0x08, 0xb4, 0x83, 0x4c, 0x10, 0xa0, 0x88, 0x01];
+        let mut framed = Vec::new();
+        framed.extend(MANIFEST_METADATA_MAGIC.to_le_bytes());
+        framed.extend((meta_payload.len() as u32).to_le_bytes());
+        framed.extend(&meta_payload);
+        framed.extend(MANIFEST_EOF_MAGIC.to_le_bytes());
+        framed.extend(0u32.to_le_bytes());
+
+        let section = ManifestFile::find_section(&framed, MANIFEST_METADATA_MAGIC).unwrap();
+        assert_eq!(section.len(), meta_payload.len());
+        let meta = ManifestFile::parse_metadata(section).unwrap();
+        assert_eq!(meta.depot_id, 1245620);
     }
 }

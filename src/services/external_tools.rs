@@ -1,5 +1,6 @@
 //! ExternalToolsManager — inspects, updates, and launches `DepotDownloaderMod`,
 //! `Goldberg Emulator`, `SteamAutoPatch`, and `StubRemover` with Linux `wine` / `dotnet` wrappers.
+use crate::services::file_hash::FileHashService;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -379,9 +380,15 @@ impl ExternalToolsManager {
                 let extract_res = extract_archive(&archive_path, &tool_dir);
                 let _ = fs::remove_file(&archive_path);
                 if let Err(e) = extract_res {
-                    last_err = Some(format!("Extraction failed ({}): {}", repo, e));
-                    dl_failed = true;
-                    break;
+                    // LNX-08: If Goldberg Windows .7z archive cannot be extracted because 7z is missing on host,
+                    // do not abort the overall Linux Goldberg install
+                    if key == "goldberg" && safe_aname.ends_with(".7z") {
+                        log::warn!("Could not extract Goldberg Windows archive {}: {} (proceeding with Linux binaries)", safe_aname, e);
+                    } else {
+                        last_err = Some(format!("Extraction failed ({}): {}", repo, e));
+                        dl_failed = true;
+                        break;
+                    }
                 }
             }
 
@@ -389,6 +396,11 @@ impl ExternalToolsManager {
                 continue;
             }
 
+            // LT-49: Record file integrity hash using FileHashService
+            if let Some(exe_found) = self.inspect_tool(key).exe_path {
+                let fhs = FileHashService::new();
+                let _ = fhs.hash_file(&exe_found, exe_found.file_name().and_then(|s| s.to_str()).unwrap_or("tool"));
+            }
             if key == "goldberg" {
                 stage_goldberg_layout(&tool_dir, &self.goldberg_root());
             }

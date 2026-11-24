@@ -7,6 +7,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use crate::services::external_tools::ExternalToolsManager;
 
 use crate::services::depot_downloader::DepotDownloaderService;
 
@@ -19,6 +20,10 @@ pub struct SteamlessResult {
 }
 
 impl SteamlessResult {
+    pub fn is_success(&self) -> bool {
+        self.error.is_none() && self.patched > 0
+    }
+
     pub fn failed(&self) -> bool {
         self.error.is_some()
     }
@@ -98,7 +103,11 @@ impl SteamlessService {
 
     /// Ensure the Steamless CLI tool is available.
     /// Returns the path to the CLI executable, or None if not available.
-    pub async fn ensure_tool(&self) -> Option<PathBuf> {
+    pub fn ensure_tool(&self) -> Option<PathBuf> {
+        let mgr = ExternalToolsManager::new(Some(self.tools_dir.clone()));
+        if let Some(exe) = mgr.inspect_tool("stub_remover").exe_path {
+            return Some(exe);
+        }
         if let Some(p) = self.find_cli_in_dir(&self.tools_dir) {
             return Some(p);
         }
@@ -119,10 +128,10 @@ impl SteamlessService {
         None
     }
 
-    /// Process game executables.
-    /// Returns the number of patched executables, unchanged executables, and total count.
-    pub async fn patch_game(&self, _app_id: u32, install_path: &Path) -> SteamlessResult {
-        let cli = match self.ensure_tool().await {
+    /// Process game executables synchronously via ExternalToolsManager / Steamless CLI.
+    /// Returns the number of patched executables, unchanged executables, and total count (LT-69).
+    pub fn patch_game(&self, _app_id: u32, install_path: &Path) -> SteamlessResult {
+        let cli = match self.ensure_tool() {
             Some(p) => p,
             None => {
                 return SteamlessResult {
@@ -360,5 +369,23 @@ mod tests {
             unpacked_output_path(Path::new("/games/MyGame.v2.exe")),
             PathBuf::from("/games/MyGame.v2.exe.unpacked.exe")
         );
+    }
+
+    #[test]
+    fn test_patch_game_synchronous_execution_returns_summary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dd = DepotDownloaderService::new(Some(tmp.path().join("dd")));
+        let tools_dir = tmp.path().join("steamless");
+        fs::create_dir_all(&tools_dir).unwrap();
+        let svc = SteamlessService::with_tools_dir(dd, tools_dir);
+
+        let game_dir = tmp.path().join("game");
+        fs::create_dir_all(&game_dir).unwrap();
+
+        // When tool is not found, patch_game returns a clear error synchronously
+        let res = svc.patch_game(1245620, &game_dir);
+        assert!(!res.is_success());
+        assert_eq!(res.patched, 0);
+        assert!(res.error.is_some());
     }
 }
