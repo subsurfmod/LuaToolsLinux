@@ -1,11 +1,12 @@
 //! Interop IPC - IClientUser Interface Handlers
 //!
 //! Linux port of usefulsteamtools Interop_IPC_ISteamUser.cpp
-//! Uses memory_patch.rs for inline hooking and pattern_db.rs for symbol resolution.
-//! Integrates with ipc.rs for IPC message handling.
-
+//! Uses memory_patch.rs for inline hooking (14-byte absolute indirect jumps)
+//! and pattern_db.rs for symbol resolution.
+//! Integrates with ipc.rs for IPC message handling and ticket_store.rs for credentials.
+//! Follows bridge_lib.rs pattern: catch_unwind panic safety, OnceLock/RwLock for globals.
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::ffi::c_void;
 
 use crate::steam_bridge::memory_patch::{MemoryPatch, JMP_ABS64_LEN};
@@ -14,9 +15,10 @@ use crate::steam_bridge::binary_reader::BinaryFile;
 use crate::steam_bridge::ipc::{IpcMessage, IpcServer, IpcClient, IpcHandlerFn};
 use crate::steam_bridge::ticket_store::TicketStore;
 use crate::steam_bridge::ost_platform::dynamic_library::{get_loaded, get_symbol};
-use crate::steam_bridge::interop::interop_ipc::{
-    EIPCCommand, EIPCInterface, IpcHandlerEntry, ResolvedHandler,
-    IPCProcessMessageFn, call_original,
+use crate::steam_bridge::ost_platform::byte_search::find_in_file;
+use crate::steam_bridge::interop::ipc::{
+    EIPCInterface, ResolvedHandler, IPCProcessMessageFn, call_original,
+    make_handler, fnv1a_hash,
 };
 use crate::steam_bridge::interop::interop_misc::{
     resolve_app_id, is_online_fix_active, notify_networking_sockets_used,
@@ -36,7 +38,18 @@ pub const ONLINE_FIX_APP_ID: u32 = 480;
 
 /// Install IClientUser IPC handlers
 /// This is called during InteropIPC initialization
+/// Also installs memory patches to redirect IClientUser calls to our handlers
 pub fn install_iclientuser_handlers() -> Result<(), String> {
+    // First, install memory patches that redirect the IClientUser calls
+    // to our handler logic via trampolines
+    let patches = install_iclientuser_patches()?;
+
+    // Store patches for cleanup
+    IPC_PATCHES.get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .extend(patches);
+
     // Register default IClientUser handlers
     register_handler(
         "IClientUser",
@@ -66,8 +79,86 @@ pub fn install_iclientuser_handlers() -> Result<(), String> {
         Some(Box::new(handler_post_get_encrypted_app_ticket)),
     )?;
 
-    log::info!("[InteropIPC_ISteamUser] Installed 4 IClientUser handlers");
+    log::info!("[InteropIPC_ISteamUser] Installed 4 IClientUser handlers and {} memory patches",
+        IPC_PATCHES.get_or_init(|| Mutex::new(Vec::new())).lock().unwrap().len());
     Ok(())
+}
+
+/// Install memory patches for IClientUser interface redirection
+/// Uses pattern_db.rs to resolve function addresses by byte pattern from steam-monitor TOML
+fn install_iclientuser_patches() -> Result<Vec<MemoryPatch>, String> {
+    let mut patches = Vec::new();
+
+    // Get steamclient.so base address
+    let steam_client = get_loaded("steamclient.so");
+    let steam_client = if steam_client.is_null() {
+        get_loaded("steamclient64.so")
+    } else {
+        steam_client
+    };
+
+    if steam_client.is_null() {
+        return Err("steamclient.so not loaded in process".into());
+    }
+
+    let steam_client_base = steam_client as u64;
+
+    // Get pattern database
+    let pattern_db = pattern_db();
+
+    // Open steamclient.so to get its SHA256 for pattern lookup
+    let binary = BinaryFile::open("steamclient.so")
+        .map_err(|e| format!("Failed to open steamclient.so: {}", e))?;
+
+    let pattern_file = pattern_db.lookup_by_binary(
+        &binary,
+        PatternChannel::Ipc,
+        BinaryComponent::SteamClient,
+    ).map_err(|e| format!("Failed to lookup pattern: {}", e))?;
+
+    // Install patches for each IClientUser method
+    let methods = [
+        ("GetSteamID", handler_post_get_steam_id as *mut c_void as usize),
+        ("GetAppOwnershipTicketExtendedData", handler_post_get_app_ownership_ticket as *mut c_void as usize),
+        ("RequestEncryptedAppTicket", handler_post_request_encrypted_app_ticket as *mut c_void as usize),
+        ("GetEncryptedAppTicket", handler_post_get_encrypted_app_ticket as *mut c_void as usize),
+    ];
+
+    for (method_name, replacement) in &methods {
+        let method_key = format!("IClientUser::{}", method_name);
+        let entry = pattern_file.patterns.get(&method_key)
+            .ok_or_else(|| format!("No IPC spec for {}", method_key))?;
+
+        let func_addr = if let Some(addr) = entry.address {
+            addr
+        } else if let Some(offset) = entry.offset {
+            steam_client_base.saturating_add(offset as u64)
+        } else if let Some(pattern) = &entry.pattern {
+            // Scan for pattern in steamclient.so
+            let pattern_bytes = hex::decode(pattern).map_err(|e| format!("Invalid pattern hex: {}", e))?;
+            let found = find_in_file(
+                std::path::Path::new("steamclient.so"), &pattern_bytes, 4096
+            ).ok_or_else(|| format!("Pattern '{}' not found in steamclient.so", method_name))?;
+            found
+        } else {
+            continue;
+        };
+
+        let target = func_addr as *mut u8;
+        let mut patch = unsafe { MemoryPatch::new(target, replacement as *mut u8) };
+
+        // Validate the target is executable
+        if !crate::steam_bridge::memory_patch::is_executable_mapped_range(func_addr, JMP_ABS64_LEN) {
+            log::warn!("Skipping patch for {}: target not in executable memory", method_name);
+            continue;
+        }
+
+        unsafe { patch.install(JMP_ABS64_LEN).map_err(|e| format!("Failed to install patch for {}: {}", method_name, e)) }?;
+        patches.push(patch);
+        log::info!("[InteropIPC_ISteamUser] Installed memory patch for IClientUser::{}, target=0x{:X}", method_name, func_addr);
+    }
+
+    Ok(patches)
 }
 
 /// Get or initialize the fresh eticket cache
@@ -100,112 +191,6 @@ fn resolve_app_id_caller() -> u32 {
 /// Check if app has depot configured
 fn has_depot(app_id: u32) -> bool {
     app_id == ONLINE_FIX_APP_ID || app_id > 0
-}
-
-/// Get app ownership ticket from credential store
-fn get_app_ownership_ticket(app_id: u32) -> Option<AppOwnershipTicket> {
-    // Would integrate with AppTicket module
-    // Simplified: return None for now
-    None
-}
-
-/// Get encrypted ticket from credential store
-fn get_encrypted_ticket_from_store(app_id: u32) -> Vec<u8> {
-    TicketStore::global().get_encrypted_ticket(app_id).unwrap_or_default()
-}
-
-/// Record async call for encrypted ticket
-fn record_encrypted_ticket(async_call: u64, app_id: u32) {
-    TicketStore::global().record_async_call(async_call, app_id);
-}
-
-/// Take encrypted ticket for async call
-fn take_encrypted_ticket(async_call: u64) -> u32 {
-    TicketStore::global().take_async_call(async_call).unwrap_or(0)
-}
-
-/// Ensure buffer capacity for write
-fn ensure_buffer_capacity_fn(write: &mut [u8], needed: u32) -> bool {
-    write.len() >= needed as usize
-}
-
-/// Compute simple hash for interface::method
-fn compute_func_hash(interface: &str, method: &str) -> u32 {
-    // Simple hash: FNV-1a using std hasher
-    let mut hash: u64 = 0x811c9dc5;
-    let prime: u64 = 0x01000193;
-
-    // Hash interface string
-    for byte in interface.bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(prime);
-    }
-
-    // Hash method separator
-    for byte in "::".bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(prime);
-    }
-
-    // Hash method string
-    for byte in method.bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(prime);
-    }
-
-    hash as u32
-}
-
-/// Register an IPC handler for IClientUser interface
-fn register_handler(
-    interface_name: &str,
-    method_name: &str,
-    pre: Option<Box<dyn Fn(*mut c_void, &mut [u8], &mut [u8]) -> bool + Send + Sync>>,
-    post: Option<Box<dyn Fn(*mut c_void, &mut [u8], &mut [u8]) -> bool + Send + Sync>>,
-) -> Result<(), String> {
-    // Open steamclient.so to get its SHA256 for pattern lookup
-    let binary = BinaryFile::open("steamclient.so")
-        .map_err(|e| format!("Failed to open steamclient.so: {}", e))?;
-
-    let pattern_file = pattern_db().lookup_by_binary(
-        &binary,
-        PatternChannel::Ipc,
-        BinaryComponent::SteamClient,
-    ).map_err(|e| format!("Failed to lookup pattern: {}", e))?;
-
-    let method_key = format!("{}::{}", interface_name, method_name);
-    let entry = pattern_file.patterns.get(&method_key)
-        .ok_or_else(|| format!("No IPC spec for {}", method_key))?;
-
-    let interface_id = match interface_name {
-        "IClientUser" => EIPCInterface::IClientUser,
-        _ => return Err(format!("Unknown interface: {}", interface_name)),
-    };
-
-    let func_hash = compute_func_hash(interface_name, method_name);
-
-    let handler = ResolvedHandler {
-        interface_id,
-        func_hash,
-        name: method_key,
-        fencepost: entry.fencepost.unwrap_or(0) as u32,
-        argc: entry.argc.unwrap_or(0) as u32,
-        pre_handler: pre,
-        post_handler: post,
-    };
-
-    // Add to handler registry
-    HANDLER_REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
-        .lock().unwrap()
-        .push(handler);
-
-    Ok(())
-}
-
-/// Get the handler registry
-fn handler_registry() -> &'static Mutex<Vec<ResolvedHandler>> {
-    static REGISTRY: OnceLock<Mutex<Vec<ResolvedHandler>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -350,7 +335,7 @@ fn handler_post_request_encrypted_app_ticket(_pipe: *mut c_void, read: &mut [u8]
     let async_call = resp.return_value();
     record_encrypted_ticket(async_call, app_id);
     log::debug!("[InteropIPC] RequestEncryptedAppTicket: AppId={} hAsyncCall=0x{:X} - recorded (fresh={})",
-                app_id, async_call, have_fresh);
+            app_id, async_call, have_fresh);
     true
 }
 
@@ -378,8 +363,8 @@ fn handler_post_get_encrypted_app_ticket(_pipe: *mut c_void, _read: &mut [u8], w
         return false;
     }
 
-    log::debug!("[InteropIPC] GetEncryptedAppTicket: AppId={} serving source={}", app_id,
-                if from_fresh { "fresh" } else { "store" });
+    log::debug!("[InteropIPC] GetEncryptedAppTicket: AppId={} source={}", app_id,
+            if from_fresh { "fresh" } else { "store" });
 
     let ticket_size = ticket.len() as u32;
     if !ensure_buffer_capacity_fn(write, ticket_size) {
@@ -402,7 +387,7 @@ fn handler_post_get_encrypted_app_ticket(_pipe: *mut c_void, _read: &mut [u8], w
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Helper functions and types
-// ══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
 
 /// Ticket source for app ownership
 enum AppTicketSource {
@@ -429,7 +414,54 @@ fn fetch_fresh_eticket(_app_id: u32, _nonce: &[u8], _existing_steam_id: u64) -> 
     None
 }
 
-// ══════════════════════════════════════════════════════════════════════════
+/// Get encrypted ticket from credential store
+fn get_encrypted_ticket_from_store(app_id: u32) -> Vec<u8> {
+    TicketStore::global().get_encrypted_ticket(app_id).unwrap_or_default()
+}
+
+/// Record async call for encrypted ticket
+fn record_encrypted_ticket(async_call: u64, app_id: u32) {
+    TicketStore::global().record_async_call(async_call, app_id);
+}
+
+/// Take encrypted ticket for async call
+fn take_encrypted_ticket(async_call: u64) -> u32 {
+    TicketStore::global().take_async_call(async_call).unwrap_or(0)
+}
+
+/// Ensure buffer capacity for write
+fn ensure_buffer_capacity_fn(write: &mut [u8], needed: u32) -> bool {
+    write.len() >= needed as usize
+}
+
+/// Compute simple hash for interface::method
+fn compute_func_hash(interface: &str, method: &str) -> u32 {
+    // Simple hash: FNV-1a using std hasher
+    let mut hash: u64 = 0x811c9dc5;
+    let prime: u64 = 0x01000193;
+
+    // Hash interface string
+    for byte in interface.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(prime);
+    }
+
+    // Hash method separator
+    for byte in "::".bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(prime);
+    }
+
+    // Hash method string
+    for byte in method.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(prime);
+    }
+
+    hash as u32
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // IPC Request/Response Parsers
 // ═══════════════════════════════════════════════════════════════════════════
 

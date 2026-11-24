@@ -7,6 +7,7 @@ pub mod interop_ipc;
 pub mod interop_ipc_isteamuser;
 pub mod interop_ipc_isteamutils;
 pub mod interop_misc;
+pub mod ipc;
 
 pub use interop_ipc::{
     install as interop_ipc_install,
@@ -43,4 +44,18 @@ pub use interop_misc::{
     get_game_name_by_app_id,
     ensure_buffer_capacity,
     register_ipc_handlers,
+};
+
+pub use ipc::{
+    IpcInterface,
+    FuncHash,
+    IpcContext,
+    HandlerFn,
+    ResolvedHandler,
+    make_handler,
+    fnv1a_hash,
+    dispatch_ipc_message,
+    register_handler as ipc_register_handler,
+    register_handlers,
+    find_handler,
 };

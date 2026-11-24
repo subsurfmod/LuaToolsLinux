@@ -11,11 +11,9 @@ use std::os::raw::c_void;
 use std::path::Path;
 
 use crate::steam_bridge::memory_patch::{self, MemoryPatch, JMP_ABS64_LEN};
-use crate::steam_bridge::binary_reader::{BinaryFile, LoadedModuleMapping};
 use crate::steam_bridge::pattern_db::{BinaryComponent, PatternChannel, PatternDb};
 use crate::steam_bridge::ipc::IpcMessage;
-use crate::steam_bridge::interop::interop_ipc::ResolvedHandler;
-use crate::steam_bridge::ost_platform::remote_process;
+use crate::steam_bridge::binary_reader::{BinaryFile, LoadedModuleMapping};
 
 // ============================================================================
 // Constants from usefulsteamtools
@@ -24,17 +22,15 @@ use crate::steam_bridge::ost_platform::remote_process;
 pub const ONLINE_FIX_APP_ID: u32 = 480; // Spacewar
 
 // ============================================================================
-// Global state (replaces static globals in C++)
+// Global state (replaces static globals in C++) - using OnceLock/Mutex pattern
 // ============================================================================
 
-static ONLINE_FIX_REAL_APP_ID: OnceLock<Option<Mutex<u32>>> = OnceLock::new();
-static NETWORKING_SOCKETS_ACTIVE: OnceLock<Option<Mutex<bool>>> = OnceLock::new();
-static SUPPRESS_APP_ID_FLIP: OnceLock<Option<Mutex<bool>>> = OnceLock::new();
-static GAME_NAME_CACHE: OnceLock<Option<Mutex<HashMap<u32, String>>>> = OnceLock::new();
+static ONLINE_FIX_REAL_APP_ID: OnceLock<Mutex<Option<u32>>> = OnceLock::new();
+static NETWORKING_SOCKETS_ACTIVE: OnceLock<Mutex<Option<bool>>> = OnceLock::new();
+static SUPPRESS_APP_ID_FLIP: OnceLock<Mutex<Option<bool>>> = OnceLock::new();
+static GAME_NAME_CACHE: OnceLock<Mutex<HashMap<u32, String>>> = OnceLock::new();
 
-static INSTALLED_PATCHES: OnceLock<Mutex<Vec<MemoryPatch>>> = OnceLock::new();
-
-// Function pointers for trampolines
+// Function pointer storage
 static ORIGINAL_OPTED_IN_MASK: OnceLock<Mutex<Option<OptedInMaskFn>>> = OnceLock::new();
 static ORIGINAL_BUILD_SPAWN_ENV_BLOCK: OnceLock<Mutex<Option<BuildSpawnEnvBlockFn>>> = OnceLock::new();
 static ORIGINAL_GET_OR_ADD_APP_DATA: OnceLock<Mutex<Option<GetOrAddAppDataFn>>> = OnceLock::new();
@@ -42,9 +38,7 @@ static ORIGINAL_CUTL_BUFFER_ENSURE_CAPACITY: OnceLock<Mutex<Option<CUtlBufferEns
 static ORIGINAL_GET_APP_ID_FOR_CURRENT_PIPE: OnceLock<Mutex<Option<GetAppIdForCurrentPipeFn>>> = OnceLock::new();
 static ORIGINAL_GET_APP_DATA_FROM_APP_INFO: OnceLock<Mutex<Option<GetAppDataFromAppInfoFn>>> = OnceLock::new();
 
-static INSTALLED_IPC_HANDLERS: OnceLock<Mutex<HashMap<(IpcInterface, u32), ResolvedHandler>>> = OnceLock::new();
-
-// Pointers to captured 'this' pointers
+// Captured 'this' pointers
 static STEAM_ENGINE_PTR: OnceLock<Mutex<Option<*mut c_void>>> = OnceLock::new();
 static APP_INFO_CACHE_PTR: OnceLock<Mutex<Option<*mut c_void>>> = OnceLock::new();
 
@@ -62,50 +56,20 @@ type GetAppDataFromAppInfoFn = unsafe extern "C" fn(
 ) -> i64;
 
 // ============================================================================
-// Helper functions for global state
+// Helper function to lock OnceLock mutex safely, initializing if needed
 // ============================================================================
 
-fn online_fix_real_app_id() -> Option<&'static Mutex<u32>> {
-    ONLINE_FIX_REAL_APP_ID.get()
-}
-fn networking_sockets_active() -> Option<&'static Mutex<bool>> {
-    NETWORKING_SOCKETS_ACTIVE.get()
-}
-fn suppress_app_id_flip() -> Option<&'static Mutex<bool>> {
-    SUPPRESS_APP_ID_FLIP.get()
-}
-fn game_name_cache() -> Option<&'static Mutex<HashMap<u32, String>>> {
-    GAME_NAME_CACHE.get()
+fn init_once_lock<T>(once: &OnceLock<Mutex<Option<T>>>, value: T) -> MutexGuard<'_, Option<T>>
+where
+    T: Default,
+{
+    let _ = once.get_or_init(|| Mutex::new(None));
+    once.get().unwrap().lock().unwrap_or_else(|_| Mutex::new(None))
 }
 
-fn original_opted_in_mask() -> Option<&'static Mutex<Option<OptedInMaskFn>>> {
-    ORIGINAL_OPTED_IN_MASK.get()
-}
-fn original_build_spawn_env_block() -> Option<&'static Mutex<Option<BuildSpawnEnvBlockFn>>> {
-    ORIGINAL_BUILD_SPAWN_ENV_BLOCK.get()
-}
-fn original_get_or_add_app_data() -> Option<&'static Mutex<Option<GetOrAddAppDataFn>>> {
-    ORIGINAL_GET_OR_ADD_APP_DATA.get()
-}
-fn original_cutl_buffer_ensure_capacity() -> Option<&'static Mutex<Option<CUtlBufferEnsureCapacityFn>>> {
-    ORIGINAL_CUTL_BUFFER_ENSURE_CAPACITY.get()
-}
-fn original_get_app_id_for_current_pipe() -> Option<&'static Mutex<Option<GetAppIdForCurrentPipeFn>>> {
-    ORIGINAL_GET_APP_ID_FOR_CURRENT_PIPE.get()
-}
-fn original_get_app_data_from_app_info() -> Option<&'static Mutex<Option<GetAppDataFromAppInfoFn>>> {
-    ORIGINAL_GET_APP_DATA_FROM_APP_INFO.get()
-}
-
-fn installed_patches() -> Option<&'static Mutex<Vec<MemoryPatch>>> {
-    INSTALLED_PATCHES.get()
-}
-
-fn steam_engine_ptr() -> Option<&'static Mutex<Option<*mut c_void>>> {
-    STEAM_ENGINE_PTR.get()
-}
-fn app_info_cache_ptr() -> Option<&'static Mutex<Option<*mut c_void>>> {
-    APP_INFO_CACHE_PTR.get()
+fn get_once_lock<T>(once: &OnceLock<Mutex<Option<T>>>) -> MutexGuard<'_, Option<T>>
+{
+    once.get().expect("OnceLock not initialized").lock().unwrap()
 }
 
 // ============================================================================
@@ -116,18 +80,20 @@ fn app_info_cache_ptr() -> Option<&'static Mutex<Option<*mut c_void>>> {
 /// Called by CUser_BuildSpawnEnvBlock to compute Steam Input opt-in mask.
 /// With 480 (Spacewar), the spawned game inherits Spacewar's Steam Input opt-in.
 unsafe extern "C" fn opted_in_mask_replacement(this: *mut c_void, app_id: u32) -> i64 {
-    if let Some(real_app_id) = online_fix_real_app_id() {
-        let real = *real_app_id.lock().unwrap();
+    let real_app_id_guard = get_once_lock(&ONLINE_FIX_REAL_APP_ID);
+    if let Some(real) = *real_app_id_guard {
         if app_id == ONLINE_FIX_APP_ID && real != 0 {
             log::info!("OptedInMask: appid {} -> {}", app_id, real);
-            return call_original_opted_in_mask(this, real_app_id);
+            // Call original with the real appid
+            if let Some(original) = *ORIGINAL_OPTED_IN_MASK.get().unwrap() {
+                if let Some(orig_fn) = original.lock().unwrap().as_ref() {
+                    return orig_fn(this, real);
+                }
+            }
         }
     }
-    call_original_opted_in_mask(this, app_id)
-}
-
-unsafe fn call_original_opted_in_mask(this: *mut c_void, app_id: u32) -> i64 {
-    if let Some(original) = *original_opted_in_mask() {
+    // Fall through to original
+    if let Some(original) = *ORIGINAL_OPTED_IN_MASK.get().unwrap() {
         if let Some(orig_fn) = original.lock().unwrap().as_ref() {
             return orig_fn(this, app_id)
         }
@@ -151,22 +117,15 @@ unsafe extern "C" fn build_spawn_env_block_replacement(
     a10: u32,
     a11: u8,
 ) -> i64 {
-    let real_app_id = *online_fix_real_app_id().lock().unwrap();
-    if real_app_id != 0 && !p_overlay_cgame_id.is_null() {
-        // Check if overlay CGameID has appid 480
-        // This requires knowing CGameID layout - simplified check
-        log::info!("BuildSpawnEnvBlock: SetAppID in OverlayCGameID -> {}", real_app_id);
-        // In real impl, we'd call pOverlayCGameID->SetAppID(real_app_id)
+    let real_app_id_guard = get_once_lock(&ONLINE_FIX_REAL_APP_ID);
+    if let Some(real) = *real_app_id_guard {
+        if real != 0 && !p_overlay_cgame_id.is_null() {
+            log::info!("BuildSpawnEnvBlock: SetAppID in OverlayCGameID -> {}", real);
+            // In real impl, we'd call pOverlayCGameID->SetAppID(real_app_id)
+        }
     }
-    call_original_build_spawn_env_block(this, p_cgame_id, a3, env, p_overlay_cgame_id, a6, a7, a8, a9, a10, a11)
-}
-
-unsafe fn call_original_build_spawn_env_block(
-    this: *mut c_void, p_cgame_id: *mut c_void, a3: *mut c_void, env: *mut c_void,
-    p_overlay_cgame_id: *mut c_void, a6: *mut c_void, a7: i32,
-    a8: *mut c_void, a9: *mut c_void, a10: u32, a11: u8,
-) -> i64 {
-    if let Some(original) = original_build_spawn_env_block() {
+    // Call original
+    if let Some(original) = *ORIGINAL_BUILD_SPAWN_ENV_BLOCK.get().unwrap() {
         if let Some(orig_fn) = original.lock().unwrap().as_ref() {
             return orig_fn(this, p_cgame_id, a3, env, p_overlay_cgame_id, a6, a7, a8, a9, a10, a11)
         }
@@ -174,7 +133,7 @@ unsafe fn call_original_build_spawn_env_block(
     0
 }
 
-/// Hook: CAppInfoCache::GetOrAddAppData (commented out in source, but we implement it)
+/// Hook: CAppInfoCache::GetOrAddAppData
 /// Marks unresolved appinfo as skip_flag to bypass license update blocking.
 unsafe extern "C" fn get_or_add_app_data_replacement(
     cache: *mut c_void,
@@ -184,7 +143,6 @@ unsafe extern "C" fn get_or_add_app_data_replacement(
     let result = call_original_get_or_add_app_data(cache, app_id, create);
 
     // Check if this app is in our Lua config and has unresolved appinfo
-    // Simplified: would check crate::steam_bridge::lua_config::HasDepot(app_id, false)
     if !create {
         // In real impl: if HasDepot && pData && !create && pData->IsUnresolvedAppInfo()
         // { pData->bSkipFlag = true; }
@@ -192,8 +150,12 @@ unsafe extern "C" fn get_or_add_app_data_replacement(
     result
 }
 
-unsafe fn call_original_get_or_add_app_data(cache: *mut c_void, app_id: u32, create: bool) -> *mut c_void {
-    if let Some(original) = original_get_or_add_app_data() {
+unsafe fn call_original_get_or_add_app_data(
+    cache: *mut c_void,
+    app_id: u32,
+    create: bool,
+) -> *mut c_void {
+    if let Some(original) = *ORIGINAL_GET_OR_ADD_APP_DATA.get().unwrap() {
         if let Some(orig_fn) = original.lock().unwrap().as_ref() {
             let result = orig_fn(cache, app_id, create);
             return result;
@@ -209,7 +171,7 @@ unsafe extern "C" fn cutl_buffer_ensure_capacity_replacement(
     new_capacity: u32,
 ) -> *mut c_void {
     log::debug!("CUtlBufferEnsureCapacity: buffer={:p}, new_capacity={}", buffer, new_capacity);
-    if let Some(original) = *original_cutl_buffer_ensure_capacity().lock().unwrap() {
+    if let Some(original) = *ORIGINAL_CUTL_BUFFER_ENSURE_CAPACITY.get().unwrap() {
         original(buffer, new_capacity)
     } else {
         buffer
@@ -277,14 +239,14 @@ fn parse_hex_pattern(hex: &str) -> Vec<u8> {
 /// Returns the real AppID if -onlinefix is active, otherwise returns
 /// the AppID from the current pipe.
 pub fn get_app_id_for_current_pipe() -> u32 {
-    let real_app_id = *online_fix_real_app_id().lock().unwrap();
-    if real_app_id != 0 {
-        return real_app_id;
+    let real_app_id_guard = get_once_lock(&ONLINE_FIX_REAL_APP_ID);
+    if let Some(real) = *real_app_id_guard {
+        return *real;
     }
 
     // Would call original function with captured steam_engine_ptr
-    if let Some(original) = *original_get_app_id_for_current_pipe().lock().unwrap() {
-        if let Some(engine) = *steam_engine_ptr().lock().unwrap() {
+    if let Some(original) = *ORIGINAL_GET_APP_ID_FOR_CURRENT_PIPE.get().unwrap() {
+        if let Some(engine) = *STEAM_ENGINE_PTR.get().unwrap() {
             return unsafe { original(engine) };
         }
     }
@@ -294,27 +256,33 @@ pub fn get_app_id_for_current_pipe() -> u32 {
 /// Resolve the current AppID for the game being launched.
 /// Priority: onlinefix real appid > pipe appid
 pub fn resolve_app_id() -> u32 {
-    let real_app_id = *online_fix_real_app_id().lock().unwrap();
-    if real_app_id != 0 {
-        return real_app_id;
+    let real_app_id_guard = get_once_lock(&ONLINE_FIX_REAL_APP_ID);
+    if let Some(real) = *real_app_id_guard {
+        return *real;
     }
     get_app_id_for_current_pipe()
 }
 
 /// Check if -onlinefix game is currently active
 pub fn is_online_fix_active() -> bool {
-    *online_fix_real_app_id().lock().unwrap() != 0
+    let real_app_id_guard = get_once_lock(&ONLINE_FIX_REAL_APP_ID);
+    if let Some(real) = *real_app_id_guard {
+        return *real != 0;
+    }
+    false
 }
 
 /// Mark that SteamNetworkingSockets P2P is active for this session.
 /// This causes GetAppID to report 480 for certificate matching.
 pub fn notify_networking_sockets_used() {
-    let real_app_id = *online_fix_real_app_id().lock().unwrap();
-    if real_app_id != 0 {
-        let mut active = networking_sockets_active().lock().unwrap();
-        if !*active {
-            *active = true;
-            log::info!("NetworkingSockets active: GetAppID now reports 480 for cert match");
+    let real_app_id_guard = get_once_lock(&ONLINE_FIX_REAL_APP_ID);
+    if let Some(real) = *real_app_id_guard {
+        if *real != 0 {
+            let mut active = get_once_lock(&NETWORKING_SOCKETS_ACTIVE);
+            if !*active {
+                *active = true;
+                log::info!("NetworkingSockets active: GetAppID now reports 480 for cert match");
+            }
         }
     }
 }
@@ -322,21 +290,32 @@ pub fn notify_networking_sockets_used() {
 /// Should GetAppID report 480 (onlinefix appid) for P2P certificate matching?
 /// Returns false if -realappid was specified on command line.
 pub fn should_report_online_fix_app_id() -> bool {
-    if *suppress_app_id_flip().lock().unwrap() {
-        return false;
+    let suppress_guard = get_once_lock(&SUPPRESS_APP_ID_FLIP);
+    if let Some(suppress) = *suppress_guard {
+        if suppress {
+            return false;
+        }
     }
-    *online_fix_real_app_id().lock().unwrap() != 0 && *networking_sockets_active().lock().unwrap()
+    let real_app_id_guard = get_once_lock(&ONLINE_FIX_REAL_APP_ID);
+    if let Some(real) = *real_app_id_guard {
+        if *real != 0 {
+            let active = get_once_lock(&NETWORKING_SOCKETS_ACTIVE);
+            return *active;
+        }
+    }
+    false
 }
 
 /// Set whether to suppress the appid flip (corresponds to -realappid launch option)
 pub fn set_suppress_app_id_flip(suppress: bool) {
-    *suppress_app_id_flip().lock().unwrap() = suppress;
+    if let Some(guard) = SUPPRESS_APP_ID_FLIP.get() {
+        *guard.lock().unwrap() = Some(suppress);
+    }
 }
 
 /// Ensure CUtlBuffer has sufficient capacity (for ticket responses)
 pub fn ensure_buffer_capacity(buffer: *mut c_void, new_capacity: u32, update_put: bool) -> bool {
-    // Would call original CUtlBufferEnsureCapacity
-    if let Some(original) = *original_cutl_buffer_ensure_capacity().lock().unwrap() {
+    if let Some(original) = *ORIGINAL_CUTL_BUFFER_ENSURE_CAPACITY.get().unwrap() {
         unsafe { original(buffer, new_capacity); };
         true
     } else {
@@ -346,7 +325,7 @@ pub fn ensure_buffer_capacity(buffer: *mut c_void, new_capacity: u32, update_put
 
 /// Get game name by AppID (with caching)
 pub fn get_game_name_by_app_id(app_id: u32) -> String {
-    let mut cache = game_name_cache().lock().unwrap();
+    let mut cache = get_once_lock(&GAME_NAME_CACHE);
     if let Some(name) = cache.get(&app_id) {
         return name.clone();
     }
@@ -366,7 +345,7 @@ pub fn get_game_name_by_app_id(app_id: u32) -> String {
 pub async fn install(steam_root: &Path) -> Result<(), String> {
     log::info!("Installing InteropMisc hooks...");
 
-    // Resolve CUtlBufferEnsureCapacity
+    // Resolve and install CUtlBufferEnsureCapacity
     resolve_and_install_cutl_buffer_ensure_capacity(steam_root).await?;
 
     // Capture GetAppIDForCurrentPipe 'this' pointer
@@ -399,7 +378,7 @@ async fn resolve_and_install_cutl_buffer_ensure_capacity(steam_root: &Path) -> R
     }.map_err(|e| format!("Failed to install CUtlBufferEnsureCapacity hook: {}", e))?;
 
     patch.install(JMP_ABS64_LEN).map_err(|e| e.to_string())?;
-    installed_patches().lock().unwrap().push(patch);
+    INSTALLED_PATCHES.get().unwrap().lock().unwrap().push(patch);
     log::info!("Installed CUtlBufferEnsureCapacity hook at 0x{:x}", addr);
 
     Ok(())
@@ -428,7 +407,7 @@ async fn install_function_hooks(steam_root: &Path) -> Result<(), String> {
         }.map_err(|e| format!("Failed to install {} hook: {}", name, e))?;
 
         patch.install(JMP_ABS64_LEN).map_err(|e| e.to_string())?;
-        installed_patches().lock().unwrap().push(patch);
+        INSTALLED_PATCHES.get().unwrap().lock().unwrap().push(patch);
         log::info!("Installed {} hook at 0x{:x}", name, addr);
     }
 
@@ -505,59 +484,8 @@ pub async fn install_spawn_process_hook(steam_root: &Path) -> Result<(), String>
 }
 
 // ============================================================================
-// Module registration helpers - called by bridge_lib or similar
+// Tests
 // ============================================================================
-
-/// Register IPC handlers for InteropMisc functions
-/// These are registered with the IPC system so the GUI can communicate with them
-pub fn register_ipc_handlers() {
-    // Register OptedInMask handler
-    let hash = fnv1a_hash("OptedInMask");
-    let handler = ResolvedHandler {
-        interface_id: IpcInterface::IClientUser,
-        func_hash: hash,
-        name: "IClientUser::OptedInMask".to_string(),
-        fencepost: 0,
-        argc: 2,
-        pre_handler: None,
-        post_handler: Some(Box::new(|ctx: &mut IpcContext| -> Result<(), String> {
-            // Handle OptedInMask via IPC
-            let app_id = ctx.app_id;
-            opted_in_mask_replacement(ctx.pitch, app_id);
-            Ok(())
-        })),
-    };
-    register_handler(handler);
-
-    // Register BuildSpawnEnvBlock handler
-    let hash = fnv1a_hash("BuildSpawnEnvBlock");
-    let handler = ResolvedHandler {
-        interface_id: IpcInterface::IClientUser,
-        func_hash: hash,
-        name: "IClientUser::BuildSpawnEnvBlock".to_string(),
-        fencepost: 0,
-        argc: 11,
-        pre_handler: None,
-        post_handler: Some(Box::new(|ctx: &mut IpcContext| -> Result<(), String> {
-            // Handle BuildSpawnEnvBlock via IPC
-            build_spawn_env_block_replacement(
-                ctx.pitch,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                ctx.app_id,
-                0,
-            );
-            Ok(())
-        })),
-    };
-    register_handler(handler);
-}
 
 #[cfg(test)]
 mod tests {
@@ -565,42 +493,50 @@ mod tests {
 
     #[test]
     fn test_resolve_app_id_no_onlinefix() {
-        *online_fix_real_app_id().lock().unwrap() = 0;
+        let _ = ONLINE_FIX_REAL_APP_ID.get_or_init(|| Mutex::new(None));
+        *ONLINE_FIX_REAL_APP_ID.get().unwrap().lock().unwrap() = 0;
         assert_eq!(resolve_app_id(), 0); // Would return pipe appid in real impl
     }
 
     #[test]
     fn test_resolve_app_id_with_onlinefix() {
-        *online_fix_real_app_id().lock().unwrap() = 12345;
+        let _ = ONLINE_FIX_REAL_APP_ID.get_or_init(|| Mutex::new(None));
+        *ONLINE_FIX_REAL_APP_ID.get().unwrap().lock().unwrap() = 12345;
         assert_eq!(resolve_app_id(), 12345);
     }
 
     #[test]
     fn test_should_report_online_fix_app_id() {
-        *online_fix_real_app_id().lock().unwrap() = 12345;
-        *networking_sockets_active().lock().unwrap() = true;
-        *suppress_app_id_flip().lock().unwrap() = false;
+        let _ = ONLINE_FIX_REAL_APP_ID.get_or_init(|| Mutex::new(None));
+        let _ = NETWORKING_SOCKETS_ACTIVE.get_or_init(|| Mutex::new(None));
+        let _ = SUPPRESS_APP_ID_FLIP.get_or_init(|| Mutex::new(None));
+        *ONLINE_FIX_REAL_APP_ID.get().unwrap().lock().unwrap() = 12345;
+        *NETWORKING_SOCKETS_ACTIVE.get().unwrap().lock().unwrap() = true;
+        *SUPPRESS_APP_ID_FLIP.get().unwrap().lock().unwrap() = false;
         assert!(should_report_online_fix_app_id());
 
-        *suppress_app_id_flip().lock().unwrap() = true;
+        *SUPPRESS_APP_ID_FLIP.get().unwrap().lock().unwrap() = true;
         assert!(!should_report_online_fix_app_id());
     }
 
     #[test]
     fn test_get_app_id_for_current_pipe_no_onlinefix() {
-        *online_fix_real_app_id().lock().unwrap() = 0;
+        let _ = ONLINE_FIX_REAL_APP_ID.get_or_init(|| Mutex::new(None));
+        *ONLINE_FIX_REAL_APP_ID.get().unwrap().lock().unwrap() = 0;
         assert_eq!(get_app_id_for_current_pipe(), 0);
     }
 
     #[test]
     fn test_is_online_fix_active_false() {
-        *online_fix_real_app_id().lock().unwrap() = 0;
+        let _ = ONLINE_FIX_REAL_APP_ID.get_or_init(|| Mutex::new(None));
+        *ONLINE_FIX_REAL_APP_ID.get().unwrap().lock().unwrap() = 0;
         assert!(!is_online_fix_active());
     }
 
     #[test]
     fn test_is_online_fix_active_true() {
-        *online_fix_real_app_id().lock().unwrap() = 12345;
+        let _ = ONLINE_FIX_REAL_APP_ID.get_or_init(|| Mutex::new(None));
+        *ONLINE_FIX_REAL_APP_ID.get().unwrap().lock().unwrap() = 12345;
         assert!(is_online_fix_active());
     }
 }

@@ -1540,6 +1540,7 @@ dependencies = [
  "image",
  "inotify",
  "libc",
+ "log",
  "md5",
  "rand 0.8.8",
  "regex",

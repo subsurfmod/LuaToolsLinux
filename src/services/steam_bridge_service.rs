@@ -16,11 +16,60 @@ use crate::services::steam_service::detect_steam_install;
 use crate::services::update_service::UpdateService;
 use crate::steam_bridge::{
     binary_reader::{scan_steam_binaries, BinaryFile},
-    ipc::{self, IpcClient, IpcMessage},
+    ipc::{self, IpcMessage},
     memory_patch::MemoryPatch,
     pattern_db::{BinaryComponent, PatternChannel, PatternDb},
     preload_loader::{self, find_steam_pid, steam_integrated, LD_SO_PRELOAD_PATH},
     ticket_store::{AppTicketData, TicketStore},
+    interop::{
+        interop_ipc_install as interop_install,
+        interop_ipc_uninstall as interop_uninstall,
+        register_handler,
+        EIPCCommand,
+        EIPCInterface,
+        IpcHandlerEntry,
+        AppOwnershipTicket,
+        HANDLER_REGISTRY,
+    },
+    interop::interop_ipc_isteamuser::{
+        install_iclientuser_handlers,
+        ONLINE_FIX_APP_ID,
+        handler_post_get_steam_id,
+        handler_post_get_app_ownership_ticket,
+        handler_post_request_encrypted_app_ticket,
+        handler_post_get_encrypted_app_ticket,
+    },
+    interop::interop_ipc_isteamutils::{
+        install_iclientutils_handlers,
+        handler_post_get_app_id,
+        handler_post_get_api_call_result,
+    },
+    interop::interop_misc::{
+        interop_misc_install,
+        resolve_app_id,
+        is_online_fix_active,
+        notify_networking_sockets_used,
+        should_report_online_fix_app_id,
+        set_suppress_app_id_flip,
+        get_app_id_for_current_pipe,
+        get_game_name_by_app_id,
+        ensure_buffer_capacity,
+        register_ipc_handlers,
+    },
+    netpacket::{
+        userstats::{install_userstats_hooks, uninstall_userstats_hooks, is_userstats_hook_active},
+        netpacket_eticket::{install_eticket_hooks, uninstall_eticket_hooks, is_eticket_hook_active},
+        netpacket_ownershipticket::{install_ownershipticket_hooks, uninstall_ownershipticket_hooks, is_ownershipticket_hook_active},
+        netpacket_manifestprobe::{install_manifestprobe_hooks, uninstall_manifestprobe_hooks, is_manifestprobe_hook_active},
+    },
+    credentials::{
+        read_app_ticket,
+        write_app_ticket,
+        get_app_ticket,
+        write_e_ticket,
+        get_e_ticket,
+        AppTicketData,
+    },
 };
 
 /// Result of bridge installation or binary pattern scan.

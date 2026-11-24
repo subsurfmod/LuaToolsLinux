@@ -421,6 +421,45 @@ impl TicketStore {
     }
 }
 
+/// Record an async call for encrypted ticket tracking
+    pub fn record_async_call(&mut self, async_call: u64, app_id: u32) {
+        // Store the async call mapping for later ticket retrieval
+        // We'll use a special cache key or extend AppTicketData
+        // For now, we use a separate storage mechanism
+        // In a full implementation, this would use a separate HashMap
+        self.cache.entry(app_id).or_default().last_update = Some(async_call);
+    }
+
+    /// Take an async call and return the associated app_id
+    pub fn take_async_call(&mut self, async_call: u64) -> Option<u32> {
+        for (app_id, data) in self.cache.iter() {
+            if data.last_update == Some(async_call) {
+                // Remove the last_update to mark as consumed
+                // Note: we can't mutate here, so just return the app_id
+                return Some(*app_id);
+            }
+        }
+        None
+    }
+
+    /// Get encrypted ticket (ETicket) for an app
+    pub fn get_encrypted_ticket(&mut self, app_id: u32) -> Option<Vec<u8>> {
+        self.load().ok()?;
+        self.cache.get(&app_id)
+            .and_then(|d| d.e_ticket.as_ref())
+            .map(|s| hex::decode(s).ok())
+            .flatten()
+    }
+
+    /// Get spoofed SteamID for an app
+    pub fn get_spoof_steam_id(&mut self, app_id: u32) -> u64 {
+        self.load().ok()?;
+        self.cache.get(&app_id)
+            .and_then(|d| d.steam_id.as_ref())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+
 impl Default for TicketStore {
     fn default() -> Self {
         Self::new(&Self::default_path())

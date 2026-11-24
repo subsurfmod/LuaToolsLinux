@@ -99,6 +99,20 @@ type IPCProcessMessageFn = unsafe extern "C" fn(
     p_write: *mut c_void,
 ) -> bool;
 
+/// Calls the original IPCProcessMessage function
+fn call_original(
+    p_server: *mut c_void,
+    h_steam_pipe: u32,
+    p_read: *mut c_void,
+    p_write: *mut c_void,
+) -> bool {
+    let orig: IPCProcessMessageFn = unsafe { std::mem::transmute(
+        *crate::steam_bridge::interop::interop_ipc::PATTERN_DB.get_or_init(PatternDb::new)
+    ) };
+    // This is a placeholder - actual implementation would use the trampoline
+    false
+}
+
 /// Original function pointer (stored after hooking)
 static ORIGINAL_IPC_PROCESS_MESSAGE: OnceLock<IPCProcessMessageFn> = OnceLock::new();
 
