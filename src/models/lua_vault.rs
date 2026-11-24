@@ -217,12 +217,59 @@ impl LuaVault {
             .unwrap_or_default()
     }
 
+    pub fn get_edit_base(&self, app_id: u32) -> Option<String> {
+        self.load_index(app_id).edit_base_hash
+    }
+
     pub fn set_edit_base(&self, app_id: u32, hash_str: Option<String>) {
         let mut idx = self.load_index(app_id);
         if idx.edit_base_hash != hash_str {
             idx.edit_base_hash = hash_str;
             self.save_index(app_id, &idx);
         }
+    }
+
+    /// In-place update of an existing variant (LT-37).
+    /// Updates variant text, recalculates hash, updates variant metadata, preserves
+    /// label/kind/build_id, cleans up old variant file if hash changed, clears edit_base_hash,
+    /// and saves index.
+    pub fn update_variant(
+        &self,
+        app_id: u32,
+        base_hash: &str,
+        new_text: &str,
+    ) -> Option<LuaVariant> {
+        let bytes = new_text.as_bytes();
+        let new_hash = Self::hash_bytes(bytes);
+        let _ = fs::create_dir_all(self.app_dir(app_id));
+        fs::write(self.variant_path(app_id, &new_hash), bytes).ok()?;
+
+        let mut index = self.load_index(app_id);
+        let Some(pos) = index.variants.iter().position(|v| v.hash == base_hash) else {
+            return self.save_text(app_id, new_text, None);
+        };
+
+        let old_var = &index.variants[pos];
+        let mut updated_var = Self::describe_variant(
+            app_id,
+            new_text,
+            new_hash.clone(),
+            &old_var.kind,
+            old_var.build_id.clone(),
+            old_var.source.clone(),
+        );
+        updated_var.label = old_var.label.clone();
+        index.variants[pos] = updated_var.clone();
+        index.edit_base_hash = None;
+
+        if new_hash != base_hash {
+            if !index.variants.iter().any(|v| v.hash == base_hash) {
+                let _ = fs::remove_file(self.variant_path(app_id, base_hash));
+            }
+        }
+
+        self.save_index(app_id, &index);
+        Some(updated_var)
     }
 
     fn describe_variant(
@@ -422,5 +469,45 @@ impl LuaVault {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_update_variant_in_place_and_edit_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = LuaVault::new(None, Some(tmp.path().join("vault")));
+
+        let v1 = vault
+            .save_text(1245620, "addappid(1245620)\n", Some("Initial Variant"))
+            .unwrap();
+        assert_eq!(v1.label.as_deref(), Some("Initial Variant"));
+        let h1 = v1.hash.clone();
+
+        vault.set_edit_base(1245620, Some(h1.clone()));
+        assert_eq!(vault.get_edit_base(1245620), Some(h1.clone()));
+
+        // In-place update of variant
+        let updated = vault
+            .update_variant(
+                1245620,
+                &h1,
+                "addappid(1245620)\naddappid(2778580) -- DLC\n",
+            )
+            .unwrap();
+        assert_ne!(updated.hash, h1);
+        assert_eq!(updated.label.as_deref(), Some("Initial Variant"));
+        assert_eq!(updated.dlc_count, 1);
+        assert_eq!(vault.get_edit_base(1245620), None);
+
+        // Verify only one variant exists in index and old file is cleaned up
+        let variants = vault.get_variants(1245620);
+        assert_eq!(variants.len(), 1);
+        assert_eq!(variants[0].hash, updated.hash);
+        assert!(!vault.variant_path(1245620, &h1).exists());
+        assert!(vault.variant_path(1245620, &updated.hash).exists());
     }
 }

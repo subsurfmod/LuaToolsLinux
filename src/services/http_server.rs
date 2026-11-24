@@ -89,6 +89,40 @@ fn send_json(req: Request, status: u16, payload: Value) {
     let _ = req.respond(resp);
 }
 
+fn send_bytes(req: Request, status: u16, content_type: &str, bytes: Vec<u8>) {
+    let resp = Response::from_data(bytes)
+        .with_status_code(status)
+        .with_header(Header::from_bytes("Content-Type", content_type.to_string()).unwrap())
+        .with_header(Header::from_bytes("Access-Control-Allow-Origin", "*").unwrap())
+        .with_header(
+            Header::from_bytes(
+                "Access-Control-Allow-Methods",
+                "GET, POST, PUT, DELETE, OPTIONS, HEAD",
+            )
+            .unwrap(),
+        )
+        .with_header(
+            Header::from_bytes(
+                "Access-Control-Allow-Headers",
+                "Content-Type, Authorization, X-Requested-With, Accept, Origin",
+            )
+            .unwrap(),
+        )
+        .with_header(Header::from_bytes("Access-Control-Max-Age", "86400").unwrap());
+    let _ = req.respond(resp);
+}
+
+fn extract_query_param(query_str: &str, param: &str) -> Option<String> {
+    for pair in query_str.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k.eq_ignore_ascii_case(param) {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn extract_query_appid(query_str: &str) -> Option<u32> {
     for pair in query_str.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
@@ -504,6 +538,88 @@ fn handle_request(
         return;
     }
 
+    // Route: /api/givemethemanifestpunk (LT-44)
+    if parts == ["api", "givemethemanifestpunk"] || parts == ["givemethemanifestpunk"] {
+        let depot_id = parts
+            .iter()
+            .find_map(|p| p.parse::<u32>().ok())
+            .or_else(|| extract_query_appid(query_str))
+            .or_else(|| extract_query_param(query_str, "depotid").and_then(|v| v.parse::<u32>().ok()))
+            .or_else(|| extract_query_param(query_str, "depot_id").and_then(|v| v.parse::<u32>().ok()))
+            .unwrap_or(0);
+
+        let gid = extract_query_param(query_str, "gid")
+            .or_else(|| extract_query_param(query_str, "manifestid"))
+            .or_else(|| extract_query_param(query_str, "manifest_id"))
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+
+        if depot_id > 0 && gid > 0 {
+            if let Some(home) = dirs::home_dir() {
+                let cache_candidates = [
+                    home.join(format!(".local/share/luatools/depotcache/{}_{}.manifest", depot_id, gid)),
+                    home.join(format!(".local/share/Steam/depotcache/{}_{}.manifest", depot_id, gid)),
+                    stplug_dir.join(format!("{}_{}.manifest", depot_id, gid)),
+                ];
+                for p in cache_candidates {
+                    if let Ok(b) = std::fs::read(&p) {
+                        send_bytes(req, 200, "application/octet-stream", b);
+                        return;
+                    }
+                }
+            }
+
+            if let Ok(b) = crate::services::api_client::HubcapService::fetch_raw_manifest(depot_id, gid, None) {
+                send_bytes(req, 200, "application/octet-stream", b);
+                return;
+            }
+        }
+
+        send_json(
+            req,
+            200,
+            json!({ "ok": true, "depot_id": depot_id, "gid": gid, "cached": false }),
+        );
+        return;
+    }
+
+    // Route: /manifest/:depotid/:gid or /api/manifest/:depotid/:gid (LT-44)
+    if (parts.len() >= 3 && parts[0] == "manifest")
+        || (parts.len() >= 4 && parts[0] == "api" && parts[1] == "manifest")
+    {
+        let offset = if parts[0] == "api" { 2 } else { 1 };
+        let depot_id = parts[offset].parse::<u32>().unwrap_or(0);
+        let gid = parts.get(offset + 1).and_then(|g| g.parse::<u64>().ok()).unwrap_or(0);
+
+        if depot_id > 0 && gid > 0 {
+            if let Some(home) = dirs::home_dir() {
+                let cache_candidates = [
+                    home.join(format!(".local/share/luatools/depotcache/{}_{}.manifest", depot_id, gid)),
+                    home.join(format!(".local/share/Steam/depotcache/{}_{}.manifest", depot_id, gid)),
+                    stplug_dir.join(format!("{}_{}.manifest", depot_id, gid)),
+                ];
+                for p in cache_candidates {
+                    if let Ok(b) = std::fs::read(&p) {
+                        send_bytes(req, 200, "application/octet-stream", b);
+                        return;
+                    }
+                }
+            }
+
+            if let Ok(b) = crate::services::api_client::HubcapService::fetch_raw_manifest(depot_id, gid, None) {
+                send_bytes(req, 200, "application/octet-stream", b);
+                return;
+            }
+        }
+
+        send_json(
+            req,
+            200,
+            json!({ "ok": true, "depot_id": depot_id, "gid": gid, "cached": false }),
+        );
+        return;
+    }
+
     send_json(req, 404, json!({ "error": "Not found" }));
 }
 
@@ -609,6 +725,20 @@ mod tests {
 
         let inf: Value = ureq::get("http://127.0.0.1:16781/info/1245620").call().unwrap().into_json().unwrap();
         assert_eq!(inf["ok"], true);
+
+        // 7. Raw manifest routes: /manifest/:depotid/:gid & /api/givemethemanifestpunk
+        std::fs::write(dir.path().join("1245621_987654321.manifest"), b"MANIFEST_BYTES_SAMPLE").unwrap();
+        let mf_resp = ureq::get("http://127.0.0.1:16781/manifest/1245621/987654321").call().unwrap();
+        assert_eq!(mf_resp.status(), 200);
+        let mut mf_bytes = Vec::new();
+        mf_resp.into_reader().read_to_end(&mut mf_bytes).unwrap();
+        assert_eq!(mf_bytes, b"MANIFEST_BYTES_SAMPLE");
+
+        let punk_resp = ureq::get("http://127.0.0.1:16781/api/givemethemanifestpunk?depotid=1245621&gid=987654321").call().unwrap();
+        assert_eq!(punk_resp.status(), 200);
+        let mut punk_bytes = Vec::new();
+        punk_resp.into_reader().read_to_end(&mut punk_bytes).unwrap();
+        assert_eq!(punk_bytes, b"MANIFEST_BYTES_SAMPLE");
 
         srv.stop();
     }

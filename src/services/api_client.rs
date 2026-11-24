@@ -13,6 +13,8 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::services::auth_service::{AuthService, API_BASE_URL, SUPABASE_ANON_KEY, SUPABASE_URL};
+use crate::services::doh_resolver::DohResolver;
+use crate::services::github_proxy::GithubProxy;
 
 pub const MANIFEST_BACKEND_URL: &str = "http://167.235.229.108";
 pub const MANIFEST_BACKEND_UA: &str = "secretgoonpoon";
@@ -183,6 +185,117 @@ impl HubcapService {
         let out = dest_dir.join(format!("{}.zip", app_id));
         stream_response_to_file(resp, &out, &mut progress_cb)?;
         Ok(out)
+    }
+
+    /// Fetch raw binary depot manifest bytes by depot ID and manifest GID (LT-44).
+    pub fn fetch_raw_manifest(
+        depot_id: u32,
+        gid: u64,
+        hubcap_api_key: Option<&str>,
+    ) -> Result<Vec<u8>, String> {
+        let agent = Self::agent();
+
+        // 1. Primary: MANIFEST_BACKEND_URL /api/givemethemanifestpunk
+        let primary_url = format!(
+            "{}/api/givemethemanifestpunk?depotid={}&gid={}",
+            MANIFEST_BACKEND_URL, depot_id, gid
+        );
+        if let Ok(resp) = agent
+            .get(&primary_url)
+            .set("User-Agent", MANIFEST_BACKEND_UA)
+            .call()
+        {
+            let mut bytes = Vec::new();
+            if resp.into_reader().take(64 * 1024 * 1024).read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
+                return Ok(bytes);
+            }
+        }
+
+        // 2. Hubcap depot manifest fallback if API key is provided
+        if let Some(key) = hubcap_api_key.map(str::trim).filter(|k| !k.is_empty()) {
+            let hubcap_url = format!(
+                "{}/api/v1/depot/{}/manifest/{}?api_key={}",
+                HUBCAP_BASE_URL,
+                depot_id,
+                gid,
+                urlencoding::encode(key)
+            );
+            if let Ok(resp) = agent.get(&hubcap_url).call() {
+                let mut bytes = Vec::new();
+                if resp.into_reader().take(64 * 1024 * 1024).read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
+                    return Ok(bytes);
+                }
+            }
+        }
+
+        // 3. CDN fallbacks
+        let cdn_urls = [
+            format!("https://cdn.steamtools.net/manifest/{}_{}.manifest", depot_id, gid),
+            format!("{}/manifest/{}/{}", HUBCAP_BASE_URL, depot_id, gid),
+        ];
+        for url in cdn_urls {
+            if let Ok(resp) = agent.get(&url).call() {
+                let mut bytes = Vec::new();
+                if resp.into_reader().take(64 * 1024 * 1024).read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
+                    return Ok(bytes);
+                }
+            }
+        }
+
+        Err(format!(
+            "Failed to fetch manifest for depot {} gid {}",
+            depot_id, gid
+        ))
+    }
+
+    /// Download raw manifest binary to a file on disk (LT-44).
+    pub fn download_raw_manifest_to_file(
+        depot_id: u32,
+        gid: u64,
+        dest_path: &Path,
+        hubcap_api_key: Option<&str>,
+    ) -> Result<PathBuf, String> {
+        let bytes = Self::fetch_raw_manifest(depot_id, gid, hubcap_api_key)?;
+        if let Some(parent) = dest_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        fs::write(dest_path, bytes).map_err(|e| format!("Failed to write manifest: {}", e))?;
+        Ok(dest_path.to_path_buf())
+    }
+
+    /// Resolve domain via DNS-over-HTTPS (LT-47).
+    pub fn resolve_steam_domain_doh(domain: &str) -> Option<Vec<String>> {
+        let resolver = DohResolver::default();
+        let records = resolver.resolve(domain)?;
+        Some(records.into_iter().map(|r| r.value).collect())
+    }
+
+    /// Download with GitHub proxy and mirror fallback (LT-48).
+    pub fn download_proxied(url: &str, dest_path: &Path) -> Result<(), String> {
+        let proxy = GithubProxy::default();
+        if GithubProxy::is_github(url) {
+            for candidate in proxy.candidates(url) {
+                if let Ok(resp) = Self::agent().get(&candidate).call() {
+                    if let Some(parent) = dest_path.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    if let Ok(mut f) = fs::File::create(dest_path) {
+                        if std::io::copy(&mut resp.into_reader(), &mut f).is_ok() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            Err("All GitHub proxy mirrors failed".into())
+        } else {
+            let resp = Self::agent().get(url).call().map_err(|e| e.to_string())?;
+            if let Some(parent) = dest_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let mut f = fs::File::create(dest_path).map_err(|e| e.to_string())?;
+            std::io::copy(&mut resp.into_reader(), &mut f).map_err(|e| e.to_string())?;
+            Ok(())
+        }
     }
 }
 

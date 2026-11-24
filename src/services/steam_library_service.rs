@@ -244,6 +244,68 @@ impl SteamLibraryService {
                 .exists()
         })
     }
+
+    /// Migrates manifests from legacy directory (`<steam_root>/config/depotcache`)
+    /// to the canonical depotcache directory (`<steam_root>/depotcache`).
+    pub fn migrate_depotcache(&self) -> Result<DepotCacheMigrationResult, String> {
+        let Some(inst) = &self.steam_installation else {
+            return Err("No Steam installation detected.".to_string());
+        };
+        let legacy_dir = inst.root.join("config/depotcache");
+        let target_dir = inst.root.join("depotcache");
+        Self::migrate_depotcache_dir(&legacy_dir, &target_dir)
+    }
+
+    /// Migrates all `.manifest` files from `legacy_dir` to `target_dir`.
+    pub fn migrate_depotcache_dir(
+        legacy_dir: &std::path::Path,
+        target_dir: &std::path::Path,
+    ) -> Result<DepotCacheMigrationResult, String> {
+        if !legacy_dir.is_dir() {
+            return Ok(DepotCacheMigrationResult::default());
+        }
+        if let Err(e) = fs::create_dir_all(target_dir) {
+            return Err(format!(
+                "Cannot create depotcache directory '{}': {}",
+                target_dir.display(),
+                e
+            ));
+        }
+
+        let mut res = DepotCacheMigrationResult::default();
+        let entries = match fs::read_dir(legacy_dir) {
+            Ok(e) => e,
+            Err(e) => return Err(format!("Cannot read legacy depotcache dir: {}", e)),
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if name.ends_with(".manifest") {
+                    let target_path = target_dir.join(name);
+                    if target_path.exists() {
+                        res.skipped_count += 1;
+                    } else if let Err(e) = fs::copy(&path, &target_path) {
+                        return Err(format!("Failed to migrate '{}': {}", name, e));
+                    } else {
+                        res.migrated_count += 1;
+                        res.migrated_files.push(name.to_string());
+                    }
+                }
+            }
+        }
+        Ok(res)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DepotCacheMigrationResult {
+    pub migrated_count: usize,
+    pub skipped_count: usize,
+    pub migrated_files: Vec<String>,
 }
 
 fn escape_vdf(s: &str) -> String {
@@ -315,5 +377,29 @@ mod tests {
         let vdf_removed = fs::read_to_string(steamapps.join("libraryfolders.vdf")).unwrap();
         assert!(vdf_removed.contains("\"228980\""));
         assert!(!vdf_removed.contains("\"1245620\""));
+    }
+
+    #[test]
+    fn test_migrate_depotcache_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp.path().join("config/depotcache");
+        let target = tmp.path().join("depotcache");
+        fs::create_dir_all(&legacy).unwrap();
+
+        fs::write(legacy.join("1245621_11111111.manifest"), b"MANIFEST_1").unwrap();
+        fs::write(legacy.join("1245622_22222222.manifest"), b"MANIFEST_2").unwrap();
+        fs::write(legacy.join("other.txt"), b"NOT_A_MANIFEST").unwrap();
+
+        let res = SteamLibraryService::migrate_depotcache_dir(&legacy, &target).unwrap();
+        assert_eq!(res.migrated_count, 2);
+        assert_eq!(res.skipped_count, 0);
+        assert!(target.join("1245621_11111111.manifest").exists());
+        assert!(target.join("1245622_22222222.manifest").exists());
+        assert!(!target.join("other.txt").exists());
+
+        // Re-run migration: existing manifests must be counted as skipped
+        let res2 = SteamLibraryService::migrate_depotcache_dir(&legacy, &target).unwrap();
+        assert_eq!(res2.migrated_count, 0);
+        assert_eq!(res2.skipped_count, 2);
     }
 }

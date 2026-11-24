@@ -67,6 +67,69 @@ impl AnalyticsService {
             )
             .send_json(body);
     }
+
+    /// Track an app launch strictly gated by user consent (LT-46).
+    /// If user has not consented or telemetry is disabled, returns false and does nothing.
+    pub fn track_app_launch_gated(&self, consent_seen: bool, telemetry_enabled: bool) -> bool {
+        if !consent_seen || !telemetry_enabled {
+            return false;
+        }
+        self.track_app_launch();
+        true
+    }
+
+    /// Track a custom event strictly gated by user consent (LT-46).
+    pub fn track_event_gated(
+        &self,
+        event_name: &str,
+        properties: Option<serde_json::Value>,
+        consent_seen: bool,
+        telemetry_enabled: bool,
+    ) -> bool {
+        if !consent_seen || !telemetry_enabled {
+            return false;
+        }
+        if self.umami_host.is_empty() || self.website_id.is_empty() {
+            return false;
+        }
+        if !self.umami_host.starts_with("http://") && !self.umami_host.starts_with("https://") {
+            return false;
+        }
+
+        let clean_name = scrub_pii(event_name);
+        let mut payload = serde_json::json!({
+            "website": self.website_id,
+            "hostname": "luatools-linux",
+            "url": format!("/event/{}", clean_name),
+            "title": clean_name,
+        });
+        if let Some(props) = properties {
+            payload["data"] = props;
+        }
+
+        let body = serde_json::json!({
+            "type": "event",
+            "payload": payload,
+        });
+
+        let _ = self
+            .http
+            .post(&format!("{}/api/send", self.umami_host))
+            .set(
+                "User-Agent",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            )
+            .send_json(body);
+        true
+    }
+}
+
+fn scrub_pii(input: &str) -> String {
+    let mut out = input.to_string();
+    if let Some(home) = dirs::home_dir().and_then(|p| p.to_str().map(ToString::to_string)) {
+        out = out.replace(&home, "~");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -119,5 +182,15 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["payload"]["website"], "my-site-id");
         assert_eq!(parsed["payload"]["hostname"], "luatools-linux");
+    }
+
+    #[test]
+    fn test_telemetry_consent_gating() {
+        let svc = AnalyticsService::with_config("http://127.0.0.1:1", "my-site-id");
+        // No consent -> returns false immediately without network call
+        assert!(!svc.track_app_launch_gated(false, true));
+        assert!(!svc.track_app_launch_gated(true, false));
+        assert!(!svc.track_app_launch_gated(false, false));
+        assert!(!svc.track_event_gated("test_event", None, false, true));
     }
 }

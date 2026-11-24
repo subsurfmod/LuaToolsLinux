@@ -12,6 +12,7 @@ use walkdir_lite::collect_files_recursive;
 use crate::models::config::default_luatools_data_dir;
 use crate::services::api_client::stream_response_to_file;
 use crate::services::depot_downloader::{which_in_path, DepotDownloaderService};
+use crate::services::github_proxy::GithubProxy;
 use crate::services::wired_service::extract_archive;
 
 #[derive(Debug, Clone)]
@@ -344,10 +345,23 @@ impl ExternalToolsManager {
 
                 let base_pct = 0.1 + (idx as f32) * 0.4;
                 progress_cb(base_pct, format!("Downloading {} {} ({})", spec.name, tag, safe_aname));
-                let dl_resp = match agent.get(dl_url).set("User-Agent", &ua).call() {
-                    Ok(r) => r,
-                    Err(e) => {
-                        last_err = Some(format!("Download failed ({}): {}", repo, e));
+                let mut dl_resp_opt = None;
+                if GithubProxy::is_github(dl_url) {
+                    let proxy = GithubProxy::default();
+                    for candidate in proxy.candidates(dl_url) {
+                        if let Ok(r) = agent.get(&candidate).set("User-Agent", &ua).call() {
+                            dl_resp_opt = Some(r);
+                            break;
+                        }
+                    }
+                } else if let Ok(r) = agent.get(dl_url).set("User-Agent", &ua).call() {
+                    dl_resp_opt = Some(r);
+                }
+
+                let dl_resp = match dl_resp_opt {
+                    Some(r) => r,
+                    None => {
+                        last_err = Some(format!("Download failed ({}): {}", repo, dl_url));
                         dl_failed = true;
                         break;
                     }

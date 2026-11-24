@@ -31,6 +31,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Fixed 32-bit Steam crash: provided `assets/luatools-steam-launcher` prioritizing `steam-sls` (`LD_AUDIT=SLSsteam.so`) and stripping 64-bit `libsteam_integration.so` from `LD_PRELOAD`.
   - Fixed Manifest Binding (`LT-86`): synchronized pins to SLSsteam `ManifestOverrides` in `~/.config/SLSsteam/config.yaml`.
   - Wired bridge readers for legacy CD keys, stats, and pinned manifests with C exports.
+- **Platform Services, Directives & Extended Tooling**:
+  - Implemented OS Login Autostart (`LT-08`) managing `~/.config/autostart/luatools.desktop` with `--minimized` and CLI `--autostart-enable`/`--autostart-disable`.
+  - Implemented Steam UI Language Detection (`LT-16`) reading `registry.vdf` / `config.vdf` and mapping to canonical UI codes.
+  - Implemented `bst://` URI parsing and desktop protocol registration (`BST-60`).
+  - Added Raw Manifest Fetch Endpoints (`LT-44`) `/api/givemethemanifestpunk` and `/manifest/:depotid/:gid` with backend mirror failover.
+  - Wired `DohResolver` (`LT-47`) and `ProxiedFileDownloader` / `GitHubProxy` (`LT-48`) for resilient DNS and tool downloads.
+  - Hardened telemetry consent gating and PII path scrubbing (`LT-46`).
+  - Implemented Per-Depot DLC enable/disable toggling (`LT-31`) via `LuaFileParser::toggle_dlc_depot`.
+  - Implemented DepotCache migration service (`LT-34`) migrating `config/depotcache` to `depotcache/`.
+  - Implemented Legacy Unlocker Mode Migration (`LT-63`) detecting and safely backing up legacy SmokeAPI/GreenLuma/BST binaries.
+  - Implemented LuaVault in-place variant updates (`LT-37`) via `update_variant` and `edit_base`.
+  - Implemented CloudRedirect configuration generator (`LT-71`, `BST-42`, `BST-59`) and EMsg 147 synthesis.
+  - Implemented extended Lua directives (`BST-14`, `BST-15`, `BST-16`) for `addprocess()`, `forcedenuvo()`, and `pinApp()`.
+  - Implemented Crockford Base32 legacy CD key generator (`BST-57`) and Game Process Injection daemon with Proton/Wine overrides (`LNX-09`).
 
 ---
 
