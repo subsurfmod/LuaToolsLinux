@@ -7,7 +7,6 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use regex::Regex;
-use serde_json::json;
 
 use crate::models::config::default_luatools_cache_dir;
 
@@ -90,6 +89,12 @@ impl DonateKeysService {
             return 0;
         }
 
+        let body = new_keys
+            .iter()
+            .map(|(d, k)| format!("{}:{}", d, k))
+            .collect::<Vec<_>>()
+            .join(",");
+
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(5))
             .timeout(Duration::from_secs(15))
@@ -97,7 +102,8 @@ impl DonateKeysService {
         if let Ok(resp) = agent
             .post(endpoint)
             .set("User-Agent", DONATE_USER_AGENT)
-            .send_json(json!({ "keys": new_keys }))
+            .set("Content-Type", "text/plain")
+            .send_string(&body)
         {
             if matches!(resp.status(), 200 | 201 | 204) {
                 let count = new_keys.len();
@@ -179,7 +185,7 @@ mod tests {
         let endpoint = format!("http://{}/donatekeys/send", addr);
         assert_eq!(svc.donate_new_keys_to(&endpoint), 1);
         let body = handle.join().unwrap();
-        assert!(body.contains("1245621"));
+        assert_eq!(body, format!("1245621:{}", key));
         assert!(cache.is_file());
 
         // Second call finds no new keys and does not hit network

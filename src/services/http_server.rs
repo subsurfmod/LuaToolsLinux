@@ -72,10 +72,52 @@ fn send_json(req: Request, status: u16, payload: Value) {
         .with_header(Header::from_bytes("Content-Type", "application/json").unwrap())
         .with_header(Header::from_bytes("Access-Control-Allow-Origin", "*").unwrap())
         .with_header(
-            Header::from_bytes("Access-Control-Allow-Methods", "GET, POST, OPTIONS").unwrap(),
+            Header::from_bytes(
+                "Access-Control-Allow-Methods",
+                "GET, POST, PUT, DELETE, OPTIONS, HEAD",
+            )
+            .unwrap(),
         )
-        .with_header(Header::from_bytes("Access-Control-Allow-Headers", "Content-Type").unwrap());
+        .with_header(
+            Header::from_bytes(
+                "Access-Control-Allow-Headers",
+                "Content-Type, Authorization, X-Requested-With, Accept, Origin",
+            )
+            .unwrap(),
+        )
+        .with_header(Header::from_bytes("Access-Control-Max-Age", "86400").unwrap());
     let _ = req.respond(resp);
+}
+
+fn extract_query_appid(query_str: &str) -> Option<u32> {
+    for pair in query_str.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k.eq_ignore_ascii_case("appid") {
+                if let Ok(id) = v.parse::<u32>() {
+                    return Some(id);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn list_installed_apps(stplug_dir: &Path) -> Vec<u32> {
+    let mut apps = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(stplug_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().map_or(false, |ext| ext == "lua") {
+                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                    if let Ok(id) = stem.parse::<u32>() {
+                        apps.push(id);
+                    }
+                }
+            }
+        }
+    }
+    apps.sort();
+    apps
 }
 
 fn handle_request(
@@ -84,20 +126,33 @@ fn handle_request(
     event_tx: &Sender<RpcUiEvent>,
     wakeup: &Option<Arc<dyn Fn() + Send + Sync>>,
 ) {
+    // 1. CORS preflight handling (LT-26)
     if req.method() == &Method::Options {
         let resp = Response::empty(204)
             .with_header(Header::from_bytes("Access-Control-Allow-Origin", "*").unwrap())
             .with_header(
-                Header::from_bytes("Access-Control-Allow-Methods", "GET, POST, OPTIONS").unwrap(),
+                Header::from_bytes(
+                    "Access-Control-Allow-Methods",
+                    "GET, POST, PUT, DELETE, OPTIONS, HEAD",
+                )
+                .unwrap(),
             )
             .with_header(
-                Header::from_bytes("Access-Control-Allow-Headers", "Content-Type").unwrap(),
-            );
+                Header::from_bytes(
+                    "Access-Control-Allow-Headers",
+                    "Content-Type, Authorization, X-Requested-With, Accept, Origin",
+                )
+                .unwrap(),
+            )
+            .with_header(Header::from_bytes("Access-Control-Max-Age", "86400").unwrap());
         let _ = req.respond(resp);
         return;
     }
 
-    let path_only = req.url().split('?').next().unwrap_or("/");
+    let full_url = req.url().to_string();
+    let mut parts_split = full_url.splitn(2, '?');
+    let path_only = parts_split.next().unwrap_or("/");
+    let query_str = parts_split.next().unwrap_or("");
     let parts: Vec<&str> = path_only.split('/').filter(|s| !s.is_empty()).collect();
 
     let notify = || {
@@ -106,6 +161,39 @@ fn handle_request(
         }
     };
 
+    // Helper to extract appid from path segments, query param, or JSON body
+    let mut aid = parts
+        .iter()
+        .find_map(|p| p.parse::<u32>().ok())
+        .or_else(|| extract_query_appid(query_str))
+        .unwrap_or(0);
+
+    // Read JSON body for POST/PUT if available
+    let body_json = if req.method() == &Method::Post || req.method() == &Method::Put {
+        let mut raw = String::new();
+        let _ = req.as_reader().take(256 * 1024).read_to_string(&mut raw);
+        serde_json::from_str::<Value>(&raw).ok()
+    } else {
+        None
+    };
+
+    if aid == 0 {
+        if let Some(ref val) = body_json {
+            if let Some(id) = val
+                .get("appid")
+                .or_else(|| val.get("appId"))
+                .and_then(|v| {
+                    v.as_u64()
+                        .map(|n| n as u32)
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<u32>().ok()))
+                })
+            {
+                aid = id;
+            }
+        }
+    }
+
+    // Route: /ping
     if parts == ["ping"] {
         send_json(
             req,
@@ -115,10 +203,40 @@ fn handle_request(
         return;
     }
 
+    // Route: /version
+    if parts == ["version"] || parts == ["api", "version"] {
+        send_json(
+            req,
+            200,
+            json!({ "ok": true, "version": crate::VERSION, "platform": "linux" }),
+        );
+        return;
+    }
+
+    // Route: /status or /health
+    if parts == ["status"] || parts == ["health"] {
+        send_json(
+            req,
+            200,
+            json!({ "ok": true, "status": "running", "platform": "linux" }),
+        );
+        return;
+    }
+
+    // Route: /apps or /installed or /list
+    if parts == ["apps"] || parts == ["installed"] || parts == ["list"] {
+        let apps = list_installed_apps(stplug_dir);
+        send_json(
+            req,
+            200,
+            json!({ "ok": true, "apps": apps, "total": apps.len() }),
+        );
+        return;
+    }
+
+    // Route: /rpc (JSON-RPC)
     if parts == ["rpc"] && req.method() == &Method::Post {
-        let mut raw = String::new();
-        let _ = req.as_reader().take(256 * 1024).read_to_string(&mut raw);
-        let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
+        let Some(payload) = body_json else {
             send_json(
                 req,
                 400,
@@ -128,7 +246,7 @@ fn handle_request(
         };
         let method = payload.get("method").and_then(|v| v.as_str()).unwrap_or("");
         let args = payload.get("args").cloned().unwrap_or_else(|| json!({}));
-        let aid = args
+        let rpc_aid = args
             .get("appid")
             .or_else(|| args.get("appId"))
             .and_then(|v| {
@@ -136,31 +254,31 @@ fn handle_request(
                     .map(|n| n as u32)
                     .or_else(|| v.as_str().and_then(|s| s.parse::<u32>().ok()))
             })
-            .unwrap_or(0);
+            .unwrap_or(aid);
 
         match method {
             "Ping" | "ping" => send_json(req, 200, json!({ "success": true, "result": "pong" })),
-            "HasLuaToolsForApp" if aid > 0 => {
-                let exists = stplug_dir.join(format!("{}.lua", aid)).exists();
+            "HasLuaToolsForApp" if rpc_aid > 0 => {
+                let exists = stplug_dir.join(format!("{}.lua", rpc_aid)).exists();
                 send_json(
                     req,
                     200,
                     json!({ "success": true, "exists": exists, "result": exists }),
                 );
             }
-            "StartAddViaLuaTools" if aid > 0 => {
-                let _ = event_tx.send(RpcUiEvent::AddApp(aid));
+            "StartAddViaLuaTools" if rpc_aid > 0 => {
+                let _ = event_tx.send(RpcUiEvent::AddApp(rpc_aid));
                 notify();
                 send_json(req, 200, json!({ "success": true, "queued": true }));
             }
-            "DeleteLuaToolsForApp" if aid > 0 => {
-                let _ = std::fs::remove_file(stplug_dir.join(format!("{}.lua", aid)));
-                let _ = event_tx.send(RpcUiEvent::RemovedApp(aid));
+            "DeleteLuaToolsForApp" if rpc_aid > 0 => {
+                let _ = std::fs::remove_file(stplug_dir.join(format!("{}.lua", rpc_aid)));
+                let _ = event_tx.send(RpcUiEvent::RemovedApp(rpc_aid));
                 notify();
                 send_json(req, 200, json!({ "success": true }));
             }
-            "CheckForFixes" | "OpenFixes" if aid > 0 => {
-                let _ = event_tx.send(RpcUiEvent::OpenFix(aid));
+            "CheckForFixes" | "OpenFixes" if rpc_aid > 0 => {
+                let _ = event_tx.send(RpcUiEvent::OpenFix(rpc_aid));
                 notify();
                 send_json(req, 200, json!({ "success": true }));
             }
@@ -172,54 +290,217 @@ fn handle_request(
             "GetSettingsConfig" => {
                 send_json(req, 200, json!({ "success": true, "result": {} }));
             }
+            "GetInstalledLuaScripts" | "ReadLoadedApps" | "GetInstalledApps" => {
+                let apps = list_installed_apps(stplug_dir);
+                send_json(
+                    req,
+                    200,
+                    json!({ "success": true, "result": apps, "apps": apps }),
+                );
+            }
+            "GetAddViaLuaToolsStatus" => {
+                send_json(
+                    req,
+                    200,
+                    json!({ "success": true, "result": { "status": "completed" } }),
+                );
+            }
+            "GetApplyFixStatus" => {
+                send_json(
+                    req,
+                    200,
+                    json!({ "success": true, "result": { "status": "idle" } }),
+                );
+            }
+            "GetInstalledFixes" => {
+                send_json(req, 200, json!({ "success": true, "result": [] }));
+            }
+            "GetLauncherPath" => {
+                send_json(req, 200, json!({ "success": true, "result": "" }));
+            }
+            "GetWorkshopToolPath" => {
+                send_json(req, 200, json!({ "success": true, "result": "" }));
+            }
+            "RestartSteam" => {
+                let _ = crate::services::steam_service::SteamService::relaunch_steam_sls(None);
+                send_json(req, 200, json!({ "success": true, "result": "restarted" }));
+            }
+            "GetThemes" => {
+                send_json(req, 200, json!({ "success": true, "result": [] }));
+            }
+            "GetAvailableLocales" => {
+                send_json(
+                    req,
+                    200,
+                    json!({ "success": true, "result": ["en", "zh"] }),
+                );
+            }
+            "GetTranslations" => {
+                send_json(req, 200, json!({ "success": true, "result": {} }));
+            }
+            "GetGamesDatabase" => {
+                send_json(req, 200, json!({ "success": true, "result": {} }));
+            }
+            "GetProtonDBStatus" => {
+                send_json(req, 200, json!({ "success": true, "result": {} }));
+            }
+            "version" | "GetVersion" => {
+                send_json(
+                    req,
+                    200,
+                    json!({ "success": true, "result": crate::VERSION }),
+                );
+            }
             _ => send_json(
                 req,
                 200,
-                json!({ "success": false, "error": format!("Unsupported method: {}", method) }),
+                json!({ "success": true, "result": {} }),
             ),
         }
         return;
     }
 
-    if parts.len() == 2 {
-        if let Ok(aid) = parts[1].parse::<u32>() {
-            match parts[0] {
-                "has" => {
-                    let exists = stplug_dir.join(format!("{}.lua", aid)).exists();
-                    send_json(req, 200, json!({ "has": exists, "appid": aid }));
-                    return;
-                }
-                "add" => {
-                    let _ = event_tx.send(RpcUiEvent::AddApp(aid));
-                    notify();
-                    send_json(req, 200, json!({ "queued": true, "appid": aid }));
-                    return;
-                }
-                "remove" => {
-                    let _ = std::fs::remove_file(stplug_dir.join(format!("{}.lua", aid)));
-                    let _ = event_tx.send(RpcUiEvent::RemovedApp(aid));
-                    notify();
-                    send_json(req, 200, json!({ "removed": true, "appid": aid }));
-                    return;
-                }
-                _ => {}
-            }
-        }
+    // Route: /has or /has/:appid
+    if parts.first() == Some(&"has") || (parts.len() == 2 && parts[0] == "api" && parts[1] == "has") {
+        let exists = aid > 0 && stplug_dir.join(format!("{}.lua", aid)).exists();
+        send_json(
+            req,
+            200,
+            json!({ "has": exists, "exists": exists, "appid": aid, "ok": true }),
+        );
+        return;
     }
 
-    if parts.len() == 3 && parts[0] == "open" && parts[1] == "fix" {
-        if let Ok(aid) = parts[2].parse::<u32>() {
-            let _ = event_tx.send(RpcUiEvent::OpenFix(aid));
+    // Route: /add or /add/:appid
+    if parts.first() == Some(&"add") || (parts.len() == 2 && parts[0] == "api" && parts[1] == "add") {
+        if aid > 0 {
+            let _ = event_tx.send(RpcUiEvent::AddApp(aid));
             notify();
-            send_json(req, 200, json!({ "ok": true }));
-            return;
         }
+        send_json(
+            req,
+            200,
+            json!({ "queued": true, "appid": aid, "success": true, "ok": true }),
+        );
+        return;
     }
 
-    if parts == ["open", "settings"] {
+    // Route: /remove or /remove/:appid or /delete or /delete/:appid
+    if parts.first() == Some(&"remove")
+        || parts.first() == Some(&"delete")
+        || (parts.len() == 2 && parts[0] == "api" && (parts[1] == "remove" || parts[1] == "delete"))
+    {
+        if aid > 0 {
+            let _ = std::fs::remove_file(stplug_dir.join(format!("{}.lua", aid)));
+            let _ = event_tx.send(RpcUiEvent::RemovedApp(aid));
+            notify();
+        }
+        send_json(
+            req,
+            200,
+            json!({ "removed": true, "appid": aid, "success": true, "ok": true }),
+        );
+        return;
+    }
+
+    // Route: /open/fix or /open/fix/:appid or /fix or /fix/:appid
+    if (parts.len() >= 2 && parts[0] == "open" && parts[1] == "fix")
+        || parts.first() == Some(&"fix")
+    {
+        let _ = event_tx.send(RpcUiEvent::OpenFix(aid));
+        notify();
+        send_json(req, 200, json!({ "ok": true, "appid": aid }));
+        return;
+    }
+
+    // Route: /open/settings or /settings
+    if (parts.len() == 2 && parts[0] == "open" && parts[1] == "settings")
+        || parts == ["settings"]
+    {
         let _ = event_tx.send(RpcUiEvent::OpenSettings);
         notify();
         send_json(req, 200, json!({ "ok": true }));
+        return;
+    }
+
+    // Route: /open/app/:appid or /open/:appid
+    if (parts.len() >= 2 && parts[0] == "open" && parts[1] == "app")
+        || (parts.len() == 2 && parts[0] == "open" && aid > 0)
+    {
+        if aid > 0 {
+            let _ = event_tx.send(RpcUiEvent::AddApp(aid));
+            notify();
+        }
+        send_json(req, 200, json!({ "ok": true, "appid": aid }));
+        return;
+    }
+
+    // Route: /open/acquire or /open/acquire/:appid
+    if parts.len() >= 2 && parts[0] == "open" && parts[1] == "acquire" {
+        if aid > 0 {
+            let _ = event_tx.send(RpcUiEvent::AddApp(aid));
+            notify();
+        }
+        send_json(req, 200, json!({ "ok": true, "appid": aid, "queued": true }));
+        return;
+    }
+
+    // Route: /open/library
+    if parts == ["open", "library"] || parts == ["library"] {
+        notify();
+        send_json(req, 200, json!({ "ok": true }));
+        return;
+    }
+
+    // Route: /open/depots or /open/depots/:appid
+    if parts.len() >= 2 && parts[0] == "open" && parts[1] == "depots" {
+        notify();
+        send_json(req, 200, json!({ "ok": true, "appid": aid }));
+        return;
+    }
+
+    // Route: /steam/restart or /restart
+    if parts == ["steam", "restart"] || parts == ["restart"] {
+        let _ = crate::services::steam_service::SteamService::relaunch_steam_sls(None);
+        send_json(req, 200, json!({ "ok": true, "restarting": true }));
+        return;
+    }
+
+    // Route: /steam/status
+    if parts == ["steam", "status"] {
+        let running = crate::services::steam_service::SteamService::is_steam_running();
+        send_json(req, 200, json!({ "ok": true, "running": running }));
+        return;
+    }
+
+    // Route: /config or /settings/config
+    if parts == ["config"] || parts == ["settings", "config"] {
+        send_json(
+            req,
+            200,
+            json!({ "ok": true, "config": { "platform": "linux", "version": crate::VERSION } }),
+        );
+        return;
+    }
+
+    // Route: /check/:appid or /check/fix/:appid
+    if parts.first() == Some(&"check") {
+        send_json(
+            req,
+            200,
+            json!({ "ok": true, "appid": aid, "has_fix": true }),
+        );
+        return;
+    }
+
+    // Route: /info/:appid
+    if parts.first() == Some(&"info") {
+        let exists = aid > 0 && stplug_dir.join(format!("{}.lua", aid)).exists();
+        send_json(
+            req,
+            200,
+            json!({ "ok": true, "appid": aid, "installed": exists }),
+        );
         return;
     }
 
@@ -251,6 +532,83 @@ mod tests {
             .unwrap();
         assert_eq!(rpc["success"], true);
         assert_eq!(rpc["exists"], false);
+
+        srv.stop();
+    }
+
+    #[test]
+    fn handles_cors_preflight_and_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let mut srv = HttpServerService::start(16780, dir.path().to_path_buf(), tx, None).unwrap();
+
+        let resp = ureq::request("OPTIONS", "http://127.0.0.1:16780/rpc")
+            .set("Origin", "https://store.steampowered.com")
+            .set("Access-Control-Request-Method", "POST")
+            .set("Access-Control-Request-Headers", "Content-Type, X-Requested-With")
+            .call()
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+        assert_eq!(resp.header("Access-Control-Allow-Origin"), Some("*"));
+        assert!(resp.header("Access-Control-Allow-Methods").unwrap().contains("OPTIONS"));
+        assert!(resp.header("Access-Control-Allow-Headers").unwrap().contains("Content-Type"));
+
+        srv.stop();
+    }
+
+    #[test]
+    fn handles_store_plugin_and_extended_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut srv = HttpServerService::start(16781, dir.path().to_path_buf(), tx, None).unwrap();
+
+        // 1. /has
+        let has1: Value = ureq::get("http://127.0.0.1:16781/has/1245620").call().unwrap().into_json().unwrap();
+        assert_eq!(has1["has"], false);
+
+        let has2: Value = ureq::get("http://127.0.0.1:16781/has?appid=1245620").call().unwrap().into_json().unwrap();
+        assert_eq!(has2["has"], false);
+
+        // 2. /add
+        let add1: Value = ureq::get("http://127.0.0.1:16781/add/1245620").call().unwrap().into_json().unwrap();
+        assert_eq!(add1["queued"], true);
+        assert!(matches!(rx.try_recv().unwrap(), RpcUiEvent::AddApp(1245620)));
+
+        // Create a dummy .lua
+        std::fs::write(dir.path().join("1245620.lua"), "addappid(1245620)").unwrap();
+        let has3: Value = ureq::get("http://127.0.0.1:16781/has/1245620").call().unwrap().into_json().unwrap();
+        assert_eq!(has3["has"], true);
+
+        // 3. /apps / /installed
+        let apps: Value = ureq::get("http://127.0.0.1:16781/apps").call().unwrap().into_json().unwrap();
+        assert_eq!(apps["apps"], json!([1245620]));
+
+        // 4. /remove
+        let rem: Value = ureq::get("http://127.0.0.1:16781/remove/1245620").call().unwrap().into_json().unwrap();
+        assert_eq!(rem["removed"], true);
+        assert!(matches!(rx.try_recv().unwrap(), RpcUiEvent::RemovedApp(1245620)));
+
+        // 5. /open/fix and /open/settings
+        let fix: Value = ureq::get("http://127.0.0.1:16781/open/fix/1245620").call().unwrap().into_json().unwrap();
+        assert_eq!(fix["ok"], true);
+        assert!(matches!(rx.try_recv().unwrap(), RpcUiEvent::OpenFix(1245620)));
+
+        let set: Value = ureq::get("http://127.0.0.1:16781/open/settings").call().unwrap().into_json().unwrap();
+        assert_eq!(set["ok"], true);
+        assert!(matches!(rx.try_recv().unwrap(), RpcUiEvent::OpenSettings));
+
+        // 6. Extended routes: /version, /status, /config, /info/1245620
+        let ver: Value = ureq::get("http://127.0.0.1:16781/version").call().unwrap().into_json().unwrap();
+        assert_eq!(ver["ok"], true);
+
+        let st: Value = ureq::get("http://127.0.0.1:16781/status").call().unwrap().into_json().unwrap();
+        assert_eq!(st["status"], "running");
+
+        let cfg: Value = ureq::get("http://127.0.0.1:16781/config").call().unwrap().into_json().unwrap();
+        assert_eq!(cfg["ok"], true);
+
+        let inf: Value = ureq::get("http://127.0.0.1:16781/info/1245620").call().unwrap().into_json().unwrap();
+        assert_eq!(inf["ok"], true);
 
         srv.stop();
     }

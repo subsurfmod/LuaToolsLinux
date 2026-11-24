@@ -204,7 +204,157 @@ impl PluginInstallerService {
             false
         }
     }
+
+    pub fn default_luatools_js() -> &'static str {
+        DEFAULT_LUATOOLS_JS
+    }
+
+    pub fn install_default_luatools_js(&self, custom_target: Option<&Path>) -> Result<PathBuf, String> {
+        let target_file = if let Some(p) = custom_target {
+            if p.is_dir() {
+                p.join("luatools.js")
+            } else {
+                p.to_path_buf()
+            }
+        } else {
+            self.plugin_dir.join("luatools").join("luatools.js")
+        };
+
+        if let Some(parent) = target_file.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create plugin dir: {}", e))?;
+        }
+
+        fs::write(&target_file, DEFAULT_LUATOOLS_JS)
+            .map_err(|e| format!("Failed to write luatools.js: {}", e))?;
+
+        if let Some(parent) = target_file.parent() {
+            let manifest = serde_json::json!({
+                "name": "luatools",
+                "version": "1.0.0",
+                "description": "LuaTools Steam Store Plugin (LTSP)",
+                "main": "luatools.js",
+                "installed_at": chrono::Utc::now().to_rfc3339(),
+            });
+            let _ = fs::write(
+                parent.join("manifest.json"),
+                serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+            );
+        }
+
+        Ok(target_file)
+    }
+
+    pub fn is_luatools_js_installed(&self, steam_root: Option<&Path>) -> bool {
+        self.find_installed_luatools_js(steam_root).is_some()
+    }
+
+    pub fn find_installed_luatools_js(&self, steam_root: Option<&Path>) -> Option<PathBuf> {
+        let mut candidates = Vec::new();
+        if let Some(sr) = steam_root {
+            candidates.push(sr.join("steamui/LuaTools/luatools.js"));
+        }
+        candidates.push(self.plugin_dir.join("luatools").join("luatools.js"));
+        if let Some(h) = dirs::home_dir() {
+            candidates.push(h.join(".local/share/millennium/plugins/luatools/public/luatools.js"));
+            candidates.push(h.join(".local/share/Steam/steamui/LuaTools/luatools.js"));
+            candidates.push(h.join(".local/share/luatools/plugins/luatools/luatools.js"));
+        }
+        candidates.into_iter().find(|p| p.is_file())
+    }
+
+    pub fn ensure_luatools_js_installed(&self, steam_root: Option<&Path>) -> Result<PathBuf, String> {
+        if let Some(p) = self.find_installed_luatools_js(steam_root) {
+            return Ok(p);
+        }
+        let target = if let Some(sr) = steam_root {
+            sr.join("steamui/LuaTools/luatools.js")
+        } else if let Some(h) = dirs::home_dir() {
+            h.join(".local/share/Steam/steamui/LuaTools/luatools.js")
+        } else {
+            self.plugin_dir.join("luatools").join("luatools.js")
+        };
+        self.install_default_luatools_js(Some(&target))
+    }
 }
+
+pub const DEFAULT_LUATOOLS_JS: &str = r##"// LuaTools Store Plugin (LTSP) - Injected into Steam Store
+(function() {
+  if (window.__luatoolsStorePluginInjected) return;
+  window.__luatoolsStorePluginInjected = true;
+
+  function getAppId() {
+    const match = window.location.pathname.match(/\/app\/(\d+)/);
+    return match ? parseInt(match[1], 10) : 0;
+  }
+
+  function initLuaToolsButton() {
+    const appId = getAppId();
+    if (!appId) return;
+
+    if (window.Millennium && window.Millennium.callServerMethod) {
+      window.Millennium.callServerMethod("luatools", "HasLuaToolsForApp", { appid: appId })
+        .then(function(res) {
+          let data = {};
+          try { data = typeof res === "string" ? JSON.parse(res) : res; } catch(e) {}
+          const exists = data.exists || data.has || false;
+          renderButton(appId, exists);
+        })
+        .catch(function() {
+          renderButton(appId, false);
+        });
+    }
+  }
+
+  function renderButton(appId, exists) {
+    if (document.getElementById("luatools-store-action-btn")) return;
+    const target = document.querySelector(".game_area_purchase_game") ||
+                   document.querySelector(".queue_actions_ctn") ||
+                   document.querySelector("#game_area_purchase");
+    if (!target) return;
+
+    const btn = document.createElement("div");
+    btn.id = "luatools-store-action-btn";
+    btn.style.cssText = "margin: 10px 0; padding: 10px 16px; border-radius: 4px; font-size: 14px; font-weight: bold; cursor: pointer; display: inline-block; text-align: center; transition: all 0.2s;";
+
+    if (exists) {
+      btn.style.background = "#3d4450";
+      btn.style.color = "#e5e5e5";
+      btn.innerText = "✓ In LuaTools (Click to Remove)";
+      btn.onclick = function() {
+        btn.innerText = "Removing...";
+        window.Millennium.callServerMethod("luatools", "DeleteLuaToolsForApp", { appid: appId })
+          .then(function() {
+            btn.innerText = "+ Add via LuaTools";
+            btn.style.background = "#5c7e10";
+            btn.style.color = "#d2efa9";
+            btn.onclick = function() { renderButton(appId, false); };
+          });
+      };
+    } else {
+      btn.style.background = "#5c7e10";
+      btn.style.color = "#d2efa9";
+      btn.innerText = "+ Add via LuaTools";
+      btn.onclick = function() {
+        btn.innerText = "Queuing in LuaTools...";
+        window.Millennium.callServerMethod("luatools", "StartAddViaLuaTools", { appid: appId })
+          .then(function() {
+            btn.innerText = "✓ Added! (Refresh Steam)";
+            btn.style.background = "#2a475e";
+          });
+      };
+    }
+
+    target.parentNode.insertBefore(btn, target);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initLuaToolsButton);
+  } else {
+    initLuaToolsButton();
+  }
+})();
+"##;
 
 fn is_safe_plugin_name(name: &str) -> bool {
     if name.is_empty()
@@ -279,5 +429,17 @@ mod tests {
             dependencies: Vec::new(),
         };
         assert!(service.install_plugin(traversal).is_err());
+    }
+
+    #[test]
+    fn test_install_default_luatools_js() {
+        let dir = tempdir().unwrap();
+        let service = PluginInstallerService::new(Some(dir.path()));
+        let installed = service.install_default_luatools_js(None).unwrap();
+        assert!(installed.is_file());
+        assert_eq!(installed, dir.path().join("luatools/luatools.js"));
+        let content = fs::read_to_string(&installed).unwrap();
+        assert!(content.contains("LuaTools Store Plugin (LTSP)"));
+        assert!(service.is_luatools_js_installed(None));
     }
 }

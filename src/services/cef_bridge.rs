@@ -69,6 +69,7 @@ impl CefBridgeService {
         let stop = Arc::clone(&self.stop_flag);
         let status = Arc::clone(&self.status);
         let port = self.http_port;
+        let steam_root = self.steam_root.clone();
 
         self.handle = Some(thread::spawn(move || {
             *status.lock().unwrap() = "Polling CDP :8080...".into();
@@ -93,7 +94,7 @@ impl CefBridgeService {
                                     store_count += 1;
                                     if !tid.is_empty()
                                         && !injected_tabs.contains(tid)
-                                        && bridge_ws_tab(ws, port)
+                                        && bridge_ws_tab(ws, port, steam_root.as_deref())
                                     {
                                         injected_tabs.insert(tid.to_string());
                                     }
@@ -133,13 +134,25 @@ impl Drop for CefBridgeService {
     }
 }
 
-fn find_luatools_js() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    let candidates = [
-        home.join(".local/share/millennium/plugins/luatools/public/luatools.js"),
-        home.join(".local/share/Steam/steamui/LuaTools/luatools.js"),
-    ];
-    candidates.into_iter().find(|p| p.exists())
+pub fn find_luatools_js(steam_root: Option<&Path>) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(root) = steam_root {
+        candidates.push(root.join("steamui/LuaTools/luatools.js"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".local/share/millennium/plugins/luatools/public/luatools.js"));
+        candidates.push(home.join(".local/share/Steam/steamui/LuaTools/luatools.js"));
+        candidates.push(home.join(".local/share/luatools/plugins/luatools/luatools.js"));
+    }
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+pub fn ensure_luatools_js_installed(steam_root: Option<&Path>) -> Result<PathBuf, String> {
+    if let Some(p) = find_luatools_js(steam_root) {
+        return Ok(p);
+    }
+    let installer = crate::services::plugin_installer_service::PluginInstallerService::default();
+    installer.ensure_luatools_js_installed(steam_root)
 }
 
 fn build_polyfill_js(http_port: u16) -> String {
@@ -150,14 +163,43 @@ fn build_polyfill_js(http_port: u16) -> String {
   const BASE = "http://127.0.0.1:{http_port}";
   if (!window.Millennium) {{
     window.Millennium = {{
-      callServerMethod: async function(method, args) {{
-        const r = await fetch(BASE + "/rpc", {{
-          method: "POST",
-          headers: {{"Content-Type": "application/json"}},
-          body: JSON.stringify({{method, args: args || {{}}}})
-        }});
-        return await r.text();
-      }}
+      callServerMethod: async function(a, b, c) {{
+        let method = "";
+        let args = {{}};
+        if (c !== undefined) {{
+          method = String(b || "");
+          args = c;
+        }} else if (b !== undefined) {{
+          if (typeof b === "object" && b !== null) {{
+            method = String(a || "");
+            args = b;
+          }} else {{
+            method = String(b || "");
+            args = {{}};
+          }}
+        }} else {{
+          method = String(a || "");
+          args = {{}};
+        }}
+
+        if (typeof args === "string") {{
+          try {{ args = JSON.parse(args); }} catch (_) {{}}
+        }}
+
+        try {{
+          const r = await fetch(BASE + "/rpc", {{
+            method: "POST",
+            headers: {{"Content-Type": "application/json"}},
+            body: JSON.stringify({{method, args: args || {{}}}})
+          }});
+          return await r.text();
+        }} catch (e) {{
+          console.error("[LuaTools Polyfill] callServerMethod error:", e);
+          return JSON.stringify({{success: false, error: String(e)}});
+        }}
+      }},
+      callFrontendMethod: function() {{ return Promise.resolve(); }},
+      findElement: function() {{ return null; }}
     }};
   }}
 }})();"#
@@ -252,9 +294,9 @@ pub fn connect_ws_local(ws_url: &str) -> Result<WebSocket<TcpStream>, String> {
     ))
 }
 
-fn bridge_ws_tab(ws_url: &str, http_port: u16) -> bool {
+pub fn bridge_ws_tab(ws_url: &str, http_port: u16, steam_root: Option<&Path>) -> bool {
     let mut js = build_polyfill_js(http_port);
-    if let Some(p) = find_luatools_js() {
+    if let Ok(p) = ensure_luatools_js_installed(steam_root) {
         if let Ok(extra) = fs::read_to_string(p) {
             js.push('\n');
             js.push_str(&extra);
@@ -264,10 +306,43 @@ fn bridge_ws_tab(ws_url: &str, http_port: u16) -> bool {
     let Ok(mut socket) = connect_ws_local(ws_url) else {
         return false;
     };
-    let payload = json!({
+
+    // 1. Enable Page domain
+    let page_enable = json!({
         "id": 1,
+        "method": "Page.enable"
+    });
+    if socket
+        .send(Message::Text(page_enable.to_string().into()))
+        .is_err()
+    {
+        return false;
+    }
+    let _ = socket.read();
+
+    // 2. Bypass CSP on this tab (LT-23 CSP handling)
+    let bypass_csp = json!({
+        "id": 2,
+        "method": "Page.setBypassCSP",
+        "params": { "enabled": true }
+    });
+    if socket
+        .send(Message::Text(bypass_csp.to_string().into()))
+        .is_err()
+    {
+        return false;
+    }
+    let _ = socket.read();
+
+    // 3. Evaluate polyfill + luatools.js
+    let payload = json!({
+        "id": 3,
         "method": "Runtime.evaluate",
-        "params": { "expression": js }
+        "params": {
+            "expression": js,
+            "userGesture": true,
+            "awaitPromise": false
+        }
     });
     if socket
         .send(Message::Text(payload.to_string().into()))
@@ -290,7 +365,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
-        let server = thread::spawn(move || -> String {
+        let server = thread::spawn(move || -> Vec<String> {
             let (mut conn, _) = listener.accept().unwrap();
             let mut req = Vec::new();
             let mut buf = [0u8; 512];
@@ -327,15 +402,32 @@ mod tests {
             conn.write_all(resp.as_bytes()).unwrap();
 
             let mut ws = WebSocket::from_raw_socket(conn, Role::Server, None);
-            let msg = ws.read().unwrap().into_text().unwrap().to_string();
-            let _ = ws.send(Message::Text(r#"{"id":1,"result":{}}"#.into()));
-            msg
+            let mut received = Vec::new();
+            for _ in 0..3 {
+                if let Ok(msg) = ws.read() {
+                    if let Ok(text) = msg.into_text() {
+                        let text_str = text.to_string();
+                        let id = serde_json::from_str::<Value>(&text_str)
+                            .ok()
+                            .and_then(|v| v.get("id").and_then(|i| i.as_i64()))
+                            .unwrap_or(1);
+                        received.push(text_str);
+                        let _ = ws.send(Message::Text(format!(r#"{{"id":{},"result":{{}}}}"#, id).into()));
+                    }
+                }
+            }
+            received
         });
 
         let ws_url = format!("ws://127.0.0.1:{}/devtools/page/TAB1", port);
-        assert!(bridge_ws_tab(&ws_url, 6767));
+        assert!(bridge_ws_tab(&ws_url, 6767, None));
         let received = server.join().unwrap();
-        assert!(received.contains("Runtime.evaluate"));
-        assert!(received.contains("http://127.0.0.1:6767"));
+        assert_eq!(received.len(), 3);
+        assert!(received[0].contains("Page.enable"));
+        assert!(received[1].contains("Page.setBypassCSP"));
+        assert!(received[1].contains(r#""enabled":true"#));
+        assert!(received[2].contains("Runtime.evaluate"));
+        assert!(received[2].contains("http://127.0.0.1:6767"));
+        assert!(received[2].contains("callServerMethod"));
     }
 }
