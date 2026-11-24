@@ -9,6 +9,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
@@ -20,6 +22,26 @@ use crate::models::steam::SteamInstallation;
 use crate::parsers::lua_parser::LuaFileParser;
 use crate::services::api_client::stream_response_to_file;
 use crate::services::slssteam_service::SlssteamService;
+
+static KEYS_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn pct_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(\d{1,3}\.\d{2})%").unwrap())
+}
+
+fn is_valid_depot_key(key: &str) -> bool {
+    let k = key.trim();
+    k.len() == 64 && k.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+struct TempFileGuard(PathBuf);
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct DepotSelection {
@@ -123,11 +145,15 @@ impl DepotDownloaderService {
     }
 
     fn scan_dir_for_bin(dir: &Path) -> Option<PathBuf> {
-        if !dir.exists() {
+        Self::scan_dir_for_bin_depth(dir, 0)
+    }
+
+    fn scan_dir_for_bin_depth(dir: &Path, depth: usize) -> Option<PathBuf> {
+        if depth > 4 || !dir.is_dir() {
             return None;
         }
         // When system `dotnet` is installed (e.g. Fedora 44/45 with native glibc 2.44 / OpenSSL 3.5),
-        // prefer `DepotDownloader.dll` so it runs on the host .NET runtime instead of a older bundled runtime.
+        // prefer `DepotDownloader.dll` so it runs on the host .NET runtime instead of an older bundled runtime.
         let has_system_dotnet = which_in_path("dotnet").is_some();
         let candidates: &[&str] = if has_system_dotnet {
             &["DepotDownloader.dll", "DepotDownloader", "depotdownloader"]
@@ -143,9 +169,9 @@ impl DepotDownloaderService {
         }
         if let Ok(entries) = fs::read_dir(dir) {
             for e in entries.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    if let Some(sub) = Self::scan_dir_for_bin(&p) {
+                // Skip symlinks to prevent directory traversal loops
+                if e.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    if let Some(sub) = Self::scan_dir_for_bin_depth(&e.path(), depth + 1) {
                         return Some(sub);
                     }
                 }
@@ -357,11 +383,16 @@ impl DepotDownloaderService {
 
         let asset = chosen?;
         let dl_url = asset.get("browser_download_url").and_then(|v| v.as_str())?;
-        let aname = asset
+        let raw_aname = asset
             .get("name")
             .and_then(|v| v.as_str())
             .unwrap_or("depotdownloader.zip");
-        let zip_path = self.tool_dir.join(aname);
+        let safe_aname = Path::new(raw_aname)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+            .unwrap_or("depotdownloader.zip");
+        let zip_path = self.tool_dir.join(safe_aname);
 
         progress_cb(10.0, format!("Downloading DepotDownloader {}...", tag));
         let dl_resp = agent.get(dl_url).call().ok()?;
@@ -371,12 +402,15 @@ impl DepotDownloaderService {
         .ok()?;
 
         progress_cb(92.0, "Extracting archive...".into());
-        if let Ok(zf) = File::open(&zip_path) {
-            if let Ok(mut archive) = ZipArchive::new(zf) {
-                let _ = archive.extract(&self.tool_dir);
-            }
-        }
+        let extract_ok = File::open(&zip_path)
+            .ok()
+            .and_then(|zf| ZipArchive::new(zf).ok())
+            .and_then(|mut archive| archive.extract(&self.tool_dir).ok())
+            .is_some();
         let _ = fs::remove_file(&zip_path);
+        if !extract_ok {
+            return None;
+        }
 
         let exe = Self::scan_dir_for_bin(&self.tool_dir)?;
         let _ = Self::build_invocation(&exe);
@@ -432,14 +466,27 @@ impl DepotDownloaderService {
     ) -> BTreeMap<u32, String> {
         let mut keys = BTreeMap::new();
         if let Some(sls) = sls {
-            keys = sls.config.depot_keys.clone();
+            for (did, k) in &sls.config.depot_keys {
+                if is_valid_depot_key(k) {
+                    keys.insert(*did, k.trim().to_ascii_lowercase());
+                }
+            }
         }
         if let Some(bridge) = bridge {
+            // Pull explicit depot keys configured on the Steam bridge overrides
+            let ov = bridge.snapshot_overrides();
+            for (did, k) in ov.depot_keys {
+                if is_valid_depot_key(&k) {
+                    keys.insert(did, k.trim().to_ascii_lowercase());
+                }
+            }
             if let Ok(mut store) = bridge.ticket_store.lock() {
                 if let Ok(tickets) = store.get(app_id) {
                     if let Some(key) = tickets.app_ticket {
-                        // AppTicket is stored as hex, use it as depot key for the app itself
-                        keys.insert(app_id, key);
+                        // Only include if it is actually a 64-char hex depot key
+                        if is_valid_depot_key(&key) {
+                            keys.insert(app_id, key.trim().to_ascii_lowercase());
+                        }
                     }
                 }
             }
@@ -449,7 +496,9 @@ impl DepotDownloaderService {
             if let Some(lua) = LuaFileParser::parse_file(&lua_path, app_id) {
                 for e in lua.entries {
                     if let Some(k) = e.key {
-                        keys.insert(e.id, k);
+                        if is_valid_depot_key(&k) {
+                            keys.insert(e.id, k.trim().to_ascii_lowercase());
+                        }
                     }
                 }
             }
@@ -457,19 +506,26 @@ impl DepotDownloaderService {
         keys
     }
 
-    /// Writes depot keys to a temporary file for DepotDownloader -depotkeys support
+    /// Writes depot keys to a private (`0o600`) temporary file in DepotDownloader's `depotid;hexkey` format.
     pub fn write_depot_keys_file(keys: &BTreeMap<u32, String>) -> Option<PathBuf> {
-        if keys.is_empty() {
+        let valid_lines: Vec<String> = keys
+            .iter()
+            .filter(|(_, key)| is_valid_depot_key(key))
+            .map(|(depot_id, key)| format!("{};{}", depot_id, key.trim().to_ascii_lowercase()))
+            .collect();
+        if valid_lines.is_empty() {
             return None;
         }
-        let dir = std::env::temp_dir().join("luatools_depot_keys");
-        let _ = fs::create_dir_all(&dir);
-        let file_path = dir.join("depot_keys.txt");
-        let mut content = String::new();
-        for (depot_id, key) in keys {
-            content.push_str(&format!("{} {}\n", depot_id, key));
-        }
+        let seq = KEYS_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let file_path = std::env::temp_dir().join(format!(
+            "luatools_depotkeys_{}_{}.txt",
+            std::process::id(),
+            seq
+        ));
+        let mut content = valid_lines.join("\n");
+        content.push('\n');
         if fs::write(&file_path, content).is_ok() {
+            let _ = fs::set_permissions(&file_path, fs::Permissions::from_mode(0o600));
             Some(file_path)
         } else {
             None
@@ -482,7 +538,11 @@ impl DepotDownloaderService {
         manifest_id: &str,
     ) -> Option<PathBuf> {
         let inst = steam_inst?;
-        let fname = format!("{}_{}.manifest", depot_id, manifest_id);
+        let clean_gid = manifest_id.trim();
+        if clean_gid.is_empty() || !clean_gid.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let fname = format!("{}_{}.manifest", depot_id, clean_gid);
         let mut dirs = vec![
             inst.root.join("depotcache"),
             inst.root.join("steamapps").join("depotcache"),
@@ -602,36 +662,20 @@ impl DepotDownloaderService {
         }
 
         let target_app = selection.from_app_id.unwrap_or(app_id);
-        let bridge = self
-            .bridge_service
-            .as_ref()
-            .map(|b| b.lock().unwrap_or_else(|e| e.into_inner()));
-        let depot_keys = Self::resolve_keys(
-            self.steam_installation.as_ref(),
-            self.slssteam_service.as_ref(),
-            bridge.as_deref(),
-            app_id,
-        );
-        let keys_file = if !depot_keys.is_empty() {
-            let keys_path = std::env::temp_dir().join(format!(
-                "luatools_depotkeys_{}_{}.txt",
-                std::process::id(),
-                selection.depot_id
-            ));
-            let content = depot_keys
-                .iter()
-                .map(|(id, key)| format!("{};{}", id, key))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if fs::write(&keys_path, content).is_ok() {
-                let _ = fs::set_permissions(&keys_path, fs::Permissions::from_mode(0o600));
-                Some(keys_path)
-            } else {
-                None
-            }
-        } else {
-            None
+        let depot_keys = {
+            let bridge = self
+                .bridge_service
+                .as_ref()
+                .map(|b| b.lock().unwrap_or_else(|e| e.into_inner()));
+            Self::resolve_keys(
+                self.steam_installation.as_ref(),
+                self.slssteam_service.as_ref(),
+                bridge.as_deref(),
+                app_id,
+            )
+            // `bridge` mutex guard is dropped immediately here before spawning the child process
         };
+        let keys_guard = Self::write_depot_keys_file(&depot_keys).map(TempFileGuard);
 
         let is_mod = Self::is_mod_binary(&exe);
         let dl_args = Self::build_download_args_for_tool(
@@ -639,7 +683,7 @@ impl DepotDownloaderService {
             selection,
             download_dir,
             &opts.steam_username,
-            keys_file.as_deref(),
+            keys_guard.as_ref().map(|g| g.0.as_path()),
             is_mod,
         );
 
@@ -666,9 +710,6 @@ impl DepotDownloaderService {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                if let Some(ref kp) = keys_file {
-                    let _ = fs::remove_file(kp);
-                }
                 return DepotRunResult {
                     depot_id: selection.depot_id,
                     ok: false,
@@ -691,7 +732,7 @@ impl DepotDownloaderService {
             })
         });
 
-        let pct_re = Regex::new(r"(\d{1,3}\.\d{2})%").unwrap();
+        let pct_re = pct_regex();
         let mut last_stdout = String::new();
         let mut recent_stdout = Vec::new();
         if let Some(stdout) = child.stdout.take() {
@@ -720,9 +761,7 @@ impl DepotDownloaderService {
             .unwrap_or_default();
 
         let wait_res = child.wait();
-        if let Some(ref kp) = keys_file {
-            let _ = fs::remove_file(kp);
-        }
+        drop(keys_guard);
 
         match wait_res {
             Ok(status) if status.success() => DepotRunResult {
@@ -811,34 +850,29 @@ fn shell_quote(s: &str) -> String {
 }
 
 fn disable_core_dumps(cmd: &mut Command) {
-    #[repr(C)]
-    struct Rlimit {
-        rlim_cur: u64,
-        rlim_max: u64,
-    }
-    extern "C" {
-        fn setrlimit(resource: c_int, rlim: *const Rlimit) -> c_int;
-    }
-    use std::ffi::c_int;
-    const RLIMIT_CORE: c_int = 4;
     unsafe {
         cmd.pre_exec(|| {
-            let zero = Rlimit {
+            let zero = libc::rlimit {
                 rlim_cur: 0,
                 rlim_max: 0,
             };
-            let _ = setrlimit(RLIMIT_CORE, &zero);
+            let _ = libc::setrlimit(libc::RLIMIT_CORE, &zero);
             Ok(())
         });
     }
 }
 
 pub fn which_in_path(binary: &str) -> Option<PathBuf> {
+    if binary.is_empty() || binary.contains('/') {
+        return None;
+    }
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         let full = dir.join(binary);
-        if full.is_file() {
-            return Some(full);
+        if let Ok(meta) = fs::metadata(&full) {
+            if meta.is_file() && (meta.permissions().mode() & 0o111 != 0) {
+                return Some(full);
+            }
         }
     }
     None
@@ -903,5 +937,47 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|w| w == ["-depotkeys", "/tmp/luatools_depotkeys.txt"]));
+    }
+
+    #[test]
+    fn write_depot_keys_file_uses_semicolon_format_and_private_permissions() {
+        let mut keys = BTreeMap::new();
+        keys.insert(1245621, "AB".repeat(32));
+        keys.insert(999, "not-a-valid-key".into());
+
+        let path = DepotDownloaderService::write_depot_keys_file(&keys).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(content, format!("1245621;{}\n", "ab".repeat(32)));
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn resolve_keys_reads_bridge_depot_keys_and_rejects_invalid_manifest_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bridge = crate::services::steam_bridge_service::SteamBridgeService::with_paths(
+            None,
+            Some(tmp.path().to_path_buf()),
+        );
+        let key = "ef".repeat(32);
+        bridge.set_depot_key(55501, key.clone());
+
+        let resolved = DepotDownloaderService::resolve_keys(None, None, Some(&bridge), 55500);
+        assert_eq!(resolved.get(&55501).map(String::as_str), Some(key.as_str()));
+
+        let inst = SteamInstallation {
+            root: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config"),
+            stplug_in_path: tmp.path().join("config/stplug-in"),
+            libraries: Vec::new(),
+        };
+        assert!(DepotDownloaderService::resolve_manifest_path(
+            Some(&inst),
+            55501,
+            "../../etc/passwd"
+        )
+        .is_none());
     }
 }

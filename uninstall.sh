@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# LuaTools Linux v2.0.0 — Clean Uninstaller
+# LuaTools Linux — Clean Uninstaller
 # Usage: ./uninstall.sh [--system] [--purge]
 # ==============================================================================
 set -euo pipefail
@@ -18,12 +18,18 @@ done
 if [ "$SYSTEM_WIDE" -eq 1 ]; then
     if [ "$(id -u)" -eq 0 ]; then
         rm -f /usr/local/bin/luatools \
+              /usr/local/lib/luatools/libsteam_integration.so \
+              /usr/local/lib/luatools/libsteam_auto_patch_linux.so \
               /usr/local/share/applications/luatools.desktop \
               /usr/local/share/icons/hicolor/scalable/apps/luatools.svg
+        rmdir /usr/local/lib/luatools 2>/dev/null || true
     else
         sudo rm -f /usr/local/bin/luatools \
+                   /usr/local/lib/luatools/libsteam_integration.so \
+                   /usr/local/lib/luatools/libsteam_auto_patch_linux.so \
                    /usr/local/share/applications/luatools.desktop \
                    /usr/local/share/icons/hicolor/scalable/apps/luatools.svg
+        sudo rmdir /usr/local/lib/luatools 2>/dev/null || true
     fi
     echo "[OK] Removed system-wide LuaTools Linux files."
 else

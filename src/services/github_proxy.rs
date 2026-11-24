@@ -6,10 +6,15 @@
 //! API requests (api.github.com) get API mirrors; everything else (github.com downloads, raw, objects)
 //! gets download mirrors. The first usable response wins.
 
+use std::collections::HashSet;
+use std::fs;
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ureq::Agent;
+
+static PROXY_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct GithubProxy {
     http: Agent,
@@ -20,6 +25,7 @@ pub struct GithubProxy {
 impl Default for GithubProxy {
     fn default() -> Self {
         let http = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
             .build();
         Self {
@@ -50,28 +56,49 @@ impl GithubProxy {
     }
 
     pub fn is_github(url: &str) -> bool {
-        url.starts_with("https://github.com/")
-            || url.starts_with("https://api.github.com/")
-            || url.starts_with("https://raw.githubusercontent.com/")
-            || url.starts_with("https://objects.githubusercontent.com/")
+        let low = url.trim().to_ascii_lowercase();
+        low.starts_with("https://github.com/")
+            || low.starts_with("https://api.github.com/")
+            || low.starts_with("https://raw.githubusercontent.com/")
+            || low.starts_with("https://objects.githubusercontent.com/")
+            || low.starts_with("https://codeload.github.com/")
+            || low.starts_with("https://release-assets.githubusercontent.com/")
     }
 
     /// Generate candidate URLs: direct first, then mirror-prefixed variants.
     pub(crate) fn candidates(&self, url: &str) -> Vec<String> {
-        let mut candidates = vec![url.to_string()];
+        let trimmed_url = url.trim();
+        let mut candidates = vec![trimmed_url.to_string()];
 
-        if !Self::is_github(url) {
+        if !Self::is_github(trimmed_url) {
             return candidates;
         }
 
-        let mirrors = if url.starts_with("https://api.github.com/") {
+        let mirrors = if trimmed_url
+            .to_ascii_lowercase()
+            .starts_with("https://api.github.com/")
+        {
             &self.api_mirrors
         } else {
             &self.download_mirrors
         };
 
+        let mut seen = HashSet::new();
+        seen.insert(trimmed_url.to_string());
+
         for mirror in mirrors {
-            candidates.push(format!("{}{}", mirror, url));
+            let m = mirror.trim();
+            if m.is_empty() {
+                continue;
+            }
+            let joined = if m.ends_with('/') || m.ends_with('=') || m.ends_with('?') {
+                format!("{}{}", m, trimmed_url)
+            } else {
+                format!("{}/{}", m, trimmed_url)
+            };
+            if seen.insert(joined.clone()) {
+                candidates.push(joined);
+            }
         }
 
         candidates
@@ -103,14 +130,24 @@ impl GithubProxy {
         })))
     }
 
-    /// Download a file, trying direct then mirrors. Streams to disk with progress.
+    /// Download a file, trying direct then mirrors. Streams atomically to disk with progress.
     pub async fn download_async(
         &self,
         url: &str,
         dest_path: &std::path::Path,
         mut progress: Option<&mut dyn FnMut(f64)>,
     ) -> Result<(), Box<ureq::Error>> {
+        if let Some(parent) = dest_path.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                return Err(Box::new(ureq::Error::from(e)));
+            }
+        }
+
         let mut last: Option<ureq::Error> = None;
+        let base_name = dest_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("download");
 
         for candidate in self.candidates(url) {
             match self
@@ -127,7 +164,15 @@ impl GithubProxy {
                     let mut reader = res.into_reader();
                     let mut written = 0u64;
 
-                    match std::fs::File::create(dest_path) {
+                    let seq = PROXY_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+                    let tmp_path = dest_path.with_file_name(format!(
+                        ".{}.part.{}.{}",
+                        base_name,
+                        std::process::id(),
+                        seq
+                    ));
+
+                    match fs::File::create(&tmp_path) {
                         Ok(mut file) => {
                             let mut buf = [0u8; 81920];
                             let mut stream_err: Option<io::Error> = None;
@@ -142,7 +187,7 @@ impl GithubProxy {
                                         written += n as u64;
                                         if let Some(p) = progress.as_mut() {
                                             if let Some(t) = total {
-                                                p((written as f64) / (t as f64));
+                                                p(((written as f64) / (t as f64)).clamp(0.0, 1.0));
                                             } else {
                                                 p(0.0);
                                             }
@@ -154,9 +199,20 @@ impl GithubProxy {
                                     }
                                 }
                             }
+                            if stream_err.is_none() {
+                                if let Err(e) = file.flush() {
+                                    stream_err = Some(e);
+                                }
+                            }
+                            drop(file);
                             if let Some(err) = stream_err {
-                                let _ = std::fs::remove_file(dest_path);
+                                let _ = fs::remove_file(&tmp_path);
                                 last = Some(ureq::Error::from(err));
+                                continue;
+                            }
+                            if let Err(e) = fs::rename(&tmp_path, dest_path) {
+                                let _ = fs::remove_file(&tmp_path);
+                                last = Some(ureq::Error::from(e));
                                 continue;
                             }
                             return Ok(());
@@ -191,17 +247,44 @@ mod tests {
         assert!(GithubProxy::is_github(
             "https://raw.githubusercontent.com/user/repo/main/file.txt"
         ));
+        assert!(GithubProxy::is_github(
+            "https://codeload.github.com/user/repo/zip/main"
+        ));
+        assert!(GithubProxy::is_github(
+            "https://release-assets.githubusercontent.com/github-production-release-asset/1"
+        ));
         assert!(!GithubProxy::is_github("https://example.com/file"));
         assert!(!GithubProxy::is_github("https://google.com"));
     }
 
     #[test]
-    fn test_candidates_includes_direct_first() {
-        let p = GithubProxy::new();
+    fn test_candidates_includes_direct_first_and_normalizes_mirrors() {
+        let p = GithubProxy::new().with_mirrors(
+            vec!["https://api-mirror.example".into()],
+            vec![
+                "  ".into(),
+                "https://ghproxy.example".into(),
+                "https://ghproxy.example/".into(),
+                "https://proxy2.example/?url=".into(),
+            ],
+        );
         let cands = p.candidates("https://github.com/user/repo/archive/refs/heads/main.zip");
         assert_eq!(
-            cands[0],
-            "https://github.com/user/repo/archive/refs/heads/main.zip"
+            cands,
+            vec![
+                "https://github.com/user/repo/archive/refs/heads/main.zip",
+                "https://ghproxy.example/https://github.com/user/repo/archive/refs/heads/main.zip",
+                "https://proxy2.example/?url=https://github.com/user/repo/archive/refs/heads/main.zip",
+            ]
+        );
+
+        let api_cands = p.candidates("https://api.github.com/repos/user/repo");
+        assert_eq!(
+            api_cands,
+            vec![
+                "https://api.github.com/repos/user/repo",
+                "https://api-mirror.example/https://api.github.com/repos/user/repo",
+            ]
         );
     }
 

@@ -59,18 +59,40 @@ impl PluginInstallerService {
     }
 
     pub fn install_plugin(&self, request: PluginInstallRequest) -> Result<(), String> {
-        let plugin_dir = self.plugin_dir.join(&request.name);
+        let clean_name = request.name.trim();
+        if !is_safe_plugin_name(clean_name) {
+            return Err("Invalid plugin name (empty or contains path traversal characters)".into());
+        }
+        let clean_url = request.download_url.trim();
+        if !clean_url.starts_with("http://")
+            && !clean_url.starts_with("https://")
+            && !clean_url.starts_with("file://")
+        {
+            return Err("Invalid plugin download URL".into());
+        }
+        if let Some(ref csum) = request.checksum {
+            let clean = csum
+                .trim()
+                .strip_prefix("sha256:")
+                .or_else(|| csum.trim().strip_prefix("SHA256:"))
+                .unwrap_or(csum.trim());
+            if clean.len() != 64 || !clean.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err("Invalid SHA-256 checksum format".into());
+            }
+        }
+
+        let plugin_dir = self.plugin_dir.join(clean_name);
         if plugin_dir.exists() {
-            return Err(format!("Plugin '{}' is already installed", request.name));
+            return Err(format!("Plugin '{}' is already installed", clean_name));
         }
 
         // Mark as downloading
         {
-            let mut downloads = self.downloads.lock().unwrap();
+            let mut downloads = self.downloads.lock().unwrap_or_else(|e| e.into_inner());
             downloads.insert(
-                request.name.clone(),
+                clean_name.to_string(),
                 PluginInstallProgress {
-                    plugin_name: request.name.clone(),
+                    plugin_name: clean_name.to_string(),
                     total_bytes: 0,
                     downloaded_bytes: 0,
                     percent: 0.0,
@@ -79,19 +101,45 @@ impl PluginInstallerService {
             );
         }
 
-        // In a full implementation, download and verify the plugin here
-        // For now, just create the directory
-        if fs::create_dir_all(&plugin_dir).is_err() {
-            let mut downloads = self.downloads.lock().unwrap();
-            if let Some(progress) = downloads.get_mut(&request.name) {
+        if let Err(e) = fs::create_dir_all(&plugin_dir) {
+            let mut downloads = self.downloads.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(progress) = downloads.get_mut(clean_name) {
                 progress.status = InstallStatus::Failed;
             }
-            return Err("Failed to create plugin directory".into());
+            return Err(format!("Failed to create plugin directory: {}", e));
         }
 
         {
-            let mut downloads = self.downloads.lock().unwrap();
-            if let Some(progress) = downloads.get_mut(&request.name) {
+            let mut downloads = self.downloads.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(progress) = downloads.get_mut(clean_name) {
+                progress.status = InstallStatus::Installing;
+                progress.percent = 50.0;
+            }
+        }
+
+        let manifest = serde_json::json!({
+            "name": clean_name,
+            "version": request.version.clone().unwrap_or_else(|| "1.0.0".into()),
+            "download_url": clean_url,
+            "checksum": request.checksum,
+            "dependencies": request.dependencies,
+            "installed_at": chrono::Utc::now().to_rfc3339(),
+        });
+        if let Err(e) = fs::write(
+            plugin_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+        ) {
+            let _ = fs::remove_dir_all(&plugin_dir);
+            let mut downloads = self.downloads.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(progress) = downloads.get_mut(clean_name) {
+                progress.status = InstallStatus::Failed;
+            }
+            return Err(format!("Failed to write plugin manifest: {}", e));
+        }
+
+        {
+            let mut downloads = self.downloads.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(progress) = downloads.get_mut(clean_name) {
                 progress.status = InstallStatus::Completed;
                 progress.percent = 100.0;
             }
@@ -101,17 +149,28 @@ impl PluginInstallerService {
     }
 
     pub fn get_progress(&self, plugin_name: &str) -> Option<PluginInstallProgress> {
-        self.downloads.lock().unwrap().get(plugin_name).cloned()
+        self.downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(plugin_name.trim())
+            .cloned()
     }
 
     pub fn cancel_install(&self, plugin_name: &str) -> bool {
-        let mut downloads = self.downloads.lock().unwrap();
-        if let Some(progress) = downloads.get_mut(plugin_name) {
-            progress.status = InstallStatus::Cancelled;
-            true
-        } else {
-            false
+        let mut downloads = self.downloads.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(progress) = downloads.get_mut(plugin_name.trim()) {
+            if matches!(
+                progress.status,
+                InstallStatus::Pending
+                    | InstallStatus::Downloading
+                    | InstallStatus::Verifying
+                    | InstallStatus::Installing
+            ) {
+                progress.status = InstallStatus::Cancelled;
+                return true;
+            }
         }
+        false
     }
 
     pub fn list_installed(&self) -> Vec<String> {
@@ -125,17 +184,40 @@ impl PluginInstallerService {
                 }
             }
         }
+        plugins.sort();
         plugins
     }
 
     pub fn remove_plugin(&self, name: &str) -> bool {
-        let plugin_dir = self.plugin_dir.join(name);
-        if plugin_dir.exists() {
-            fs::remove_dir_all(&plugin_dir).is_ok()
+        let clean = name.trim();
+        if !is_safe_plugin_name(clean) {
+            return false;
+        }
+        let plugin_dir = self.plugin_dir.join(clean);
+        if plugin_dir.is_dir() && fs::remove_dir_all(&plugin_dir).is_ok() {
+            self.downloads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(clean);
+            true
         } else {
             false
         }
     }
+}
+
+fn is_safe_plugin_name(name: &str) -> bool {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.chars().any(|c| c.is_control() || c == '\0')
+    {
+        return false;
+    }
+    let mut comps = Path::new(name).components();
+    matches!(comps.next(), Some(std::path::Component::Normal(_))) && comps.next().is_none()
 }
 
 impl Default for PluginInstallerService {
@@ -150,22 +232,33 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn test_install_plugin() {
+    fn test_install_plugin_writes_manifest_and_removes_cleanly() {
         let dir = tempdir().unwrap();
         let service = PluginInstallerService::new(Some(dir.path()));
         let request = PluginInstallRequest {
             name: "TestPlugin".into(),
             version: Some("1.0.0".into()),
             download_url: "https://example.com/plugin.zip".into(),
-            checksum: None,
+            checksum: Some("cd".repeat(32)),
             dependencies: Vec::new(),
         };
         assert!(service.install_plugin(request).is_ok());
         assert!(service.list_installed().contains(&"TestPlugin".into()));
+        assert!(dir.path().join("TestPlugin/manifest.json").is_file());
+        assert_eq!(
+            service.get_progress("TestPlugin").unwrap().status,
+            InstallStatus::Completed
+        );
+        // Completed install cannot be transitioned to Cancelled
+        assert!(!service.cancel_install("TestPlugin"));
+        // Traversal remove is rejected
+        assert!(!service.remove_plugin("../outside"));
+        assert!(service.remove_plugin("TestPlugin"));
+        assert!(service.get_progress("TestPlugin").is_none());
     }
 
     #[test]
-    fn test_install_duplicate() {
+    fn test_install_duplicate_and_invalid_names_rejected() {
         let dir = tempdir().unwrap();
         let service = PluginInstallerService::new(Some(dir.path()));
         let request = PluginInstallRequest {
@@ -177,5 +270,14 @@ mod tests {
         };
         assert!(service.install_plugin(request.clone()).is_ok());
         assert!(service.install_plugin(request).is_err());
+
+        let traversal = PluginInstallRequest {
+            name: "../../evil".into(),
+            version: None,
+            download_url: "https://example.com/plugin.zip".into(),
+            checksum: None,
+            dependencies: Vec::new(),
+        };
+        assert!(service.install_plugin(traversal).is_err());
     }
 }

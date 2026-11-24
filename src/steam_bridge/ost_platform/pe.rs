@@ -18,15 +18,40 @@ const IMAGE_DOS_SIGNATURE: u16 = 0x5A4D;
 const IMAGE_NT_SIGNATURE: u32 = 0x00004550; // PE00
 
 const IMAGE_SIZEOF_FILE_HEADER: usize = 20;
-const IMAGE_SIZEOF_OPTIONAL_HEADER64: usize = 224;
-const IMAGE_SIZEOF_OPTIONAL_HEADER32: usize = 240;
+const IMAGE_SIZEOF_SECTION_HEADER: usize = 40;
+const IMAGE_SIZEOF_EXPORT_DIRECTORY: usize = 40;
+const PE32_EXPORT_DIR_OFFSET: usize = 96;
+const PE32_NUM_RVA_AND_SIZES_OFFSET: usize = 92;
+const PE64_EXPORT_DIR_OFFSET: usize = 112;
+const PE64_NUM_RVA_AND_SIZES_OFFSET: usize = 108;
 
 // Maximum length for a PE section name (8 bytes)
 const PE_SECTION_NAME_LEN: usize = 8;
+const MAX_EXPORT_CSTR_LEN: usize = 4096;
 
-// Owning byte buffer for bulk file reads.
-/// Unlike Vec<uint8_t>, sizing it does NOT initialize the storage — it uses
-/// a single uninitialized allocation. Move-only; converts to a span for scanning/parsing.
+fn read_u16_le(data: &[u8], offset: usize) -> Option<u16> {
+    let end = offset.checked_add(2)?;
+    let slice = data.get(offset..end)?;
+    Some(u16::from_le_bytes([slice[0], slice[1]]))
+}
+
+fn read_u32_le(data: &[u8], offset: usize) -> Option<u32> {
+    let end = offset.checked_add(4)?;
+    let slice = data.get(offset..end)?;
+    Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn read_cstr_at(data: &[u8], offset: usize, max_len: usize) -> Option<String> {
+    let tail = data.get(offset..)?;
+    let bounded = &tail[..tail.len().min(max_len)];
+    let nul_pos = bounded
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(bounded.len());
+    Some(String::from_utf8_lossy(&bounded[..nul_pos]).into_owned())
+}
+
+/// Owning byte buffer for bulk file reads.
 #[derive(Debug, Clone)]
 pub struct ByteBuffer {
     data: Option<Box<[u8]>>,
@@ -44,6 +69,9 @@ impl ByteBuffer {
     }
 
     pub fn from_slice(data: &[u8]) -> Self {
+        if data.is_empty() {
+            return ByteBuffer::new(0);
+        }
         let size = data.len();
         let boxed = Some(data.to_vec().into_boxed_slice());
         ByteBuffer { data: boxed, size }
@@ -83,8 +111,6 @@ impl Default for ByteBuffer {
     }
 }
 
-// Removed Clone impl to avoid conflicting impl issues - use from_slice instead
-
 impl From<Vec<u8>> for ByteBuffer {
     fn from(v: Vec<u8>) -> Self {
         ByteBuffer::from_slice(&v)
@@ -120,9 +146,11 @@ impl Section {
 
     /// Returns true if this section contains the given RVA.
     pub fn contains_rva(&self, rva: u32) -> bool {
-        let size = self.virtual_size.max(self.raw_size);
-        let end = self.virtual_address + size;
-        end >= self.virtual_address && rva >= self.virtual_address && rva < end
+        let size = u64::from(self.virtual_size.max(self.raw_size));
+        let start = u64::from(self.virtual_address);
+        let end = start + size;
+        let rva64 = u64::from(rva);
+        rva64 >= start && rva64 < end
     }
 }
 
@@ -202,191 +230,113 @@ impl Image {
         }
 
         // Check DOS header signature
-        let dos_magic = u16::from_le_bytes([data[0], data[1]]);
+        let dos_magic = read_u16_le(&data, 0).ok_or(PError::FileTooSmall)?;
         if dos_magic != IMAGE_DOS_SIGNATURE {
             return Err(PError::InvalidDosMagic { got: dos_magic });
         }
 
         // Check NT signature at e_lfanew offset
-        let lfanew = u32::from_le_bytes([data[0x3C], data[0x3D], data[0x3E], data[0x3F]]) as usize;
-
-        if lfanew + 4 > data.len() {
-            return Err(PError::FileTooSmall);
-        }
-
-        let nt_signature = u32::from_le_bytes([
-            data[lfanew],
-            data[lfanew + 1],
-            data[lfanew + 2],
-            data[lfanew + 3],
-        ]);
+        let lfanew = read_u32_le(&data, 0x3C).ok_or(PError::FileTooSmall)? as usize;
+        let nt_signature = read_u32_le(&data, lfanew).ok_or(PError::FileTooSmall)?;
         if nt_signature != IMAGE_NT_SIGNATURE {
             return Err(PError::InvalidNtSignature);
         }
 
-        // Parse file header
-        let file_header_offset = lfanew + 4;
-        if file_header_offset + IMAGE_SIZEOF_FILE_HEADER > data.len() {
+        // Parse COFF file header
+        let file_header_offset = lfanew.checked_add(4).ok_or(PError::FileTooSmall)?;
+        let optional_offset = file_header_offset
+            .checked_add(IMAGE_SIZEOF_FILE_HEADER)
+            .ok_or(PError::FileTooSmall)?;
+        if optional_offset > data.len() {
             return Err(PError::FileTooSmall);
         }
 
-        let file_header = ImageFileHeader {
-            machine: u16::from_le_bytes([data[file_header_offset], data[file_header_offset + 1]]),
-            number_of_sections: u16::from_le_bytes([
-                data[file_header_offset + 2],
-                data[file_header_offset + 3],
-            ]),
-            time_date_stamp: u32::from_le_bytes([
-                data[file_header_offset + 4],
-                data[file_header_offset + 5],
-                data[file_header_offset + 6],
-                data[file_header_offset + 7],
-            ]),
-            pointer_to_symbol_table: u32::from_le_bytes([
-                data[file_header_offset + 8],
-                data[file_header_offset + 9],
-                data[file_header_offset + 10],
-                data[file_header_offset + 11],
-            ]),
-            number_of_symbols: u32::from_le_bytes([
-                data[file_header_offset + 12],
-                data[file_header_offset + 13],
-                data[file_header_offset + 14],
-                data[file_header_offset + 15],
-            ]),
-            size_of_optional_header: u16::from_le_bytes([
-                data[file_header_offset + 16],
-                data[file_header_offset + 17],
-            ]),
-            characteristics: u16::from_le_bytes([
-                data[file_header_offset + 18],
-                data[file_header_offset + 19],
-            ]),
-        };
+        let number_of_sections =
+            read_u16_le(&data, file_header_offset + 2).ok_or(PError::FileTooSmall)?;
+        let size_of_optional_header =
+            read_u16_le(&data, file_header_offset + 16).ok_or(PError::FileTooSmall)? as usize;
 
-        // Parse optional header
-        let optional_offset = file_header_offset + IMAGE_SIZEOF_FILE_HEADER;
-        if optional_offset + file_header.size_of_optional_header as usize > data.len() {
+        let sections_offset = optional_offset
+            .checked_add(size_of_optional_header)
+            .ok_or(PError::FileTooSmall)?;
+        if sections_offset > data.len() {
             return Err(PError::FileTooSmall);
         }
 
-        let magic = u16::from_le_bytes([data[optional_offset], data[optional_offset + 1]]);
         let mut entry_point_rva: u32 = 0;
         let mut export_dir_rva_val: u32 = 0;
         let mut export_dir_size_val: u32 = 0;
-        let mut sections_offset = optional_offset + 2; // Skip magic
 
-        let is_64bit = magic == 0x20B; // IMAGE_NT_OPTIONAL_HDR64_MAGIC
-        let is_32bit = magic == 0x10B; // IMAGE_NT_OPTIONAL_HDR32_MAGIC
+        if size_of_optional_header >= 2 {
+            let magic = read_u16_le(&data, optional_offset).ok_or(PError::FileTooSmall)?;
+            let is_64bit = magic == 0x20B; // IMAGE_NT_OPTIONAL_HDR64_MAGIC (PE32+)
+            let is_32bit = magic == 0x10B; // IMAGE_NT_OPTIONAL_HDR32_MAGIC (PE32)
 
-        if is_64bit || is_32bit {
-            if is_64bit {
-                // 64-bit optional header
-                if optional_offset + IMAGE_SIZEOF_OPTIONAL_HEADER64 > data.len() {
-                    return Err(PError::FileTooSmall);
+            if is_64bit || is_32bit {
+                if size_of_optional_header >= 20 {
+                    entry_point_rva = read_u32_le(&data, optional_offset + 16).unwrap_or(0);
                 }
 
-                entry_point_rva = u32::from_le_bytes([
-                    data[optional_offset + 16],
-                    data[optional_offset + 17],
-                    data[optional_offset + 18],
-                    data[optional_offset + 19],
-                ]);
-                export_dir_rva_val = u32::from_le_bytes([
-                    data[optional_offset + 96 + 16],
-                    data[optional_offset + 96 + 17],
-                    data[optional_offset + 96 + 18],
-                    data[optional_offset + 96 + 19],
-                ]);
-                export_dir_size_val = u32::from_le_bytes([
-                    data[optional_offset + 96 + 20],
-                    data[optional_offset + 96 + 21],
-                    data[optional_offset + 96 + 22],
-                    data[optional_offset + 96 + 23],
-                ]);
+                let (num_dirs_off, export_dir_off) = if is_64bit {
+                    (PE64_NUM_RVA_AND_SIZES_OFFSET, PE64_EXPORT_DIR_OFFSET)
+                } else {
+                    (PE32_NUM_RVA_AND_SIZES_OFFSET, PE32_EXPORT_DIR_OFFSET)
+                };
 
-                // Parse section headers - they come after the optional header
-                sections_offset = optional_offset + IMAGE_SIZEOF_OPTIONAL_HEADER64;
-            } else {
-                // 32-bit optional header
-                if optional_offset + IMAGE_SIZEOF_OPTIONAL_HEADER32 > data.len() {
-                    return Err(PError::FileTooSmall);
+                if size_of_optional_header >= export_dir_off + 8 {
+                    let num_rva_and_sizes =
+                        read_u32_le(&data, optional_offset + num_dirs_off).unwrap_or(0);
+                    if num_rva_and_sizes >= 1 {
+                        export_dir_rva_val =
+                            read_u32_le(&data, optional_offset + export_dir_off).unwrap_or(0);
+                        export_dir_size_val =
+                            read_u32_le(&data, optional_offset + export_dir_off + 4).unwrap_or(0);
+                    }
                 }
-
-                entry_point_rva = u32::from_le_bytes([
-                    data[optional_offset + 16],
-                    data[optional_offset + 17],
-                    data[optional_offset + 18],
-                    data[optional_offset + 19],
-                ]);
-                export_dir_rva_val = u32::from_le_bytes([
-                    data[optional_offset + 92 + 16],
-                    data[optional_offset + 92 + 17],
-                    data[optional_offset + 92 + 18],
-                    data[optional_offset + 92 + 19],
-                ]);
-                export_dir_size_val = u32::from_le_bytes([
-                    data[optional_offset + 92 + 20],
-                    data[optional_offset + 92 + 21],
-                    data[optional_offset + 92 + 22],
-                    data[optional_offset + 92 + 23],
-                ]);
-
-                // Parse section headers - they come after the optional header
-                sections_offset = optional_offset + IMAGE_SIZEOF_OPTIONAL_HEADER32;
             }
         }
 
-        // Parse section headers
-        let num_sections = file_header.number_of_sections as usize;
-        let mut sections = Vec::with_capacity(num_sections);
+        // Parse section headers (IMAGE_SECTION_HEADER, 40 bytes each)
+        let num_sections = number_of_sections as usize;
+        let max_possible_sections =
+            data.len().saturating_sub(sections_offset) / IMAGE_SIZEOF_SECTION_HEADER;
+        let mut sections = Vec::with_capacity(num_sections.min(max_possible_sections));
 
         for i in 0..num_sections {
-            let section_offset = sections_offset + i * 40; // IMAGE_SIZEOF_SECTION_HEADER = 40
-            if section_offset + 40 > data.len() {
+            let Some(rel_off) = i.checked_mul(IMAGE_SIZEOF_SECTION_HEADER) else {
+                break;
+            };
+            let Some(section_offset) = sections_offset.checked_add(rel_off) else {
+                break;
+            };
+            let Some(section_end) = section_offset.checked_add(IMAGE_SIZEOF_SECTION_HEADER) else {
+                break;
+            };
+            if section_end > data.len() {
                 break;
             }
 
-            let section_data = &data[section_offset..section_offset + 40];
+            let section_data = &data[section_offset..section_end];
 
-            // Parse section name (8 bytes, null-terminated)
-            let mut name_bytes = [0u8; PE_SECTION_NAME_LEN];
-            name_bytes.copy_from_slice(&section_data[0..PE_SECTION_NAME_LEN]);
-            let name = std::str::from_utf8(&name_bytes)
-                .unwrap_or("")
-                .trim_end_matches('\0')
-                .to_string();
+            // Section name (8 bytes, null-padded)
+            let name_raw = &section_data[0..PE_SECTION_NAME_LEN];
+            let name_end = name_raw
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(PE_SECTION_NAME_LEN);
+            let name = String::from_utf8_lossy(&name_raw[..name_end]).into_owned();
 
-            let virtual_size = u32::from_le_bytes([
-                section_data[8],
-                section_data[9],
-                section_data[10],
-                section_data[11],
-            ]);
-            let virtual_address = u32::from_le_bytes([
-                section_data[12],
-                section_data[13],
-                section_data[14],
-                section_data[15],
-            ]);
-            let raw_data_pointer = u32::from_le_bytes([
-                section_data[16],
-                section_data[17],
-                section_data[18],
-                section_data[19],
-            ]);
-            let raw_data_size = u32::from_le_bytes([
-                section_data[20],
-                section_data[21],
-                section_data[22],
-                section_data[23],
-            ]);
-            let characteristics = u32::from_le_bytes([
-                section_data[24],
-                section_data[25],
-                section_data[26],
-                section_data[27],
-            ]);
+            // Standard PE/COFF IMAGE_SECTION_HEADER field offsets:
+            //  8..12: VirtualSize
+            // 12..16: VirtualAddress
+            // 16..20: SizeOfRawData
+            // 20..24: PointerToRawData
+            // 36..40: Characteristics
+            let virtual_size = read_u32_le(section_data, 8).unwrap_or(0);
+            let virtual_address = read_u32_le(section_data, 12).unwrap_or(0);
+            let raw_data_size = read_u32_le(section_data, 16).unwrap_or(0);
+            let raw_data_pointer = read_u32_le(section_data, 20).unwrap_or(0);
+            let characteristics = read_u32_le(section_data, 36).unwrap_or(0);
 
             sections.push(Section {
                 name,
@@ -398,8 +348,6 @@ impl Image {
             });
         }
 
-        let valid = true;
-
         Ok(Image {
             path: path_str,
             bytes,
@@ -408,7 +356,7 @@ impl Image {
             entry_point_rva,
             export_directory_rva: export_dir_rva_val,
             export_directory_size: export_dir_size_val,
-            valid,
+            valid: true,
         })
     }
 
@@ -449,27 +397,26 @@ impl Image {
 
     /// Converts an RVA to a file offset.
     pub fn rva_to_offset(&self, rva: u32) -> Option<usize> {
-        if let Some(section) = self.section_containing_rva(rva) {
-            let delta = rva - section.virtual_address;
-            if delta >= section.raw_size {
-                return None;
-            }
-            let offset = section.raw_offset as usize + delta as usize;
-            if offset > self.file_size as usize {
-                return None;
-            }
-            Some(offset)
-        } else {
-            None
+        let section = self.section_containing_rva(rva)?;
+        let delta = rva.checked_sub(section.virtual_address)?;
+        if delta >= section.raw_size {
+            return None;
         }
+        let offset = (section.raw_offset as usize).checked_add(delta as usize)?;
+        if offset > self.bytes.size() {
+            return None;
+        }
+        Some(offset)
     }
 
     /// Converts a raw file offset to an RVA.
     pub fn raw_offset_to_rva(&self, raw_offset: usize) -> Option<u32> {
         for section in &self.sections {
             let section_raw = section.raw_offset as usize;
-            let section_end = section_raw + section.raw_size as usize;
-            if section_end < section_raw || raw_offset < section_raw || raw_offset >= section_end {
+            let Some(section_end) = section_raw.checked_add(section.raw_size as usize) else {
+                continue;
+            };
+            if raw_offset < section_raw || raw_offset >= section_end {
                 continue;
             }
             let delta_usize = raw_offset - section_raw;
@@ -481,21 +428,18 @@ impl Image {
 
     /// Reads raw bytes at the given offset and size.
     pub fn read_raw_bytes(&self, offset: usize, size: usize) -> Result<ByteBuffer, PError> {
-        if offset > self.file_size as usize {
+        let file_len = self.bytes.size();
+        if offset > file_len {
             return Err(PError::IoError(std::io::Error::other(format!(
                 "Offset {} exceeds file size {}",
                 offset, self.file_size
             ))));
         }
-        let actual_size = (self.file_size as usize).saturating_sub(offset);
+        let actual_size = file_len.saturating_sub(offset);
         let size = size.min(actual_size);
-        let data = self
-            .bytes
-            .as_slice()
-            .get(offset..offset + size)
-            .unwrap_or(&[])
-            .to_vec();
-        Ok(ByteBuffer::from_slice(&data[..]))
+        let end = offset.checked_add(size).unwrap_or(file_len);
+        let data = self.bytes.as_slice().get(offset..end).unwrap_or(&[]);
+        Ok(ByteBuffer::from_slice(data))
     }
 
     /// Reads all bytes of the image.
@@ -505,172 +449,112 @@ impl Image {
 
     /// Finds an export by name.
     pub fn find_export(&self, symbol_name: &str) -> Result<Export, PError> {
-        if !self.valid {
+        if !self.valid || self.export_directory_rva == 0 || self.export_directory_size == 0 {
             return Err(PError::ExportNotFound(symbol_name.to_string()));
         }
 
-        if self.export_directory_rva == 0 || self.export_directory_size == 0 {
-            return Err(PError::ExportNotFound(symbol_name.to_string()));
-        }
-
-        // Read the export directory
+        let file_bytes = self.bytes.as_slice();
         let export_offset = self
             .rva_to_offset(self.export_directory_rva)
             .ok_or_else(|| PError::ExportNotFound(symbol_name.to_string()))?;
-        let export_bytes =
-            self.read_raw_bytes(export_offset, self.export_directory_size as usize)?;
 
-        // Parse IMAGE_EXPORT_DIRECTORY
-        let export_dir_size = std::mem::size_of::<IMAGE_EXPORT_DIRECTORY>();
-        if export_bytes.size() < export_dir_size {
+        let export_dir_end = export_offset
+            .checked_add(IMAGE_SIZEOF_EXPORT_DIRECTORY)
+            .ok_or_else(|| PError::ExportNotFound(symbol_name.to_string()))?;
+        if export_dir_end > file_bytes.len() {
             return Err(PError::ExportNotFound(symbol_name.to_string()));
         }
 
-        let export_data = export_bytes.as_slice();
-        let exports = unsafe { &*(export_data.as_ptr() as *const IMAGE_EXPORT_DIRECTORY) };
+        let dir = &file_bytes[export_offset..export_dir_end];
+        let number_of_functions = read_u32_le(dir, 20).unwrap_or(0) as usize;
+        let number_of_names = read_u32_le(dir, 24).unwrap_or(0) as usize;
+        let address_of_functions_rva = read_u32_le(dir, 28).unwrap_or(0);
+        let address_of_names_rva = read_u32_le(dir, 32).unwrap_or(0);
+        let address_of_name_ordinals_rva = read_u32_le(dir, 36).unwrap_or(0);
 
-        if exports.number_of_names == 0 || exports.number_of_functions == 0 {
+        if number_of_names == 0 || number_of_functions == 0 {
             return Err(PError::ExportNotFound(symbol_name.to_string()));
         }
-
-        // Helper to read a DWORD from a file offset
-        let read_dword = |file_offset: usize| -> u32 {
-            if file_offset + 4 > export_data.len() {
-                return 0;
-            }
-            u32::from_le_bytes([
-                export_data[file_offset],
-                export_data[file_offset + 1],
-                export_data[file_offset + 2],
-                export_data[file_offset + 3],
-            ])
-        };
-
-        // Read RVAs for the three arrays
-        let names_rva = read_dword(exports.address_of_names as usize);
-        let ordinals_rva = read_dword(exports.address_of_name_ordinals as usize);
-        let functions_rva = read_dword(exports.address_of_functions as usize);
 
         let names_offset = self
-            .rva_to_offset(names_rva)
+            .rva_to_offset(address_of_names_rva)
             .ok_or_else(|| PError::ExportNotFound(symbol_name.to_string()))?;
         let ordinals_offset = self
-            .rva_to_offset(ordinals_rva)
+            .rva_to_offset(address_of_name_ordinals_rva)
             .ok_or_else(|| PError::ExportNotFound(symbol_name.to_string()))?;
         let functions_offset = self
-            .rva_to_offset(functions_rva)
+            .rva_to_offset(address_of_functions_rva)
             .ok_or_else(|| PError::ExportNotFound(symbol_name.to_string()))?;
 
-        // Read the ordinals array
-        let ordinals_data =
-            &export_data[ordinals_offset..ordinals_offset + (exports.number_of_names as usize) * 2];
+        let names_end = number_of_names
+            .checked_mul(4)
+            .and_then(|n| names_offset.checked_add(n))
+            .ok_or_else(|| PError::ExportNotFound(symbol_name.to_string()))?;
+        let ordinals_end = number_of_names
+            .checked_mul(2)
+            .and_then(|n| ordinals_offset.checked_add(n))
+            .ok_or_else(|| PError::ExportNotFound(symbol_name.to_string()))?;
+        let functions_end = number_of_functions
+            .checked_mul(4)
+            .and_then(|n| functions_offset.checked_add(n))
+            .ok_or_else(|| PError::ExportNotFound(symbol_name.to_string()))?;
 
-        // Read the functions array
-        let functions_data = &export_data
-            [functions_offset..functions_offset + (exports.number_of_functions as usize) * 4];
+        if names_end > file_bytes.len()
+            || ordinals_end > file_bytes.len()
+            || functions_end > file_bytes.len()
+        {
+            return Err(PError::ExportNotFound(symbol_name.to_string()));
+        }
 
-        for i in 0..exports.number_of_names {
-            // Get the RVA of the name at index i
-            let name_rva_offset = (i as usize) * 4;
-            let name_rva = read_dword(names_offset + name_rva_offset);
+        let export_end =
+            u64::from(self.export_directory_rva) + u64::from(self.export_directory_size);
 
-            let name_file_offset = self
-                .rva_to_offset(name_rva)
+        for i in 0..number_of_names {
+            let name_rva = read_u32_le(file_bytes, names_offset + i * 4)
                 .ok_or_else(|| PError::ExportNotFound(symbol_name.to_string()))?;
-            let name_data = self.read_raw_bytes(name_file_offset, 256)?;
-            let name_bytes = name_data.as_slice();
-
-            // Find null terminator and convert to string
-            let name_str: String = name_bytes
-                .iter()
-                .take_while(|&&b| b != 0)
-                .map(|&b| b as char)
-                .collect();
+            let Some(name_file_offset) = self.rva_to_offset(name_rva) else {
+                continue;
+            };
+            let Some(name_str) = read_cstr_at(file_bytes, name_file_offset, MAX_EXPORT_CSTR_LEN)
+            else {
+                continue;
+            };
 
             if name_str == symbol_name {
-                // Get the ordinal for this name
-                let ordinal_offset = (i as usize) * 2;
-                let ordinal = u16::from_le_bytes([
-                    ordinals_data[ordinal_offset],
-                    ordinals_data[ordinal_offset + 1],
-                ]) as u32;
-
-                // Get the function RVA using the ordinal (base + index)
-                let func_index = ordinal + exports.base;
-                let func_rva_offset = (func_index as usize) * 4;
-
-                if func_rva_offset + 4 > functions_data.len() {
-                    return Err(PError::ExportNotFound(symbol_name.to_string()));
+                // AddressOfNameOrdinals entries are 0-based indices into AddressOfFunctions.
+                let func_index = read_u16_le(file_bytes, ordinals_offset + i * 2)
+                    .ok_or_else(|| PError::ExportNotFound(symbol_name.to_string()))?
+                    as usize;
+                if func_index >= number_of_functions {
+                    return Err(PError::OrdinalOutOfRange(func_index as u32));
                 }
 
-                let func_rva = read_dword(functions_offset + func_rva_offset);
+                let func_rva = read_u32_le(file_bytes, functions_offset + func_index * 4)
+                    .ok_or_else(|| PError::ExportNotFound(symbol_name.to_string()))?;
 
-                // Check if this export has a forwarder
-                let export_end = self.export_directory_rva + self.export_directory_size;
+                let func_rva64 = u64::from(func_rva);
                 let func_within_export =
-                    func_rva >= self.export_directory_rva && func_rva < export_end;
+                    func_rva64 >= u64::from(self.export_directory_rva) && func_rva64 < export_end;
 
                 let forwarder = if func_within_export {
                     let fwd_file_offset = self
                         .rva_to_offset(func_rva)
                         .ok_or_else(|| PError::ExportNotFound(symbol_name.to_string()))?;
-                    let fwd_buf = self.read_raw_bytes(fwd_file_offset, 256)?;
-                    let fwd_bytes = fwd_buf.as_slice();
-                    let fwd_str: String = fwd_bytes
-                        .iter()
-                        .take_while(|&&b| b != 0)
-                        .map(|&b| b as char)
-                        .collect();
-                    if !fwd_str.is_empty() {
-                        Some(fwd_str)
-                    } else {
-                        None
-                    }
+                    read_cstr_at(file_bytes, fwd_file_offset, MAX_EXPORT_CSTR_LEN)
+                        .unwrap_or_default()
                 } else {
-                    None
+                    String::new()
                 };
 
                 return Ok(Export {
                     rva: func_rva,
-                    forwarder: forwarder.unwrap_or(String::new()),
+                    forwarder,
                 });
             }
         }
 
         Err(PError::ExportNotFound(symbol_name.to_string()))
     }
-}
-
-// PE structures needed for export parsing
-
-/// IMAGE_FILE_HEADER corresponds to the COFF file header
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-struct ImageFileHeader {
-    machine: u16,
-    number_of_sections: u16,
-    time_date_stamp: u32,
-    pointer_to_symbol_table: u32,
-    number_of_symbols: u32,
-    size_of_optional_header: u16,
-    characteristics: u16,
-}
-
-/// IMAGE_EXPORT_DIRECTORY corresponds to the export directory in a PE file
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-struct IMAGE_EXPORT_DIRECTORY {
-    characteristics: u32,
-    time_date_stamp: u32,
-    major_version: u16,
-    minor_version: u16,
-    name: u32,
-    base: u32,
-    number_of_functions: u32,
-    number_of_names: u32,
-    address_of_functions: u32,
-    address_of_name_ordinals: u32,
-    address_of_names: u32,
 }
 
 #[cfg(test)]
@@ -731,5 +615,143 @@ mod tests {
         let bb: ByteBuffer = vec.into();
         assert_eq!(bb.size(), 3);
         assert_eq!(*bb.as_slice(), [10, 20, 30]);
+        assert!(ByteBuffer::from_slice(&[]).data().is_null());
+    }
+
+    fn build_synthetic_pe(is_64bit: bool) -> Vec<u8> {
+        let mut buf = vec![0u8; 0x1000];
+        // DOS header
+        buf[0..2].copy_from_slice(&IMAGE_DOS_SIGNATURE.to_le_bytes());
+        let lfanew: usize = 0x80;
+        buf[0x3C..0x40].copy_from_slice(&(lfanew as u32).to_le_bytes());
+
+        // NT signature
+        buf[lfanew..lfanew + 4].copy_from_slice(&IMAGE_NT_SIGNATURE.to_le_bytes());
+
+        // COFF FileHeader (20 bytes)
+        let fh = lfanew + 4;
+        let opt_size: u16 = if is_64bit { 240 } else { 224 };
+        buf[fh + 2..fh + 4].copy_from_slice(&2u16.to_le_bytes()); // NumberOfSections = 2
+        buf[fh + 16..fh + 18].copy_from_slice(&opt_size.to_le_bytes());
+
+        // Optional header
+        let opt = fh + 20;
+        let magic: u16 = if is_64bit { 0x20B } else { 0x10B };
+        buf[opt..opt + 2].copy_from_slice(&magic.to_le_bytes());
+        buf[opt + 16..opt + 20].copy_from_slice(&0x1010u32.to_le_bytes()); // AddressOfEntryPoint
+
+        let (num_dirs_off, export_dir_off) = if is_64bit {
+            (PE64_NUM_RVA_AND_SIZES_OFFSET, PE64_EXPORT_DIR_OFFSET)
+        } else {
+            (PE32_NUM_RVA_AND_SIZES_OFFSET, PE32_EXPORT_DIR_OFFSET)
+        };
+        buf[opt + num_dirs_off..opt + num_dirs_off + 4].copy_from_slice(&16u32.to_le_bytes());
+        // Export directory at RVA 0x2000, size 0x180
+        buf[opt + export_dir_off..opt + export_dir_off + 4]
+            .copy_from_slice(&0x2000u32.to_le_bytes());
+        buf[opt + export_dir_off + 4..opt + export_dir_off + 8]
+            .copy_from_slice(&0x180u32.to_le_bytes());
+
+        // Section 0: .text (VA 0x1000, VSize 0x200, RawSize 0x200, RawPtr 0x400, RX)
+        let sec0 = opt + opt_size as usize;
+        buf[sec0..sec0 + 5].copy_from_slice(b".text");
+        buf[sec0 + 8..sec0 + 12].copy_from_slice(&0x200u32.to_le_bytes());
+        buf[sec0 + 12..sec0 + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        buf[sec0 + 16..sec0 + 20].copy_from_slice(&0x200u32.to_le_bytes()); // SizeOfRawData
+        buf[sec0 + 20..sec0 + 24].copy_from_slice(&0x400u32.to_le_bytes()); // PointerToRawData
+        buf[sec0 + 36..sec0 + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes()); // Characteristics
+
+        // Section 1: .edata (VA 0x2000, VSize 0x200, RawSize 0x200, RawPtr 0x600, R)
+        let sec1 = sec0 + 40;
+        buf[sec1..sec1 + 6].copy_from_slice(b".edata");
+        buf[sec1 + 8..sec1 + 12].copy_from_slice(&0x200u32.to_le_bytes());
+        buf[sec1 + 12..sec1 + 16].copy_from_slice(&0x2000u32.to_le_bytes());
+        buf[sec1 + 16..sec1 + 20].copy_from_slice(&0x200u32.to_le_bytes());
+        buf[sec1 + 20..sec1 + 24].copy_from_slice(&0x600u32.to_le_bytes());
+        buf[sec1 + 36..sec1 + 40].copy_from_slice(&0x4000_0040u32.to_le_bytes());
+
+        // IMAGE_EXPORT_DIRECTORY at file offset 0x600 (RVA 0x2000)
+        // Base = 1, NumberOfFunctions = 2, NumberOfNames = 2
+        // AddressOfFunctions = 0x2040, AddressOfNames = 0x2050, AddressOfNameOrdinals = 0x2060
+        let ed = 0x600;
+        buf[ed + 16..ed + 20].copy_from_slice(&1u32.to_le_bytes()); // Base = 1
+        buf[ed + 20..ed + 24].copy_from_slice(&2u32.to_le_bytes()); // NumberOfFunctions
+        buf[ed + 24..ed + 28].copy_from_slice(&2u32.to_le_bytes()); // NumberOfNames
+        buf[ed + 28..ed + 32].copy_from_slice(&0x2040u32.to_le_bytes()); // AddressOfFunctions
+        buf[ed + 32..ed + 36].copy_from_slice(&0x2050u32.to_le_bytes()); // AddressOfNames
+        buf[ed + 36..ed + 40].copy_from_slice(&0x2060u32.to_le_bytes()); // AddressOfNameOrdinals
+
+        // Functions table at 0x640 (RVA 0x2040):
+        // [0] -> normal function RVA 0x1050
+        // [1] -> forwarded export RVA 0x20A0 (inside export dir 0x2000..0x2180)
+        buf[0x640..0x644].copy_from_slice(&0x1050u32.to_le_bytes());
+        buf[0x644..0x648].copy_from_slice(&0x20A0u32.to_le_bytes());
+
+        // Names table at 0x650 (RVA 0x2050):
+        buf[0x650..0x654].copy_from_slice(&0x2080u32.to_le_bytes()); // "SteamAPI_Init"
+        buf[0x654..0x658].copy_from_slice(&0x2090u32.to_le_bytes()); // "ForwardedFn"
+
+        // Name ordinals table at 0x660 (RVA 0x2060) — 0-based indices into AddressOfFunctions:
+        buf[0x660..0x662].copy_from_slice(&0u16.to_le_bytes());
+        buf[0x662..0x664].copy_from_slice(&1u16.to_le_bytes());
+
+        // Strings
+        buf[0x680..0x68E].copy_from_slice(b"SteamAPI_Init\0");
+        buf[0x690..0x69C].copy_from_slice(b"ForwardedFn\0");
+        buf[0x6A0..0x6B4].copy_from_slice(b"other.TargetExport\0\0");
+
+        buf
+    }
+
+    #[test]
+    fn test_parse_pe32_and_pe64_sections_and_exports() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, is_64) in [("sample32.dll", false), ("sample64.dll", true)] {
+            let path = dir.path().join(name);
+            fs::write(&path, build_synthetic_pe(is_64)).unwrap();
+
+            let img = Image::new(path.to_str().unwrap()).expect("valid PE");
+            assert!(img.is_valid());
+            assert_eq!(img.entry_point_rva(), 0x1010);
+            assert_eq!(img.sections().len(), 2);
+            assert!(img.has_section(".text"));
+            assert!(img.has_section(".edata"));
+
+            let text = &img.sections()[0];
+            assert_eq!(text.raw_offset, 0x400);
+            assert_eq!(text.raw_size, 0x200);
+            assert!(text.is_executable());
+            assert!(!text.is_writable());
+
+            assert_eq!(img.rva_to_offset(0x1050), Some(0x450));
+            assert_eq!(img.raw_offset_to_rva(0x450), Some(0x1050));
+
+            let exp = img.find_export("SteamAPI_Init").expect("normal export");
+            assert_eq!(exp.rva, 0x1050);
+            assert!(!exp.is_forwarder());
+
+            let fwd = img.find_export("ForwardedFn").expect("forwarded export");
+            assert!(fwd.is_forwarder());
+            assert_eq!(fwd.forwarder, "other.TargetExport");
+
+            assert!(matches!(
+                img.find_export("MissingExport"),
+                Err(PError::ExportNotFound(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn test_section_contains_rva_no_overflow() {
+        let sec = Section {
+            name: ".high".into(),
+            virtual_address: u32::MAX - 0x10,
+            virtual_size: 0x100,
+            raw_offset: 0,
+            raw_size: 0,
+            characteristics: 0,
+        };
+        assert!(sec.contains_rva(u32::MAX));
+        assert!(!sec.contains_rva(0));
     }
 }

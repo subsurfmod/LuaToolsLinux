@@ -9,7 +9,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::steam_bridge::interop::interop_misc::resolve_app_id;
 use crate::steam_bridge::interop::ipc::{
-    fnv1a_hash, FuncHash, HandlerFn, IpcContext, IpcInterface,
+    self, fnv1a_hash, FuncHash, HandlerFn, IpcContext, IpcInterface,
 };
 use crate::steam_bridge::ost_platform::steam_credential_store;
 
@@ -61,6 +61,15 @@ pub fn register_eticket_handlers() {
     let mut map = eticket_handlers().lock().unwrap_or_else(|e| e.into_inner());
     let iface = IpcInterface::IClientUser;
 
+    let get_post: HandlerFn = Arc::new(|ctx: &mut IpcContext| -> Result<(), String> {
+        handle_recv_get_encrypted_app_ticket_post(ctx);
+        Ok(())
+    });
+    let req_post: HandlerFn = Arc::new(|ctx: &mut IpcContext| -> Result<(), String> {
+        handle_send_request_encrypted_app_ticket_post(ctx);
+        Ok(())
+    });
+
     map.insert(
         (iface, NETPACKET_ETICKET_GET_ENCRYPTED_APP_TICKET_FNHASH),
         EticketHandler {
@@ -70,10 +79,7 @@ pub fn register_eticket_handlers() {
             fencepost: 0,
             argc: 4,
             pre_handler: None,
-            post_handler: Some(Arc::new(|ctx: &mut IpcContext| -> Result<(), String> {
-                handle_recv_get_encrypted_app_ticket_post(ctx);
-                Ok(())
-            })),
+            post_handler: Some(Arc::clone(&get_post)),
         },
     );
 
@@ -86,12 +92,29 @@ pub fn register_eticket_handlers() {
             fencepost: 0,
             argc: 4,
             pre_handler: None,
-            post_handler: Some(Arc::new(|ctx: &mut IpcContext| -> Result<(), String> {
-                handle_send_request_encrypted_app_ticket_post(ctx);
-                Ok(())
-            })),
+            post_handler: Some(Arc::clone(&req_post)),
         },
     );
+    drop(map);
+
+    ipc::register_handler(ipc::make_handler(
+        iface,
+        NETPACKET_ETICKET_GET_ENCRYPTED_APP_TICKET_FNHASH,
+        "Hooks_NetPacket_ETicket::HandleRecv_GetEncryptedAppTicket",
+        0,
+        4,
+        None,
+        Some(get_post),
+    ));
+    ipc::register_handler(ipc::make_handler(
+        iface,
+        NETPACKET_ETICKET_REQUEST_ENCRYPTED_APP_TICKET_FNHASH,
+        "Hooks_NetPacket_ETicket::HandleSend_RequestEncryptedAppTicket",
+        0,
+        4,
+        None,
+        Some(req_post),
+    ));
 }
 
 pub fn unregister_eticket_handlers() {
@@ -99,6 +122,9 @@ pub fn unregister_eticket_handlers() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+    let iface = IpcInterface::IClientUser;
+    let _ = ipc::unregister_handler(iface, NETPACKET_ETICKET_GET_ENCRYPTED_APP_TICKET_FNHASH);
+    let _ = ipc::unregister_handler(iface, NETPACKET_ETICKET_REQUEST_ENCRYPTED_APP_TICKET_FNHASH);
 }
 
 fn handle_recv_get_encrypted_app_ticket_post(ctx: &mut IpcContext) {
@@ -138,6 +164,27 @@ fn handle_send_request_encrypted_app_ticket_post(ctx: &mut IpcContext) {
     }
 }
 
+/// Strictly decode an unsigned 64-bit protobuf varint from `slice`.
+/// Rejects truncated varints and 10th-byte overflows (`byte > 1`).
+pub(crate) fn decode_varint(slice: &[u8]) -> Option<(u64, usize)> {
+    let mut result: u64 = 0;
+    let mut shift: u32 = 0;
+    for (idx, &byte) in slice.iter().enumerate() {
+        if idx >= 10 {
+            return None;
+        }
+        if idx == 9 && byte > 1 {
+            return None;
+        }
+        result |= u64::from(byte & 0x7F) << shift;
+        if (byte & 0x80) == 0 {
+            return Some((result, idx + 1));
+        }
+        shift += 7;
+    }
+    None
+}
+
 pub fn parse_eticket_steam_id(write_buf: &[u8]) -> Option<u64> {
     if write_buf.len() < 16 {
         return None;
@@ -152,31 +199,17 @@ pub fn parse_eticket_steam_id(write_buf: &[u8]) -> Option<u64> {
         return None;
     }
 
-    let mut offset = ticket_data_start + 8;
-    let mut result: u64 = 0;
-    let mut shift: u32 = 0;
-    let mut bytes_consumed: usize = 0;
-
-    while offset < ticket_data_end && shift < 64 {
-        let byte = write_buf[offset];
-        result |= u64::from(byte & 0x7F) << shift;
-        shift += 7;
-        bytes_consumed += 1;
-        offset += 1;
-
-        if (byte & 0x80) == 0 {
-            break;
-        }
-        if bytes_consumed > 10 {
-            return None;
+    if let Some(varint_start) = ticket_data_start.checked_add(8) {
+        if varint_start < ticket_data_end {
+            if let Some((val, _)) = decode_varint(&write_buf[varint_start..ticket_data_end]) {
+                if val >= 0x0110_0001_0000_0000 {
+                    return Some(val);
+                }
+            }
         }
     }
 
-    if bytes_consumed > 0 && result >= 0x0110_0001_0000_0000 {
-        return Some(result);
-    }
-
-    if write_buf.len() >= 28 {
+    if ticket_data_end >= 28 && write_buf.len() >= 28 {
         let potential_steam_id = u64::from_le_bytes([
             write_buf[20],
             write_buf[21],
@@ -210,11 +243,16 @@ fn encode_varint(mut val: u64, out: &mut Vec<u8>) {
     }
 }
 
-pub fn handle_recv_get_encrypted_app_ticket_response(write_buf: &mut Vec<u8>, app_id: u32) {
+/// Pure helper that forces `eresult = OK` and appends an encoded ETicket protobuf block
+/// when `spoofed_steam_id != 0`.
+pub fn handle_recv_get_encrypted_app_ticket_response_with_steam_id(
+    write_buf: &mut Vec<u8>,
+    app_id: u32,
+    spoofed_steam_id: u64,
+) {
     if write_buf.len() >= 12 {
         write_buf[8..12].copy_from_slice(&0u32.to_le_bytes());
 
-        let spoofed_steam_id = read_spoofed_steam_id(app_id);
         if spoofed_steam_id != 0 {
             let mut eticket_block = Vec::new();
             // Field 1 (varint): app_id
@@ -224,15 +262,22 @@ pub fn handle_recv_get_encrypted_app_ticket_response(write_buf: &mut Vec<u8>, ap
             eticket_block.push(0x10);
             encode_varint(spoofed_steam_id, &mut eticket_block);
 
-            if write_buf.len() > 12 {
-                write_buf.truncate(12);
-                write_buf.extend_from_slice(&eticket_block);
-            }
+            write_buf.truncate(12);
+            write_buf.extend_from_slice(&eticket_block);
         }
     }
     log::debug!(
         "HandleRecv_GetEncryptedAppTicketResponse: AppId={} - forced eresult=OK",
         app_id
+    );
+}
+
+pub fn handle_recv_get_encrypted_app_ticket_response(write_buf: &mut Vec<u8>, app_id: u32) {
+    let spoofed_steam_id = read_spoofed_steam_id(app_id);
+    handle_recv_get_encrypted_app_ticket_response_with_steam_id(
+        write_buf,
+        app_id,
+        spoofed_steam_id,
     );
 }
 
@@ -265,6 +310,8 @@ pub fn is_eticket_hook_active() -> bool {
 mod tests {
     use super::*;
 
+    static ETICKET_TEST_GUARD: Mutex<()> = Mutex::new(());
+
     #[test]
     fn test_fnv1a_hash_eticket() {
         assert_eq!(
@@ -278,31 +325,61 @@ mod tests {
     }
 
     #[test]
-    fn test_handler_registration() {
+    fn test_handler_registration_and_uninstall() {
+        let _g = ETICKET_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         install_eticket().unwrap();
         assert!(is_eticket_hook_active());
-        let handlers = eticket_handlers().lock().unwrap();
-        assert!(handlers.contains_key(&(
+        {
+            let handlers = eticket_handlers().lock().unwrap();
+            assert!(handlers.contains_key(&(
+                IpcInterface::IClientUser,
+                NETPACKET_ETICKET_GET_ENCRYPTED_APP_TICKET_FNHASH
+            )));
+            assert!(handlers.contains_key(&(
+                IpcInterface::IClientUser,
+                NETPACKET_ETICKET_REQUEST_ENCRYPTED_APP_TICKET_FNHASH
+            )));
+        }
+        assert!(ipc::find_handler(
             IpcInterface::IClientUser,
             NETPACKET_ETICKET_GET_ENCRYPTED_APP_TICKET_FNHASH
-        )));
-        assert!(handlers.contains_key(&(
+        )
+        .is_some());
+
+        uninstall_eticket();
+        assert!(!is_eticket_hook_active());
+        assert!(ipc::find_handler(
             IpcInterface::IClientUser,
-            NETPACKET_ETICKET_REQUEST_ENCRYPTED_APP_TICKET_FNHASH
-        )));
+            NETPACKET_ETICKET_GET_ENCRYPTED_APP_TICKET_FNHASH
+        )
+        .is_none());
     }
 
     #[test]
-    fn test_parse_eticket_steam_id() {
+    fn test_parse_eticket_steam_id_and_varint_validation() {
         let mut write_buf = vec![0u8; 36];
         write_buf[8..12].copy_from_slice(&1u32.to_le_bytes());
         write_buf[12..16].copy_from_slice(&20u32.to_le_bytes());
         write_buf[16] = 0x08 | ((1245620u32 as u8) & 0x7F);
-        let test_steam_id = 76561198028121353u64;
+        let test_steam_id = 76_561_198_028_121_353u64;
         write_buf[20..28].copy_from_slice(&test_steam_id.to_le_bytes());
 
         let result = parse_eticket_steam_id(&write_buf);
         assert_eq!(result, Some(test_steam_id));
+
+        // Encoded varint at offset 24 inside ticket payload
+        let mut varint_buf = vec![0u8; 40];
+        varint_buf[12..16].copy_from_slice(&24u32.to_le_bytes());
+        let mut encoded = Vec::new();
+        encode_varint(test_steam_id, &mut encoded);
+        varint_buf[24..24 + encoded.len()].copy_from_slice(&encoded);
+        assert_eq!(parse_eticket_steam_id(&varint_buf), Some(test_steam_id));
+
+        // Truncated varint (MSB set on final byte) and 10th-byte overflow must be rejected
+        assert!(decode_varint(&[0x80, 0x80]).is_none());
+        assert!(
+            decode_varint(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02]).is_none()
+        );
     }
 
     #[test]
@@ -312,11 +389,23 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_recv_get_encrypted_app_ticket_response() {
-        let mut write_buf = vec![0u8; 100];
+    fn test_handle_recv_get_encrypted_app_ticket_response_exact_12_bytes() {
+        let mut write_buf = vec![0u8; 12];
         write_buf[8..12].copy_from_slice(&2u32.to_le_bytes());
-        handle_recv_get_encrypted_app_ticket_response(&mut write_buf, 123456);
+        let test_sid = 76_561_198_028_121_353u64;
+        handle_recv_get_encrypted_app_ticket_response_with_steam_id(
+            &mut write_buf,
+            123456,
+            test_sid,
+        );
         assert_eq!(write_buf[8..12], 0u32.to_le_bytes());
-        assert!(write_buf.len() >= 12);
+        // Must have appended field 1 (app_id) + field 2 (steam_id) even when input was exactly 12 bytes
+        assert!(write_buf.len() > 12);
+        assert_eq!(write_buf[12], 0x08);
+        let (decoded_app, n1) = decode_varint(&write_buf[13..]).unwrap();
+        assert_eq!(decoded_app, 123456);
+        assert_eq!(write_buf[13 + n1], 0x10);
+        let (decoded_sid, _) = decode_varint(&write_buf[14 + n1..]).unwrap();
+        assert_eq!(decoded_sid, test_sid);
     }
 }

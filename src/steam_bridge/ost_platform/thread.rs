@@ -4,6 +4,8 @@
 //! Uses pthread_create for thread creation.
 
 use std::os::raw::c_uint;
+use std::os::unix::thread::JoinHandleExt;
+use std::ptr;
 use std::thread as std_thread;
 
 use thiserror::Error;
@@ -42,9 +44,9 @@ pub fn current_native_thread_handle() -> NativeThreadHandle {
 /// Start a detached thread with the given entry function.
 ///
 /// Equivalent to Windows StartDetached().
-/// The thread is created with PTHREAD_CREATE_DETACHED so the caller doesn't need to join it.
-/// The return value (uint32_t) is executed but not retrievable in detached mode
-/// (matching Windows detached behavior).
+/// Uses `std::thread::Builder::spawn` so thread creation failures return null
+/// instead of panicking, and returns the spawned thread's real `pthread_t`
+/// handle before detaching it.
 ///
 /// # Arguments
 /// * `entry` - Function to run in the new thread returning a `u32` exit code.
@@ -52,29 +54,24 @@ pub fn current_native_thread_handle() -> NativeThreadHandle {
 /// # Returns
 /// The native thread handle on success, or null on failure.
 pub fn start_detached(entry: fn() -> c_uint) -> NativeThreadHandle {
-    // Spawn a detached thread
-    // Using std::thread::spawn with a move closure - the thread is detached
-    // when the JoinHandle is dropped without being joined
-    let _join_handle = std_thread::spawn(move || {
+    match std_thread::Builder::new().spawn(move || {
         let _return_value = entry();
-    });
-
-    // Return a native handle based on thread identity
-    // Use the current PID + a marker to create a unique handle
-    let pid = unsafe { libc::getpid() };
-    let handle_value: NativeThreadHandle = (pid as usize | 1) as *mut std::ffi::c_void;
-    handle_value
+    }) {
+        Ok(join_handle) => {
+            let pthread_id = join_handle.as_pthread_t();
+            // Dropping join_handle detaches the thread cleanly.
+            drop(join_handle);
+            pthread_id as NativeThreadHandle
+        }
+        Err(_) => ptr::null_mut(),
+    }
 }
 
 /// Start a detached thread matching the Windows `StartDetached` API.
 ///
 /// Equivalent to: `bool StartDetached(std::function<uint32_t()> entry)`
 pub fn start_detached_thread(entry: fn() -> c_uint) -> bool {
-    // Spawn a detached thread running the entry function
-    let _handle = start_detached(entry);
-    // On Linux, thread creation rarely fails unless the system is out of resources
-    // We always return true for API compatibility
-    true
+    !start_detached(entry).is_null()
 }
 
 // ============= API matching Windows OSTPlatform::Thread =============
@@ -98,8 +95,7 @@ pub fn get_current_native_thread_handle() -> NativeThreadHandle {
 /// True if the thread was started successfully.
 #[allow(dead_code)]
 pub fn start_detached_api(entry: fn() -> c_uint) -> bool {
-    let _result = start_detached(entry);
-    true
+    start_detached_thread(entry)
 }
 
 #[cfg(test)]
@@ -138,5 +134,39 @@ mod tests {
         // Test the C-compatible API returns bool
         let result = start_detached_api(|| 0);
         assert!(result, "start_detached_api should return true");
+    }
+
+    #[test]
+    fn test_start_detached_returns_distinct_real_pthread_handle() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        static WORKER_HANDLE: AtomicUsize = AtomicUsize::new(0);
+        WORKER_HANDLE.store(0, Ordering::SeqCst);
+
+        let caller_handle = current_native_thread_handle();
+        let spawned_handle = start_detached(|| {
+            WORKER_HANDLE.store(current_native_thread_handle() as usize, Ordering::SeqCst);
+            std_thread::sleep(Duration::from_millis(30));
+            7
+        });
+        assert!(!spawned_handle.is_null());
+        assert_ne!(
+            spawned_handle, caller_handle,
+            "Spawned thread must have a different native handle than caller"
+        );
+
+        for _ in 0..50 {
+            let observed = WORKER_HANDLE.load(Ordering::SeqCst);
+            if observed != 0 {
+                assert_eq!(
+                    observed, spawned_handle as usize,
+                    "start_detached must return the worker's real pthread_t handle"
+                );
+                return;
+            }
+            std_thread::sleep(Duration::from_millis(5));
+        }
+        panic!("Detached worker thread did not record its handle in time");
     }
 }

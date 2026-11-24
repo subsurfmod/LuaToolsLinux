@@ -90,9 +90,11 @@ pub struct Context {
     /// Instruction pointer (RIP on x64)
     ip: u64,
     /// General purpose registers for argument reading
-    regs: [u64; 8], // ax, cx, dx, bx, sp, bp, si, di (x86_64 compat), but we use them as: rcx, rdx, r8, r9, rsp, rbp, rsi, rdi
+    regs: [u64; 8], // regs[0..4] = rcx, rdx, r8, r9; regs[4..8] = rsp, rbp, rsi, rdi
     /// Stack pointer (RSP) for reading stack arguments
     rsp: u64,
+    /// Whether the handler requested single-stepping (TF in RFLAGS)
+    single_step: bool,
 }
 
 impl Context {
@@ -104,6 +106,7 @@ impl Context {
             ip,
             regs,
             rsp,
+            single_step: false,
         }
     }
 
@@ -124,7 +127,7 @@ impl Context {
     /// prologue moves it). Returns 0 on a bad index or unreadable stack slot.
     /// Matches OSTPlatform::Trap::Context::Argument()
     pub fn argument(&self, index: i32) -> u64 {
-        if index < 1 {
+        if !self.valid || index < 1 {
             return 0;
         }
 
@@ -134,18 +137,34 @@ impl Context {
             return self.regs[index as usize - 1];
         }
 
-        // Args 5+ are on the stack. Use RSP + index * 8 (matching Windows API formula)
-        let _slot = self.rsp + (index as u64) * 8;
+        // Args 5+ are on the stack at RSP + index * 8 (matching Win64 shadow space layout).
+        let Some(byte_offset) = (index as u64).checked_mul(8) else {
+            return 0;
+        };
+        let Some(slot) = self.rsp.checked_add(byte_offset) else {
+            return 0;
+        };
+        if slot == 0
+            || !super::memory::is_readable(
+                slot as *const std::ffi::c_void,
+                std::mem::size_of::<u64>(),
+            )
+        {
+            return 0;
+        }
 
-        0
+        unsafe { ptr::read_unaligned(slot as *const u64) }
     }
 
     /// Enable single-step tracing (TF flag in RFLAGS).
     /// Matches OSTPlatform::Trap::Context::EnableSingleStep()
     pub fn enable_single_step(&mut self) {
-        // On Linux, we can't directly modify RFLAGS from a Context snapshot.
-        // This would need to be done via ptrace or directly on the running process.
-        // For now, just note the intent.
+        self.single_step = true;
+    }
+
+    /// Returns whether `enable_single_step` was requested on this context.
+    pub fn is_single_step_enabled(&self) -> bool {
+        self.single_step
     }
 }
 
@@ -191,20 +210,34 @@ pub fn add_vectored_handler(handler: Handler) -> Result<HandlerHandle> {
 }
 
 /// Remove a vectored exception handler.
-/// Matches OSTPlatform::Trap::RemoveVectoredHandler
+/// Matches OSTPlatform::Trap::RemoveVectoredHandler.
+/// Only removes the handler if `handle` matches the currently installed handler.
 pub fn remove_vectored_handler(handle: HandlerHandle) -> Result<()> {
-    let handle_ptr = handle as *mut Handler;
-    let prev = HANDLER.swap(ptr::null_mut(), Ordering::AcqRel);
-    if !prev.is_null() {
-        // Safety: prev was created by Box::into_raw in add_vectored_handler.
-        unsafe {
-            drop(Box::from_raw(prev));
-        }
-    } else if !handle_ptr.is_null() {
-        return Err(TrapError::NoHandlerInstalled);
+    if handle.is_null() {
+        return Err(TrapError::InvalidIndex(
+            "Null vectored handler handle".to_string(),
+        ));
     }
 
-    Ok(())
+    let handle_ptr = handle as *mut Handler;
+    match HANDLER.compare_exchange(
+        handle_ptr,
+        ptr::null_mut(),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(prev) => {
+            // Safety: prev matched handle_ptr and was created by Box::into_raw in add_vectored_handler.
+            unsafe {
+                drop(Box::from_raw(prev));
+            }
+            Ok(())
+        }
+        Err(current) if current.is_null() => Err(TrapError::NoHandlerInstalled),
+        Err(_) => Err(TrapError::InvalidIndex(
+            "Handler handle does not match installed handler".to_string(),
+        )),
+    }
 }
 
 /// Get the main executable path, matching the API needs.
@@ -216,19 +249,21 @@ pub fn get_main_executable_path() -> Result<PathBuf> {
     }
 }
 
-/// Exception kind from a signal/code
-pub fn exception_kind_from_signal(signal: c_int, _code: c_ulong) -> ExceptionKind {
+/// Exception kind from a Linux signal number and `siginfo_t::si_code`.
+pub fn exception_kind_from_signal(signal: c_int, code: c_ulong) -> ExceptionKind {
+    // Linux <asm-generic/siginfo.h> constants for SIGTRAP:
+    const TRAP_BRKPT: c_ulong = 1;
+    const TRAP_TRACE: c_ulong = 2;
+    const TRAP_HWBKPT: c_ulong = 4;
+    const SI_KERNEL: c_ulong = 0x80;
+
     match signal {
-        // SIGTRAP - breakpoint or trace trap
-        libc::SIGTRAP => ExceptionKind::Other,
-        // SIGILL - illegal instruction
-        libc::SIGILL => ExceptionKind::Other,
-        // SIGFPE - floating point exception
-        libc::SIGFPE => ExceptionKind::Other,
-        // SIGSEGV - segment violation
-        libc::SIGSEGV => ExceptionKind::Other,
-        // SIGBUS - bus error
-        libc::SIGBUS => ExceptionKind::Other,
+        libc::SIGTRAP => match code {
+            TRAP_BRKPT | SI_KERNEL => ExceptionKind::Breakpoint,
+            TRAP_TRACE | TRAP_HWBKPT => ExceptionKind::SingleStep,
+            _ => ExceptionKind::Other,
+        },
+        libc::SIGILL | libc::SIGFPE | libc::SIGSEGV | libc::SIGBUS => ExceptionKind::Other,
         _ => ExceptionKind::Other,
     }
 }
@@ -236,10 +271,12 @@ pub fn exception_kind_from_signal(signal: c_int, _code: c_ulong) -> ExceptionKin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static HANDLER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_exception_kind_from_signal() {
-        // Test that we can create exception kinds
         let bp = ExceptionKind::Breakpoint;
         let ss = ExceptionKind::SingleStep;
         let other = ExceptionKind::Other;
@@ -247,6 +284,23 @@ mod tests {
         assert_eq!(format!("{}", bp), "Breakpoint");
         assert_eq!(format!("{}", ss), "SingleStep");
         assert_eq!(format!("{}", other), "Other");
+
+        assert_eq!(
+            exception_kind_from_signal(libc::SIGTRAP, 1),
+            ExceptionKind::Breakpoint
+        );
+        assert_eq!(
+            exception_kind_from_signal(libc::SIGTRAP, 0x80),
+            ExceptionKind::Breakpoint
+        );
+        assert_eq!(
+            exception_kind_from_signal(libc::SIGTRAP, 2),
+            ExceptionKind::SingleStep
+        );
+        assert_eq!(
+            exception_kind_from_signal(libc::SIGSEGV, 1),
+            ExceptionKind::Other
+        );
     }
 
     #[test]
@@ -259,6 +313,7 @@ mod tests {
         );
         assert!(ctx.valid);
         assert_eq!(ctx.instruction_pointer(), 0x401000);
+        assert!(!ctx.is_single_step_enabled());
     }
 
     #[test]
@@ -277,8 +332,29 @@ mod tests {
         assert_eq!(ctx.argument(3), 0x300);
         // Arg 4 = R9 = regs[3]
         assert_eq!(ctx.argument(4), 0x400);
-        // Arg 5+ = stack, returns 0 for now
+        // Arg 5+ with unmapped RSP safely returns 0
         assert_eq!(ctx.argument(5), 0);
+
+        // Arg 5+ with valid readable stack frame reads slot RSP + index * 8
+        let fake_stack: [u64; 8] = [0, 0, 0, 0, 0, 0x5555_AAAA, 0x6666_BBBB, 0];
+        let mut stack_ctx = Context::new(
+            true,
+            0x401000,
+            [1, 2, 3, 4, 0, 0, 0, 0],
+            fake_stack.as_ptr() as u64,
+        );
+        assert_eq!(stack_ctx.argument(5), 0x5555_AAAA);
+        assert_eq!(stack_ctx.argument(6), 0x6666_BBBB);
+        stack_ctx.enable_single_step();
+        assert!(stack_ctx.is_single_step_enabled());
+
+        // Overflowing RSP must safely return 0, never panic
+        let overflow_ctx = Context::new(true, 0x401000, [0; 8], u64::MAX - 8);
+        assert_eq!(overflow_ctx.argument(5), 0);
+
+        // Invalid context returns 0 even for register args
+        let invalid_ctx = Context::new(false, 0, [0x99; 8], fake_stack.as_ptr() as u64);
+        assert_eq!(invalid_ctx.argument(1), 0);
     }
 
     #[test]
@@ -293,19 +369,37 @@ mod tests {
 
     #[test]
     fn test_handler_handle() {
+        let _guard = HANDLER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let handler: Handler = Box::new(|_kind, _ctx| true);
         let handle = add_vectored_handler(handler).expect("add_vectored_handler should succeed");
         assert!(!handle.is_null(), "Handler handle should not be null");
 
+        // Duplicate install must fail
+        let dup: Handler = Box::new(|_kind, _ctx| false);
+        assert!(matches!(
+            add_vectored_handler(dup),
+            Err(TrapError::HandlerAlreadyInstalled)
+        ));
+
+        // Null or mismatched handle must NOT uninstall the active handler
+        assert!(remove_vectored_handler(ptr::null_mut()).is_err());
+        let wrong_handle = (handle as usize).wrapping_add(16) as HandlerHandle;
+        assert!(remove_vectored_handler(wrong_handle).is_err());
+
         let result = remove_vectored_handler(handle);
         assert!(result.is_ok(), "Remove handler should succeed");
+
+        // Removing again returns NoHandlerInstalled
+        assert!(matches!(
+            remove_vectored_handler(handle),
+            Err(TrapError::NoHandlerInstalled)
+        ));
     }
 
     #[test]
     fn test_get_main_executable_path() {
         let path = get_main_executable_path();
         assert!(path.is_ok(), "Should get main executable path");
-        println!("Main executable: {:?}", path.unwrap());
     }
 
     #[test]

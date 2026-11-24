@@ -3,7 +3,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -13,6 +14,49 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::models::config::default_luatools_cache_dir;
+
+static CACHE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let seq = CACHE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("cache");
+    let tmp = path.with_file_name(format!(".{}.tmp.{}.{}", fname, std::process::id(), seq));
+    if let Err(e) = fs::write(&tmp, bytes) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn parse_release_year(date_str: &str) -> Option<i32> {
+    let bytes = date_str.as_bytes();
+    let mut best: Option<i32> = None;
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        let is_start = i == 0 || !bytes[i - 1].is_ascii_digit();
+        let is_end = i + 4 == bytes.len() || !bytes[i + 4].is_ascii_digit();
+        if is_start && is_end && bytes[i..i + 4].iter().all(|b| b.is_ascii_digit()) {
+            if let Ok(s) = std::str::from_utf8(&bytes[i..i + 4]) {
+                if let Ok(year) = s.parse::<i32>() {
+                    if (1970..=2100).contains(&year) {
+                        best = Some(year);
+                    }
+                }
+            }
+            i += 4;
+            continue;
+        }
+        i += 1;
+    }
+    best
+}
 
 const STEAM_PLACEHOLDER_SHA256: &str =
     "732ec27ff347292488e3341f00d0750a31f42c44f55da4e04bc8f61d7eb1b6f3";
@@ -64,11 +108,14 @@ impl AppOverview {
         !self.developers.is_empty()
     }
     pub fn has_distinct_publisher(&self) -> bool {
-        !self.publishers.is_empty()
-            && !self
-                .publishers
-                .iter()
-                .any(|p| self.developers.iter().any(|d| d.eq_ignore_ascii_case(p)))
+        self.publishers.iter().any(|p| {
+            let trimmed = p.trim();
+            !trimmed.is_empty()
+                && !self
+                    .developers
+                    .iter()
+                    .any(|d| d.trim().eq_ignore_ascii_case(trimmed))
+        })
     }
     pub fn has_genres(&self) -> bool {
         !self.genres.is_empty()
@@ -133,7 +180,13 @@ impl SteamAppInfoCache {
     }
 
     pub fn get(&self, app_id: u32) -> Option<GameDetails> {
-        if let Some(hit) = self.mem.lock().unwrap().get(&app_id).cloned() {
+        if let Some(hit) = self
+            .mem
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&app_id)
+            .cloned()
+        {
             return Some(hit);
         }
 
@@ -141,7 +194,10 @@ impl SteamAppInfoCache {
         if let Ok(raw) = fs::read_to_string(&cache_file) {
             if let Ok(val) = serde_json::from_str::<Value>(&raw) {
                 if let Some(d) = Self::parse_details(app_id, &val) {
-                    self.mem.lock().unwrap().insert(app_id, d.clone());
+                    self.mem
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(app_id, d.clone());
                     return Some(d);
                 }
             }
@@ -149,7 +205,7 @@ impl SteamAppInfoCache {
 
         // Gentle 350ms rate limit against Steam Store API
         {
-            let mut last = self.last_req.lock().unwrap();
+            let mut last = self.last_req.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(prev) = *last {
                 let elapsed = prev.elapsed();
                 if elapsed < Duration::from_millis(350) {
@@ -160,6 +216,7 @@ impl SteamAppInfoCache {
         }
 
         let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(8))
             .timeout(Duration::from_secs(15))
             .build();
         let url = format!(
@@ -179,10 +236,13 @@ impl SteamAppInfoCache {
         }
         let data = entry.get("data")?;
         if let Ok(serialized) = serde_json::to_string(data) {
-            let _ = fs::write(&cache_file, serialized);
+            let _ = atomic_write_bytes(&cache_file, serialized.as_bytes());
         }
         let details = Self::parse_details(app_id, data)?;
-        self.mem.lock().unwrap().insert(app_id, details.clone());
+        self.mem
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(app_id, details.clone());
         Some(details)
     }
 
@@ -271,10 +331,7 @@ impl SteamAppInfoCache {
                 .get("release_date")
                 .and_then(|r| r.get("date"))
                 .and_then(|v| v.as_str())
-                .and_then(|s| {
-                    let year_str = s.split_whitespace().last().unwrap_or(s);
-                    year_str.parse::<i32>().ok()
-                }),
+                .and_then(parse_release_year),
             metacritic: obj
                 .get("metacritic")
                 .and_then(|m| m.get("score"))
@@ -349,7 +406,7 @@ impl SteamAppListCache {
 
     pub fn ensure_loaded(&self) {
         {
-            let mut l = self.loaded.lock().unwrap();
+            let mut l = self.loaded.lock().unwrap_or_else(|e| e.into_inner());
             if *l {
                 return;
             }
@@ -359,7 +416,7 @@ impl SteamAppListCache {
         let mut fresh_enough = false;
         if let Ok(raw) = fs::read_to_string(&self.cache_path) {
             if let Ok(parsed) = serde_json::from_str::<HashMap<String, String>>(&raw) {
-                let mut guard = self.map.lock().unwrap();
+                let mut guard = self.map.lock().unwrap_or_else(|e| e.into_inner());
                 for (k, v) in parsed {
                     if let Ok(aid) = k.parse::<u32>() {
                         guard.insert(aid, v);
@@ -387,6 +444,7 @@ impl SteamAppListCache {
         let path_clone = self.cache_path.clone();
         thread::spawn(move || {
             let agent = ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(10))
                 .timeout(Duration::from_secs(30))
                 .build();
             let Ok(resp) = agent.get("https://applist.morrenus.xyz/").call() else {
@@ -407,7 +465,11 @@ impl SteamAppListCache {
             let mut new_map = HashMap::new();
             let mut disk_map = HashMap::new();
             for item in apps {
-                let aid = item.get("appid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let aid = item
+                    .get("appid")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|n| u32::try_from(n).ok())
+                    .unwrap_or(0);
                 let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 if aid > 0 && !name.is_empty() {
                     new_map.insert(aid, name.to_string());
@@ -415,9 +477,9 @@ impl SteamAppListCache {
                 }
             }
             if !new_map.is_empty() {
-                *map_ref.lock().unwrap() = new_map;
+                *map_ref.lock().unwrap_or_else(|e| e.into_inner()) = new_map;
                 if let Ok(js) = serde_json::to_string(&disk_map) {
-                    let _ = fs::write(&path_clone, js);
+                    let _ = atomic_write_bytes(&path_clone, js.as_bytes());
                 }
             }
         });
@@ -425,7 +487,11 @@ impl SteamAppListCache {
 
     pub fn get_name(&self, app_id: u32) -> Option<String> {
         self.ensure_loaded();
-        self.map.lock().unwrap().get(&app_id).cloned()
+        self.map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&app_id)
+            .cloned()
     }
 }
 
@@ -489,9 +555,14 @@ impl CoverCache {
         let p = self.cache_dir.join(format!("{}.jpg", app_id));
         let bytes = fs::read(&p).ok()?;
         if bytes.len() > 100 && (&bytes[0..3] == b"\xFF\xD8\xFF" || &bytes[0..4] == b"\x89PNG") {
-            return Some(p);
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            let digest = format!("{:x}", hasher.finalize());
+            if digest != STEAM_PLACEHOLDER_SHA256 {
+                return Some(p);
+            }
         }
-        // Purge corrupt / non-image cache entries so the cover can be re-fetched cleanly
+        // Purge corrupt / placeholder / non-image cache entries so the cover can be re-fetched cleanly
         let _ = fs::remove_file(&p);
         None
     }
@@ -542,7 +613,7 @@ impl CoverCache {
             if let Ok(bytes) = fs::read(&cand) {
                 if Self::is_valid_image_bytes(&bytes) {
                     let dest = self.cache_dir.join(format!("{}.jpg", app_id));
-                    if fs::write(&dest, &bytes).is_ok() {
+                    if atomic_write_bytes(&dest, &bytes).is_ok() {
                         return Some(dest);
                     }
                     return Some(cand);
@@ -620,15 +691,16 @@ impl CoverCache {
             .call()
             .ok()?;
         let mut bytes = Vec::new();
+        const MAX_COVER_BYTES: usize = 4 * 1024 * 1024;
         resp.into_reader()
-            .take(4 * 1024 * 1024)
+            .take((MAX_COVER_BYTES as u64) + 1)
             .read_to_end(&mut bytes)
             .ok()?;
-        if !Self::is_valid_image_bytes(&bytes) {
+        if bytes.len() > MAX_COVER_BYTES || !Self::is_valid_image_bytes(&bytes) {
             return None;
         }
         let dest = self.cache_dir.join(format!("{}.jpg", app_id));
-        if fs::write(&dest, &bytes).is_ok() {
+        if atomic_write_bytes(&dest, &bytes).is_ok() {
             return Some(dest);
         }
         None
@@ -808,34 +880,57 @@ impl HardwareAppIdService {
 
     pub fn is_hardware(&self, app_id: u32) -> bool {
         self.ensure_loaded();
-        self.ids.lock().unwrap().contains(&app_id)
+        self.ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&app_id)
     }
 
     fn ensure_loaded(&self) {
         {
-            let mut l = self.loaded.lock().unwrap();
+            let mut l = self.loaded.lock().unwrap_or_else(|e| e.into_inner());
             if *l {
                 return;
             }
             *l = true;
         }
 
+        let mut fresh_enough = false;
         if let Ok(raw) = fs::read_to_string(&self.cache_path) {
             if let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) {
-                let mut set = self.ids.lock().unwrap();
+                let mut set = self.ids.lock().unwrap_or_else(|e| e.into_inner());
                 for item in arr {
-                    if let Some(aid) = item.get("appid").and_then(|v| v.as_u64()) {
-                        set.insert(aid as u32);
+                    if let Some(aid) = item
+                        .get("appid")
+                        .and_then(|v| v.as_u64())
+                        .and_then(|n| u32::try_from(n).ok())
+                    {
+                        set.insert(aid);
                     }
                 }
-                return;
+                if let Ok(meta) = fs::metadata(&self.cache_path) {
+                    if let Ok(mtime) = meta.modified() {
+                        if SystemTime::now()
+                            .duration_since(mtime)
+                            .map(|d| d.as_secs() < TTL_14_DAYS)
+                            .unwrap_or(false)
+                        {
+                            fresh_enough = true;
+                        }
+                    }
+                }
             }
+        }
+
+        if fresh_enough {
+            return;
         }
 
         let ids_ref = Arc::clone(&self.ids);
         let path_clone = self.cache_path.clone();
         thread::spawn(move || {
             let agent = ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(8))
                 .timeout(Duration::from_secs(15))
                 .build();
             let Ok(resp) = agent.get(HARDWARE_APPID_URL).call() else {
@@ -844,15 +939,73 @@ impl HardwareAppIdService {
             let Ok(text) = resp.into_string() else {
                 return;
             };
-            let _ = fs::write(&path_clone, &text);
-            if let Ok(arr) = serde_json::from_str::<Vec<Value>>(&text) {
-                let mut set = ids_ref.lock().unwrap();
-                for item in arr {
-                    if let Some(aid) = item.get("appid").and_then(|v| v.as_u64()) {
-                        set.insert(aid as u32);
-                    }
+            // Validate JSON before overwriting the on-disk cache
+            let Ok(arr) = serde_json::from_str::<Vec<Value>>(&text) else {
+                return;
+            };
+            let mut parsed_ids = HashSet::new();
+            for item in arr {
+                if let Some(aid) = item
+                    .get("appid")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|n| u32::try_from(n).ok())
+                {
+                    parsed_ids.insert(aid);
                 }
             }
+            if !parsed_ids.is_empty() {
+                let _ = atomic_write_bytes(&path_clone, text.as_bytes());
+                *ids_ref.lock().unwrap_or_else(|e| e.into_inner()) = parsed_ids;
+            }
         });
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    #[test]
+    fn overview_distinct_publisher_handles_co_publishing_and_blank_entries() {
+        let same = AppOverview {
+            developers: vec!["FromSoftware".into()],
+            publishers: vec!["fromsoftware".into()],
+            ..Default::default()
+        };
+        assert!(!same.has_distinct_publisher());
+
+        let co_pub = AppOverview {
+            developers: vec!["FromSoftware".into()],
+            publishers: vec!["FromSoftware".into(), "Bandai Namco".into()],
+            ..Default::default()
+        };
+        assert!(co_pub.has_distinct_publisher());
+
+        let blank_pub = AppOverview {
+            developers: vec!["Studio".into()],
+            publishers: vec!["   ".into()],
+            ..Default::default()
+        };
+        assert!(!blank_pub.has_distinct_publisher());
+    }
+
+    #[test]
+    fn parses_release_year_across_date_formats() {
+        assert_eq!(parse_release_year("25 Feb, 2022"), Some(2022));
+        assert_eq!(parse_release_year("2023-05-10"), Some(2023));
+        assert_eq!(parse_release_year("Q4 2025."), Some(2025));
+        assert_eq!(parse_release_year("Coming Soon"), None);
+    }
+
+    #[test]
+    fn hardware_appid_service_loads_cached_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("hardware_appid.json");
+        fs::write(&cache, r#"[{"appid": 1675200}, {"appid": 353370}]"#).unwrap();
+
+        let svc = HardwareAppIdService::new(Some(cache));
+        assert!(svc.is_hardware(1675200));
+        assert!(svc.is_hardware(353370));
+        assert!(!svc.is_hardware(1245620));
     }
 }

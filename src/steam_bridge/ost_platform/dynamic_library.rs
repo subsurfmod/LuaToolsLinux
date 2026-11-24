@@ -3,13 +3,45 @@
 //! Provides dlopen/dlsym based dynamic library loading compatible with the Windows API.
 //! Uses libdl for dynamic loading and /proc/self/maps for module enumeration.
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::{Mutex, OnceLock};
 
 use thiserror::Error;
+
+fn open_handles() -> &'static Mutex<HashMap<usize, usize>> {
+    static OPEN_HANDLES: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+    OPEN_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_opened_handle(handle: ModuleHandle) {
+    if !handle.is_null() {
+        let mut map = open_handles().lock().unwrap_or_else(|e| e.into_inner());
+        *map.entry(handle as usize).or_insert(0) += 1;
+    }
+}
+
+/// Parse the file path column from a `/proc/<pid>/maps` line, preserving spaces in paths.
+fn parse_maps_path(line: &str) -> Option<&str> {
+    let mut rest = line.trim_start();
+    // Skip first 5 whitespace-separated fields: addr, perms, offset, dev, inode
+    for _ in 0..5 {
+        let ws = rest.find(char::is_whitespace)?;
+        rest = rest[ws..].trim_start();
+    }
+    if rest.is_empty() {
+        return None;
+    }
+    let cleaned = rest.strip_suffix(" (deleted)").unwrap_or(rest).trim();
+    if cleaned.is_empty() || cleaned.starts_with('[') {
+        return None;
+    }
+    Some(cleaned)
+}
 
 /// Error type for dynamic library operations.
 #[derive(Debug, Error)]
@@ -65,48 +97,52 @@ pub fn load(path: &Path) -> ModuleHandle {
 
 /// Load a shared library with specific flags.
 fn load_with_flags(path: &Path, flags: i32) -> ModuleHandle {
-    let path_bytes = match path.as_os_str().as_bytes().to_vec() {
-        bytes if bytes.contains(&0) => return ptr::null_mut(),
-        bytes => bytes,
-    };
+    let raw = path.as_os_str().as_bytes();
+    if raw.is_empty() || raw.contains(&0) {
+        return ptr::null_mut();
+    }
 
-    let c_path = match CString::new(path_bytes) {
+    let c_path = match CString::new(raw) {
         Ok(s) => s,
         Err(_) => return ptr::null_mut(),
     };
 
-    unsafe { libc::dlopen(c_path.as_ptr(), flags) }
+    // Clear any stale thread-local dlerror before dlopen so get_last_error_code()
+    // accurately reflects this call.
+    unsafe {
+        let _ = libc::dlerror();
+    }
+    let handle = unsafe { libc::dlopen(c_path.as_ptr(), flags) };
+    record_opened_handle(handle);
+    handle
 }
 
 /// Get a handle to an already-loaded module by name.
-/// Searches /proc/self/maps for the module.
+/// Uses `dlopen(RTLD_NOLOAD)` first, then searches `/proc/self/maps`.
 ///
 /// # Arguments
 /// * `module_name` - Name of the module (e.g., "libc.so.6")
 ///
 /// # Returns
-/// A module handle on success, or null if not found.
+/// A module handle on success, or null if not currently loaded.
 pub fn get_loaded(module_name: &str) -> ModuleHandle {
-    // First try to find the module path in /proc/self/maps
-    if let Some(path) = find_module_path_in_maps(module_name) {
-        return load(&path);
+    if module_name.is_empty() || module_name.as_bytes().contains(&0) {
+        return ptr::null_mut();
     }
 
-    // If not found in maps, try searching common library paths
-    let common_search_paths = [
-        "/usr/lib",
-        "/lib",
-        "/usr/lib64",
-        "/lib64",
-        "/usr/lib/x86_64-linux-gnu",
-        "/lib/x86_64-linux-gnu",
-    ];
+    // 1. Fast path: ask the dynamic linker directly without loading anything new.
+    let noload = load_with_flags(Path::new(module_name), libc::RTLD_LAZY | libc::RTLD_NOLOAD);
+    if !noload.is_null() {
+        return noload;
+    }
 
-    for search_dir in &common_search_paths {
-        let candidate = Path::new(search_dir).join(module_name);
-        if candidate.exists() {
-            return load(&candidate);
+    // 2. Search /proc/self/maps for an already-mapped file matching module_name.
+    if let Some(path) = find_module_path_in_maps(module_name) {
+        let h = load_with_flags(&path, libc::RTLD_LAZY | libc::RTLD_NOLOAD);
+        if !h.is_null() {
+            return h;
         }
+        return load_with_flags(&path, libc::RTLD_LAZY | libc::RTLD_LOCAL);
     }
 
     ptr::null_mut()
@@ -114,37 +150,50 @@ pub fn get_loaded(module_name: &str) -> ModuleHandle {
 
 /// Find a module path in /proc/self/maps by name.
 fn find_module_path_in_maps(module_name: &str) -> Option<PathBuf> {
+    if module_name.is_empty() {
+        return None;
+    }
     let maps = fs::read_to_string("/proc/self/maps").ok()?;
+    find_module_path_in_maps_str(&maps, module_name)
+}
+
+fn find_module_path_in_maps_str(maps: &str, module_name: &str) -> Option<PathBuf> {
+    if module_name.is_empty() {
+        return None;
+    }
+
+    let versioned_prefix = format!("{}.", module_name);
+    let lib_exact = if module_name.starts_with("lib") {
+        None
+    } else {
+        Some(format!("lib{}", module_name))
+    };
+    let mut fallback: Option<PathBuf> = None;
 
     for line in maps.lines() {
-        // Skip anonymous mappings and kernel mappings
-        if line.starts_with('[') || line.contains("(deleted)") {
+        let Some(path_clean) = parse_maps_path(line) else {
             continue;
-        }
-
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 6 {
-            continue;
-        }
-
-        let path_str = parts[5..].join(" ");
-        let path_clean = path_str.trim_end_matches(" (deleted)").trim();
+        };
 
         let path = Path::new(path_clean);
+        if path_clean == module_name {
+            return Some(path.to_path_buf());
+        }
 
-        // Check if the file name matches the module name
         if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
             if file_name == module_name {
                 return Some(path.to_path_buf());
             }
-            // Also check for partial matches (e.g., "libc.so.6" matches "libc.so.6")
-            if module_name.contains(file_name) || file_name.contains(module_name) {
-                return Some(path.to_path_buf());
+            if fallback.is_none()
+                && (file_name.starts_with(&versioned_prefix)
+                    || lib_exact.as_deref() == Some(file_name))
+            {
+                fallback = Some(path.to_path_buf());
             }
         }
     }
 
-    None
+    fallback
 }
 
 /// Get a symbol (function or variable) from a loaded module by name.
@@ -158,7 +207,7 @@ fn find_module_path_in_maps(module_name: &str) -> Option<PathBuf> {
 /// Pointer to the symbol, or null if not found.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn get_symbol(module: ModuleHandle, symbol_name: &str) -> *mut std::ffi::c_void {
-    if module.is_null() {
+    if module.is_null() || symbol_name.is_empty() {
         return ptr::null_mut();
     }
 
@@ -167,7 +216,10 @@ pub fn get_symbol(module: ModuleHandle, symbol_name: &str) -> *mut std::ffi::c_v
         Err(_) => return ptr::null_mut(),
     };
 
-    unsafe { libc::dlsym(module, c_name.as_ptr()) }
+    unsafe {
+        let _ = libc::dlerror();
+        libc::dlsym(module, c_name.as_ptr())
+    }
 }
 
 /// Get a symbol by ordinal (not supported on Linux, returns null).
@@ -281,6 +333,13 @@ pub fn get_module_directory(module: ModuleHandle) -> PathBuf {
                         return parent.to_path_buf();
                     }
                 }
+                if let Some(resolved) = find_module_path_in_maps(&name) {
+                    if let Some(parent) = resolved.parent() {
+                        if !parent.as_os_str().is_empty() {
+                            return parent.to_path_buf();
+                        }
+                    }
+                }
             } else if let Ok(exe) = fs::read_link("/proc/self/exe") {
                 if let Some(parent) = exe.parent() {
                     return parent.to_path_buf();
@@ -328,19 +387,37 @@ pub fn get_or_load(path: &Path) -> ModuleHandle {
 
 /// Close/unload a loaded module.
 /// Equivalent to Windows FreeLibrary.
-/// Note: On Linux, we don't decrement the reference count in most cases
-/// because other code may have loaded the same library.
-///
-/// # Arguments
-/// * `_module` - Module handle (currently unused, kept for API compatibility)
+/// Calls `dlclose` only for handles opened through this module's tracked `load`/`get_loaded`
+/// calls, preventing refcount leaks while avoiding double-`dlclose` UB on untracked or null handles.
 ///
 /// # Returns
-/// Always returns true (for API compatibility).
-pub fn unload(_module: ModuleHandle) -> bool {
-    // Linux's dlclose() would decrement the reference count
-    // but we don't track reference counts ourselves
-    // Other code may still hold references
-    true
+/// `true` on success (and for null/untracked handles for API compatibility).
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn unload(module: ModuleHandle) -> bool {
+    if module.is_null() {
+        return true;
+    }
+
+    let should_close = {
+        let mut map = open_handles().lock().unwrap_or_else(|e| e.into_inner());
+        match map.get_mut(&(module as usize)) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                true
+            }
+            Some(_) => {
+                map.remove(&(module as usize));
+                true
+            }
+            None => false,
+        }
+    };
+
+    if should_close {
+        unsafe { libc::dlclose(module) == 0 }
+    } else {
+        true
+    }
 }
 
 /// Check if a module is valid (non-null and loadable).
@@ -354,23 +431,17 @@ pub fn list_loaded_modules() -> Vec<PathBuf> {
         Ok(m) => m,
         Err(_) => return Vec::new(),
     };
+    parse_loaded_modules_from_maps(&maps)
+}
 
+fn parse_loaded_modules_from_maps(maps: &str) -> Vec<PathBuf> {
     let mut modules = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
     for line in maps.lines() {
-        // Skip anonymous mappings and kernel mappings
-        if line.starts_with('[') || line.contains("(deleted)") {
+        let Some(path_clean) = parse_maps_path(line) else {
             continue;
-        }
-
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 6 {
-            continue;
-        }
-
-        let path_str = parts[5..].join(" ");
-        let path_clean = path_str.trim_end_matches(" (deleted)").trim();
+        };
 
         let path = PathBuf::from(path_clean);
         if seen.insert(path.clone()) {
@@ -382,25 +453,48 @@ pub fn list_loaded_modules() -> Vec<PathBuf> {
 }
 
 /// Convert a Windows-style DLL name to Linux .so name.
-/// E.g., "kernel32.dll" -> "libkernel32.so" (though this is just an example)
+/// E.g., "kernel32.dll" -> "libkernel32.so"
 pub fn dll_to_so_name(dll_name: &str) -> String {
-    let name = Path::new(dll_name)
+    let trimmed = dll_name.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    // Preserve names that are already Linux shared object names (e.g., foo.so, libc.so.6)
+    let file_name = Path::new(trimmed)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(trimmed);
+    if file_name.ends_with(".so") || file_name.contains(".so.") {
+        return file_name.to_string();
+    }
+
+    let stem = Path::new(file_name)
         .file_stem()
         .and_then(|s| s.to_str())
-        .unwrap_or(dll_name);
+        .unwrap_or(file_name);
 
-    // Try different prefixes and suffixes
-    for prefix in &["", "lib"] {
+    let prefixes: &[&str] = if stem.starts_with("lib") {
+        &[""]
+    } else {
+        &["", "lib"]
+    };
+
+    // Try different prefixes and suffixes in current directory
+    for prefix in prefixes {
         for suffix in &["", ".so", ".so.6", ".so.1"] {
-            let candidate = format!("{}{}{}", prefix, name, suffix);
+            let candidate = format!("{}{}{}", prefix, stem, suffix);
             if Path::new(&candidate).exists() {
                 return candidate;
             }
         }
     }
 
-    // Return the transformed name even if file doesn't exist
-    format!("lib{}.so", name)
+    if stem.starts_with("lib") {
+        format!("{}.so", stem)
+    } else {
+        format!("lib{}.so", stem)
+    }
 }
 
 #[cfg(test)]
@@ -658,5 +752,65 @@ mod tests {
                 let _ = parent_exists;
             }
         }
+    }
+
+    #[test]
+    fn test_list_loaded_modules_excludes_pseudo_mappings() {
+        let modules = list_loaded_modules();
+        assert!(
+            !modules.is_empty(),
+            "Current process should have mapped modules"
+        );
+        for m in &modules {
+            let s = m.to_string_lossy();
+            assert!(
+                !s.starts_with('['),
+                "Pseudo-mapping {:?} should not be listed as a module",
+                m
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_loaded_rejects_empty_and_nonexistent() {
+        assert!(get_loaded("").is_null());
+        assert!(get_loaded("definitely_not_loaded_lib_987654.so").is_null());
+    }
+
+    #[test]
+    fn test_parse_maps_and_exact_matching() {
+        let fake_maps = "\
+7f000000-7f001000 r-xp 00000000 00:00 0                                  [vdso]\n\
+7f002000-7f003000 r--p 00000000 08:01 123                                /opt/my  app/libfoo.so\n\
+7f004000-7f005000 r--p 00000000 08:01 124                                /usr/lib/c\n";
+        let mods = parse_loaded_modules_from_maps(fake_maps);
+        assert_eq!(mods.len(), 2);
+        assert_eq!(mods[0], PathBuf::from("/opt/my  app/libfoo.so"));
+        // Must not match `/usr/lib/c` when looking for `steamclient.so`
+        assert_eq!(
+            find_module_path_in_maps_str(fake_maps, "steamclient.so"),
+            None
+        );
+        assert_eq!(
+            find_module_path_in_maps_str(fake_maps, "libfoo.so"),
+            Some(PathBuf::from("/opt/my  app/libfoo.so"))
+        );
+    }
+
+    #[test]
+    fn test_dll_to_so_name_edge_cases() {
+        assert_eq!(dll_to_so_name(""), "");
+        assert_eq!(dll_to_so_name("libfoo.dll"), "libfoo.so");
+        assert_eq!(dll_to_so_name("steamclient.so"), "steamclient.so");
+        assert_eq!(dll_to_so_name("libc.so.6"), "libc.so.6");
+    }
+
+    #[test]
+    fn test_load_and_unload_tracked_handle() {
+        let h = load(Path::new("libc.so.6"));
+        assert!(!h.is_null());
+        assert!(unload(h));
+        // Second unload on same handle must be a safe no-op, not double-dlclose UB
+        assert!(unload(h));
     }
 }

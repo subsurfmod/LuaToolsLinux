@@ -4,12 +4,14 @@
 //! with caching and verification support.
 
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{self, Read};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use md5::compute as md5_compute;
 use sha2::{Digest, Sha256};
+
+const HASH_BUF_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct FileHash {
@@ -23,39 +25,70 @@ pub struct FileHash {
 }
 
 impl FileHash {
-    pub fn new(file_path: &Path, file_name: &str) -> Self {
-        let file_size = fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
-        let bytes = fs::read(file_path).unwrap_or_default();
-
+    pub fn try_new(file_path: &Path, file_name: &str) -> io::Result<Self> {
+        let mut file = File::open(file_path)?;
         let mut sha256_hasher = Sha256::new();
-        sha256_hasher.update(&bytes);
-        let sha256 = format!("{:x}", sha256_hasher.finalize());
-
         let mut sha1_hasher = sha1::Sha1::new();
-        sha1_hasher.update(&bytes);
-        let sha1 = format!("{:x}", sha1_hasher.finalize());
+        let mut md5_ctx = md5::Context::new();
+        let mut buf = [0u8; HASH_BUF_SIZE];
+        let mut total_bytes: u64 = 0;
 
-        let md5 = format!("{:x}", md5_compute(&bytes));
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            let chunk = &buf[..n];
+            sha256_hasher.update(chunk);
+            sha1_hasher.update(chunk);
+            md5_ctx.consume(chunk);
+            total_bytes += n as u64;
+        }
 
-        Self {
+        let file_size = fs::metadata(file_path)
+            .map(|m| m.len())
+            .unwrap_or(total_bytes);
+
+        Ok(Self {
             file_path: file_path.to_string_lossy().to_string(),
             file_name: file_name.to_string(),
             file_size,
-            sha256,
-            sha1,
-            md5,
+            sha256: format!("{:x}", sha256_hasher.finalize()),
+            sha1: format!("{:x}", sha1_hasher.finalize()),
+            md5: format!("{:x}", md5_ctx.finalize()),
             last_verified: Some(chrono::Utc::now().to_rfc3339()),
-        }
+        })
+    }
+
+    pub fn new(file_path: &Path, file_name: &str) -> Self {
+        Self::try_new(file_path, file_name).unwrap_or_else(|_| Self {
+            file_path: file_path.to_string_lossy().to_string(),
+            file_name: file_name.to_string(),
+            file_size: 0,
+            sha256: String::new(),
+            sha1: String::new(),
+            md5: String::new(),
+            last_verified: None,
+        })
     }
 
     pub fn verify(&self, file_path: &Path) -> bool {
-        let bytes = match fs::read(file_path) {
-            Ok(b) => b,
-            Err(_) => return false,
+        if self.sha256.is_empty() {
+            return false;
+        }
+        let Ok(mut file) = File::open(file_path) else {
+            return false;
         };
 
         let mut hasher = Sha256::new();
-        hasher.update(&bytes);
+        let mut buf = [0u8; HASH_BUF_SIZE];
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => hasher.update(&buf[..n]),
+                Err(_) => return false,
+            }
+        }
         let computed = format!("{:x}", hasher.finalize());
         computed == self.sha256
     }
@@ -77,7 +110,7 @@ impl FileHashService {
         let hash = FileHash::new(file_path, file_name);
         self.cache
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(file_path.to_string_lossy().to_string(), hash.clone());
         hash
     }
@@ -85,22 +118,23 @@ impl FileHashService {
     pub fn get_hash(&self, file_path: &Path) -> Option<FileHash> {
         self.cache
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&file_path.to_string_lossy().to_string())
             .cloned()
     }
 
     pub fn verify_file(&self, file_path: &Path) -> bool {
-        self.cache
+        let cached = self
+            .cache
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&file_path.to_string_lossy().to_string())
-            .map(|h| h.verify(file_path))
-            .unwrap_or(false)
+            .cloned();
+        cached.map(|h| h.verify(file_path)).unwrap_or(false)
     }
 
     pub fn clear_cache(&mut self) {
-        self.cache.lock().unwrap().clear();
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 
@@ -121,7 +155,29 @@ mod tests {
         let hash = service.hash_file(&file_path, "test.txt");
 
         assert_eq!(hash.file_name, "test.txt");
-        assert!(!hash.sha256.is_empty());
+        assert_eq!(hash.file_size, 11);
+        assert_eq!(
+            hash.sha256,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+        assert_eq!(hash.sha1, "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed");
+        assert_eq!(hash.md5, "5eb63bbbe01eeed093cb22bb8f5acdc3");
         assert!(service.verify_file(&file_path));
+
+        std::fs::write(&file_path, b"tampered").unwrap();
+        assert!(!service.verify_file(&file_path));
+    }
+
+    #[test]
+    fn test_missing_file_returns_unverified_and_fails_verify() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("nope.txt");
+        let service = FileHashService::new();
+        let hash = service.hash_file(&missing, "nope.txt");
+        assert!(hash.sha256.is_empty());
+        assert!(hash.last_verified.is_none());
+
+        std::fs::write(&missing, b"").unwrap();
+        assert!(!service.verify_file(&missing));
     }
 }

@@ -36,10 +36,15 @@ impl std::fmt::Display for LogLevel {
     }
 }
 
+#[derive(Clone)]
 pub struct PluginLog {
     max_entries: usize,
     entries: Arc<Mutex<VecDeque<LogEntry>>>,
     log_file: Option<PathBuf>,
+}
+
+fn sanitize_log_field(s: &str) -> String {
+    s.replace('\r', "\\r").replace('\n', "\\n")
 }
 
 impl PluginLog {
@@ -62,28 +67,36 @@ impl PluginLog {
             message: message.to_string(),
         };
 
-        let mut entries = self.entries.lock().unwrap();
-        entries.push_back(entry.clone());
-        if entries.len() > self.max_entries {
-            entries.pop_front();
+        if self.max_entries > 0 {
+            let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            entries.push_back(entry.clone());
+            while entries.len() > self.max_entries {
+                entries.pop_front();
+            }
         }
-        drop(entries);
 
         if let Some(ref log_file) = self.log_file {
+            if let Some(parent) = log_file.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
             let _ = fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(log_file)
                 .and_then(|mut f| {
                     use std::io::Write;
-                    writeln!(
-                        f,
-                        "[{}] [{}] {}: {}",
-                        entry.timestamp,
-                        entry.level,
-                        entry.plugin_name.unwrap_or_default(),
-                        entry.message
-                    )
+                    let safe_msg = sanitize_log_field(&entry.message);
+                    match entry.plugin_name.as_deref().filter(|s| !s.is_empty()) {
+                        Some(name) => writeln!(
+                            f,
+                            "[{}] [{}] {}: {}",
+                            entry.timestamp,
+                            entry.level,
+                            sanitize_log_field(name),
+                            safe_msg
+                        ),
+                        None => writeln!(f, "[{}] [{}] {}", entry.timestamp, entry.level, safe_msg),
+                    }
                 });
         }
     }
@@ -105,11 +118,19 @@ impl PluginLog {
     }
 
     pub fn get_entries(&self) -> Vec<LogEntry> {
-        self.entries.lock().unwrap().iter().cloned().collect()
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect()
     }
 
     pub fn clear(&mut self) {
-        self.entries.lock().unwrap().clear();
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 
@@ -152,14 +173,24 @@ mod tests {
         log.info(None, "msg4");
         assert_eq!(log.get_entries().len(), 3);
         assert_eq!(log.get_entries()[0].message, "msg2");
+
+        let zero = PluginLog::new(0, None);
+        zero.info(None, "ignored");
+        assert!(zero.get_entries().is_empty());
     }
 
     #[test]
-    fn test_log_to_file() {
+    fn test_log_to_nested_file_sanitizes_newlines() {
         let dir = tempdir().unwrap();
-        let log_file = dir.path().join("plugin.log");
+        let log_file = dir.path().join("nested/logs/plugin.log");
         let log = PluginLog::new(10, Some(&log_file));
-        log.info(Some("TestPlugin"), "File log test");
+        log.info(Some("TestPlugin"), "line1\nline2");
+        log.warn(None, "core warning");
         assert!(log_file.exists());
+        let content = fs::read_to_string(&log_file).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("TestPlugin: line1\\nline2"));
+        assert!(lines[1].ends_with("] [WARN] core warning"));
     }
 }

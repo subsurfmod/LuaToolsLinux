@@ -48,14 +48,37 @@ impl PluginAddService {
     }
 
     pub fn validate_plugin(&self, info: &PluginInfo) -> Result<(), String> {
-        if info.name.is_empty() {
-            return Err("Plugin name is required".into());
+        let name = info.name.trim();
+        if !is_safe_plugin_name(name) {
+            return Err(
+                "Plugin name is required and must not contain path separators or traversal segments"
+                    .into(),
+            );
         }
-        if info.version.is_empty() {
+        if info.version.trim().is_empty() {
             return Err("Plugin version is required".into());
         }
-        if info.download_url.is_empty() {
+        let url = info.download_url.trim();
+        if url.is_empty() {
             return Err("Plugin download URL is required".into());
+        }
+        if !url.starts_with("http://")
+            && !url.starts_with("https://")
+            && !url.starts_with("file://")
+        {
+            return Err("Plugin download URL must start with http://, https://, or file://".into());
+        }
+        if let Some(ref csum) = info.checksum {
+            let clean = csum
+                .trim()
+                .strip_prefix("sha256:")
+                .or_else(|| csum.trim().strip_prefix("SHA256:"))
+                .unwrap_or(csum.trim());
+            if clean.len() != 64 || !clean.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(
+                    "Plugin checksum must be a valid 64-character hex SHA-256 digest".into(),
+                );
+            }
         }
         Ok(())
     }
@@ -70,20 +93,35 @@ impl PluginAddService {
             };
         }
 
-        let plugin_dir = self.plugin_dir.join(&info.name);
+        let clean_name = info.name.trim();
+        let plugin_dir = self.plugin_dir.join(clean_name);
         if fs::create_dir_all(&plugin_dir).is_err() {
             return PluginInstallResult {
                 success: false,
-                plugin_name: info.name.clone(),
+                plugin_name: clean_name.to_string(),
                 installed_path: None,
                 error_message: Some("Failed to create plugin directory".into()),
             };
         }
 
-        // In a full implementation, download and verify the plugin here
+        let mut normalized = info.clone();
+        normalized.name = clean_name.to_string();
+        let meta_path = plugin_dir.join("plugin.json");
+        if let Ok(js) = serde_json::to_string_pretty(&normalized) {
+            if let Err(e) = fs::write(&meta_path, js) {
+                let _ = fs::remove_dir_all(&plugin_dir);
+                return PluginInstallResult {
+                    success: false,
+                    plugin_name: clean_name.to_string(),
+                    installed_path: None,
+                    error_message: Some(format!("Failed to write plugin metadata: {}", e)),
+                };
+            }
+        }
+
         PluginInstallResult {
             success: true,
-            plugin_name: info.name.clone(),
+            plugin_name: clean_name.to_string(),
             installed_path: Some(plugin_dir.to_string_lossy().to_string()),
             error_message: None,
         }
@@ -96,6 +134,13 @@ impl PluginAddService {
                 let path = entry.path();
                 if path.is_dir() {
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        let meta_path = path.join("plugin.json");
+                        if let Ok(raw) = fs::read_to_string(&meta_path) {
+                            if let Ok(info) = serde_json::from_str::<PluginInfo>(&raw) {
+                                plugins.push(info);
+                                continue;
+                            }
+                        }
                         plugins.push(PluginInfo {
                             name: name.to_string(),
                             version: "1.0.0".into(),
@@ -110,17 +155,36 @@ impl PluginAddService {
                 }
             }
         }
+        plugins.sort_by(|a, b| a.name.cmp(&b.name));
         plugins
     }
 
     pub fn remove_plugin(&self, name: &str) -> bool {
-        let plugin_dir = self.plugin_dir.join(name);
-        if plugin_dir.exists() {
+        let clean = name.trim();
+        if !is_safe_plugin_name(clean) {
+            return false;
+        }
+        let plugin_dir = self.plugin_dir.join(clean);
+        if plugin_dir.is_dir() {
             fs::remove_dir_all(&plugin_dir).is_ok()
         } else {
             false
         }
     }
+}
+
+fn is_safe_plugin_name(name: &str) -> bool {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.chars().any(|c| c.is_control() || c == '\0')
+    {
+        return false;
+    }
+    let mut comps = Path::new(name).components();
+    matches!(comps.next(), Some(std::path::Component::Normal(_))) && comps.next().is_none()
 }
 
 impl Default for PluginAddService {
@@ -136,34 +200,6 @@ mod tests {
 
     #[test]
     fn test_validate_plugin() {
-        let service = PluginAddService::new(None);
-        let info = PluginInfo {
-            name: "TestPlugin".into(),
-            version: "1.0.0".into(),
-            author: "Test".into(),
-            description: "Test plugin".into(),
-            download_url: "https://example.com/plugin.zip".into(),
-            checksum: None,
-            dependencies: Vec::new(),
-            min_version: None,
-        };
-        assert!(service.validate_plugin(&info).is_ok());
-
-        let info = PluginInfo {
-            name: String::new(),
-            version: "1.0.0".into(),
-            author: "Test".into(),
-            description: "Test".into(),
-            download_url: "https://example.com/plugin.zip".into(),
-            checksum: None,
-            dependencies: Vec::new(),
-            min_version: None,
-        };
-        assert!(service.validate_plugin(&info).is_err());
-    }
-
-    #[test]
-    fn test_add_plugin() {
         let dir = tempdir().unwrap();
         let service = PluginAddService::new(Some(dir.path()));
         let info = PluginInfo {
@@ -172,12 +208,58 @@ mod tests {
             author: "Test".into(),
             description: "Test plugin".into(),
             download_url: "https://example.com/plugin.zip".into(),
-            checksum: None,
+            checksum: Some("ab".repeat(32)),
             dependencies: Vec::new(),
             min_version: None,
+        };
+        assert!(service.validate_plugin(&info).is_ok());
+
+        for bad_name in ["", "   ", "../escape", "a/b", "a\\b", "..", "."] {
+            let mut bad = info.clone();
+            bad.name = bad_name.into();
+            assert!(
+                service.validate_plugin(&bad).is_err(),
+                "expected '{}' to be rejected",
+                bad_name
+            );
+        }
+
+        let mut bad_url = info.clone();
+        bad_url.download_url = "ftp://example.com/p.zip".into();
+        assert!(service.validate_plugin(&bad_url).is_err());
+
+        let mut bad_checksum = info.clone();
+        bad_checksum.checksum = Some("not-a-sha256".into());
+        assert!(service.validate_plugin(&bad_checksum).is_err());
+    }
+
+    #[test]
+    fn test_add_list_and_remove_plugin_persists_metadata_and_blocks_traversal() {
+        let dir = tempdir().unwrap();
+        let service = PluginAddService::new(Some(dir.path()));
+        let info = PluginInfo {
+            name: "TestPlugin".into(),
+            version: "2.3.4".into(),
+            author: "LuaTools".into(),
+            description: "Real description".into(),
+            download_url: "https://example.com/plugin.zip".into(),
+            checksum: None,
+            dependencies: vec!["core".into()],
+            min_version: Some("2.9.0".into()),
         };
         let result = service.add_plugin(&info);
         assert!(result.success);
         assert!(result.installed_path.is_some());
+
+        let listed = service.list_plugins();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].version, "2.3.4");
+        assert_eq!(listed[0].author, "LuaTools");
+        assert_eq!(listed[0].dependencies, vec!["core"]);
+
+        assert!(!service.remove_plugin(".."));
+        assert!(!service.remove_plugin("../TestPlugin"));
+        assert!(service.remove_plugin("TestPlugin"));
+        assert!(service.list_plugins().is_empty());
     }
 }

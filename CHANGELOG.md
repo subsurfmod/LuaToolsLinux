@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.9.1-beta] - 2026-11-24
+
+### Audited & Improved (All 78 Files Changed Since `v2.6.1`)
+- **Services & Parsers (21 files — `src/parsers/lua_parser.rs`, `src/services/*.rs`)**:
+  - **Parsing & Hashing**: Stripped UTF-8 BOM and fixed multi-dash comment toggling and empty-input newline handling in `lua_parser.rs`; replaced full-file `fs::read` (OOM risk on large game assets) with 64 KiB streaming single-pass SHA-256/SHA-1/MD5 hashing in `asset_hash.rs` and `file_hash.rs`.
+  - **Networking, Proxies & Telemetry**: Fixed inverted Umami `website`/`hostname` payload fields in `analytics_service.rs`; replaced no-op DoH stub with a real TTL-cached JSON-over-HTTPS resolver in `doh_resolver.rs`; redacted Hubcap `api_key` from error strings, hardened `Content-Disposition` filename parsing (`OnceLock`, RFC 5987, path-traversal guard), and made downloads atomic via `.part` temp files in `api_client.rs`, `github_proxy.rs`, and `proxied_file_downloader.rs` (64 MiB cap + 10s connect timeouts).
+  - **Fixes, Depots, Plugins & Tools**: Fixed `depot_downloader.rs` holding `bridge_service` mutex across child execution, switched depot keys delimiter to `;` with `0o600` unique temp files + RAII cleanup, and wired bridge hex depot keys; added path-traversal guards, backup pre-verification, and mid-apply rollback across `fixes_service.rs`, `plugin_add_service.rs`, and `plugin_installer_service.rs`; fixed Linux Wine/.NET invocation and `.unpacked.exe` replacement in `steamless_service.rs`; hardened `caches.rs` (atomic writes, placeholder SHA-256 rejection, poison-safe locks), `donate_keys.rs`, `external_tools.rs`, `mode_migration.rs`, `plugin_log.rs`, `steam_auto_crack_service.rs`, and `steam_bridge_service.rs`.
+- **OSTPlatform Linux Backend (17 files — `src/steam_bridge/ost_platform/*.rs`)**:
+  - **Memory, PE & Syscall Safety**: Fixed swapped PE32/PE64 optional header & section offsets, eliminated unaligned cast UB, and added checked arithmetic in `pe.rs`; fixed `dynamic_library.rs` `/proc/self/maps` parsing and `dlopen`/`dlclose` handle tracking; replaced raw `&'static str` pointer borrow with scoped `with_cstr` in `numbers.rs`; fixed `hash.rs` streaming reads and `sha256_of_process_memory` error handling; switched `directory_watch.rs` to `poll()` + `eventfd` with clean `Drop` thread join; fixed `trap.rs` Linux `SIGTRAP` `si_code` decoding and CAS handle validation; returned real `pthread_t` handles in `thread.rs`.
+  - **Parsing, Process, Dialog & Credentials**: Added recursion/size/varint guards in `bkv_parser.rs`; reused single overlap buffer in `byte_search.rs`; prevented `zenity`/`yad` flag injection & added headless guard in `dialog.rs`; fixed surrogate-safe UTF-16 conversions in `encoding.rs`; hardened `http.rs`, `memory.rs`, `process.rs` (sub-second FILETIME + `setsid` reaper), `remote_process.rs` (ELF `e_machine` check + safe `LD_PRELOAD` builder), and `steam_credential_store.rs`.
+- **Steam Bridge, Interop, NetPacket & Credentials (23 files — `src/steam_bridge/**`)**:
+  - **Core Bridge & Tickets**: Fixed `ticket_store.rs` and `credentials/legacycdkey.rs` VDF quote/comment brace counting and in-place upserts (preserving existing Steam fields/nested blocks with atomic writes); fixed `credentials/eticketclient.rs` hex decoding; hardened `ipc.rs` (`1 MiB` frame cap, `0o600` socket, `RwLock` handler dispatch, 32-thread cap); added wildcard-aware `parse_pattern_and_mask()` and `(app_id, depot_id)` keying in `manifest_hooks.rs`; fixed `preload_loader.rs` `(deleted)` suffix stripping, `kill` PID safety, and shell escaping; fixed `cloud_redirect.rs`, `denuvo_auth.rs`, `token_bridge.rs`, and `mod.rs` state tracking.
+  - **Interop & NetPacket**: Wrapped all `extern "C"` hooks and IPC callbacks in `catch_unwind`, fixed trampoline UAF and real ASLR address resolution in `interop_ipc.rs` and `interop_misc.rs`, fixed ownership/encrypted ticket bounds & probe eviction in `interop_ipc_isteamuser.rs`, wired `interop_ipc_isteamutils.rs` handlers, fixed varint overflow & response framing in `netpacket_eticket.rs`, `netpacket_ownershipticket.rs`, `netpacket_manifestprobe.rs`, and `userstats.rs`.
+- **UI, Tests & Packaging (17 files — `src/ui/*.rs`, `tests/ui_visual_qa.rs`, `README.md`, `install.sh`, `uninstall.sh`, `packaging/*`)**:
+  - Wired syntax highlighting & live validation (`validate_lua_text`) in `lua_editor.rs`; added `Esc` modal dismissal, input validation, `Copy` buttons, and Quick Setup sync across `dialogs.rs`; fixed offline/404 cover retry storms, top-bar pill width, and panic-free QA setup in `app.rs`; improved Home/Discover/Library/Depots/Settings/Guide UX in `views_primary.rs`, `views_workbench.rs`, and `views_guide.rs`; expanded workspace tests to **339 passing (0 warnings)**.
+  - Fixed `install.sh` / `uninstall.sh` to install and remove `libsteam_integration.so` and `libsteam_auto_patch_linux.so` cleanly on both prebuilt and `--system` installs, and cleaned up `packaging/build-packages.sh` & `packaging/luatools-linux.spec`.
+  - Reformatted `README.md` to match the Leonida layout with zero emojis while preserving all LuaTools Linux documentation and screenshots.
+
+---
+
 ## [2.9.0-beta] - 2026-11-24
 
 ### Merged & Cleaned

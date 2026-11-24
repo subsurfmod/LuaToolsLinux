@@ -5,12 +5,17 @@
 
 use std::ffi::c_void;
 use std::fmt;
+use std::panic::{self, AssertUnwindSafe};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::steam_bridge::binary_reader::BinaryFile;
+use crate::steam_bridge::binary_reader::{find_loaded_module_mapping, BinaryFile};
+use crate::steam_bridge::interop::interop_ipc_isteamuser::install_iclientuser_handlers;
+use crate::steam_bridge::interop::interop_ipc_isteamutils::install_iclientutils_handlers;
 use crate::steam_bridge::interop::interop_misc;
 use crate::steam_bridge::interop::ipc::fnv1a_hash;
 use crate::steam_bridge::ipc::{IpcMessage, IpcServer};
+use crate::steam_bridge::manifest_hooks::{self, parse_pattern_and_mask, ManifestOverride};
 use crate::steam_bridge::memory_patch::{MemoryPatch, JMP_ABS64_LEN};
 use crate::steam_bridge::pattern_db::{BinaryComponent, PatternChannel, PatternDb};
 use crate::steam_bridge::ticket_store::TicketStore;
@@ -24,6 +29,17 @@ pub enum EIPCCommand {
     Callback = 3,
 }
 
+impl EIPCCommand {
+    fn from_u32(v: u32) -> Option<Self> {
+        match v {
+            1 => Some(EIPCCommand::InterfaceCall),
+            2 => Some(EIPCCommand::Handshake),
+            3 => Some(EIPCCommand::Callback),
+            _ => None,
+        }
+    }
+}
+
 /// IPC interface IDs (matching Windows `EIPCInterface`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
@@ -31,6 +47,17 @@ pub enum EIPCInterface {
     IClientUser = 1,
     IClientUtils = 2,
     IClientNetworkingSocketsSerialized = 46,
+}
+
+impl EIPCInterface {
+    fn from_u32(v: u32) -> Option<Self> {
+        match v {
+            1 => Some(EIPCInterface::IClientUser),
+            2 => Some(EIPCInterface::IClientUtils),
+            46 => Some(EIPCInterface::IClientNetworkingSocketsSerialized),
+            _ => None,
+        }
+    }
 }
 
 /// Function signature for IPC handlers (pre and post).
@@ -111,7 +138,7 @@ pub type IPCProcessMessageFn = unsafe extern "C" fn(
     p_write: *mut c_void,
 ) -> bool;
 
-static ORIGINAL_IPC_PROCESS_MESSAGE: OnceLock<IPCProcessMessageFn> = OnceLock::new();
+static ORIGINAL_IPC_PROCESS_MESSAGE: OnceLock<Mutex<Option<IPCProcessMessageFn>>> = OnceLock::new();
 
 fn handlers() -> &'static Mutex<Vec<ResolvedHandler>> {
     HANDLER_REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
@@ -129,36 +156,43 @@ fn ipc_server() -> &'static Mutex<Option<IpcServer>> {
     IPC_SERVER.get_or_init(|| Mutex::new(None))
 }
 
+fn original_ipc_process_message() -> &'static Mutex<Option<IPCProcessMessageFn>> {
+    ORIGINAL_IPC_PROCESS_MESSAGE.get_or_init(|| Mutex::new(None))
+}
+
+fn find_loaded_module_file_path(candidates: &[&str]) -> Option<(String, PathBuf)> {
+    let loaded = crate::steam_bridge::ost_platform::dynamic_library::list_loaded_modules();
+    for &name in candidates {
+        if let Some(path) = loaded
+            .iter()
+            .find(|p| p.file_name().and_then(|n| n.to_str()) == Some(name))
+        {
+            return Some((name.to_string(), path.clone()));
+        }
+    }
+    None
+}
+
 /// Initialize the Interop IPC system.
 pub fn install() -> Result<(), String> {
     let _ = pattern_db();
 
-    let steam_client =
-        crate::steam_bridge::ost_platform::dynamic_library::get_loaded("steamclient.so");
-    let steam_client = if steam_client.is_null() {
-        crate::steam_bridge::ost_platform::dynamic_library::get_loaded("steamclient64.so")
-    } else {
-        steam_client
-    };
+    let (client_mod_name, client_path) =
+        find_loaded_module_file_path(&["steamclient.so", "steamclient64.so"])
+            .ok_or_else(|| "steamclient.so not loaded in process".to_string())?;
 
-    if steam_client.is_null() {
-        return Err("steamclient.so not loaded in process".into());
+    let mapping = find_loaded_module_mapping(&client_mod_name)
+        .ok_or_else(|| format!("{} mapping not found in /proc/self/maps", client_mod_name))?;
+    let _ = STEAM_CLIENT_BASE.set(mapping.base_addr);
+
+    if let Some((ui_name, _)) = find_loaded_module_file_path(&["steamui.so", "steamui64.so"]) {
+        if let Some(ui_map) = find_loaded_module_mapping(&ui_name) {
+            let _ = STEAM_UI_BASE.set(ui_map.base_addr);
+        }
     }
 
-    let _ = STEAM_CLIENT_BASE.set(steam_client as u64);
-
-    let steam_ui = crate::steam_bridge::ost_platform::dynamic_library::get_loaded("steamui.so");
-    let steam_ui = if steam_ui.is_null() {
-        crate::steam_bridge::ost_platform::dynamic_library::get_loaded("steamui64.so")
-    } else {
-        steam_ui
-    };
-    if !steam_ui.is_null() {
-        let _ = STEAM_UI_BASE.set(steam_ui as u64);
-    }
-
-    let binary = BinaryFile::open("steamclient.so")
-        .map_err(|e| format!("Failed to open steamclient.so: {}", e))?;
+    let binary = BinaryFile::open(&client_path)
+        .map_err(|e| format!("Failed to open {}: {}", client_path.display(), e))?;
 
     let pattern_file = pattern_db()
         .lookup_by_binary(&binary, PatternChannel::Ipc, BinaryComponent::SteamClient)
@@ -169,23 +203,30 @@ pub fn install() -> Result<(), String> {
         .get("IPCProcessMessage")
         .ok_or("IPCProcessMessage pattern not found")?;
 
-    let ipc_process_msg_addr = if let Some(addr) = ipc_process_msg_entry.address {
-        addr
+    let ipc_process_msg_addr = if let Some(pattern) = &ipc_process_msg_entry.pattern {
+        let (pattern_bytes, mask_bytes) =
+            parse_pattern_and_mask(pattern, ipc_process_msg_entry.mask.as_deref())
+                .ok_or_else(|| "Invalid IPCProcessMessage hex pattern or mask".to_string())?;
+        let offset = ipc_process_msg_entry.offset.unwrap_or(0);
+        let vaddr = binary
+            .resolve_pattern_address(&pattern_bytes, mask_bytes.as_deref(), offset, None)
+            .ok_or_else(|| "Pattern scan failed for IPCProcessMessage".to_string())?;
+        binary
+            .vaddr_to_runtime_addr(vaddr, &mapping, JMP_ABS64_LEN)
+            .ok_or_else(|| "Resolved IPCProcessMessage address is not executable".to_string())?
+    } else if let Some(vaddr) = ipc_process_msg_entry.address {
+        binary
+            .vaddr_to_runtime_addr(vaddr, &mapping, JMP_ABS64_LEN)
+            .ok_or_else(|| "IPCProcessMessage address is not in executable memory".to_string())?
     } else if let Some(offset) = ipc_process_msg_entry.offset {
-        STEAM_CLIENT_BASE
-            .get()
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(offset as u64)
-    } else if let Some(pattern) = &ipc_process_msg_entry.pattern {
-        let pattern_bytes =
-            hex::decode(pattern).map_err(|e| format!("Invalid pattern hex: {}", e))?;
-        crate::steam_bridge::ost_platform::byte_search::find_in_file(
-            std::path::Path::new("steamclient.so"),
-            &pattern_bytes,
-            4096,
-        )
-        .ok_or_else(|| "Pattern scan failed".to_string())?
+        let addr = mapping
+            .base_addr
+            .checked_add_signed(offset)
+            .ok_or_else(|| "IPCProcessMessage offset overflow".to_string())?;
+        if !mapping.contains_executable_range(addr, JMP_ABS64_LEN) {
+            return Err("IPCProcessMessage offset is not in executable memory".into());
+        }
+        addr
     } else {
         return Err("No address, offset, or pattern for IPCProcessMessage".into());
     };
@@ -198,7 +239,9 @@ pub fn install() -> Result<(), String> {
 
     if !patch.trampoline.is_null() {
         let original: IPCProcessMessageFn = unsafe { std::mem::transmute(patch.trampoline) };
-        let _ = ORIGINAL_IPC_PROCESS_MESSAGE.set(original);
+        *original_ipc_process_message()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(original);
     }
 
     ipc_patches()
@@ -227,6 +270,11 @@ pub fn uninstall() -> Result<(), String> {
         server.stop();
     }
 
+    // Clear saved trampoline before freeing trampoline pages inside `patch.uninstall()`.
+    *original_ipc_process_message()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+
     let mut patches = ipc_patches().lock().unwrap_or_else(|e| e.into_inner());
     for mut patch in patches.drain(..) {
         unsafe { patch.uninstall() }?;
@@ -237,7 +285,7 @@ pub fn uninstall() -> Result<(), String> {
     Ok(())
 }
 
-/// Register an IPC handler (called by feature modules).
+/// Register an IPC handler (replaces any existing handler for the same interface + method).
 pub fn register_handler(
     interface_name: &str,
     method_name: &str,
@@ -264,50 +312,21 @@ pub fn register_handler(
         post_handler: post,
     };
 
-    handlers()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(handler);
+    let mut list = handlers().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = list
+        .iter_mut()
+        .find(|h| h.interface_id == interface_id && h.func_hash == func_hash)
+    {
+        *existing = handler;
+    } else {
+        list.push(handler);
+    }
     Ok(())
 }
 
 fn register_default_handlers() {
-    let _ = register_handler(
-        "IClientUser",
-        "GetSteamID",
-        None,
-        Some(Arc::new(handler_post_get_steam_id)),
-    );
-    let _ = register_handler(
-        "IClientUser",
-        "GetAppOwnershipTicketExtendedData",
-        None,
-        Some(Arc::new(handler_post_get_app_ownership_ticket)),
-    );
-    let _ = register_handler(
-        "IClientUser",
-        "RequestEncryptedAppTicket",
-        None,
-        Some(Arc::new(handler_post_request_encrypted_app_ticket)),
-    );
-    let _ = register_handler(
-        "IClientUser",
-        "GetEncryptedAppTicket",
-        None,
-        Some(Arc::new(handler_post_get_encrypted_app_ticket)),
-    );
-    let _ = register_handler(
-        "IClientUtils",
-        "GetAppID",
-        None,
-        Some(Arc::new(handler_post_get_app_id)),
-    );
-    let _ = register_handler(
-        "IClientUtils",
-        "GetAPICallResult",
-        None,
-        Some(Arc::new(handler_post_get_api_call_result)),
-    );
+    let _ = install_iclientuser_handlers();
+    let _ = install_iclientutils_handlers();
 }
 
 unsafe extern "C" fn hook_ipc_process_message(
@@ -316,56 +335,64 @@ unsafe extern "C" fn hook_ipc_process_message(
     p_read: *mut c_void,
     p_write: *mut c_void,
 ) -> bool {
-    if p_read.is_null() || p_write.is_null() {
-        return call_original(p_server, h_steam_pipe, p_read, p_write);
-    }
-
-    let mut read_buffer = IPCBuffer::from_raw(p_read);
-    let mut write_buffer = IPCBuffer::from_raw(p_write);
-
-    handle_handshake(p_server, h_steam_pipe, &read_buffer);
-    detect_networking_sockets(&read_buffer);
-
-    let dispatch = resolve_dispatch(p_server, h_steam_pipe, &read_buffer);
-    if !dispatch.enabled() {
-        return call_original(p_server, h_steam_pipe, p_read, p_write);
-    }
-
-    if let Some(handler) = &dispatch.handler {
-        if let Some(pre) = &handler.pre_handler {
-            pre(
-                dispatch.pipe,
-                read_buffer.as_mut_slice(),
-                write_buffer.as_mut_slice(),
-            );
+    panic::catch_unwind(AssertUnwindSafe(|| {
+        // Guard against null or aliased buffers (aliasing &mut slices would be UB).
+        if p_read.is_null() || p_write.is_null() || p_read == p_write {
+            return call_original(p_server, h_steam_pipe, p_read, p_write);
         }
-    }
 
-    let result = call_original(p_server, h_steam_pipe, p_read, p_write);
+        let mut read_buffer = IPCBuffer::from_raw(p_read);
+        let mut write_buffer = IPCBuffer::from_raw(p_write);
 
-    if result {
+        handle_handshake(p_server, h_steam_pipe, &read_buffer);
+        detect_networking_sockets(&read_buffer);
+
+        let dispatch = resolve_dispatch(p_server, h_steam_pipe, &read_buffer);
+        if !dispatch.enabled() {
+            return call_original(p_server, h_steam_pipe, p_read, p_write);
+        }
+
         if let Some(handler) = &dispatch.handler {
-            if let Some(post) = &handler.post_handler {
-                post(
+            if let Some(pre) = &handler.pre_handler {
+                pre(
                     dispatch.pipe,
                     read_buffer.as_mut_slice(),
                     write_buffer.as_mut_slice(),
                 );
             }
         }
-    }
 
-    result
+        let result = call_original(p_server, h_steam_pipe, p_read, p_write);
+
+        if result {
+            if let Some(handler) = &dispatch.handler {
+                if let Some(post) = &handler.post_handler {
+                    post(
+                        dispatch.pipe,
+                        read_buffer.as_mut_slice(),
+                        write_buffer.as_mut_slice(),
+                    );
+                }
+            }
+        }
+
+        result
+    }))
+    .unwrap_or(false)
 }
 
 /// Call the original `IPCProcessMessage` trampoline if installed.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn call_original(
     p_server: *mut c_void,
     h_steam_pipe: u32,
     p_read: *mut c_void,
     p_write: *mut c_void,
 ) -> bool {
-    if let Some(original) = ORIGINAL_IPC_PROCESS_MESSAGE.get() {
+    let orig = *original_ipc_process_message()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(original) = orig {
         unsafe { original(p_server, h_steam_pipe, p_read, p_write) }
     } else {
         false
@@ -461,14 +488,21 @@ struct IPCBuffer {
 
 impl IPCBuffer {
     fn from_raw(ptr: *mut c_void) -> Self {
-        Self { ptr, size: 4096 }
+        let size = if ptr.is_null() { 0 } else { 4096 };
+        Self { ptr, size }
     }
 
     fn as_slice(&self) -> &[u8] {
+        if self.ptr.is_null() || self.size == 0 {
+            return &[];
+        }
         unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.size) }
     }
 
     fn as_mut_slice(&mut self) -> &mut [u8] {
+        if self.ptr.is_null() || self.size == 0 {
+            return &mut [];
+        }
         unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u8, self.size) }
     }
 }
@@ -490,14 +524,22 @@ impl IPCRequest {
         }
 
         let cmd_raw = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        let cmd = match cmd_raw {
-            1 => EIPCCommand::InterfaceCall,
-            2 => EIPCCommand::Handshake,
-            3 => EIPCCommand::Callback,
-            _ => EIPCCommand::InterfaceCall,
+        let Some(cmd) = EIPCCommand::from_u32(cmd_raw) else {
+            return Self {
+                cmd: EIPCCommand::InterfaceCall,
+                data: Vec::new(),
+                valid: false,
+            };
         };
         let body_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
-        if data.len() < 8 + body_len {
+        let Some(end) = 8usize.checked_add(body_len) else {
+            return Self {
+                cmd,
+                data: Vec::new(),
+                valid: false,
+            };
+        };
+        if data.len() < end {
             return Self {
                 cmd,
                 data: Vec::new(),
@@ -507,7 +549,7 @@ impl IPCRequest {
 
         Self {
             cmd,
-            data: data[8..8 + body_len].to_vec(),
+            data: data[8..end].to_vec(),
             valid: true,
         }
     }
@@ -534,7 +576,7 @@ impl IPCHandshakeReq {
     fn parse(data: &[u8]) -> Self {
         Self {
             data: data.to_vec(),
-            valid: !data.is_empty(),
+            valid: data.len() >= 4,
         }
     }
 
@@ -552,7 +594,8 @@ impl IPCHandshakeReq {
 }
 
 struct IPCInterfaceCall {
-    data: Vec<u8>,
+    iface: EIPCInterface,
+    func_hash: u32,
     valid: bool,
 }
 
@@ -560,12 +603,23 @@ impl IPCInterfaceCall {
     fn parse(data: &[u8]) -> Self {
         if data.len() < 12 {
             return Self {
-                data: Vec::new(),
+                iface: EIPCInterface::IClientUser,
+                func_hash: 0,
                 valid: false,
             };
         }
+        let iface_raw = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let Some(iface) = EIPCInterface::from_u32(iface_raw) else {
+            return Self {
+                iface: EIPCInterface::IClientUser,
+                func_hash: 0,
+                valid: false,
+            };
+        };
+        let func_hash = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         Self {
-            data: data.to_vec(),
+            iface,
+            func_hash,
             valid: true,
         }
     }
@@ -575,24 +629,11 @@ impl IPCInterfaceCall {
     }
 
     fn interface_id(&self) -> EIPCInterface {
-        if self.data.len() >= 4 {
-            match u32::from_le_bytes([self.data[0], self.data[1], self.data[2], self.data[3]]) {
-                1 => EIPCInterface::IClientUser,
-                2 => EIPCInterface::IClientUtils,
-                46 => EIPCInterface::IClientNetworkingSocketsSerialized,
-                _ => EIPCInterface::IClientUser,
-            }
-        } else {
-            EIPCInterface::IClientUser
-        }
+        self.iface
     }
 
     fn func_hash(&self) -> u32 {
-        if self.data.len() >= 8 {
-            u32::from_le_bytes([self.data[4], self.data[5], self.data[6], self.data[7]])
-        } else {
-            0
-        }
+        self.func_hash
     }
 }
 
@@ -639,158 +680,53 @@ fn handle_gui_message(msg: IpcMessage) -> Option<IpcMessage> {
             let _ = store.set(data);
             None
         }
-        IpcMessage::SetPlayUnowned { enabled: _ } => None,
-        _ => None,
-    }
-}
-
-fn handler_post_get_steam_id(_pipe: *mut c_void, _read: &mut [u8], write: &mut [u8]) -> bool {
-    let app_id = interop_misc::resolve_app_id();
-    if app_id == 0 || write.len() < 8 {
-        return false;
-    }
-
-    let spoofed = {
-        let mut store = TicketStore::global()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        store.get_spoof_steam_id(app_id)
-    };
-    if spoofed == 0 {
-        return false;
-    }
-
-    write[0..8].copy_from_slice(&spoofed.to_le_bytes());
-    log::debug!(
-        "[InteropIPC] GetSteamID: AppId={} spoofed to 0x{:X}",
-        app_id,
-        spoofed
-    );
-    true
-}
-
-fn handler_post_get_app_ownership_ticket(
-    _pipe: *mut c_void,
-    read: &mut [u8],
-    write: &mut [u8],
-) -> bool {
-    if read.len() < 8 {
-        return false;
-    }
-    let req_app_id = u32::from_le_bytes([read[0], read[1], read[2], read[3]]);
-    let max_ticket_size = i32::from_le_bytes([read[4], read[5], read[6], read[7]]);
-    if max_ticket_size < 0 {
-        return false;
-    }
-
-    let app_id = if req_app_id == interop_misc::ONLINE_FIX_APP_ID {
-        interop_misc::resolve_app_id()
-    } else {
-        req_app_id
-    };
-
-    let ticket_bytes = {
-        let mut store = TicketStore::global()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        store
-            .get(app_id)
-            .ok()
-            .and_then(|d| d.app_ticket)
-            .and_then(|h| hex::decode(&h).ok())
-    };
-    let Some(ticket) = ticket_bytes else {
-        return false;
-    };
-
-    if ticket.len() > max_ticket_size as usize || write.len() < 4 + ticket.len() {
-        return false;
-    }
-    write[0..4].copy_from_slice(&(ticket.len() as u32).to_le_bytes());
-    write[4..4 + ticket.len()].copy_from_slice(&ticket);
-    true
-}
-
-fn handler_post_request_encrypted_app_ticket(
-    _pipe: *mut c_void,
-    _read: &mut [u8],
-    write: &mut [u8],
-) -> bool {
-    if write.len() < 8 {
-        return false;
-    }
-    let app_id = interop_misc::resolve_app_id();
-    let async_call = u64::from_le_bytes([
-        write[0], write[1], write[2], write[3], write[4], write[5], write[6], write[7],
-    ]);
-    let mut store = TicketStore::global()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    store.record_async_call(async_call, app_id);
-    true
-}
-
-fn handler_post_get_encrypted_app_ticket(
-    _pipe: *mut c_void,
-    _read: &mut [u8],
-    write: &mut [u8],
-) -> bool {
-    let app_id = interop_misc::resolve_app_id();
-    let ticket = {
-        let mut store = TicketStore::global()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        store.get_encrypted_ticket(app_id).unwrap_or_default()
-    };
-    if ticket.is_empty() || write.len() < 5 + ticket.len() {
-        return false;
-    }
-    write[0] = 1;
-    write[1..5].copy_from_slice(&(ticket.len() as u32).to_le_bytes());
-    write[5..5 + ticket.len()].copy_from_slice(&ticket);
-    true
-}
-
-fn handler_post_get_app_id(_pipe: *mut c_void, _read: &mut [u8], write: &mut [u8]) -> bool {
-    if interop_misc::should_report_online_fix_app_id() || write.len() < 4 {
-        return false;
-    }
-    let real_app_id = interop_misc::resolve_app_id();
-    if real_app_id == 0 {
-        return false;
-    }
-    let current = u32::from_le_bytes([write[0], write[1], write[2], write[3]]);
-    if current == real_app_id {
-        return false;
-    }
-    write[0..4].copy_from_slice(&real_app_id.to_le_bytes());
-    true
-}
-
-fn handler_post_get_api_call_result(_pipe: *mut c_void, read: &mut [u8], write: &mut [u8]) -> bool {
-    if read.len() < 16 || write.len() < 4 {
-        return false;
-    }
-    let callback_id = u32::from_le_bytes([read[0], read[1], read[2], read[3]]);
-    let async_call = u64::from_le_bytes([
-        read[4], read[5], read[6], read[7], read[8], read[9], read[10], read[11],
-    ]);
-    const ENCRYPTED_APP_TICKET_RESPONSE_CALLBACK: u32 = 1010;
-    if callback_id == ENCRYPTED_APP_TICKET_RESPONSE_CALLBACK {
-        let app_id = {
+        IpcMessage::RemoveTicket { app_id } => {
             let mut store = TicketStore::global()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            store.take_async_call(async_call).unwrap_or(0)
-        };
-        if app_id == 0 {
-            return false;
+            let _ = store.remove(app_id);
+            None
         }
-        // EResult::OK = 1
-        write[0..4].copy_from_slice(&1u32.to_le_bytes());
-        return true;
+        IpcMessage::SetAppIdSpoof { app_id, spoof_id } => {
+            if spoof_id == interop_misc::ONLINE_FIX_APP_ID {
+                interop_misc::set_online_fix_real_app_id(app_id);
+            }
+            None
+        }
+        IpcMessage::RemoveAppIdSpoof { .. } => {
+            interop_misc::set_online_fix_real_app_id(0);
+            None
+        }
+        IpcMessage::SetManifestPin {
+            app_id,
+            depot_id,
+            manifest_id,
+            size,
+        } => {
+            let active = if let Ok(gid) = manifest_id.trim().parse::<u64>() {
+                manifest_hooks::set_manifest_override(
+                    app_id,
+                    depot_id,
+                    ManifestOverride::new(gid, (size > 0).then_some(size)),
+                );
+                true
+            } else {
+                false
+            };
+            Some(IpcMessage::ManifestBound {
+                app_id,
+                depot_id,
+                manifest_id,
+                active,
+            })
+        }
+        IpcMessage::RemoveManifestPin { app_id, depot_id } => {
+            manifest_hooks::remove_manifest_override(app_id, depot_id);
+            None
+        }
+        IpcMessage::SetPlayUnowned { enabled: _ } => None,
+        _ => None,
     }
-    false
 }
 
 #[cfg(test)]
@@ -818,5 +754,91 @@ mod tests {
         assert_eq!(EIPCInterface::IClientUser as u32, 1);
         assert_eq!(EIPCInterface::IClientUtils as u32, 2);
         assert_eq!(EIPCInterface::IClientNetworkingSocketsSerialized as u32, 46);
+    }
+
+    #[test]
+    fn test_ipc_request_and_interface_call_reject_malformed_and_unknown() {
+        // Unknown command ID (99) must not parse as valid InterfaceCall
+        let mut bad_cmd = Vec::new();
+        bad_cmd.extend_from_slice(&99u32.to_le_bytes());
+        bad_cmd.extend_from_slice(&0u32.to_le_bytes());
+        assert!(!IPCRequest::parse(&bad_cmd).ok());
+
+        // Overflowing body_len must be rejected cleanly
+        let mut overflow = Vec::new();
+        overflow.extend_from_slice(&1u32.to_le_bytes());
+        overflow.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(!IPCRequest::parse(&overflow).ok());
+
+        // Valid InterfaceCall request + unknown interface ID (7) must be rejected
+        let mut bad_iface_body = Vec::new();
+        bad_iface_body.extend_from_slice(&7u32.to_le_bytes());
+        bad_iface_body.extend_from_slice(&0x1234u32.to_le_bytes());
+        bad_iface_body.extend_from_slice(&0u32.to_le_bytes());
+        assert!(!IPCInterfaceCall::parse(&bad_iface_body).ok());
+
+        // Valid IClientNetworkingSocketsSerialized call
+        let mut good_body = Vec::new();
+        good_body.extend_from_slice(&46u32.to_le_bytes());
+        good_body.extend_from_slice(&0xCAFE_BABEu32.to_le_bytes());
+        good_body.extend_from_slice(&0u32.to_le_bytes());
+        let call = IPCInterfaceCall::parse(&good_body);
+        assert!(call.ok());
+        assert_eq!(
+            call.interface_id(),
+            EIPCInterface::IClientNetworkingSocketsSerialized
+        );
+        assert_eq!(call.func_hash(), 0xCAFE_BABE);
+
+        // Null IPCBuffer must safely return empty slices
+        let mut null_buf = IPCBuffer::from_raw(std::ptr::null_mut());
+        assert!(null_buf.as_slice().is_empty());
+        assert!(null_buf.as_mut_slice().is_empty());
+    }
+
+    #[test]
+    fn test_register_handler_replaces_duplicates_and_gui_manifest_pin() {
+        assert!(register_handler("UnknownIface", "Foo", None, None).is_err());
+
+        register_handler("IClientUser", "DupMethodTest", None, None).unwrap();
+        let count_after_first = handlers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|h| h.name == "IClientUser::DupMethodTest")
+            .count();
+        register_handler("IClientUser", "DupMethodTest", None, None).unwrap();
+        let count_after_second = handlers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|h| h.name == "IClientUser::DupMethodTest")
+            .count();
+        assert_eq!(count_after_first, 1);
+        assert_eq!(count_after_second, 1);
+
+        let reply = handle_gui_message(IpcMessage::SetManifestPin {
+            app_id: 55501,
+            depot_id: 55502,
+            manifest_id: "987654321".into(),
+            size: 4096,
+        })
+        .unwrap();
+        assert!(matches!(
+            reply,
+            IpcMessage::ManifestBound {
+                app_id: 55501,
+                depot_id: 55502,
+                active: true,
+                ..
+            }
+        ));
+        assert!(manifest_hooks::get_manifest_overrides().contains_key(&(55501, 55502)));
+
+        handle_gui_message(IpcMessage::RemoveManifestPin {
+            app_id: 55501,
+            depot_id: 55502,
+        });
+        assert!(!manifest_hooks::get_manifest_overrides().contains_key(&(55501, 55502)));
     }
 }

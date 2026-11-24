@@ -40,26 +40,33 @@ fn apply_slice(value: &str, slice: Option<TextSlice>) -> NumbersResult<&str> {
     let Some(s) = slice else {
         return Ok(value);
     };
+    if s.offset > value.len() || !value.is_char_boundary(s.offset) {
+        return Err(NumbersError::SliceOutOfBounds);
+    }
     if s.count == 0 {
-        return Ok(value);
+        return Ok(&value[s.offset..]);
     }
     let end = s
         .offset
         .checked_add(s.count)
         .ok_or(NumbersError::SliceOutOfBounds)?;
-    if end > value.len() || !value.is_char_boundary(s.offset) || !value.is_char_boundary(end) {
+    if end > value.len() || !value.is_char_boundary(end) {
         return Err(NumbersError::SliceOutOfBounds);
     }
     Ok(&value[s.offset..end])
 }
 
-fn cstr_to_str(value: *const c_char) -> NumbersResult<&'static str> {
+fn with_cstr<T>(
+    value: *const c_char,
+    f: impl FnOnce(&str) -> NumbersResult<T>,
+) -> NumbersResult<T> {
     if value.is_null() {
         return Err(NumbersError::NullPointer);
     }
-    unsafe { CStr::from_ptr(value) }
+    let s = unsafe { CStr::from_ptr(value) }
         .to_str()
-        .map_err(|e| NumbersError::InvalidFormat(e.to_string()))
+        .map_err(|e| NumbersError::InvalidFormat(e.to_string()))?;
+    f(s)
 }
 
 fn strip_hex_prefix(value: &str) -> &str {
@@ -100,7 +107,7 @@ pub fn parse_uint64_wide(value: &[u16]) -> NumbersResult<u64> {
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn parse_uint64_cstr(value: *const c_char) -> NumbersResult<u64> {
-    parse_uint64(cstr_to_str(value)?)
+    with_cstr(value, parse_uint64)
 }
 
 pub fn parse_uint64_with_slice(value: &str, slice: TextSlice) -> NumbersResult<u64> {
@@ -124,7 +131,7 @@ pub fn parse_uint32_wide(value: &[u16]) -> NumbersResult<u32> {
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn parse_uint32_cstr(value: *const c_char) -> NumbersResult<u32> {
-    parse_uint32(cstr_to_str(value)?)
+    with_cstr(value, parse_uint32)
 }
 
 pub fn parse_uint32_with_slice(value: &str, slice: TextSlice) -> NumbersResult<u32> {
@@ -149,7 +156,7 @@ pub fn parse_int64_wide(value: &[u16]) -> NumbersResult<i64> {
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn parse_int64_cstr(value: *const c_char) -> NumbersResult<i64> {
-    parse_int64(cstr_to_str(value)?)
+    with_cstr(value, parse_int64)
 }
 
 pub fn parse_int64_with_slice(value: &str, slice: TextSlice) -> NumbersResult<i64> {
@@ -174,7 +181,7 @@ pub fn parse_int32_wide(value: &[u16]) -> NumbersResult<i32> {
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn parse_int32_cstr(value: *const c_char) -> NumbersResult<i32> {
-    parse_int32(cstr_to_str(value)?)
+    with_cstr(value, parse_int32)
 }
 
 pub fn parse_int32_with_slice(value: &str, slice: TextSlice) -> NumbersResult<i32> {
@@ -197,7 +204,7 @@ pub fn parse_hex_uint64_wide(value: &[u16]) -> NumbersResult<u64> {
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn parse_hex_uint64_cstr(value: *const c_char) -> NumbersResult<u64> {
-    parse_hex_uint64(cstr_to_str(value)?)
+    with_cstr(value, parse_hex_uint64)
 }
 
 pub fn parse_hex_uint64_with_slice(value: &str, slice: TextSlice) -> NumbersResult<u64> {
@@ -220,7 +227,7 @@ pub fn parse_hex_uint32_wide(value: &[u16]) -> NumbersResult<u32> {
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn parse_hex_uint32_cstr(value: *const c_char) -> NumbersResult<u32> {
-    parse_hex_uint32(cstr_to_str(value)?)
+    with_cstr(value, parse_hex_uint32)
 }
 
 pub fn parse_hex_uint32_with_slice(value: &str, slice: TextSlice) -> NumbersResult<u32> {
@@ -329,5 +336,58 @@ mod tests {
         let c = std::ffi::CString::new("0x2A").unwrap();
         assert_eq!(parse_hex_uint32_cstr(c.as_ptr()).unwrap(), 42);
         assert!(parse_uint64_cstr(std::ptr::null()).is_err());
+    }
+
+    #[test]
+    fn test_slice_edge_cases_and_bounds() {
+        // Non-zero offset with count == 0 parses suffix from offset
+        assert_eq!(
+            parse_uint64_with_slice(
+                "ab345",
+                TextSlice {
+                    offset: 2,
+                    count: 0
+                }
+            )
+            .unwrap(),
+            345
+        );
+        // Out-of-bounds offset with count == 0 must error
+        assert!(matches!(
+            parse_uint64_with_slice(
+                "123",
+                TextSlice {
+                    offset: 99,
+                    count: 0
+                }
+            ),
+            Err(NumbersError::SliceOutOfBounds)
+        ));
+        // Mid-UTF-8 char boundary must return SliceOutOfBounds, never panic
+        assert!(matches!(
+            parse_uint64_with_slice(
+                "é123",
+                TextSlice {
+                    offset: 1,
+                    count: 2
+                }
+            ),
+            Err(NumbersError::SliceOutOfBounds)
+        ));
+        // Signed extremes & overflow classification
+        assert_eq!(parse_int64("-9223372036854775808").unwrap(), i64::MIN);
+        assert!(matches!(
+            parse_int64("-9223372036854775809"),
+            Err(NumbersError::OutOfRange(_))
+        ));
+        assert_eq!(parse_int32("-2147483648").unwrap(), i32::MIN);
+        assert!(matches!(
+            parse_hex_uint64("0x10000000000000000"),
+            Err(NumbersError::OutOfRange(_))
+        ));
+        assert!(matches!(
+            parse_hex_uint64("0x"),
+            Err(NumbersError::InvalidHex(_))
+        ));
     }
 }

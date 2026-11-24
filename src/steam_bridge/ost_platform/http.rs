@@ -31,6 +31,29 @@ pub struct Result {
     pub ok: bool,
 }
 
+const DEFAULT_TIMEOUT_MS: u32 = 10_000;
+const MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+fn effective_timeout_ms(raw: u32) -> u64 {
+    if raw == 0 {
+        u64::from(DEFAULT_TIMEOUT_MS)
+    } else {
+        u64::from(raw.max(50))
+    }
+}
+
+fn has_http_scheme(url: &str) -> bool {
+    url.get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+        || url
+            .get(..8)
+            .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+}
+
+fn is_valid_http_method(verb: &str) -> bool {
+    !verb.is_empty() && verb.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-')
+}
+
 /// Execute an HTTP request, matching `OSTPlatform::Http::Execute`.
 #[allow(
     non_snake_case,
@@ -43,13 +66,14 @@ pub fn Execute(
     req_body: *const c_void,
     req_body_len: u32,
     headers: *const c_char,
-    _timeout_resolve: u32,
+    timeout_resolve: u32,
     timeout_connect: u32,
     timeout_send: u32,
     timeout_recv: u32,
     max_body_bytes: u32,
 ) -> Result {
-    if !url.starts_with("http://") && !url.starts_with("https://") {
+    let url = url.trim();
+    if !has_http_scheme(url) {
         return Result {
             body: String::new(),
             status: 0,
@@ -57,11 +81,13 @@ pub fn Execute(
         };
     }
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_millis(u64::from(timeout_connect.max(50))))
-        .timeout_write(Duration::from_millis(u64::from(timeout_send.max(50))))
-        .timeout_read(Duration::from_millis(u64::from(timeout_recv.max(50))))
-        .build();
+    if req_body.is_null() && req_body_len > 0 {
+        return Result {
+            body: "Null request body pointer with non-zero length".to_string(),
+            status: 0,
+            ok: false,
+        };
+    }
 
     let method_upper = method.trim().to_ascii_uppercase();
     let verb = if method_upper.is_empty() {
@@ -69,6 +95,27 @@ pub fn Execute(
     } else {
         method_upper.as_str()
     };
+    if !is_valid_http_method(verb) {
+        return Result {
+            body: format!("Invalid HTTP method: {}", method),
+            status: 0,
+            ok: false,
+        };
+    }
+
+    let connect_ms = if timeout_connect > 0 {
+        effective_timeout_ms(timeout_connect)
+    } else if timeout_resolve > 0 {
+        effective_timeout_ms(timeout_resolve)
+    } else {
+        u64::from(DEFAULT_TIMEOUT_MS)
+    };
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_millis(connect_ms))
+        .timeout_write(Duration::from_millis(effective_timeout_ms(timeout_send)))
+        .timeout_read(Duration::from_millis(effective_timeout_ms(timeout_recv)))
+        .build();
 
     let mut req = agent.request(verb, url);
 
@@ -77,9 +124,11 @@ pub fn Execute(
             for line in raw_hdrs.lines() {
                 if let Some((k, v)) = line.split_once(':') {
                     let k = k.trim();
-                    let v = v.trim();
-                    if !k.is_empty() {
-                        req = req.set(k, v);
+                    let v = v.trim().replace('\r', "");
+                    let valid_key =
+                        !k.is_empty() && k.bytes().all(|b| b.is_ascii_graphic() && b != b':');
+                    if valid_key {
+                        req = req.set(k, &v);
                     }
                 }
             }
@@ -95,7 +144,7 @@ pub fn Execute(
     };
 
     let read_capped = |resp: ureq::Response| -> String {
-        let cap = (max_body_bytes as usize).min(16 * 1024 * 1024);
+        let cap = (max_body_bytes as usize).min(MAX_RESPONSE_BODY_BYTES);
         let mut buf = Vec::new();
         let _ = resp
             .into_reader()
@@ -106,7 +155,7 @@ pub fn Execute(
             format!(
                 "{}...(truncated to {} bytes)",
                 String::from_utf8_lossy(&buf),
-                max_body_bytes
+                cap
             )
         } else {
             String::from_utf8_lossy(&buf).into_owned()
@@ -274,5 +323,75 @@ mod tests {
         assert_eq!(port, 80);
         assert_eq!(path, "/");
         assert_eq!(host, "example.com");
+    }
+
+    #[test]
+    fn test_execute_edge_cases_and_headers() {
+        use std::ffi::CString;
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        // Null body with non-zero length must fail cleanly
+        let r_null = Execute(
+            "POST",
+            "http://127.0.0.1:9/test",
+            ptr::null(),
+            10,
+            ptr::null(),
+            100,
+            100,
+            100,
+            100,
+            1024,
+        );
+        assert!(!r_null.ok);
+        assert_eq!(r_null.status, 0);
+
+        // Invalid method must fail cleanly
+        let r_bad_method = Execute(
+            "GET\r\nEvil",
+            "http://127.0.0.1:9/test",
+            ptr::null(),
+            0,
+            ptr::null(),
+            100,
+            100,
+            100,
+            100,
+            1024,
+        );
+        assert!(!r_bad_method.ok);
+
+        // Local server verifying custom headers, 404 handling, zero timeouts, and uppercase scheme
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut req_buf = [0u8; 1024];
+                let n = stream.read(&mut req_buf).unwrap_or(0);
+                let req_text = String::from_utf8_lossy(&req_buf[..n]).to_ascii_lowercase();
+                let has_hdr = req_text.contains("x-test-token: secret42");
+                let body = if has_hdr {
+                    "header-ok"
+                } else {
+                    "header-missing"
+                };
+                let resp = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let hdrs = CString::new("X-Test-Token: secret42\r\nBad Header: ignore\r\n").unwrap();
+        let url = format!("HTTP://{}/missing", addr);
+        let r = Execute("get", &url, ptr::null(), 0, hdrs.as_ptr(), 0, 0, 0, 0, 1024);
+        assert!(!r.ok);
+        assert_eq!(r.status, 404);
+        assert_eq!(r.body, "header-ok");
+
+        let _ = handle.join();
     }
 }

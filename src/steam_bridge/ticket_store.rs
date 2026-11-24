@@ -78,9 +78,94 @@ impl TicketStore {
         trimmed.eq_ignore_ascii_case("\"apps\"")
     }
 
+    /// Count `{` and `}` characters outside quoted strings and `//` line comments.
+    pub(crate) fn count_unquoted_braces(line: &str) -> (u32, u32) {
+        let mut opens = 0u32;
+        let mut closes = 0u32;
+        let mut in_quotes = false;
+        let mut escaped = false;
+        let mut chars = line.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if in_quotes {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_quotes = false;
+                }
+                continue;
+            }
+            match ch {
+                '"' => in_quotes = true,
+                '/' if chars.peek() == Some(&'/') => break,
+                '{' => opens += 1,
+                '}' => closes += 1,
+                _ => {}
+            }
+        }
+        (opens, closes)
+    }
+
+    /// Escape a string value for safe emission inside a VDF double-quoted token.
+    pub(crate) fn escape_vdf_value(val: &str) -> String {
+        let mut out = String::with_capacity(val.len());
+        for ch in val.chars() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\r' => {}
+                _ => out.push(ch),
+            }
+        }
+        out
+    }
+
+    fn parse_quoted_token(s: &str) -> Option<(String, &str)> {
+        let rest = s.strip_prefix('"')?;
+        let mut out = String::new();
+        let mut escaped = false;
+        for (idx, ch) in rest.char_indices() {
+            if escaped {
+                match ch {
+                    'n' => out.push('\n'),
+                    't' => out.push('\t'),
+                    '\\' => out.push('\\'),
+                    '"' => out.push('"'),
+                    other => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                }
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                return Some((out, &rest[idx + 1..]));
+            } else {
+                out.push(ch);
+            }
+        }
+        None
+    }
+
+    fn write_atomic(path: &Path, content: &str) -> Result<(), TicketError> {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("localconfig.vdf");
+        let tmp_path = path.with_file_name(format!(".{}.tmp.{}", file_name, std::process::id()));
+        fs::write(&tmp_path, content)?;
+        fs::rename(&tmp_path, path)?;
+        Ok(())
+    }
+
     fn _parse_vdf(&mut self, path: &Path) -> Result<(), TicketError> {
         let content = fs::read_to_string(path)?;
         let app_blocks = Self::extract_app_blocks(&content);
+        let mut parsed = BTreeMap::new();
         for (appid_str, block) in app_blocks {
             if let Ok(app_id) = appid_str.parse::<u32>() {
                 let mut data = AppTicketData {
@@ -101,13 +186,14 @@ impl TicketStore {
                         }
                     }
                 }
-                self.cache.insert(app_id, data);
+                parsed.insert(app_id, data);
             }
         }
+        self.cache = parsed;
         Ok(())
     }
 
-    fn extract_app_blocks(content: &str) -> Vec<(String, String)> {
+    pub(crate) fn extract_app_blocks(content: &str) -> Vec<(String, String)> {
         let mut blocks = Vec::new();
         let mut in_apps = false;
         let mut seen_apps_open_brace = false;
@@ -130,14 +216,11 @@ impl TicketStore {
             }
 
             let prev_depth = depth;
-            for ch in trimmed.chars() {
-                if ch == '{' {
-                    depth += 1;
-                    seen_apps_open_brace = true;
-                } else if ch == '}' {
-                    depth = depth.saturating_sub(1);
-                }
+            let (opens, closes) = Self::count_unquoted_braces(trimmed);
+            if opens > 0 {
+                seen_apps_open_brace = true;
             }
+            depth = depth.saturating_add(opens).saturating_sub(closes);
 
             if prev_depth == 1 && depth == 1 {
                 if let Some(appid) = Self::extract_quoted_number(trimmed) {
@@ -176,40 +259,35 @@ impl TicketStore {
         blocks
     }
 
-    fn extract_quoted_number(line: &str) -> Option<String> {
+    pub(crate) fn extract_quoted_number(line: &str) -> Option<String> {
         let line = line.trim();
-        if line.starts_with('"') && line.len() > 2 {
-            let end = line[1..].find('"')? + 1;
-            let inner = &line[1..end];
-            if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit()) {
-                return Some(inner.to_string());
-            }
+        let (inner, rest) = Self::parse_quoted_token(line)?;
+        // Must be a section header (no value token after the closing quote).
+        if !rest.trim().is_empty() {
+            return None;
+        }
+        if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit()) {
+            return Some(inner);
         }
         None
     }
 
-    fn split_kv(line: &str) -> Option<(String, String)> {
+    pub(crate) fn split_kv(line: &str) -> Option<(String, String)> {
         let line = line.trim();
-        if !line.starts_with('"') {
-            return None;
-        }
-        let key_end = line[1..].find('"')? + 1;
-        let key = &line[1..key_end];
-        // Advance past the closing quote of the key (`key_end + 1`), not `key_end`.
-        let rest = line.get(key_end + 1..)?.trim();
-        if rest.is_empty() {
-            return None;
-        }
-        let val = if let Some(stripped) = rest.strip_prefix('"') {
-            let v_end = stripped.find('"')?;
-            stripped[..v_end].to_string()
-        } else {
-            rest.split_whitespace().next().unwrap_or("").to_string()
-        };
+        let (key, rest) = Self::parse_quoted_token(line)?;
         if key.is_empty() {
             return None;
         }
-        Some((key.to_string(), val))
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return None;
+        }
+        let val = if rest.starts_with('"') {
+            Self::parse_quoted_token(rest)?.0
+        } else {
+            rest.split_whitespace().next().unwrap_or("").to_string()
+        };
+        Some((key, val))
     }
 
     pub fn get(&mut self, app_id: u32) -> Result<AppTicketData, TicketError> {
@@ -224,8 +302,9 @@ impl TicketStore {
     }
 
     pub fn set(&mut self, data: AppTicketData) -> Result<(), TicketError> {
-        self.cache.insert(data.app_id, data.clone());
-        self._persist_app(data)
+        self._persist_app(&data)?;
+        self.cache.insert(data.app_id, data);
+        Ok(())
     }
 
     pub fn remove(&mut self, app_id: u32) -> Result<(), TicketError> {
@@ -245,7 +324,7 @@ impl TicketStore {
             .unwrap_or(false)
     }
 
-    fn _persist_app(&self, data: AppTicketData) -> Result<(), TicketError> {
+    fn _persist_app(&self, data: &AppTicketData) -> Result<(), TicketError> {
         fs::create_dir_all(&self.config_dir)?;
         let vdf_path = self.config_dir.join("localconfig.vdf");
         let content = if vdf_path.exists() {
@@ -253,9 +332,8 @@ impl TicketStore {
         } else {
             String::from("\"UserLocalConfigStore\"\n{\n    \"Software\"\n    {\n        \"Valve\"\n        {\n            \"Steam\"\n            {\n                \"apps\"\n                {\n                }\n            }\n        }\n    }\n}\n")
         };
-        let new_content = Self::upsert_app_block(&content, data.app_id, &data);
-        fs::write(&vdf_path, new_content)?;
-        Ok(())
+        let new_content = Self::upsert_app_block(&content, data.app_id, data);
+        Self::write_atomic(&vdf_path, &new_content)
     }
 
     fn _remove_app_from_vdf(&self, app_id: u32) -> Result<(), TicketError> {
@@ -265,33 +343,42 @@ impl TicketStore {
         }
         let content = fs::read_to_string(&vdf_path)?;
         let new_content = Self::remove_app_block(&content, app_id);
-        fs::write(&vdf_path, new_content)?;
-        Ok(())
+        Self::write_atomic(&vdf_path, &new_content)
+    }
+
+    fn format_new_app_block(app_id: u32, data: &AppTicketData) -> String {
+        let appid_str = app_id.to_string();
+        let steam_id = Self::escape_vdf_value(data.steam_id.as_deref().unwrap_or(""));
+        let app_ticket = Self::escape_vdf_value(data.app_ticket.as_deref().unwrap_or(""));
+        let e_ticket = Self::escape_vdf_value(data.e_ticket.as_deref().unwrap_or(""));
+        format!(
+            "        \"{}\"\n        {{\n            \"appid\" \"{}\"\n            \"SteamID\" \"{}\"\n            \"AppTicket\" \"{}\"\n            \"ETicket\" \"{}\"\n        }}\n",
+            appid_str, appid_str, steam_id, app_ticket, e_ticket
+        )
     }
 
     fn upsert_app_block(content: &str, app_id: u32, data: &AppTicketData) -> String {
         let appid_str = app_id.to_string();
-        let block = format!(
-            "        \"{}\"\n        {{\n            \"appid\" \"{}\"\n            \"SteamID\" \"{}\"\n            \"AppTicket\" \"{}\"\n            \"ETicket\" \"{}\"\n        }}\n",
-            appid_str,
-            appid_str,
-            data.steam_id.as_deref().unwrap_or(""),
-            data.app_ticket.as_deref().unwrap_or(""),
-            data.e_ticket.as_deref().unwrap_or(""),
-        );
+        let steam_id = Self::escape_vdf_value(data.steam_id.as_deref().unwrap_or(""));
+        let app_ticket = Self::escape_vdf_value(data.app_ticket.as_deref().unwrap_or(""));
+        let e_ticket = Self::escape_vdf_value(data.e_ticket.as_deref().unwrap_or(""));
 
         let lines: Vec<&str> = content.lines().collect();
-        let mut result = String::new();
+        let mut result = String::with_capacity(content.len() + 256);
         let mut in_apps = false;
         let mut seen_apps_open_brace = false;
         let mut depth = 0u32;
         let mut inserted = false;
-        let mut skipping_target = false;
+        let mut in_target_app = false;
+        let mut saw_appid = false;
+        let mut saw_steam_id = false;
+        let mut saw_app_ticket = false;
+        let mut saw_e_ticket = false;
 
         for line in &lines {
             let trimmed = line.trim();
 
-            if !in_apps && Self::is_apps_section_key(trimmed) {
+            if !in_apps && !inserted && Self::is_apps_section_key(trimmed) {
                 in_apps = true;
                 seen_apps_open_brace = false;
                 depth = 0;
@@ -307,30 +394,87 @@ impl TicketStore {
             }
 
             let prev_depth = depth;
-            for ch in trimmed.chars() {
-                if ch == '{' {
-                    depth += 1;
-                    seen_apps_open_brace = true;
-                } else if ch == '}' {
-                    depth = depth.saturating_sub(1);
-                }
+            let (opens, closes) = Self::count_unquoted_braces(trimmed);
+            if opens > 0 {
+                seen_apps_open_brace = true;
             }
+            depth = depth.saturating_add(opens).saturating_sub(closes);
 
-            if skipping_target {
-                // Keep skipping until we leave the target app's `{ ... }` block back to depth == 1
+            if in_target_app {
+                // Closing brace of the target app block: emit any missing ticket keys before `}`
                 if prev_depth >= 2 && depth == 1 {
-                    skipping_target = false;
+                    if !saw_appid {
+                        result.push_str(&format!("            \"appid\" \"{}\"\n", appid_str));
+                    }
+                    if !saw_steam_id {
+                        result.push_str(&format!("            \"SteamID\" \"{}\"\n", steam_id));
+                    }
+                    if !saw_app_ticket {
+                        result.push_str(&format!("            \"AppTicket\" \"{}\"\n", app_ticket));
+                    }
+                    if !saw_e_ticket {
+                        result.push_str(&format!("            \"ETicket\" \"{}\"\n", e_ticket));
+                    }
+                    result.push_str(line);
+                    result.push('\n');
+                    in_target_app = false;
+                    continue;
                 }
+
+                // Direct key-value lines inside the target app block (depth == 2):
+                // update ticket keys in place and preserve all other Steam fields & sub-blocks.
+                if prev_depth == 2 && depth == 2 {
+                    if let Some((key, _)) = Self::split_kv(trimmed) {
+                        let indent_len = line.len() - line.trim_start().len();
+                        let indent = &line[..indent_len];
+                        match key.as_str() {
+                            "appid" => {
+                                saw_appid = true;
+                                result
+                                    .push_str(&format!("{}\"appid\" \"{}\"\n", indent, appid_str));
+                                continue;
+                            }
+                            "SteamID" => {
+                                saw_steam_id = true;
+                                result
+                                    .push_str(&format!("{}\"SteamID\" \"{}\"\n", indent, steam_id));
+                                continue;
+                            }
+                            "AppTicket" => {
+                                saw_app_ticket = true;
+                                result.push_str(&format!(
+                                    "{}\"AppTicket\" \"{}\"\n",
+                                    indent, app_ticket
+                                ));
+                                continue;
+                            }
+                            "ETicket" => {
+                                saw_e_ticket = true;
+                                result
+                                    .push_str(&format!("{}\"ETicket\" \"{}\"\n", indent, e_ticket));
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                result.push_str(line);
+                result.push('\n');
                 continue;
             }
 
             if prev_depth == 1 && depth == 1 {
                 if let Some(aid) = Self::extract_quoted_number(trimmed) {
                     if aid == appid_str {
-                        // Replace existing app block in place
-                        result.push_str(&block);
+                        in_target_app = true;
                         inserted = true;
-                        skipping_target = true;
+                        saw_appid = false;
+                        saw_steam_id = false;
+                        saw_app_ticket = false;
+                        saw_e_ticket = false;
+                        result.push_str(line);
+                        result.push('\n');
                         continue;
                     }
                 }
@@ -339,7 +483,7 @@ impl TicketStore {
             // Closing brace of `"apps"` — insert new app block BEFORE writing `}`
             if seen_apps_open_brace && depth == 0 {
                 if !inserted {
-                    result.push_str(&block);
+                    result.push_str(&Self::format_new_app_block(app_id, data));
                     inserted = true;
                 }
                 result.push_str(line);
@@ -355,7 +499,7 @@ impl TicketStore {
 
         if !inserted {
             result.push_str("\"apps\"\n{\n");
-            result.push_str(&block);
+            result.push_str(&Self::format_new_app_block(app_id, data));
             result.push_str("}\n");
         }
 
@@ -365,7 +509,7 @@ impl TicketStore {
     fn remove_app_block(content: &str, app_id: u32) -> String {
         let appid_str = app_id.to_string();
         let lines: Vec<&str> = content.lines().collect();
-        let mut result = String::new();
+        let mut result = String::with_capacity(content.len());
         let mut in_apps = false;
         let mut seen_apps_open_brace = false;
         let mut depth = 0u32;
@@ -390,14 +534,11 @@ impl TicketStore {
             }
 
             let prev_depth = depth;
-            for ch in trimmed.chars() {
-                if ch == '{' {
-                    depth += 1;
-                    seen_apps_open_brace = true;
-                } else if ch == '}' {
-                    depth = depth.saturating_sub(1);
-                }
+            let (opens, closes) = Self::count_unquoted_braces(trimmed);
+            if opens > 0 {
+                seen_apps_open_brace = true;
             }
+            depth = depth.saturating_add(opens).saturating_sub(closes);
 
             if skipping_target {
                 if prev_depth >= 2 && depth == 1 {
@@ -589,5 +730,76 @@ mod tests {
         let blocks = TicketStore::extract_app_blocks(vdf);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].0, "480");
+    }
+
+    #[test]
+    fn upsert_preserves_existing_steam_fields_nested_blocks_and_quoted_braces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vdf = r#""UserLocalConfigStore"
+{
+    "Software"
+    {
+        "Valve"
+        {
+            "Steam"
+            {
+                "apps"
+                {
+                    "1245620"
+                    {
+                        "LaunchOptions" "gamemoderun %command% --cfg={\"a\":1}"
+                        "Playtime" "3600"
+                        "LegacyCDKey" "ABCD-EFGH-IJKL-MNOP"
+                        "cloud"
+                        {
+                            "last_sync_state" "synchronized"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+"#;
+        fs::write(tmp.path().join("localconfig.vdf"), vdf).unwrap();
+
+        let mut store = TicketStore::new(tmp.path());
+        store
+            .set(AppTicketData {
+                app_id: 1245620,
+                steam_id: Some("76561198028121353".into()),
+                app_ticket: Some("deadbeef".into()),
+                e_ticket: Some("cafebabe".into()),
+                last_update: None,
+            })
+            .unwrap();
+
+        let written = fs::read_to_string(tmp.path().join("localconfig.vdf")).unwrap();
+        assert!(written.contains("\"LaunchOptions\" \"gamemoderun %command% --cfg={\\\"a\\\":1}\""));
+        assert!(written.contains("\"Playtime\" \"3600\""));
+        assert!(written.contains("\"LegacyCDKey\" \"ABCD-EFGH-IJKL-MNOP\""));
+        assert!(written.contains("\"last_sync_state\" \"synchronized\""));
+
+        let mut reloaded = TicketStore::new(tmp.path());
+        let data = reloaded.get(1245620).unwrap();
+        assert_eq!(data.steam_id.as_deref(), Some("76561198028121353"));
+        assert_eq!(data.app_ticket.as_deref(), Some("deadbeef"));
+        assert_eq!(data.e_ticket.as_deref(), Some("cafebabe"));
+    }
+
+    #[test]
+    fn extract_quoted_number_ignores_kv_lines_and_handles_escaped_quotes() {
+        assert_eq!(
+            TicketStore::extract_quoted_number("\"1245620\""),
+            Some("1245620".into())
+        );
+        assert_eq!(
+            TicketStore::extract_quoted_number("\"1245620\" \"not_a_section\""),
+            None
+        );
+        assert_eq!(
+            TicketStore::split_kv("\"LaunchOptions\" \"echo \\\"hello\\\"\""),
+            Some(("LaunchOptions".into(), "echo \"hello\"".into()))
+        );
     }
 }

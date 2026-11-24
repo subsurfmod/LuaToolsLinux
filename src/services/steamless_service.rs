@@ -1,11 +1,14 @@
 //! SteamlessService - SteamStub conversion via Steamless CLI.
 //!
-//! Runs the Steamless.CLI tool (atom0s/Steamless) to modify game executables.
-//! The tool is downloaded via GitHub proxy with mirror fallback and cached under
-//! ~/.local/share/luatools/steamless.
+//! Runs the Steamless.CLI tool (atom0s/Steamless) to unpack SteamStub-protected
+//! Windows executables via Wine / .NET invocation on Linux.
 
+use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+use crate::services::depot_downloader::DepotDownloaderService;
 
 #[derive(Debug, Clone)]
 pub struct SteamlessResult {
@@ -23,7 +26,7 @@ impl SteamlessResult {
 
 pub struct SteamlessService {
     #[allow(dead_code)]
-    depot_downloader: crate::services::depot_downloader::DepotDownloaderService,
+    depot_downloader: DepotDownloaderService,
     tools_dir: PathBuf,
 }
 
@@ -32,18 +35,23 @@ impl Default for SteamlessService {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         let tools_dir = home.join(".local/share/luatools/steamless");
         Self {
-            depot_downloader: crate::services::depot_downloader::DepotDownloaderService::new(None),
+            depot_downloader: DepotDownloaderService::new(None),
             tools_dir,
         }
     }
 }
 
 impl SteamlessService {
-    pub fn new(
-        depot_downloader: crate::services::depot_downloader::DepotDownloaderService,
-    ) -> Self {
+    pub fn new(depot_downloader: DepotDownloaderService) -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         let tools_dir = home.join(".local/share/luatools/steamless");
+        Self {
+            depot_downloader,
+            tools_dir,
+        }
+    }
+
+    pub fn with_tools_dir(depot_downloader: DepotDownloaderService, tools_dir: PathBuf) -> Self {
         Self {
             depot_downloader,
             tools_dir,
@@ -54,45 +62,57 @@ impl SteamlessService {
         &self.tools_dir
     }
 
-    /// Check if the Steamless CLI tool is available.
+    /// Check if the Steamless CLI tool is available in `tools_dir`.
     pub fn has_tool(&self) -> bool {
-        self.cli_path().is_file()
+        self.find_cli_in_dir(&self.tools_dir).is_some()
     }
 
-    /// Path to the Steamless CLI executable.
+    /// Canonical path to the Steamless CLI executable.
     pub fn cli_path(&self) -> PathBuf {
         self.tools_dir.join("Steamless.CLI.exe")
     }
 
-    /// Ensure the Steamless CLI tool is downloaded and available.
+    fn find_cli_in_dir(&self, dir: &Path) -> Option<PathBuf> {
+        let direct = dir.join("Steamless.CLI.exe");
+        if direct.is_file() {
+            return Some(direct);
+        }
+        let entries = fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() {
+                let name = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if (name.contains("steamless") || name.contains("stubremover"))
+                    && (name.ends_with(".exe") || name.ends_with(".dll"))
+                {
+                    return Some(p);
+                }
+            }
+        }
+        None
+    }
+
+    /// Ensure the Steamless CLI tool is available.
     /// Returns the path to the CLI executable, or None if not available.
     pub async fn ensure_tool(&self) -> Option<PathBuf> {
-        let cli_path = self.cli_path();
-        if cli_path.is_file() {
-            return Some(cli_path);
+        if let Some(p) = self.find_cli_in_dir(&self.tools_dir) {
+            return Some(p);
         }
 
-        // In a full implementation, this would download from GitHub via the proxy
-        // For now, check if the tool is already present
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         let search_dirs = [
             home.join(".local/share/luatools/steamless"),
+            home.join(".local/share/luatools/tools/stub_remover"),
             home.join(".local/share/LuaTools/steamless"),
         ];
 
         for dir in &search_dirs {
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.is_file() {
-                        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        if name.contains("steamless")
-                            && (name.ends_with(".exe") || name.ends_with(".dll"))
-                        {
-                            return Some(p);
-                        }
-                    }
-                }
+            if let Some(p) = self.find_cli_in_dir(dir) {
+                return Some(p);
             }
         }
 
@@ -114,15 +134,14 @@ impl SteamlessService {
             }
         };
 
-        // Find executables to patch - look for .exe files in the install directory
         let exes = match find_exes(install_path) {
             Ok(e) => e,
-            Err(_) => {
+            Err(e) => {
                 return SteamlessResult {
                     patched: 0,
                     unchanged: 0,
                     total: 0,
-                    error: Some("Failed to scan game directory".to_string()),
+                    error: Some(format!("Failed to scan game directory: {}", e)),
                 };
             }
         };
@@ -141,16 +160,8 @@ impl SteamlessService {
 
         for exe in exes {
             match run_steamless(&cli, &exe) {
-                Ok(changed) => {
-                    if changed {
-                        patched += 1;
-                    } else {
-                        unchanged += 1;
-                    }
-                }
-                Err(_) => {
-                    unchanged += 1;
-                }
+                Ok(true) => patched += 1,
+                Ok(false) | Err(_) => unchanged += 1,
             }
         }
 
@@ -163,72 +174,125 @@ impl SteamlessService {
     }
 }
 
+const SKIP_PATTERNS: &[&str] = &[
+    "redist",
+    "vcredist",
+    "directx",
+    "dxsetup",
+    "vc_redist",
+    "dotnet",
+    "setup",
+    "install",
+    "uninstall",
+    "crashreport",
+    "crashhandler",
+    "bugsplat",
+    "easyanticheat",
+    "battleye",
+    "be_service",
+    "_launcher",
+    "bootstrap",
+    "cefprocess",
+    "cef_process",
+    "steamwebhelper",
+    "uplay",
+];
+
+fn should_skip_name(lower: &str) -> bool {
+    SKIP_PATTERNS.iter().any(|s| lower.contains(s))
+}
+
+fn unpacked_output_path(exe: &Path) -> PathBuf {
+    let mut os = OsString::from(exe.as_os_str());
+    os.push(".unpacked.exe");
+    PathBuf::from(os)
+}
+
+fn backup_output_path(exe: &Path) -> PathBuf {
+    let mut os = OsString::from(exe.as_os_str());
+    os.push(".orig.bak");
+    PathBuf::from(os)
+}
+
 /// Find executable files (.exe) in a directory, recursively skipping common non-game directories.
 fn find_exes(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
-    let mut exes = Vec::new();
-    let skip_patterns = [
-        "redist",
-        "vcredist",
-        "directx",
-        "dxsetup",
-        "vc_redist",
-        "dotnet",
-        "setup",
-        "install",
-        "uninstall",
-        "crashreport",
-        "crashhandler",
-        "bugsplat",
-        "easyanticheat",
-        "battleye",
-        "be_service",
-        "_launcher",
-        "bootstrap",
-        "cefprocess",
-        "cef_process",
-        "steamwebhelper",
-        "uplay",
-    ];
+    if !dir.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Game directory not found: {}", dir.display()),
+        ));
+    }
 
-    for entry in walkdir::WalkDir::new(dir) {
+    let mut exes = Vec::new();
+    let walker = walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            if entry.file_type().is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    let lower = name.to_ascii_lowercase();
+                    return !should_skip_name(&lower);
+                }
+            }
+            true
+        });
+
+    for entry in walker {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
         };
         let path = entry.path();
-        if path.is_file() {
+        if entry.file_type().is_file() {
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 let lower = name.to_ascii_lowercase();
-                if lower.ends_with(".exe") && !skip_patterns.iter().any(|s| lower.contains(s)) {
+                if lower.ends_with(".exe")
+                    && !lower.ends_with(".unpacked.exe")
+                    && !should_skip_name(&lower)
+                {
                     exes.push(path.to_path_buf());
                 }
             }
         }
     }
 
+    exes.sort();
     Ok(exes)
 }
 
-/// Run Steamless CLI on a single executable.
+/// Run Steamless CLI on a single executable using the appropriate Linux runtime wrapper
+/// (`wine` for `.exe`, `dotnet` for `.dll`, or direct execution for native binaries).
 fn run_steamless(cli: &Path, exe: &Path) -> Result<bool, Box<dyn std::error::Error>> {
-    let output = Command::new(cli)
+    let prefix = DepotDownloaderService::build_invocation(cli).map_err(std::io::Error::other)?;
+    let first = prefix
+        .first()
+        .ok_or_else(|| std::io::Error::other("Empty Steamless invocation"))?;
+
+    let mut cmd = Command::new(first);
+    for arg in &prefix[1..] {
+        cmd.arg(arg);
+    }
+    let output = cmd
         .arg(exe)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;
 
     if output.status.success() {
-        // Check if the file was actually modified (Steamless creates .unpacked.exe then replaces)
-        let unpacked = exe.with_extension("exe.unpacked.exe");
+        let unpacked = unpacked_output_path(exe);
         if unpacked.is_file() {
-            // Steamless created an unpacked file - the game was processed
-            Ok(true)
-        } else {
-            Ok(false)
+            let backup = backup_output_path(exe);
+            if !backup.exists() {
+                fs::copy(exe, &backup)?;
+            }
+            fs::rename(&unpacked, exe)?;
+            return Ok(true);
         }
-    } else {
-        Ok(false)
     }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -236,21 +300,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_service_creation() {
-        let dd = crate::services::depot_downloader::DepotDownloaderService::new(None);
-        let svc = SteamlessService::new(dd);
+    fn test_service_creation_and_case_insensitive_tool_detection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dd = DepotDownloaderService::new(Some(tmp.path().join("dd")));
+        let tools_dir = tmp.path().join("steamless");
+        fs::create_dir_all(&tools_dir).unwrap();
+
+        let svc = SteamlessService::with_tools_dir(dd, tools_dir.clone());
         assert!(!svc.has_tool());
+
+        fs::write(tools_dir.join("Steamless.CLI.dll"), b"dll").unwrap();
+        assert!(svc.has_tool());
     }
 
     #[test]
-    fn test_find_exes() {
+    fn test_find_exes_skips_non_game_dirs_and_unpacked_files() {
         let dir = tempfile::tempdir().unwrap();
         let game_dir = dir.path().join("game");
-        std::fs::create_dir_all(&game_dir).unwrap();
-        std::fs::write(game_dir.join("game.exe"), b"fake exe").unwrap();
-        std::fs::write(game_dir.join("launcher.exe"), b"fake launcher").unwrap();
+        fs::create_dir_all(game_dir.join("_CommonRedist/DirectX")).unwrap();
+        fs::create_dir_all(game_dir.join("EasyAntiCheat")).unwrap();
+        fs::write(game_dir.join("game.exe"), b"fake exe").unwrap();
+        fs::write(game_dir.join("game.exe.unpacked.exe"), b"old unpacked").unwrap();
+        fs::write(game_dir.join("launcher.exe"), b"fake launcher").unwrap();
+        fs::write(
+            game_dir.join("_CommonRedist/DirectX/helper.exe"),
+            b"redist helper",
+        )
+        .unwrap();
+        fs::write(
+            game_dir.join("EasyAntiCheat/start_protected_game.exe"),
+            b"eac",
+        )
+        .unwrap();
 
         let exes = find_exes(&game_dir).unwrap();
         assert_eq!(exes.len(), 2);
+        assert!(exes.iter().any(|p| p.ends_with("game.exe")));
+        assert!(exes.iter().any(|p| p.ends_with("launcher.exe")));
+
+        assert!(find_exes(&dir.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn test_unpacked_output_path_preserves_original_case_and_extension() {
+        assert_eq!(
+            unpacked_output_path(Path::new("/games/Game.EXE")),
+            PathBuf::from("/games/Game.EXE.unpacked.exe")
+        );
+        assert_eq!(
+            unpacked_output_path(Path::new("/games/MyGame.v2.exe")),
+            PathBuf::from("/games/MyGame.v2.exe.unpacked.exe")
+        );
     }
 }

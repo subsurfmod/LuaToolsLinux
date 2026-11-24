@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# LuaTools Linux v2.0.0 — One-Command Dependency & Native App Installer
+# LuaTools Linux — One-Command Dependency & Native App Installer
 # Supports: Fedora/RHEL (dnf), Debian/Ubuntu (apt), Arch/SteamOS (pacman),
 #           openSUSE (zypper), and portable user-space installations.
 # ==============================================================================
 set -euo pipefail
 
 APP_NAME="luatools"
-APP_VERSION="2.9.0-beta"
+APP_VERSION="2.9.1-beta"
 REPO_URL="https://github.com/subsurfmod/LuaToolsLinux.git"
 SCRIPT_DIR=""
 if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
@@ -176,32 +176,54 @@ ensure_binary() {
     (cd "${SCRIPT_DIR}" && cargo build --workspace --release -j "${CARGO_BUILD_JOBS:-2}")
     (cd "${SCRIPT_DIR}" && cargo build --profile debug-debug -p bridge_lib -j "${CARGO_BUILD_JOBS:-2}" || true)
     BIN_SOURCE="${SCRIPT_DIR}/target/release/${APP_NAME}"
-    mkdir -p "${SCRIPT_DIR}/dist" "${HOME}/.local/lib/luatools"
+    mkdir -p "${SCRIPT_DIR}/dist"
     install -m 0755 "${BIN_SOURCE}" "${SCRIPT_DIR}/dist/${APP_NAME}"
     local bridge_so="${SCRIPT_DIR}/target/debug-debug/libsteam_integration.so"
     [ -f "$bridge_so" ] || bridge_so="${SCRIPT_DIR}/target/release/libsteam_integration.so"
     if [ -f "$bridge_so" ]; then
         install -m 0755 "$bridge_so" "${SCRIPT_DIR}/dist/libsteam_integration.so"
-        install -m 0755 "$bridge_so" "${HOME}/.local/lib/luatools/libsteam_integration.so"
     fi
     if [ -f "${SCRIPT_DIR}/target/release/libsteam_auto_patch_linux.so" ]; then
         install -m 0755 "${SCRIPT_DIR}/target/release/libsteam_auto_patch_linux.so" "${SCRIPT_DIR}/dist/libsteam_auto_patch_linux.so"
-        install -m 0755 "${SCRIPT_DIR}/target/release/libsteam_auto_patch_linux.so" "${HOME}/.local/lib/luatools/libsteam_auto_patch_linux.so"
     fi
     ok "Built stripped native binary ($(du -h "${BIN_SOURCE}" | awk '{print $1}')) -> ${BIN_SOURCE}"
 }
 
 # ------------------------------------------------------------------------------
-# 3. Install Binary, Vector Icon, Desktop Launcher & luatools:// URI Handler
+# 3. Install Binary, Shared Libraries, Vector Icon, Desktop Launcher & URI Handler
 # ------------------------------------------------------------------------------
 install_files() {
+    local bridge_src=""
+    for candidate in \
+        "${SCRIPT_DIR}/dist/libsteam_integration.so" \
+        "${SCRIPT_DIR}/target/debug-debug/libsteam_integration.so" \
+        "${SCRIPT_DIR}/target/release/libsteam_integration.so"; do
+        if [ -f "$candidate" ]; then
+            bridge_src="$candidate"
+            break
+        fi
+    done
+
+    local patch_src=""
+    for candidate in \
+        "${SCRIPT_DIR}/dist/libsteam_auto_patch_linux.so" \
+        "${SCRIPT_DIR}/target/release/libsteam_auto_patch_linux.so"; do
+        if [ -f "$candidate" ]; then
+            patch_src="$candidate"
+            break
+        fi
+    done
+
     if [ "$SYSTEM_WIDE" -eq 1 ]; then
         local bin_dir="/usr/local/bin"
+        local lib_dir="/usr/local/lib/luatools"
         local apps_dir="/usr/local/share/applications"
         local icon_dir="/usr/local/share/icons/hicolor/scalable/apps"
         info "Installing system-wide into /usr/local..."
-        run_privileged mkdir -p "$bin_dir" "$apps_dir" "$icon_dir"
+        run_privileged mkdir -p "$bin_dir" "$lib_dir" "$apps_dir" "$icon_dir"
         run_privileged install -m 0755 "$BIN_SOURCE" "${bin_dir}/${APP_NAME}"
+        [ -n "$bridge_src" ] && run_privileged install -m 0755 "$bridge_src" "${lib_dir}/libsteam_integration.so"
+        [ -n "$patch_src" ] && run_privileged install -m 0755 "$patch_src" "${lib_dir}/libsteam_auto_patch_linux.so"
         run_privileged install -m 0644 "${SCRIPT_DIR}/assets/luatools.svg" "${icon_dir}/luatools.svg"
 
         local tmp_desktop
@@ -216,16 +238,19 @@ install_files() {
         INSTALLED_BIN="${bin_dir}/${APP_NAME}"
     else
         local bin_dir="${HOME}/.local/bin"
+        local lib_dir="${HOME}/.local/lib/luatools"
         local apps_dir="${HOME}/.local/share/applications"
         local icon_dir="${HOME}/.local/share/icons/hicolor/scalable/apps"
         info "Installing for current user into ~/.local..."
-        mkdir -p "$bin_dir" "$apps_dir" "$icon_dir" \
+        mkdir -p "$bin_dir" "$lib_dir" "$apps_dir" "$icon_dir" \
                  "${HOME}/.config/luatools" \
                  "${HOME}/.local/share/luatools/luavault" \
                  "${HOME}/.local/share/luatools/tools" \
                  "${HOME}/.cache/luatools"
 
         install -m 0755 "$BIN_SOURCE" "${bin_dir}/${APP_NAME}"
+        [ -n "$bridge_src" ] && install -m 0755 "$bridge_src" "${lib_dir}/libsteam_integration.so"
+        [ -n "$patch_src" ] && install -m 0755 "$patch_src" "${lib_dir}/libsteam_auto_patch_linux.so"
         install -m 0644 "${SCRIPT_DIR}/assets/luatools.svg" "${icon_dir}/luatools.svg"
         sed "s|@EXEC_PATH@|${bin_dir}/${APP_NAME}|g" "${SCRIPT_DIR}/assets/luatools.desktop.in" > "${apps_dir}/luatools.desktop"
         chmod 0644 "${apps_dir}/luatools.desktop"

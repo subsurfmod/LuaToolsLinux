@@ -61,35 +61,44 @@ impl InjectStatus {
     }
 }
 
-/// Get the architecture of a remote process by reading /proc/<pid>/exe and checking ELF class.
+/// Get the architecture of a remote process by reading `/proc/<pid>/exe` ELF header.
 pub fn get_architecture(pid: u32) -> Architecture {
-    let exe_path = format!("/proc/{}/exe", pid);
-    let target_path = match fs::read_link(&exe_path) {
-        Ok(p) => p,
-        Err(_) => return Architecture::Unknown,
-    };
+    if pid == 0 {
+        return Architecture::Unknown;
+    }
 
-    // Read ELF header to determine architecture
-    let mut file = match fs::File::open(&target_path) {
+    let exe_path = format!("/proc/{}/exe", pid);
+    let mut file = match fs::File::open(&exe_path) {
         Ok(f) => f,
         Err(_) => return Architecture::Unknown,
     };
 
-    let mut header = [0u8; 16];
+    let mut header = [0u8; 20];
     use std::io::Read;
     if file.read_exact(&mut header).is_err() {
         return Architecture::Unknown;
     }
 
-    // Check ELF magic
-    if &header[0..4] != b"\x7fELF" {
+    parse_elf_architecture(&header)
+}
+
+fn parse_elf_architecture(header: &[u8]) -> Architecture {
+    if header.len() < 20 || &header[0..4] != b"\x7fELF" {
         return Architecture::Unknown;
     }
 
-    // ELF class: 1 = 32-bit, 2 = 64-bit
-    match header[4] {
-        1 => Architecture::X86,
-        2 => Architecture::X64,
+    let ei_class = header[4];
+    let ei_data = header[5];
+    let e_machine = match ei_data {
+        1 => u16::from_le_bytes([header[18], header[19]]),
+        2 => u16::from_be_bytes([header[18], header[19]]),
+        _ => return Architecture::Unknown,
+    };
+
+    // EM_386 = 3, EM_X86_64 = 62
+    match (ei_class, e_machine) {
+        (1, 3) => Architecture::X86,
+        (2, 62) => Architecture::X64,
         _ => Architecture::Unknown,
     }
 }
@@ -97,17 +106,22 @@ pub fn get_architecture(pid: u32) -> Architecture {
 /// Inject a library into a remote process using ptrace.
 /// This is the Linux equivalent of Windows DLL injection.
 ///
-/// Method: Attach via ptrace, find dlopen in target, call it with library path,
-/// then detach.
+/// Method: Attach via ptrace, verify registers/access, and report status.
+/// Direct live ptrace `dlopen` shellcode injection is intentionally not performed;
+/// callers should prefer launching with `LD_PRELOAD`.
 pub fn inject_library(pid: u32, library_path: &Path) -> InjectStatus {
-    // Validate library path exists
-    if !library_path.exists() {
+    if pid == 0 || pid == std::process::id() || pid > i32::MAX as u32 {
+        return InjectStatus::OpenProcessFailed;
+    }
+
+    // Validate library path exists and is a regular file (or symlink to one)
+    if !library_path.is_file() {
         return InjectStatus::InvalidLibraryPath;
     }
 
     let library_path_str = match library_path.to_str() {
-        Some(s) => s,
-        None => return InjectStatus::InvalidLibraryPath,
+        Some(s) if !s.is_empty() && !s.as_bytes().contains(&0) => s,
+        _ => return InjectStatus::InvalidLibraryPath,
     };
 
     // Get target architecture
@@ -129,92 +143,150 @@ pub fn inject_library(pid: u32, library_path: &Path) -> InjectStatus {
         return InjectStatus::UnknownArchitecture;
     }
 
-    // Use ptrace to inject
     inject_via_ptrace(pid, library_path_str)
 }
 
-/// Inject library via ptrace by calling dlopen in the target process.
+/// Attach via ptrace, validate register access, restore cleanly, and report status.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 fn inject_via_ptrace(pid: u32, _library_path: &str) -> InjectStatus {
     use libc::{
         ptrace, waitpid, PTRACE_ATTACH, PTRACE_DETACH, PTRACE_GETREGS, PTRACE_SETREGS, WIFSTOPPED,
     };
     use std::mem;
 
+    let raw_pid = pid as libc::pid_t;
+
     // Attach to target process
-    let result = unsafe { ptrace(PTRACE_ATTACH, pid, 0, 0) };
+    let result = unsafe { ptrace(PTRACE_ATTACH, raw_pid, 0, 0) };
     if result == -1 {
         return InjectStatus::PtraceAttachFailed;
     }
 
-    // Wait for process to stop
+    // Wait for process to stop (retrying on EINTR)
     let mut status = 0;
-    let wait_result = unsafe { waitpid(pid as i32, &mut status, 0) };
+    let wait_result = loop {
+        let rc = unsafe { waitpid(raw_pid, &mut status, 0) };
+        if rc == -1 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        break rc;
+    };
     if wait_result == -1 || !WIFSTOPPED(status) {
-        unsafe { ptrace(PTRACE_DETACH, pid, 0, 0) };
+        unsafe { ptrace(PTRACE_DETACH, raw_pid, 0, 0) };
         return InjectStatus::WaitFailed;
     }
 
     // Get registers
-    #[cfg(target_arch = "x86_64")]
     let mut regs: libc::user_regs_struct = unsafe { mem::zeroed() };
-    #[cfg(target_arch = "x86")]
-    let mut regs: libc::user_regs_struct32 = unsafe { mem::zeroed() };
-
     let result = unsafe {
         ptrace(
             PTRACE_GETREGS,
-            pid,
+            raw_pid,
             0,
-            &mut regs as *mut _ as *mut libc::c_void,
+            (&mut regs as *mut libc::user_regs_struct).cast::<libc::c_void>(),
         )
     };
     if result == -1 {
-        unsafe { ptrace(PTRACE_DETACH, pid, 0, 0) };
+        unsafe { ptrace(PTRACE_DETACH, raw_pid, 0, 0) };
         return InjectStatus::PtraceAttachFailed;
     }
 
-    // Save original registers for restoration
+    // Restore original registers and detach cleanly
     let original_regs = regs;
-
-    // Find dlopen address in target process
-    // We'll need to find libc.so.6 in the target and resolve dlopen
-    // This is complex - for now, use a simpler approach: write library path to target memory
-    // and call dlopen via a small shellcode
-
-    // For simplicity and reliability, use the LD_PRELOAD approach via a launcher
-    // instead of direct ptrace injection. The ptrace method is complex and error-prone.
-    // We'll detach and return a status indicating to use LD_PRELOAD instead.
-
-    unsafe {
+    let _ = unsafe {
         ptrace(
             PTRACE_SETREGS,
-            pid,
+            raw_pid,
             0,
-            &original_regs as *const _ as *mut libc::c_void,
+            (&original_regs as *const libc::user_regs_struct).cast::<libc::c_void>(),
         )
     };
-    unsafe { ptrace(PTRACE_DETACH, pid, 0, 0) };
+    if unsafe { ptrace(PTRACE_DETACH, raw_pid, 0, 0) } == -1 {
+        return InjectStatus::PtraceDetachFailed;
+    }
 
-    // Return success - actual injection is done via LD_PRELOAD in preload_loader
-    InjectStatus::Ok
+    // Direct shellcode dlopen injection is not performed; report honestly instead of false Ok.
+    InjectStatus::ResolveLoadLibraryFailed
 }
 
-/// Alternative injection method: use LD_PRELOAD environment variable.
-/// This is the preferred method on Linux - launch the target with LD_PRELOAD set.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+fn inject_via_ptrace(_pid: u32, _library_path: &str) -> InjectStatus {
+    InjectStatus::UnknownArchitecture
+}
+
+/// Build an updated environment vector with `LD_PRELOAD` and `LD_LIBRARY_PATH` safely prepended
+/// without introducing empty colon segments (which glibc interprets as the current working directory).
+pub fn build_ld_preload_env(existing_env: &[String], library_path: &Path) -> Vec<String> {
+    let mut env_vars = existing_env.to_vec();
+    let lib_str = library_path.to_string_lossy();
+
+    let mut found_preload = false;
+    for env in &mut env_vars {
+        if let Some(rest) = env.strip_prefix("LD_PRELOAD=") {
+            let trimmed = rest.trim();
+            if trimmed.is_empty() {
+                *env = format!("LD_PRELOAD={}", lib_str);
+            } else if !trimmed.split(':').any(|item| item == lib_str.as_ref()) {
+                *env = format!("LD_PRELOAD={}:{}", lib_str, trimmed);
+            }
+            found_preload = true;
+            break;
+        }
+    }
+    if !found_preload {
+        env_vars.push(format!("LD_PRELOAD={}", lib_str));
+    }
+
+    if let Some(parent) = library_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let lib_dir = parent.to_string_lossy();
+        let mut found_lib_path = false;
+        for env in &mut env_vars {
+            if let Some(rest) = env.strip_prefix("LD_LIBRARY_PATH=") {
+                let trimmed = rest.trim();
+                if trimmed.is_empty() {
+                    *env = format!("LD_LIBRARY_PATH={}", lib_dir);
+                } else if !trimmed.split(':').any(|item| item == lib_dir.as_ref()) {
+                    *env = format!("LD_LIBRARY_PATH={}:{}", lib_dir, trimmed);
+                }
+                found_lib_path = true;
+                break;
+            }
+        }
+        if !found_lib_path {
+            env_vars.push(format!("LD_LIBRARY_PATH={}", lib_dir));
+        }
+    }
+
+    env_vars
+}
+
+/// Alternative injection method: validate target process & library for `LD_PRELOAD` launch.
+/// Reading `/proc/<pid>/cmdline` and `/proc/<pid>/environ` verifies the process is accessible
+/// and prepares `LD_PRELOAD`/`LD_LIBRARY_PATH` cleanly.
 pub fn inject_via_ld_preload(pid: u32, library_path: &Path) -> InjectStatus {
-    // Read the target's command line and environment
-    let cmdline = super::process::get_process_command_line(pid);
-    let args: Vec<String> = cmdline
-        .unwrap_or_default()
-        .split_whitespace()
-        .map(|s| s.to_string())
+    if pid == 0 {
+        return InjectStatus::OpenProcessFailed;
+    }
+    if !library_path.is_file() {
+        return InjectStatus::InvalidLibraryPath;
+    }
+
+    // Read the target's null-delimited command line directly so arguments with spaces survive.
+    let cmdline_path = format!("/proc/{}/cmdline", pid);
+    let Ok(cmdline_bytes) = fs::read(&cmdline_path) else {
+        return InjectStatus::OpenProcessFailed;
+    };
+    let args: Vec<String> = cmdline_bytes
+        .split(|&b| b == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
         .collect();
 
     if args.is_empty() {
         return InjectStatus::OpenProcessFailed;
     }
 
-    // Get environment
+    // Read environment
     let mut env_vars = Vec::new();
     let environ_path = format!("/proc/{}/environ", pid);
     if let Ok(content) = fs::read(&environ_path) {
@@ -227,38 +299,9 @@ pub fn inject_via_ld_preload(pid: u32, library_path: &Path) -> InjectStatus {
         }
     }
 
-    // Add/update LD_PRELOAD
-    let lib_str = library_path.to_string_lossy().to_string();
-    let mut found = false;
-    for env in &mut env_vars {
-        if env.starts_with("LD_PRELOAD=") {
-            *env = format!("LD_PRELOAD={}:{}", lib_str, &env[11..]);
-            found = true;
-            break;
-        }
-    }
-    if !found {
-        env_vars.push(format!("LD_PRELOAD={}", lib_str));
-    }
+    let _prepared_env = build_ld_preload_env(&env_vars, library_path);
 
-    // Also set LD_LIBRARY_PATH to include the library's directory
-    if let Some(parent) = library_path.parent() {
-        let lib_dir = parent.to_string_lossy().to_string();
-        let mut found = false;
-        for env in &mut env_vars {
-            if env.starts_with("LD_LIBRARY_PATH=") {
-                *env = format!("LD_LIBRARY_PATH={}:{}", lib_dir, &env[16..]);
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            env_vars.push(format!("LD_LIBRARY_PATH={}", lib_dir));
-        }
-    }
-
-    // We can't easily restart the process from here - this would need to be done
-    // by the caller. Return status indicating LD_PRELOAD method should be used.
+    // Restarting an arbitrary live process must be coordinated by the launcher.
     InjectStatus::Ok
 }
 
@@ -291,5 +334,62 @@ mod tests {
     fn test_architecture_strings() {
         assert_eq!(Architecture::X64.as_str(), "x64");
         assert_eq!(Architecture::X86.as_str(), "x86");
+    }
+
+    #[test]
+    fn test_parse_elf_architecture_distinguishes_machine() {
+        let mut x64_hdr = [0u8; 20];
+        x64_hdr[0..4].copy_from_slice(b"\x7fELF");
+        x64_hdr[4] = 2; // 64-bit
+        x64_hdr[5] = 1; // little-endian
+        x64_hdr[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+        assert_eq!(parse_elf_architecture(&x64_hdr), Architecture::X64);
+
+        let mut x86_hdr = x64_hdr;
+        x86_hdr[4] = 1; // 32-bit
+        x86_hdr[18..20].copy_from_slice(&3u16.to_le_bytes()); // EM_386
+        assert_eq!(parse_elf_architecture(&x86_hdr), Architecture::X86);
+
+        let mut arm64_hdr = x64_hdr;
+        arm64_hdr[18..20].copy_from_slice(&183u16.to_le_bytes()); // EM_AARCH64
+        assert_eq!(parse_elf_architecture(&arm64_hdr), Architecture::Unknown);
+        assert_eq!(get_architecture(0), Architecture::Unknown);
+    }
+
+    #[test]
+    fn test_build_ld_preload_env_no_empty_colon_and_dedup() {
+        let existing = vec![
+            "PATH=/usr/bin".to_string(),
+            "LD_PRELOAD=".to_string(),
+            "LD_LIBRARY_PATH=".to_string(),
+        ];
+        let lib = Path::new("/opt/luatools/libbridge.so");
+        let env = build_ld_preload_env(&existing, lib);
+        assert!(env.contains(&"LD_PRELOAD=/opt/luatools/libbridge.so".to_string()));
+        assert!(env.contains(&"LD_LIBRARY_PATH=/opt/luatools".to_string()));
+
+        // Calling again must not duplicate entries
+        let env2 = build_ld_preload_env(&env, lib);
+        assert_eq!(env, env2);
+    }
+
+    #[test]
+    fn test_inject_rejects_invalid_pid_and_missing_library() {
+        assert_eq!(
+            inject_library(0, Path::new("/nonexistent.so")),
+            InjectStatus::OpenProcessFailed
+        );
+        assert_eq!(
+            inject_library(id(), Path::new("/nonexistent.so")),
+            InjectStatus::OpenProcessFailed
+        );
+        assert_eq!(
+            inject_via_ld_preload(0, Path::new("/nonexistent.so")),
+            InjectStatus::OpenProcessFailed
+        );
+        assert_eq!(
+            inject_via_ld_preload(id(), Path::new("/nonexistent/libfoo.so")),
+            InjectStatus::InvalidLibraryPath
+        );
     }
 }

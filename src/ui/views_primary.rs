@@ -364,16 +364,17 @@ impl LuaToolsApp {
                                 ui.set_width(222.0);
                                 ui.vertical(|ui| {
                                     ui.spacing_mut().item_spacing.y = 6.0;
-                                    if let Some(t) = tex {
+                                    let cover_resp = if let Some(t) = tex {
                                         ui.add(
                                             egui::Image::new(&t)
                                                 .fit_to_exact_size(Vec2::new(222.0, 104.0))
-                                                .corner_radius(CornerRadius::same(3)),
-                                        );
+                                                .corner_radius(CornerRadius::same(3))
+                                                .sense(Sense::click()),
+                                        )
                                     } else {
-                                        let (rect, _) = ui.allocate_exact_size(
+                                        let (rect, resp) = ui.allocate_exact_size(
                                             Vec2::new(222.0, 104.0),
-                                            Sense::hover(),
+                                            Sense::click(),
                                         );
                                         ui.painter().rect_filled(
                                             rect,
@@ -392,12 +393,22 @@ impl LuaToolsApp {
                                             FontId::new(13.0, FontFamily::Monospace),
                                             Palette::TEXT_MUTED,
                                         );
+                                        resp
+                                    };
+                                    if cover_resp.hovered() {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                     }
-                                    ui.label(
+                                    if cover_resp.clicked() {
+                                        open_depots = Some(aid);
+                                    }
+                                    let title_resp = ui.label(
                                         RichText::new(truncate_label(&name, 26))
                                             .font(semibold_font(13.5))
                                             .color(Palette::TEXT_PRIMARY),
                                     );
+                                    if name.chars().count() > 26 {
+                                        title_resp.on_hover_text(&name);
+                                    }
                                     egui::Sides::new().show(
                                         ui,
                                         |ui| {
@@ -613,10 +624,11 @@ impl LuaToolsApp {
                                             let title = self
                                                 .acquire_details
                                                 .as_ref()
-                                                .map(|d| d.name.as_str())
-                                                .unwrap_or("Loading title…");
+                                                .filter(|d| d.app_id == aid && !d.name.is_empty())
+                                                .map(|d| d.name.clone())
+                                                .unwrap_or_else(|| self.resolve_game_title(aid));
                                             ui.label(
-                                                RichText::new(title)
+                                                RichText::new(&title)
                                                     .font(display_font(20.0))
                                                     .color(Palette::TEXT_PRIMARY),
                                             );
@@ -690,18 +702,25 @@ impl LuaToolsApp {
                                                 if is_av {
                                                     avail_providers.push(prov.clone());
                                                 }
-                                                let is_sel =
-                                                    self.acquire_selected_source.as_deref()
+                                                let is_sel = is_av
+                                                    && self.acquire_selected_source.as_deref()
                                                         == Some(prov.as_str());
                                                 let badge = if is_av {
                                                     "● Available"
                                                 } else {
                                                     "○ Unavailable"
                                                 };
-                                                if clean_list_row(ui, prov, badge, is_sel).clicked()
-                                                {
-                                                    self.acquire_selected_source =
-                                                        Some(prov.clone());
+                                                let row_resp =
+                                                    clean_list_row(ui, prov, badge, is_sel);
+                                                if is_av {
+                                                    if row_resp.clicked() {
+                                                        self.acquire_selected_source =
+                                                            Some(prov.clone());
+                                                    }
+                                                } else {
+                                                    row_resp.on_hover_text(
+                                                        "This provider does not currently host a manifest for this AppID.",
+                                                    );
                                                 }
                                             }
                                         }
@@ -773,17 +792,22 @@ impl LuaToolsApp {
                                         }
 
                                         if let Some(dlc) = &self.acquire_dlc_info {
-                                            if dlc.missing_count > 0
-                                                && secondary_button(
-                                                    ui,
-                                                    &format!(
-                                                        "Generate DLC (+{})",
-                                                        dlc.missing_count
-                                                    ),
-                                                )
-                                                .clicked()
-                                            {
-                                                self.start_dlc_generation(aid, ui.ctx());
+                                            if dlc.missing_count > 0 {
+                                                let missing = dlc.missing_count;
+                                                let mut trigger_dlc = false;
+                                                ui.add_enabled_ui(!self.acquire_busy, |ui| {
+                                                    if secondary_button(
+                                                        ui,
+                                                        &format!("Generate DLC (+{})", missing),
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        trigger_dlc = true;
+                                                    }
+                                                });
+                                                if trigger_dlc {
+                                                    self.start_dlc_generation(aid, ui.ctx());
+                                                }
                                             }
                                         }
 
@@ -876,16 +900,33 @@ impl LuaToolsApp {
             self.add_appid_modal.open = true;
         }
         if do_refresh {
-            self.refresh_library_rows();
+            self.refresh_all_local_state();
         }
         if do_bulk_del {
             if let Some(installer) = self.lua_installer.clone() {
                 let ids: Vec<u32> = self.library_selected_ids.iter().copied().collect();
+                let mut removed = 0usize;
                 for aid in ids {
-                    let _ = installer.uninstall_lua(aid, false, Some(&mut self.slssteam_service));
+                    let res = installer.uninstall_lua(aid, false, Some(&mut self.slssteam_service));
+                    if res.ok {
+                        removed += 1;
+                    }
                 }
                 self.library_selected_ids.clear();
                 self.refresh_all_local_state();
+                if removed > 0 {
+                    self.notify(
+                        format!("Removed {} .lua manifest(s).", removed),
+                        ToastKind::Info,
+                    );
+                } else {
+                    self.notify(
+                        "Selected title(s) had no stplug-in .lua file to remove.",
+                        ToastKind::Warning,
+                    );
+                }
+            } else {
+                self.notify("Steam installation not detected.", ToastKind::Warning);
             }
         }
 
@@ -1011,7 +1052,28 @@ impl LuaToolsApp {
                 .column(Column::exact(145.0))
                 .column(Column::exact(210.0))
                 .header(32.0, |mut header| {
-                    for h in ["", "Game", "Status", "Overrides", "Actions"] {
+                    header.col(|ui| {
+                        let mut all_selected = !filtered.is_empty()
+                            && filtered
+                                .iter()
+                                .all(|r| self.library_selected_ids.contains(&r.app_id));
+                        if ui
+                            .add(Checkbox::without_text(&mut all_selected))
+                            .on_hover_text("Select / deselect all visible titles")
+                            .changed()
+                        {
+                            if all_selected {
+                                for r in &filtered {
+                                    self.library_selected_ids.insert(r.app_id);
+                                }
+                            } else {
+                                for r in &filtered {
+                                    self.library_selected_ids.remove(&r.app_id);
+                                }
+                            }
+                        }
+                    });
+                    for h in ["Game", "Status", "Overrides", "Actions"] {
                         header.col(|ui| {
                             ui.label(
                                 RichText::new(h)
@@ -1037,11 +1099,14 @@ impl LuaToolsApp {
 
                             row.col(|ui| {
                                 ui.spacing_mut().item_spacing.x = 8.0;
-                                ui.label(
-                                    RichText::new(&r.name)
+                                let name_resp = ui.label(
+                                    RichText::new(truncate_label(&r.name, 42))
                                         .font(semibold_font(13.5))
                                         .color(Palette::TEXT_PRIMARY),
                                 );
+                                if r.name.chars().count() > 42 {
+                                    name_resp.on_hover_text(&r.name);
+                                }
                                 ui.label(
                                     RichText::new(format!("#{}", r.app_id))
                                         .font(FontId::new(11.5, FontFamily::Monospace))
@@ -1177,9 +1242,19 @@ impl LuaToolsApp {
         }
         if let Some(aid) = act_delete {
             if let Some(installer) = self.lua_installer.clone() {
-                let _ = installer.uninstall_lua(aid, false, Some(&mut self.slssteam_service));
+                let res = installer.uninstall_lua(aid, false, Some(&mut self.slssteam_service));
                 self.refresh_all_local_state();
-                self.notify(format!("Removed {}.lua", aid), ToastKind::Info);
+                if res.ok {
+                    self.notify(format!("Removed {}.lua", aid), ToastKind::Info);
+                } else {
+                    self.notify(
+                        res.error
+                            .unwrap_or_else(|| format!("Failed to remove {}.lua", aid)),
+                        ToastKind::Warning,
+                    );
+                }
+            } else {
+                self.notify("Steam installation not detected.", ToastKind::Warning);
             }
         }
         if let Some((aid, gname)) = act_add_lib {
@@ -1392,7 +1467,11 @@ pub fn clean_list_row(
             },
         );
     }
-    resp
+    if title.chars().count() > 28 {
+        resp.on_hover_text(title)
+    } else {
+        resp
+    }
 }
 
 fn truncate_label(s: &str, max_chars: usize) -> String {

@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::steam_bridge::ticket_store::TicketError;
+use crate::steam_bridge::ticket_store::{TicketError, TicketStore};
 
 /// Error type for legacy CD-key operations.
 #[derive(Debug, thiserror::Error)]
@@ -80,139 +80,44 @@ impl LegacyCdKeyStore {
         trimmed.eq_ignore_ascii_case("\"apps\"")
     }
 
+    fn write_atomic(path: &Path, content: &str) -> Result<(), TicketError> {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("localconfig.vdf");
+        let tmp_path =
+            path.with_file_name(format!(".{}.cdkey.tmp.{}", file_name, std::process::id()));
+        fs::write(&tmp_path, content)?;
+        fs::rename(&tmp_path, path)?;
+        Ok(())
+    }
+
     fn _parse_vdf(&mut self, path: &Path) -> Result<(), TicketError> {
         let content = std::fs::read_to_string(path)?;
-        let app_blocks = Self::extract_app_blocks(&content);
+        let app_blocks = TicketStore::extract_app_blocks(&content);
+        let mut parsed = BTreeMap::new();
         for (appid_str, block) in app_blocks {
             if let Ok(app_id) = appid_str.parse::<u32>() {
                 let mut data = LegacyCdKeyData::default();
                 for line in block.lines() {
                     let line = line.trim();
-                    if let Some((key, val)) = Self::split_kv(line) {
+                    if let Some((key, val)) = TicketStore::split_kv(line) {
                         if val.is_empty() {
                             continue;
                         }
-                        match key.as_str() {
-                            "SteamID" => {}
-                            "AppTicket" => {}
-                            "ETicket" => {}
-                            "LegacyCDKey" => {
-                                data.override_key = Some(val);
-                                data.has_key = true;
-                            }
-                            _ => {}
+                        if key == "LegacyCDKey" {
+                            data.override_key = Some(val);
+                            data.has_key = true;
                         }
                     }
                 }
-                self.cache.insert(app_id, data);
+                if data.has_key {
+                    parsed.insert(app_id, data);
+                }
             }
         }
+        self.cache = parsed;
         Ok(())
-    }
-
-    fn extract_app_blocks(content: &str) -> Vec<(String, String)> {
-        let mut blocks = Vec::new();
-        let mut in_apps = false;
-        let mut seen_apps_open_brace = false;
-        let mut depth = 0u32;
-        let mut current_appid: Option<String> = None;
-        let mut current_block = String::new();
-
-        for line in content.lines() {
-            let trimmed = line.trim();
-
-            if !in_apps && Self::is_apps_section_key(trimmed) {
-                in_apps = true;
-                seen_apps_open_brace = false;
-                depth = 0;
-                continue;
-            }
-
-            if !in_apps {
-                continue;
-            }
-
-            let prev_depth = depth;
-            for ch in trimmed.chars() {
-                if ch == '{' {
-                    depth += 1;
-                    seen_apps_open_brace = true;
-                } else if ch == '}' {
-                    depth = depth.saturating_sub(1);
-                }
-            }
-
-            if prev_depth == 1 && depth == 1 {
-                if let Some(appid) = Self::extract_quoted_number(trimmed) {
-                    if let Some(prev) = current_appid.replace(appid) {
-                        blocks.push((prev, current_block.clone()));
-                    }
-                    current_block.clear();
-                    continue;
-                }
-            }
-
-            if depth >= 2 && current_appid.is_some() {
-                current_block.push_str(trimmed);
-                current_block.push('\n');
-            } else if prev_depth >= 2 && depth == 1 {
-                if let Some(prev) = current_appid.take() {
-                    blocks.push((prev, current_block.clone()));
-                    current_block.clear();
-                }
-            }
-
-            if seen_apps_open_brace && depth == 0 {
-                if let Some(prev) = current_appid.take() {
-                    blocks.push((prev, current_block.clone()));
-                    current_block.clear();
-                }
-                in_apps = false;
-                seen_apps_open_brace = false;
-            }
-        }
-
-        if let Some(aid) = current_appid.take() {
-            blocks.push((aid, current_block));
-        }
-
-        blocks
-    }
-
-    fn extract_quoted_number(line: &str) -> Option<String> {
-        let line = line.trim();
-        if line.starts_with('"') && line.len() > 2 {
-            let end = line[1..].find('"')? + 1;
-            let inner = &line[1..end];
-            if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit()) {
-                return Some(inner.to_string());
-            }
-        }
-        None
-    }
-
-    fn split_kv(line: &str) -> Option<(String, String)> {
-        let line = line.trim();
-        if !line.starts_with('"') {
-            return None;
-        }
-        let key_end = line[1..].find('"')? + 1;
-        let key = &line[1..key_end];
-        // Advance past the closing quote of the key (`key_end + 1`), not `key_end`.
-        let rest = line.get(key_end + 1..)?.trim();
-        if rest.is_empty() {
-            return None;
-        }
-        let val = if let Some(stripped) = rest.strip_prefix('"') {
-            let v_end = stripped.find('"')?;
-            stripped[..v_end].to_string()
-        } else {
-            rest.split_whitespace().next().unwrap_or("").to_string()
-        };
-        if key.is_empty() {
-            return None;
-        }
-        Some((key.to_string(), val))
     }
 
     pub fn get(&mut self, app_id: u32) -> Result<&LegacyCdKeyData, TicketError> {
@@ -223,8 +128,14 @@ impl LegacyCdKeyStore {
     }
 
     pub fn set_override(&mut self, app_id: u32, key: String) -> Result<(), TicketError> {
+        let trimmed = key.trim().to_string();
+        if trimmed.is_empty() {
+            return Err(TicketError::Parse(
+                "Legacy CD key override cannot be empty".into(),
+            ));
+        }
         let data = LegacyCdKeyData {
-            override_key: Some(key),
+            override_key: Some(trimmed),
             has_key: true,
         };
         self._persist_override(app_id, &data)?;
@@ -246,33 +157,33 @@ impl LegacyCdKeyStore {
             String::from("\"UserLocalConfigStore\"\n{\n    \"Software\"\n    {\n        \"Valve\"\n        {\n            \"Steam\"\n            {\n                \"apps\"\n                {\n                }\n            }\n        }\n    }\n}\n")
         };
         let new_content = Self::upsert_legacy_cd_key_block(&content, app_id, data);
-        fs::write(&vdf_path, new_content)?;
-        Ok(())
+        Self::write_atomic(&vdf_path, &new_content)
     }
 
     fn upsert_legacy_cd_key_block(content: &str, app_id: u32, data: &LegacyCdKeyData) -> String {
         let appid_str = app_id.to_string();
-        let legacy_key_block = if let Some(ref key) = data.override_key {
-            format!(
-                "        \"{}\"\n        {{\n            \"LegacyCDKey\" \"{}\"\n        }}\n",
-                appid_str, key
-            )
-        } else {
-            String::new()
+        let Some(ref raw_key) = data.override_key else {
+            return Self::remove_legacy_cd_key_block(content, app_id);
         };
+        let escaped_key = TicketStore::escape_vdf_value(raw_key);
+        let new_block = format!(
+            "        \"{}\"\n        {{\n            \"LegacyCDKey\" \"{}\"\n        }}\n",
+            appid_str, escaped_key
+        );
 
         let lines: Vec<&str> = content.lines().collect();
-        let mut result = String::new();
+        let mut result = String::with_capacity(content.len() + 128);
         let mut in_apps = false;
         let mut seen_apps_open_brace = false;
         let mut depth = 0u32;
         let mut inserted = false;
-        let mut skipping_target = false;
+        let mut in_target_app = false;
+        let mut replaced_key_in_place = false;
 
         for line in &lines {
             let trimmed = line.trim();
 
-            if !in_apps && Self::is_apps_section_key(trimmed) {
+            if !in_apps && !inserted && Self::is_apps_section_key(trimmed) {
                 in_apps = true;
                 seen_apps_open_brace = false;
                 depth = 0;
@@ -288,29 +199,56 @@ impl LegacyCdKeyStore {
             }
 
             let prev_depth = depth;
-            for ch in trimmed.chars() {
-                if ch == '{' {
-                    depth += 1;
-                    seen_apps_open_brace = true;
-                } else if ch == '}' {
-                    depth = depth.saturating_sub(1);
-                }
+            let (opens, closes) = TicketStore::count_unquoted_braces(trimmed);
+            if opens > 0 {
+                seen_apps_open_brace = true;
             }
+            depth = depth.saturating_add(opens).saturating_sub(closes);
 
-            if skipping_target {
+            if in_target_app {
+                // Closing brace of the target app block: append `"LegacyCDKey"` if not already present.
                 if prev_depth >= 2 && depth == 1 {
-                    skipping_target = false;
+                    if !replaced_key_in_place {
+                        result.push_str(&format!(
+                            "            \"LegacyCDKey\" \"{}\"\n",
+                            escaped_key
+                        ));
+                    }
+                    result.push_str(line);
+                    result.push('\n');
+                    in_target_app = false;
+                    continue;
                 }
+
+                // Update `"LegacyCDKey"` in place while preserving all other Steam/ticket keys.
+                if prev_depth == 2 && depth == 2 {
+                    if let Some((key, _)) = TicketStore::split_kv(trimmed) {
+                        if key == "LegacyCDKey" {
+                            let indent_len = line.len() - line.trim_start().len();
+                            let indent = &line[..indent_len];
+                            result.push_str(&format!(
+                                "{}\"LegacyCDKey\" \"{}\"\n",
+                                indent, escaped_key
+                            ));
+                            replaced_key_in_place = true;
+                            continue;
+                        }
+                    }
+                }
+
+                result.push_str(line);
+                result.push('\n');
                 continue;
             }
 
             if prev_depth == 1 && depth == 1 {
-                if let Some(aid) = Self::extract_quoted_number(trimmed) {
+                if let Some(aid) = TicketStore::extract_quoted_number(trimmed) {
                     if aid == appid_str {
-                        // Replace existing app block in place
-                        result.push_str(&legacy_key_block);
+                        in_target_app = true;
                         inserted = true;
-                        skipping_target = true;
+                        replaced_key_in_place = false;
+                        result.push_str(line);
+                        result.push('\n');
                         continue;
                     }
                 }
@@ -319,7 +257,7 @@ impl LegacyCdKeyStore {
             // Closing brace of `"apps"` — insert new app block BEFORE writing `}`
             if seen_apps_open_brace && depth == 0 {
                 if !inserted {
-                    result.push_str(&legacy_key_block);
+                    result.push_str(&new_block);
                     inserted = true;
                 }
                 result.push_str(line);
@@ -335,7 +273,7 @@ impl LegacyCdKeyStore {
 
         if !inserted {
             result.push_str("\"apps\"\n{\n");
-            result.push_str(&legacy_key_block);
+            result.push_str(&new_block);
             result.push_str("}\n");
         }
 
@@ -349,18 +287,21 @@ impl LegacyCdKeyStore {
         }
         let content = fs::read_to_string(&vdf_path)?;
         let new_content = Self::remove_legacy_cd_key_block(&content, app_id);
-        fs::write(&vdf_path, new_content)?;
-        Ok(())
+        Self::write_atomic(&vdf_path, &new_content)
     }
 
+    /// Remove only the `"LegacyCDKey"` key from `<app_id>`'s VDF block, preserving all
+    /// other Steam fields and tickets. Drops the `<app_id>` block itself only if it becomes empty.
     fn remove_legacy_cd_key_block(content: &str, app_id: u32) -> String {
         let appid_str = app_id.to_string();
         let lines: Vec<&str> = content.lines().collect();
-        let mut result = String::new();
+        let mut result = String::with_capacity(content.len());
         let mut in_apps = false;
         let mut seen_apps_open_brace = false;
         let mut depth = 0u32;
-        let mut skipping_target = false;
+        let mut in_target_app = false;
+        let mut target_buf: Vec<&str> = Vec::new();
+        let mut target_has_other_content = false;
 
         for line in &lines {
             let trimmed = line.trim();
@@ -381,26 +322,49 @@ impl LegacyCdKeyStore {
             }
 
             let prev_depth = depth;
-            for ch in trimmed.chars() {
-                if ch == '{' {
-                    depth += 1;
-                    seen_apps_open_brace = true;
-                } else if ch == '}' {
-                    depth = depth.saturating_sub(1);
-                }
+            let (opens, closes) = TicketStore::count_unquoted_braces(trimmed);
+            if opens > 0 {
+                seen_apps_open_brace = true;
             }
+            depth = depth.saturating_add(opens).saturating_sub(closes);
 
-            if skipping_target {
+            if in_target_app {
+                if prev_depth == 2 && depth == 2 {
+                    if let Some((key, _)) = TicketStore::split_kv(trimmed) {
+                        if key == "LegacyCDKey" {
+                            continue;
+                        }
+                    }
+                }
+
+                target_buf.push(line);
+
                 if prev_depth >= 2 && depth == 1 {
-                    skipping_target = false;
+                    // End of target app block
+                    if target_has_other_content {
+                        for kept in &target_buf {
+                            result.push_str(kept);
+                            result.push('\n');
+                        }
+                    }
+                    target_buf.clear();
+                    in_target_app = false;
+                    continue;
+                }
+
+                if depth >= 2 && trimmed != "{" && !trimmed.is_empty() {
+                    target_has_other_content = true;
                 }
                 continue;
             }
 
             if prev_depth == 1 && depth == 1 {
-                if let Some(aid) = Self::extract_quoted_number(trimmed) {
+                if let Some(aid) = TicketStore::extract_quoted_number(trimmed) {
                     if aid == appid_str {
-                        skipping_target = true;
+                        in_target_app = true;
+                        target_has_other_content = false;
+                        target_buf.clear();
+                        target_buf.push(line);
                         continue;
                     }
                 }
@@ -412,6 +376,13 @@ impl LegacyCdKeyStore {
             if seen_apps_open_brace && depth == 0 {
                 in_apps = false;
                 seen_apps_open_brace = false;
+            }
+        }
+
+        if in_target_app && target_has_other_content {
+            for kept in &target_buf {
+                result.push_str(kept);
+                result.push('\n');
             }
         }
 
@@ -433,11 +404,11 @@ impl LegacyCdKeyStore {
 }
 
 /// Synthesize a deterministic legacy CD key from appId and accountId.
-fn fnv1a_hash(input: &str) -> u64 {
-    let mut hash: u64 = 0x811c9dc5;
+fn fnv1a_hash32(input: &str) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
     for byte in input.bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x01000193);
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
     }
     hash
 }
@@ -446,7 +417,7 @@ pub fn synthesize(app_id: u32, account_id: u32) -> String {
     let seed_a = format!("{}:{}", app_id, account_id);
     let seed_b = format!("OST:{}:{}", account_id, app_id);
 
-    let mut bits = (fnv1a_hash(&seed_a) << 32) | (fnv1a_hash(&seed_b) & 0xFFFF_FFFF);
+    let mut bits = (u64::from(fnv1a_hash32(&seed_a)) << 32) | u64::from(fnv1a_hash32(&seed_b));
 
     const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
@@ -481,6 +452,7 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::steam_bridge::ticket_store::AppTicketData;
 
     #[test]
     fn test_synthesize_deterministic_key() {
@@ -506,6 +478,7 @@ mod tests {
         let mut store = LegacyCdKeyStore::new(store_path);
         store.load().unwrap();
 
+        assert!(store.set_override(1245620, "   ".into()).is_err());
         store.set_override(1245620, "USERKEY1234".into()).unwrap();
 
         let data = store.get(1245620).unwrap();
@@ -556,6 +529,48 @@ mod tests {
             .unwrap();
         assert!(result.contains('-'));
         assert_eq!(result.len(), 19);
+    }
+
+    #[test]
+    fn test_set_and_remove_override_preserves_tickets_and_steam_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_path = tmp.path();
+
+        // Write an AppTicket first
+        let mut tickets = TicketStore::new(store_path);
+        tickets
+            .set(AppTicketData {
+                app_id: 1245620,
+                steam_id: Some("76561198028121353".into()),
+                app_ticket: Some("deadbeef".into()),
+                e_ticket: Some("cafebabe".into()),
+                last_update: None,
+            })
+            .unwrap();
+
+        let mut cdkeys = LegacyCdKeyStore::new(store_path);
+        // Apps without LegacyCDKey must NOT appear in list_app_ids
+        assert!(cdkeys.list_app_ids().unwrap().is_empty());
+
+        cdkeys
+            .set_override(1245620, "KEY-1111-2222-3333".into())
+            .unwrap();
+        assert_eq!(cdkeys.list_app_ids().unwrap(), vec![1245620]);
+
+        // Ticket fields must still be intact!
+        let mut tickets2 = TicketStore::new(store_path);
+        let t = tickets2.get(1245620).unwrap();
+        assert_eq!(t.app_ticket.as_deref(), Some("deadbeef"));
+        assert_eq!(t.e_ticket.as_deref(), Some("cafebabe"));
+
+        // Removing the LegacyCDKey must NOT delete the app's TicketStore block!
+        cdkeys.remove_override(1245620).unwrap();
+        assert!(cdkeys.list_app_ids().unwrap().is_empty());
+
+        let mut tickets3 = TicketStore::new(store_path);
+        let t3 = tickets3.get(1245620).unwrap();
+        assert_eq!(t3.app_ticket.as_deref(), Some("deadbeef"));
+        assert_eq!(t3.e_ticket.as_deref(), Some("cafebabe"));
     }
 
     #[test]

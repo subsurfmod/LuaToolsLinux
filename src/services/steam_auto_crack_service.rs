@@ -53,9 +53,22 @@ impl SteamAutoCrackService {
     }
 
     pub fn launch_for_app(&self, app_id: u32, install_path: &Path) -> Result<String, String> {
+        if !install_path.exists() {
+            return Err(format!(
+                "Game directory does not exist: {}",
+                install_path.display()
+            ));
+        }
+
+        let resolved_app_id = if app_id > 0 {
+            Some(app_id)
+        } else {
+            infer_app_id_from_dir(install_path)
+        };
+
         if self.has_native_goldberg() {
             let cfg = AutoPatchConfig {
-                app_id: if app_id > 0 { Some(app_id) } else { None },
+                app_id: resolved_app_id,
                 config_path: self.settings_template_dir(),
                 goldberg_path: self.goldberg_root(),
                 apply_path: install_path.to_path_buf(),
@@ -80,12 +93,25 @@ impl SteamAutoCrackService {
         }
 
         self.tools_manager
-            .launch_steamautopatch(app_id, install_path)
+            .launch_steamautopatch(resolved_app_id.unwrap_or(0), install_path)
     }
 
     pub fn launch_for_folder(&self, folder: &Path) -> Result<String, String> {
         self.launch_for_app(0, folder)
     }
+}
+
+fn infer_app_id_from_dir(dir: &Path) -> Option<u32> {
+    for rel in ["steam_appid.txt", "steam_settings/steam_appid.txt"] {
+        if let Ok(raw) = std::fs::read_to_string(dir.join(rel)) {
+            if let Ok(id) = raw.trim().parse::<u32>() {
+                if id > 0 {
+                    return Some(id);
+                }
+            }
+        }
+    }
+    None
 }
 
 impl Default for SteamAutoCrackService {
@@ -110,10 +136,15 @@ mod tests {
         assert!(svc.tool_path().is_none());
         let err = svc.launch_for_folder(tmp.path()).unwrap_err();
         assert!(err.contains("SteamAutoPatch"));
+
+        let missing_err = svc
+            .launch_for_app(1245620, &tmp.path().join("does_not_exist"))
+            .unwrap_err();
+        assert!(missing_err.contains("does not exist"));
     }
 
     #[test]
-    fn applies_native_goldberg_when_staged() {
+    fn applies_native_goldberg_when_staged_and_infers_appid_from_folder() {
         let tmp = tempfile::tempdir().unwrap();
         let mgr = ExternalToolsManager::new(Some(tmp.path().join("tools")));
         let gb_x64 = tmp.path().join("goldberg/regular/x64");
@@ -125,10 +156,12 @@ mod tests {
         let mut elf = vec![0x7f, b'E', b'L', b'F', 2, 1, 1, 0];
         elf.extend_from_slice(b"SteamUser021\0");
         fs::write(game_dir.join("libsteam_api.so"), &elf).unwrap();
+        fs::write(game_dir.join("steam_appid.txt"), "1245620\n").unwrap();
 
         let svc = SteamAutoCrackService::new(mgr);
         assert!(svc.is_available());
-        let msg = svc.launch_for_app(1245620, &game_dir).unwrap();
+        // launch_for_folder (app_id = 0) infers 1245620 from steam_appid.txt
+        let msg = svc.launch_for_folder(&game_dir).unwrap();
         assert!(msg.contains("Applied native Linux Goldberg"));
         assert_eq!(
             fs::read(game_dir.join("libsteam_api.so")).unwrap(),

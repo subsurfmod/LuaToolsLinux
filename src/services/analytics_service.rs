@@ -17,14 +17,7 @@ pub struct AnalyticsService {
 
 impl Default for AnalyticsService {
     fn default() -> Self {
-        let http = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(3))
-            .build();
-        Self {
-            http,
-            umami_host: "https://api.umami.is".to_string(),
-            website_id: "luatools-linux".to_string(),
-        }
+        Self::with_config("https://api.umami.is", "luatools-linux")
     }
 }
 
@@ -33,24 +26,44 @@ impl AnalyticsService {
         Self::default()
     }
 
-    /// Track an app launch. Best-effort: never throws.
-    pub fn track_app_launch(&self) {
-        let body = serde_json::json!({
+    pub fn with_config(umami_host: impl Into<String>, website_id: impl Into<String>) -> Self {
+        let http = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(2))
+            .timeout(Duration::from_secs(3))
+            .build();
+        let host = umami_host.into().trim().trim_end_matches('/').to_string();
+        Self {
+            http,
+            umami_host: host,
+            website_id: website_id.into().trim().to_string(),
+        }
+    }
+
+    fn build_launch_payload(&self) -> serde_json::Value {
+        serde_json::json!({
             "type": "event",
             "payload": {
-                "website": self.umami_host,
-                "hostname": self.website_id,
+                "website": self.website_id,
+                "hostname": "luatools-linux",
                 "url": format!("/launch/{}", VERSION),
                 "title": "App Launch",
             },
-        });
+        })
+    }
+
+    /// Track an app launch. Best-effort: never throws.
+    pub fn track_app_launch(&self) {
+        if self.umami_host.is_empty() || self.website_id.is_empty() {
+            return;
+        }
+        let body = self.build_launch_payload();
 
         let _ = self
             .http
             .post(&format!("{}/api/send", self.umami_host))
             .set(
                 "User-Agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
             )
             .send_json(body);
     }
@@ -68,9 +81,43 @@ mod tests {
     }
 
     #[test]
+    fn test_launch_payload_uses_website_id_not_host() {
+        let svc = AnalyticsService::with_config("https://api.umami.is/", "site-uuid-123");
+        assert_eq!(svc.umami_host, "https://api.umami.is");
+        let payload = svc.build_launch_payload();
+        assert_eq!(payload["type"], "event");
+        assert_eq!(payload["payload"]["website"], "site-uuid-123");
+        assert_eq!(payload["payload"]["hostname"], "luatools-linux");
+        assert_eq!(payload["payload"]["url"], format!("/launch/{}", VERSION));
+    }
+
+    #[test]
     fn test_track_app_launch_does_not_panic() {
-        let svc = AnalyticsService::new();
-        // Should not panic even if network is unreachable
+        // Use a closed loopback port so the test never hits external networks.
+        let svc = AnalyticsService::with_config("http://127.0.0.1:1", "luatools-linux");
         svc.track_app_launch();
+    }
+
+    #[test]
+    fn test_track_app_launch_posts_to_endpoint() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_ip().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut req = server.recv().unwrap();
+            let url = req.url().to_string();
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let _ = req.respond(tiny_http::Response::from_string("ok"));
+            (url, body)
+        });
+
+        let svc = AnalyticsService::with_config(format!("http://{}", addr), "my-site-id");
+        svc.track_app_launch();
+
+        let (url, body) = handle.join().unwrap();
+        assert_eq!(url, "/api/send");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["payload"]["website"], "my-site-id");
+        assert_eq!(parsed["payload"]["hostname"], "luatools-linux");
     }
 }

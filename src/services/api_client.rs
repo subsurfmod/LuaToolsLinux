@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -95,23 +97,24 @@ impl HubcapService {
 
     fn agent() -> ureq::Agent {
         ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
             .timeout(Duration::from_secs(120))
             .build()
     }
 
     pub fn get_stats(&self, key: &str) -> Option<HubcapStats> {
+        let trimmed = key.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
         let url = format!(
             "{}/api/v1/user/stats?api_key={}",
             HUBCAP_BASE_URL,
-            urlencoding::encode(key.trim())
+            urlencoding::encode(trimmed)
         );
         let val: Value = Self::agent().get(&url).call().ok()?.into_json().ok()?;
         Some(HubcapStats {
-            user_id: val
-                .get("user_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
+            user_id: json_id_to_string(val.get("user_id")),
             daily_usage: val.get("daily_usage").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
             daily_limit: val.get("daily_limit").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
             can_make_requests: val
@@ -122,10 +125,14 @@ impl HubcapService {
     }
 
     pub fn check_status(&self, key: &str, app_id: u32) -> Option<bool> {
+        let trimmed = key.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
         let url = format!("{}/api/v1/status/{}", HUBCAP_BASE_URL, app_id);
         let val: Value = Self::agent()
             .get(&url)
-            .set("Authorization", &format!("Bearer {}", key.trim()))
+            .set("Authorization", &format!("Bearer {}", trimmed))
             .call()
             .ok()?
             .into_json()
@@ -147,12 +154,16 @@ impl HubcapService {
     where
         F: FnMut(f32, String),
     {
+        let trimmed = key.trim();
+        if trimmed.is_empty() {
+            return Err("Hubcap API key is empty.".into());
+        }
         fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
         let url = format!(
             "{}/api/v1/manifest/{}?api_key={}",
             HUBCAP_BASE_URL,
             app_id,
-            urlencoding::encode(key.trim())
+            urlencoding::encode(trimmed)
         );
         let resp = match Self::agent().get(&url).call() {
             Ok(r) => r,
@@ -161,7 +172,12 @@ impl HubcapService {
             Err(ureq::Error::Status(404, _)) => {
                 return Err("No manifest available on Hubcap for this game.".into())
             }
-            Err(e) => return Err(format!("Hubcap download failed: {}", e)),
+            Err(e) => {
+                return Err(format!(
+                    "Hubcap download failed: {}",
+                    redact_api_key(&e.to_string())
+                ))
+            }
         };
 
         let out = dest_dir.join(format!("{}.zip", app_id));
@@ -182,14 +198,19 @@ impl LuaToolsApiClient {
 
     fn agent() -> ureq::Agent {
         ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))
             .build()
     }
 
     pub fn search_store(&self, query: &str) -> Result<Vec<SteamSearchItem>, String> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return Ok(Vec::new());
+        }
         let url = format!(
             "https://store.steampowered.com/api/storesearch/?term={}&l=english&cc=US",
-            urlencoding::encode(query.trim())
+            urlencoding::encode(trimmed)
         );
         let val: Value = Self::agent()
             .get(&url)
@@ -205,7 +226,11 @@ impl LuaToolsApiClient {
         let mut results = Vec::new();
         if let Some(items) = val.get("items").and_then(|v| v.as_array()) {
             for item in items.iter().take(18) {
-                let aid = item.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let aid = item
+                    .get("id")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|n| u32::try_from(n).ok())
+                    .unwrap_or(0);
                 if aid == 0 {
                     continue;
                 }
@@ -351,11 +376,7 @@ impl LuaToolsApiClient {
             ))
             .ok()?;
         Some(DlcInfo {
-            appid: val
-                .get("appid")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
+            appid: json_id_to_string(val.get("appid")),
             name: val
                 .get("name")
                 .and_then(|v| v.as_str())
@@ -504,28 +525,24 @@ impl LuaToolsApiClient {
                     .map(|list| {
                         list.iter()
                             .map(|t| DRMFixTag {
-                                id: t
-                                    .get("id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
+                                id: json_id_to_string(t.get("id")),
                                 name: t
                                     .get("name")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or_default()
                                     .to_string(),
-                                slug: String::new(),
+                                slug: t
+                                    .get("slug")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
                             })
                             .collect()
                     })
                     .unwrap_or_default();
 
                 out.push(DRMFixFixItem {
-                    id: f
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
+                    id: json_id_to_string(f.get("id")),
                     title: f
                         .get("title")
                         .and_then(|v| v.as_str())
@@ -575,8 +592,9 @@ impl LuaToolsApiClient {
         let signed_url = meta
             .get("url")
             .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| "Server returned an empty download URL.".to_string())?;
+            .map(str::trim)
+            .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
+            .ok_or_else(|| "Server returned an invalid or empty download URL.".to_string())?;
 
         fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
         let resp = Self::agent()
@@ -585,8 +603,9 @@ impl LuaToolsApiClient {
             .map_err(|e| format!("Signed download failed: {}", e))?;
 
         let cd = resp.header("content-disposition").unwrap_or("");
-        let fname =
-            filename_from_content_disposition(cd).unwrap_or_else(|| fallback_name.to_string());
+        let fname = filename_from_content_disposition(cd)
+            .or_else(|| sanitize_filename(fallback_name))
+            .unwrap_or_else(|| "download.bin".to_string());
         let out = dest_dir.join(fname);
         stream_response_to_file(resp, &out, &mut progress_cb)?;
         Ok(out)
@@ -665,17 +684,75 @@ impl LuaToolsApiClient {
     }
 }
 
+static STREAM_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn json_id_to_string(val: Option<&Value>) -> String {
+    match val {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn redact_api_key(msg: &str) -> String {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"(?i)(api_key=)[^&\s]+").unwrap());
+    re.replace_all(msg, "${1}<redacted>").into_owned()
+}
+
+fn sanitize_filename(raw: &str) -> Option<String> {
+    let normalized = raw.trim().replace('\\', "/");
+    let fname = Path::new(&normalized)
+        .file_name()
+        .and_then(|s| s.to_str())?
+        .trim();
+    if fname.is_empty()
+        || fname == "."
+        || fname == ".."
+        || fname.chars().any(|c| c.is_control() || c == '\0')
+    {
+        return None;
+    }
+    Some(fname.to_string())
+}
+
 fn filename_from_content_disposition(cd: &str) -> Option<String> {
     if cd.is_empty() {
         return None;
     }
-    let re = Regex::new(r#"(?i)filename\*?=(?:UTF-8'')?"?([^";\r\n]+)"?"#).ok()?;
-    let raw = re.captures(cd)?.get(1)?.as_str();
-    let decoded = urlencoding::decode(raw).ok()?;
-    Path::new(decoded.as_ref())
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(ToString::to_string)
+    static RE_STAR: OnceLock<Regex> = OnceLock::new();
+    static RE_PLAIN: OnceLock<Regex> = OnceLock::new();
+    let re_star = RE_STAR.get_or_init(|| {
+        Regex::new(r#"(?i)filename\*\s*=\s*(?:[A-Za-z0-9_-]+''\s*)?"?([^";\r\n]+)"?"#).unwrap()
+    });
+    let re_plain =
+        RE_PLAIN.get_or_init(|| Regex::new(r#"(?i)filename\s*=\s*"?([^";\r\n]+)"?"#).unwrap());
+
+    if let Some(raw) = re_star
+        .captures(cd)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str())
+    {
+        let decoded = urlencoding::decode(raw)
+            .map(|c| c.into_owned())
+            .unwrap_or_else(|_| raw.to_string());
+        if let Some(clean) = sanitize_filename(&decoded) {
+            return Some(clean);
+        }
+    }
+    if let Some(raw) = re_plain
+        .captures(cd)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str())
+    {
+        let decoded = urlencoding::decode(raw)
+            .map(|c| c.into_owned())
+            .unwrap_or_else(|_| raw.to_string());
+        if let Some(clean) = sanitize_filename(&decoded) {
+            return Some(clean);
+        }
+    }
+    None
 }
 
 pub fn stream_response_to_file<F>(
@@ -686,34 +763,149 @@ pub fn stream_response_to_file<F>(
 where
     F: FnMut(f32, String),
 {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
     let total = resp
         .header("content-length")
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
     let mut reader = resp.into_reader();
-    let mut out = File::create(dest).map_err(|e| e.to_string())?;
 
-    let mut buf = [0u8; 16 * 1024];
-    let mut downloaded: u64 = 0;
-    loop {
-        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
+    let seq = STREAM_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let base_name = dest
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("download");
+    let tmp_path = dest.with_file_name(format!(
+        ".{}.part.{}.{}",
+        base_name,
+        std::process::id(),
+        seq
+    ));
+
+    let write_res: Result<(), String> = (|| {
+        let mut out = File::create(&tmp_path).map_err(|e| e.to_string())?;
+        let mut buf = [0u8; 16 * 1024];
+        let mut downloaded: u64 = 0;
+        loop {
+            let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+            downloaded += n as u64;
+            if total > 0 {
+                let pct = ((downloaded as f32) / (total as f32)).clamp(0.0, 1.0);
+                progress_cb(
+                    pct,
+                    format!(
+                        "Downloading... {} KB / {} KB",
+                        downloaded / 1024,
+                        total / 1024
+                    ),
+                );
+            } else {
+                progress_cb(0.0, format!("Downloading... {} KB", downloaded / 1024));
+            }
         }
-        out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-        downloaded += n as u64;
-        if total > 0 {
-            let pct = (downloaded as f32) / (total as f32);
-            progress_cb(
-                pct,
-                format!(
-                    "Downloading... {} KB / {} KB",
-                    downloaded / 1024,
-                    total / 1024
-                ),
-            );
-        }
+        out.flush().map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
     }
-    out.flush().map_err(|e| e.to_string())?;
+
+    if let Err(e) = fs::rename(&tmp_path, dest) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e.to_string());
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_disposition_prefers_rfc5987_and_blocks_traversal() {
+        assert_eq!(
+            filename_from_content_disposition(
+                r#"attachment; filename="fallback.zip"; filename*=UTF-8''Elden%20Ring.zip"#
+            )
+            .as_deref(),
+            Some("Elden Ring.zip")
+        );
+        assert_eq!(
+            filename_from_content_disposition(r#"attachment; filename="..\..\evil.zip""#)
+                .as_deref(),
+            Some("evil.zip")
+        );
+        assert_eq!(
+            filename_from_content_disposition(r#"attachment; filename="..""#),
+            None
+        );
+        assert_eq!(
+            sanitize_filename("../../secret/fix.zip").as_deref(),
+            Some("fix.zip")
+        );
+        assert_eq!(sanitize_filename(".."), None);
+    }
+
+    #[test]
+    fn redacts_hubcap_api_key_in_error_messages() {
+        let err =
+            "https://hubcapmanifest.com/api/v1/manifest/730?api_key=smm_deadbeef&x=1: timeout";
+        let clean = redact_api_key(err);
+        assert!(!clean.contains("smm_deadbeef"));
+        assert!(clean.contains("api_key=<redacted>&x=1"));
+    }
+
+    #[test]
+    fn json_id_handles_strings_and_numbers() {
+        assert_eq!(json_id_to_string(Some(&Value::from(1245620))), "1245620");
+        assert_eq!(json_id_to_string(Some(&Value::from("abc-1"))), "abc-1");
+        assert_eq!(json_id_to_string(None), "");
+    }
+
+    #[test]
+    fn stream_response_to_file_writes_atomically_and_reports_progress() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_ip().unwrap();
+        let payload = vec![b'A'; 32 * 1024];
+        let payload_len = payload.len();
+        let payload_clone = payload.clone();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            let resp = tiny_http::Response::new(
+                tiny_http::StatusCode(200),
+                Vec::new(),
+                std::io::Cursor::new(payload_clone),
+                Some(payload_len),
+                None,
+            )
+            .with_chunked_threshold(payload_len + 1);
+            let _ = req.respond(resp);
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("nested/out.zip");
+        let resp = ureq::get(&format!("http://{}/file.zip", addr))
+            .call()
+            .unwrap();
+        let mut max_pct = 0.0f32;
+        stream_response_to_file(resp, &dest, &mut |pct, _| {
+            assert!((0.0..=1.0).contains(&pct));
+            if pct > max_pct {
+                max_pct = pct;
+            }
+        })
+        .unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(fs::read(&dest).unwrap(), payload);
+        assert!((max_pct - 1.0).abs() < 0.01);
+    }
 }

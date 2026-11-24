@@ -8,7 +8,8 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::os::unix::process::CommandExt;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use thiserror::Error;
@@ -73,16 +74,170 @@ impl ModuleInfo {
 /// This matches Windows FILETIME format.
 const UNIX_EPOCH_TO_FILETIME_OFFSET: u64 = 116444736000000000; // 100ns intervals between 1601 and 1970
 
+#[cfg(test)]
 fn unix_time_to_filetime(unix_secs: u64) -> u64 {
-    unix_secs * 10_000_000 + UNIX_EPOCH_TO_FILETIME_OFFSET
+    unix_secs
+        .saturating_mul(10_000_000)
+        .saturating_add(UNIX_EPOCH_TO_FILETIME_OFFSET)
 }
 
 /// Convert FILETIME (100ns intervals since Jan 1, 1601) to Unix time (seconds since 1970).
+#[cfg(test)]
 fn filetime_to_unix_time(filetime: u64) -> u64 {
     if filetime < UNIX_EPOCH_TO_FILETIME_OFFSET {
         return 0;
     }
     (filetime - UNIX_EPOCH_TO_FILETIME_OFFSET) / 10_000_000
+}
+
+fn ticks_and_boot_to_filetime(boot_time: u64, starttime_ticks: u64, clk_tck: u64) -> Option<u64> {
+    if clk_tck == 0 {
+        return None;
+    }
+    let ticks_100ns = (u128::from(starttime_ticks) * 10_000_000) / u128::from(clk_tck);
+    let total = u128::from(boot_time)
+        .checked_mul(10_000_000)?
+        .checked_add(u128::from(UNIX_EPOCH_TO_FILETIME_OFFSET))?
+        .checked_add(ticks_100ns)?;
+    u64::try_from(total).ok()
+}
+
+fn map_proc_io_err(pid: u32, file: &str, e: std::io::Error) -> ProcessError {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => ProcessError::ProcessNotFound(pid),
+        std::io::ErrorKind::PermissionDenied => ProcessError::PermissionDenied(pid),
+        _ => ProcessError::ProcReadError {
+            pid,
+            file: file.to_string(),
+            source: e,
+        },
+    }
+}
+
+fn parse_maps_modules(content: &str) -> Vec<ModuleInfo> {
+    let mut seen_paths: HashMap<String, ModuleInfo> = HashMap::new();
+
+    for line in content.lines() {
+        let mut rest = line.trim_start();
+        let Some(ws1) = rest.find(char::is_whitespace) else {
+            continue;
+        };
+        let range = &rest[..ws1];
+        rest = rest[ws1..].trim_start();
+
+        let Some(ws2) = rest.find(char::is_whitespace) else {
+            continue;
+        };
+        let perms = &rest[..ws2];
+        rest = rest[ws2..].trim_start();
+
+        // Skip offset, dev, inode (3 fields)
+        let mut ok = true;
+        for _ in 0..3 {
+            let Some(ws) = rest.find(char::is_whitespace) else {
+                ok = false;
+                break;
+            };
+            rest = rest[ws..].trim_start();
+        }
+        if !ok || rest.is_empty() {
+            continue;
+        }
+
+        let path_clean = rest.strip_suffix(" (deleted)").unwrap_or(rest).trim();
+        if path_clean.is_empty() || path_clean.starts_with('[') {
+            // Skip anonymous mappings like [stack], [heap], [vdso], etc.
+            continue;
+        }
+
+        let size = if let Some((start_str, end_str)) = range.split_once('-') {
+            let start = u64::from_str_radix(start_str, 16).unwrap_or(0);
+            let end = u64::from_str_radix(end_str, 16).unwrap_or(0);
+            u32::try_from(end.saturating_sub(start)).unwrap_or(u32::MAX)
+        } else {
+            0
+        };
+
+        let executable = perms.contains('x');
+
+        if let Some(existing) = seen_paths.get_mut(path_clean) {
+            existing.size = existing.size.saturating_add(size);
+            existing.executable |= executable;
+        } else {
+            seen_paths.insert(
+                path_clean.to_string(),
+                ModuleInfo {
+                    path: path_clean.to_string(),
+                    native_path: PathBuf::from(path_clean),
+                    size,
+                    executable,
+                },
+            );
+        }
+    }
+
+    let mut modules: Vec<ModuleInfo> = seen_paths.into_values().collect();
+    modules.sort_by(|a, b| a.path.cmp(&b.path));
+    modules
+}
+
+fn split_command_line(command_line: &str) -> Option<Vec<String>> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut token_started = false;
+
+    for ch in command_line.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            token_started = true;
+            continue;
+        }
+
+        if ch == '\\' && !in_single {
+            escaped = true;
+            token_started = true;
+            continue;
+        }
+
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            token_started = true;
+            continue;
+        }
+
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            token_started = true;
+            continue;
+        }
+
+        if ch.is_whitespace() && !in_single && !in_double {
+            if token_started {
+                args.push(std::mem::take(&mut current));
+                token_started = false;
+            }
+            continue;
+        }
+
+        current.push(ch);
+        token_started = true;
+    }
+
+    if in_single || in_double || escaped {
+        return None;
+    }
+    if token_started {
+        args.push(current);
+    }
+    if args.is_empty() {
+        None
+    } else {
+        Some(args)
+    }
 }
 
 /// Get process creation time (start time) from /proc/<pid>/stat.
@@ -117,8 +272,7 @@ pub fn get_creation_time(pid: u32) -> Option<u64> {
         return None;
     }
 
-    let start_time_secs = boot_time + (starttime_ticks / (clk_tck as u64));
-    Some(unix_time_to_filetime(start_time_secs))
+    ticks_and_boot_to_filetime(boot_time, starttime_ticks, clk_tck as u64)
 }
 
 /// Get system boot time from /proc/stat (Unix timestamp in seconds).
@@ -145,12 +299,17 @@ pub fn format_creation_time(file_time: u64) -> String {
         return "-".to_string();
     }
 
-    let unix_secs = filetime_to_unix_time(file_time);
-    if unix_secs == 0 {
+    if file_time < UNIX_EPOCH_TO_FILETIME_OFFSET {
         return format!("filetime={}", file_time);
     }
 
-    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(unix_secs as i64, 0);
+    let since_unix_100ns = file_time - UNIX_EPOCH_TO_FILETIME_OFFSET;
+    let Ok(unix_secs) = i64::try_from(since_unix_100ns / 10_000_000) else {
+        return format!("filetime={}", file_time);
+    };
+    let nanos = ((since_unix_100ns % 10_000_000) * 100) as u32;
+
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(unix_secs, nanos);
     dt.map(|d| d.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
         .unwrap_or_else(|| format!("filetime={}", file_time))
 }
@@ -255,94 +414,7 @@ pub fn enumerate_modules(pid: u32) -> Vec<ModuleInfo> {
         Err(_) => return Vec::new(),
     };
 
-    let mut modules = Vec::new();
-    let mut seen_paths: HashMap<String, ModuleInfo> = HashMap::new();
-
-    for line in content.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 6 {
-            continue;
-        }
-
-        // Parse address range
-        let range = parts[0];
-        let perms = parts[1];
-        // let offset_str = parts[2]; // unused
-        let path_str = parts[5..].join(" ");
-        let path_clean = path_str.trim_end_matches(" (deleted)").trim();
-
-        if path_clean.is_empty() || path_clean.starts_with('[') {
-            // Skip anonymous mappings like [stack], [heap], [vdso], etc.
-            continue;
-        }
-
-        let path = Path::new(path_clean);
-
-        // Parse size from address range (start-end)
-        let size = if let Some((start_str, end_str)) = range.split_once('-') {
-            let start = u64::from_str_radix(start_str, 16).unwrap_or(0);
-            let end = u64::from_str_radix(end_str, 16).unwrap_or(0);
-            (end.saturating_sub(start)) as u32
-        } else {
-            0
-        };
-
-        let executable = perms.contains('x');
-
-        // Deduplicate by path, keep the first (usually the main mapping)
-        if let Some(existing) = seen_paths.get(path_clean) {
-            // Merge sizes if this is a different mapping of the same file
-            if existing.executable != executable {
-                // Update if we found an executable mapping
-                if executable {
-                    seen_paths.insert(
-                        path_clean.to_string(),
-                        ModuleInfo {
-                            path: path_clean.to_string(),
-                            native_path: path.to_path_buf(),
-                            size: existing.size + size,
-                            executable: true,
-                        },
-                    );
-                } else {
-                    seen_paths.insert(
-                        path_clean.to_string(),
-                        ModuleInfo {
-                            path: path_clean.to_string(),
-                            native_path: path.to_path_buf(),
-                            size: existing.size + size,
-                            executable: existing.executable,
-                        },
-                    );
-                }
-            } else {
-                // Same executable status, just add size
-                seen_paths.insert(
-                    path_clean.to_string(),
-                    ModuleInfo {
-                        path: path_clean.to_string(),
-                        native_path: path.to_path_buf(),
-                        size: existing.size + size,
-                        executable,
-                    },
-                );
-            }
-        } else {
-            seen_paths.insert(
-                path_clean.to_string(),
-                ModuleInfo {
-                    path: path_clean.to_string(),
-                    native_path: path.to_path_buf(),
-                    size,
-                    executable,
-                },
-            );
-        }
-    }
-
-    modules.extend(seen_paths.into_values());
-    modules.sort_by(|a, b| a.path.cmp(&b.path));
-    modules
+    parse_maps_modules(&content)
 }
 
 /// Check if a path is a system module path (under /usr/lib, /lib, etc.).
@@ -355,6 +427,10 @@ pub fn enumerate_modules(pid: u32) -> Vec<ModuleInfo> {
 /// True if the path is under a system library directory.
 pub fn is_system_module_path(path: &str) -> bool {
     let path = Path::new(path);
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return false;
+    }
+
     let system_dirs = [
         "/usr/lib",
         "/lib",
@@ -378,40 +454,44 @@ pub fn is_system_module_path(path: &str) -> bool {
 
 /// Launch a detached, hidden process (equivalent to Windows CreateProcess with
 /// DETACHED_PROCESS | CREATE_NO_WINDOW).
-/// The child does not share a console and is not tied to the caller's lifetime.
+/// Creates a new session via `setsid()` and reaps the child in a detached reaper
+/// thread so no zombie `<defunct>` processes accumulate.
 ///
 /// # Arguments
-/// * `command_line` - Full command line to execute (program + args)
+/// * `command_line` - Full command line to execute (program + args, supports quotes)
 ///
 /// # Returns
 /// True if the process was created successfully.
 pub fn launch_detached_hidden(command_line: &str) -> bool {
-    if command_line.trim().is_empty() {
+    let Some(parts) = split_command_line(command_line.trim()) else {
         return false;
-    }
+    };
 
-    // Parse command line into program + args
-    let parts: Vec<&str> = command_line.split_whitespace().collect();
-    if parts.is_empty() {
-        return false;
-    }
-
-    let program = parts[0];
+    let program = &parts[0];
     let args = &parts[1..];
 
-    // Use setsid to detach from controlling terminal
-    let result = Command::new(program)
-        .args(args)
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+        .stderr(std::process::Stdio::null());
 
-    match result {
-        Ok(child) => {
-            // On Unix, just don't wait on the child - it will be reaped by init
-            // This is the equivalent of Windows DETACHED_PROCESS
-            std::mem::forget(child);
+    // Safety: setsid() is async-signal-safe per POSIX.1-2008.
+    unsafe {
+        cmd.pre_exec(|| {
+            let _ = libc::setsid();
+            Ok(())
+        });
+    }
+
+    match cmd.spawn() {
+        Ok(mut child) => {
+            // Reap the detached child asynchronously so it never lingers as a zombie.
+            let _ = std::thread::Builder::new()
+                .name("ost-child-reaper".to_string())
+                .spawn(move || {
+                    let _ = child.wait();
+                });
             true
         }
         Err(_) => false,
@@ -426,11 +506,7 @@ pub fn get_creation_time_checked(pid: u32) -> Result<u64> {
     }
 
     let stat_path = format!("/proc/{}/stat", pid);
-    let content = fs::read_to_string(&stat_path).map_err(|e| ProcessError::ProcReadError {
-        pid,
-        file: "stat".to_string(),
-        source: e,
-    })?;
+    let content = fs::read_to_string(&stat_path).map_err(|e| map_proc_io_err(pid, "stat", e))?;
 
     let starttime_ticks = parse_stat_starttime(&content).ok_or_else(|| {
         ProcessError::ParseError("failed to parse starttime from /proc/stat".into())
@@ -447,8 +523,8 @@ pub fn get_creation_time_checked(pid: u32) -> Result<u64> {
         ));
     }
 
-    let start_time_secs = boot_time + (starttime_ticks / (clk_tck as u64));
-    Ok(unix_time_to_filetime(start_time_secs))
+    ticks_and_boot_to_filetime(boot_time, starttime_ticks, clk_tck as u64)
+        .ok_or_else(|| ProcessError::ParseError("overflow computing process FILETIME".into()))
 }
 
 /// Get image path with full error information.
@@ -460,19 +536,7 @@ pub fn get_image_path_checked(pid: u32) -> Result<String> {
     let exe_path = format!("/proc/{}/exe", pid);
     fs::read_link(&exe_path)
         .map(|p| p.to_string_lossy().to_string())
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                ProcessError::ProcessNotFound(pid)
-            } else if e.kind() == std::io::ErrorKind::PermissionDenied {
-                ProcessError::PermissionDenied(pid)
-            } else {
-                ProcessError::ProcReadError {
-                    pid,
-                    file: "exe".to_string(),
-                    source: e,
-                }
-            }
-        })
+        .map_err(|e| map_proc_io_err(pid, "exe", e))
 }
 
 /// Get environment variable with full error information.
@@ -485,11 +549,7 @@ pub fn get_environment_variable_value_checked(pid: u32, name: &str) -> Result<Op
     }
 
     let environ_path = format!("/proc/{}/environ", pid);
-    let content = fs::read(&environ_path).map_err(|e| ProcessError::ProcReadError {
-        pid,
-        file: "environ".to_string(),
-        source: e,
-    })?;
+    let content = fs::read(&environ_path).map_err(|e| map_proc_io_err(pid, "environ", e))?;
 
     for part in content.split(|&b| b == 0) {
         if let Ok(s) = std::str::from_utf8(part) {
@@ -510,11 +570,7 @@ pub fn get_process_command_line_checked(pid: u32) -> Result<Option<String>> {
     }
 
     let cmdline_path = format!("/proc/{}/cmdline", pid);
-    let content = fs::read(&cmdline_path).map_err(|e| ProcessError::ProcReadError {
-        pid,
-        file: "cmdline".to_string(),
-        source: e,
-    })?;
+    let content = fs::read(&cmdline_path).map_err(|e| map_proc_io_err(pid, "cmdline", e))?;
 
     let args: Vec<String> = content
         .split(|&b| b == 0)
@@ -537,92 +593,8 @@ pub fn enumerate_modules_checked(pid: u32) -> Result<Vec<ModuleInfo>> {
     }
 
     let maps_path = format!("/proc/{}/maps", pid);
-    let content = fs::read_to_string(&maps_path).map_err(|e| ProcessError::ProcReadError {
-        pid,
-        file: "maps".to_string(),
-        source: e,
-    })?;
-
-    let mut modules = Vec::new();
-    let mut seen_paths: HashMap<String, ModuleInfo> = HashMap::new();
-
-    for line in content.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 6 {
-            continue;
-        }
-
-        let range = parts[0];
-        let perms = parts[1];
-        let path_str = parts[5..].join(" ");
-        let path_clean = path_str.trim_end_matches(" (deleted)").trim();
-
-        if path_clean.is_empty() || path_clean.starts_with('[') {
-            continue;
-        }
-
-        let path = Path::new(path_clean);
-
-        let size = if let Some((start_str, end_str)) = range.split_once('-') {
-            let start = u64::from_str_radix(start_str, 16).unwrap_or(0);
-            let end = u64::from_str_radix(end_str, 16).unwrap_or(0);
-            (end.saturating_sub(start)) as u32
-        } else {
-            0
-        };
-
-        let executable = perms.contains('x');
-
-        if let Some(existing) = seen_paths.get(path_clean) {
-            if existing.executable != executable {
-                if executable {
-                    seen_paths.insert(
-                        path_clean.to_string(),
-                        ModuleInfo {
-                            path: path_clean.to_string(),
-                            native_path: path.to_path_buf(),
-                            size: existing.size + size,
-                            executable: true,
-                        },
-                    );
-                } else {
-                    seen_paths.insert(
-                        path_clean.to_string(),
-                        ModuleInfo {
-                            path: path_clean.to_string(),
-                            native_path: path.to_path_buf(),
-                            size: existing.size + size,
-                            executable: existing.executable,
-                        },
-                    );
-                }
-            } else {
-                seen_paths.insert(
-                    path_clean.to_string(),
-                    ModuleInfo {
-                        path: path_clean.to_string(),
-                        native_path: path.to_path_buf(),
-                        size: existing.size + size,
-                        executable,
-                    },
-                );
-            }
-        } else {
-            seen_paths.insert(
-                path_clean.to_string(),
-                ModuleInfo {
-                    path: path_clean.to_string(),
-                    native_path: path.to_path_buf(),
-                    size,
-                    executable,
-                },
-            );
-        }
-    }
-
-    modules.extend(seen_paths.into_values());
-    modules.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(modules)
+    let content = fs::read_to_string(&maps_path).map_err(|e| map_proc_io_err(pid, "maps", e))?;
+    Ok(parse_maps_modules(&content))
 }
 
 #[cfg(test)]
@@ -866,5 +838,48 @@ mod tests {
     fn test_get_env_var_invalid_pid() {
         let value = get_environment_variable_value(0, "TEST");
         assert!(value.is_none(), "PID 0 should return None");
+    }
+
+    #[test]
+    fn test_format_creation_time_subsecond_and_epoch() {
+        // Unix epoch itself should format as 1970-01-01 00:00:00.000
+        assert_eq!(
+            format_creation_time(UNIX_EPOCH_TO_FILETIME_OFFSET),
+            "1970-01-01 00:00:00.000"
+        );
+        // 123 milliseconds past 2024-01-15 14:30:45 UTC
+        let ft = unix_time_to_filetime(1_705_329_045) + 1_230_000;
+        assert_eq!(format_creation_time(ft), "2024-01-15 14:30:45.123");
+
+        // Sub-second tick precision preserved
+        let ft_ticks = ticks_and_boot_to_filetime(1_705_329_045, 50, 100).unwrap();
+        assert_eq!(format_creation_time(ft_ticks), "2024-01-15 14:30:45.500");
+    }
+
+    #[test]
+    fn test_parse_maps_modules_saturating_size_and_spaces() {
+        let maps = "\
+0000000000001000-0000000100001000 r-xp 00000000 08:01 1 /opt/my  game/libhuge.so\n\
+0000000100001000-0000000100002000 rw-p 00000000 08:01 1 /opt/my  game/libhuge.so\n\
+00007fff00000000-00007fff00021000 rw-p 00000000 00:00 0 [stack]\n";
+        let mods = parse_maps_modules(maps);
+        assert_eq!(mods.len(), 1);
+        assert_eq!(mods[0].path, "/opt/my  game/libhuge.so");
+        assert_eq!(mods[0].size, u32::MAX);
+        assert!(mods[0].executable);
+    }
+
+    #[test]
+    fn test_is_system_module_rejects_parent_traversal() {
+        assert!(!is_system_module_path("/usr/lib/../../tmp/evil.so"));
+    }
+
+    #[test]
+    fn test_split_command_line_quotes() {
+        assert_eq!(
+            split_command_line("\"/usr/bin/my app\" --flag 'hello world'").unwrap(),
+            vec!["/usr/bin/my app", "--flag", "hello world"]
+        );
+        assert!(split_command_line("\"unterminated").is_none());
     }
 }

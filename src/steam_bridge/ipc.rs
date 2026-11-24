@@ -8,16 +8,36 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::Shutdown;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+/// Hard upper bound for a single IPC JSON payload (1 MiB) to prevent memory exhaustion.
+pub const MAX_IPC_MESSAGE_BYTES: usize = 1024 * 1024;
+const MAX_CONCURRENT_IPC_CONNECTIONS: usize = 32;
+
 pub type IpcHandlerFn = dyn Fn(IpcMessage) -> Option<IpcMessage> + Send + Sync;
+
+fn read_bounded_string<R: Read>(reader: R, max_bytes: usize) -> Result<String, String> {
+    let mut buf = Vec::new();
+    reader
+        .take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("Receive error: {}", e))?;
+    if buf.len() > max_bytes {
+        return Err(format!(
+            "IPC payload exceeds maximum size of {} bytes",
+            max_bytes
+        ));
+    }
+    String::from_utf8(buf).map_err(|e| format!("Invalid UTF-8 in IPC payload: {}", e))
+}
 
 /// Socket path for the IPC channel.
 pub fn ipc_socket_path() -> PathBuf {
@@ -114,8 +134,18 @@ impl IpcMessage {
 pub struct IpcServer {
     socket_path: PathBuf,
     listener: Option<UnixListener>,
+    accept_thread: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
-    handler: Arc<Mutex<Box<IpcHandlerFn>>>,
+    active_connections: Arc<AtomicUsize>,
+    handler: Arc<RwLock<Arc<IpcHandlerFn>>>,
+}
+
+struct ActiveConnGuard(Arc<AtomicUsize>);
+
+impl Drop for ActiveConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl Default for IpcServer {
@@ -133,8 +163,10 @@ impl IpcServer {
         Self {
             socket_path,
             listener: None,
+            accept_thread: None,
             stop: Arc::new(AtomicBool::new(false)),
-            handler: Arc::new(Mutex::new(Box::new(|_msg| None))),
+            active_connections: Arc::new(AtomicUsize::new(0)),
+            handler: Arc::new(RwLock::new(Arc::new(|_msg| None))),
         }
     }
 
@@ -142,10 +174,13 @@ impl IpcServer {
     where
         F: Fn(IpcMessage) -> Option<IpcMessage> + Send + Sync + 'static,
     {
-        *self.handler.lock().unwrap_or_else(|e| e.into_inner()) = Box::new(handler);
+        *self.handler.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(handler);
     }
 
     pub fn start(&mut self) -> Result<(), String> {
+        if self.listener.is_some() {
+            self.stop();
+        }
         if let Some(parent) = self.socket_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -157,45 +192,59 @@ impl IpcServer {
                 e
             )
         })?;
+        // Restrict socket access to the current user (especially important if fallback is /tmp).
+        let _ = std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o600));
         let thread_listener = listener
             .try_clone()
             .map_err(|e| format!("Failed to clone IPC listener: {}", e))?;
-        self.stop.store(false, Ordering::Relaxed);
+        self.stop.store(false, Ordering::Release);
         self.listener = Some(listener);
 
         let stop = Arc::clone(&self.stop);
         let handler = Arc::clone(&self.handler);
+        let active_connections = Arc::clone(&self.active_connections);
 
-        thread::spawn(move || {
+        let handle = thread::spawn(move || {
             for stream in thread_listener.incoming() {
-                if stop.load(Ordering::Relaxed) {
+                if stop.load(Ordering::Acquire) {
                     break;
                 }
                 match stream {
                     Ok(mut stream) => {
-                        let handler = Arc::clone(&handler);
+                        let prev = active_connections.fetch_add(1, Ordering::AcqRel);
+                        if prev >= MAX_CONCURRENT_IPC_CONNECTIONS {
+                            active_connections.fetch_sub(1, Ordering::AcqRel);
+                            let _ = stream.shutdown(Shutdown::Both);
+                            continue;
+                        }
+                        let handler_lock = Arc::clone(&handler);
+                        let guard = ActiveConnGuard(Arc::clone(&active_connections));
                         thread::spawn(move || {
+                            let _conn_guard = guard;
                             let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
                             let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
-                            let mut raw = String::new();
-                            if stream.read_to_string(&mut raw).is_ok() && !raw.trim().is_empty() {
-                                if let Ok(msg) = IpcMessage::from_json(raw.trim()) {
-                                    let response = std::panic::catch_unwind(
-                                        std::panic::AssertUnwindSafe(|| {
-                                            let guard =
-                                                handler.lock().unwrap_or_else(|e| e.into_inner());
-                                            (guard)(msg)
-                                        }),
-                                    )
-                                    .unwrap_or_else(|_| {
-                                        eprintln!(
-                                            "[steam_ipc] recovered from panic in IPC handler"
+                            if let Ok(raw) = read_bounded_string(&mut stream, MAX_IPC_MESSAGE_BYTES)
+                            {
+                                let trimmed = raw.trim();
+                                if !trimmed.is_empty() {
+                                    if let Ok(msg) = IpcMessage::from_json(trimmed) {
+                                        let handler_fn = Arc::clone(
+                                            &handler_lock.read().unwrap_or_else(|e| e.into_inner()),
                                         );
-                                        None
-                                    });
-                                    if let Some(resp) = response {
-                                        if let Ok(js) = resp.to_json() {
-                                            let _ = stream.write_all(js.as_bytes());
+                                        let response = std::panic::catch_unwind(
+                                            std::panic::AssertUnwindSafe(move || (handler_fn)(msg)),
+                                        )
+                                        .unwrap_or_else(|_| {
+                                            eprintln!(
+                                                "[steam_ipc] recovered from panic in IPC handler"
+                                            );
+                                            None
+                                        });
+                                        if let Some(resp) = response {
+                                            if let Ok(js) = resp.to_json() {
+                                                let _ = stream.write_all(js.as_bytes());
+                                                let _ = stream.flush();
+                                            }
                                         }
                                     }
                                 }
@@ -204,22 +253,26 @@ impl IpcServer {
                         });
                     }
                     Err(_) => {
-                        if stop.load(Ordering::Relaxed) {
+                        if stop.load(Ordering::Acquire) {
                             break;
                         }
                     }
                 }
             }
         });
+        self.accept_thread = Some(handle);
 
         Ok(())
     }
 
     pub fn stop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.store(true, Ordering::Release);
         if self.listener.take().is_some() {
             // Wake up blocking accept() cleanly and remove only a socket this server owned
             let _ = UnixStream::connect(&self.socket_path);
+            if let Some(handle) = self.accept_thread.take() {
+                let _ = handle.join();
+            }
             let _ = std::fs::remove_file(&self.socket_path);
         }
     }
@@ -263,15 +316,19 @@ impl IpcClient {
         let json = msg
             .to_json()
             .map_err(|e| format!("Serialization error: {}", e))?;
+        if json.len() > MAX_IPC_MESSAGE_BYTES {
+            return Err(format!(
+                "IPC message exceeds maximum size of {} bytes",
+                MAX_IPC_MESSAGE_BYTES
+            ));
+        }
         stream
             .write_all(json.as_bytes())
             .map_err(|e| format!("Send error: {}", e))?;
+        let _ = stream.flush();
         let _ = stream.shutdown(Shutdown::Write);
 
-        let mut raw = String::new();
-        stream
-            .read_to_string(&mut raw)
-            .map_err(|e| format!("Receive error: {}", e))?;
+        let raw = read_bounded_string(&mut stream, MAX_IPC_MESSAGE_BYTES)?;
 
         if raw.trim().is_empty() {
             return Ok(None);
@@ -320,6 +377,10 @@ mod tests {
         });
         srv.start().unwrap();
 
+        // Socket permissions should be owner-only (0600)
+        let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
         let client = IpcClient::with_socket_path(&sock);
         assert!(client.ping().unwrap());
 
@@ -342,7 +403,58 @@ mod tests {
             } if app_id == 1245620 && depot_id == 1245621 && manifest_id == "abc123" && active
         ));
 
+        // Restarting an active server should cleanly rebind without leaking
+        srv.start().unwrap();
+        assert!(client.ping().unwrap());
+
         srv.stop();
+        assert!(!sock.exists());
+    }
+
+    #[test]
+    fn server_recovers_from_handler_panic_and_rejects_oversized_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("panic_ipc.sock");
+
+        let mut srv = IpcServer::with_socket_path(sock.clone());
+        srv.set_handler(|msg| match msg {
+            IpcMessage::Ping => Some(IpcMessage::Pong {
+                active: true,
+                version: "test".into(),
+            }),
+            IpcMessage::RemoveTicket { app_id: 666 } => panic!("simulated handler panic"),
+            _ => None,
+        });
+        srv.start().unwrap();
+
+        let client = IpcClient::with_socket_path(&sock);
+        // Trigger panic in handler -> server must stay alive and return None
+        assert!(client
+            .send(&IpcMessage::RemoveTicket { app_id: 666 })
+            .unwrap()
+            .is_none());
+        assert!(client.ping().unwrap());
+
+        // Oversized client payload must be rejected before writing
+        let huge = IpcMessage::SetLegacyCdKey {
+            app_id: 1,
+            key: "A".repeat(MAX_IPC_MESSAGE_BYTES + 16),
+        };
+        assert!(client.send(&huge).is_err());
+
+        srv.stop();
+    }
+
+    #[test]
+    fn read_bounded_string_rejects_oversized_and_invalid_utf8() {
+        let big = vec![b'x'; 32];
+        assert!(read_bounded_string(big.as_slice(), 16).is_err());
+        assert_eq!(
+            read_bounded_string(&big[..16], 16).unwrap(),
+            "xxxxxxxxxxxxxxxx"
+        );
+        let bad_utf8: &[u8] = &[0xFF, 0xFE];
+        assert!(read_bounded_string(bad_utf8, 16).is_err());
     }
 
     #[test]

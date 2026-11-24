@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# LuaTools Linux v2.0.0 — Native Package Builder (.rpm, .deb, .tar.gz, AppDir)
+# LuaTools Linux — Native Package Builder (.rpm, .deb, .tar.gz, AppDir)
 # ==============================================================================
 set -euo pipefail
 
-VERSION="2.9.0-beta"
+VERSION="2.9.1-beta"
 ARCH="$(uname -m)"
 DEB_ARCH="amd64"
 [ "$ARCH" = "aarch64" ] && DEB_ARCH="arm64"
@@ -60,9 +60,12 @@ if command -v rpmbuild >/dev/null 2>&1; then
     cp -f "${SCRIPT_DIR}/luatools-linux.spec" "${RPM_TOP}/SPECS/luatools-linux.spec"
 
     rpmbuild --define "_topdir ${RPM_TOP}" --define "_tmppath ${RPM_TOP}/TMP" -bb "${RPM_TOP}/SPECS/luatools-linux.spec"
-    find "${RPM_TOP}/RPMS" -name "*.rpm" -exec cp -f {} "${DIST_DIR}/" \;
+    BUILT_RPM="$(find "${RPM_TOP}/RPMS" -name "*.rpm" | head -n1)"
+    if [ -n "$BUILT_RPM" ]; then
+        cp -f "$BUILT_RPM" "${DIST_DIR}/"
+        echo "  -> ${DIST_DIR}/$(basename "$BUILT_RPM")"
+    fi
     rm -rf "$RPM_TOP"
-    echo "  -> $(ls -1 "${DIST_DIR}"/*.rpm | tail -n1)"
 else
     echo "[3/4] Skipping .rpm (rpmbuild not installed)."
 fi
@@ -99,7 +102,7 @@ Depends: libegl1, libgl1, libx11-6, libxkbcommon0, xdg-utils
 Recommends: zenity
 Maintainer: LuaTools Linux Contributors <noreply@lua.tools>
 Description: Native Rust workstation for Steam stplug-in lua manifests and fixes
- Lightweight hardware-accelerated native Linux port of LuaTools v2.0.0.
+ Lightweight hardware-accelerated native Linux edition of LuaTools (${VERSION}).
 EOF
 
 DEB_OUT="${DIST_DIR}/luatools-linux_${VERSION}_${DEB_ARCH}.deb"

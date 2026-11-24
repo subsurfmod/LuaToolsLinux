@@ -10,7 +10,7 @@
 //! - Variable-length encoding for integers
 
 use std::collections::BTreeMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +34,9 @@ pub struct BkvNode {
 }
 
 const MAX_BKV_ALLOC_LEN: usize = 64 * 1024 * 1024;
+const MAX_BKV_NAME_LEN: usize = 64 * 1024;
+const MAX_BKV_DEPTH: usize = 64;
+const READ_CHUNK_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BkvError {
@@ -64,16 +67,23 @@ impl<R: Read + Seek> BkvReader<R> {
 
     pub fn parse(&mut self) -> Result<BkvValue, BkvError> {
         let mut magic = [0u8; 4];
-        self.reader.read_exact(&mut magic)?;
+        self.read_exact_checked(&mut magic)?;
         if magic != [b'B', b'K', b'V', 0] {
             return Err(BkvError::InvalidMagic(magic));
         }
 
-        let (_name, value) = self.read_node()?;
+        let (_name, value) = self.read_node(0)?;
         Ok(value)
     }
 
-    fn read_node(&mut self) -> Result<(String, BkvValue), BkvError> {
+    fn read_node(&mut self, depth: usize) -> Result<(String, BkvValue), BkvError> {
+        if depth > MAX_BKV_DEPTH {
+            return Err(BkvError::Parse(format!(
+                "Maximum BKV nesting depth ({}) exceeded",
+                MAX_BKV_DEPTH
+            )));
+        }
+
         let node_type = self.read_u8()?;
         let name = self.read_null_terminated_string()?;
 
@@ -87,14 +97,20 @@ impl<R: Read + Seek> BkvReader<R> {
             6 => BkvValue::Color(self.read_color()?),
             7 => BkvValue::UInt64(self.read_uint64()?),
             8 => BkvValue::Binary(self.read_binary()?),
-            9 => BkvValue::Object(self.read_object()?),
-            10 => BkvValue::Array(self.read_array()?),
+            9 => BkvValue::Object(self.read_object(depth + 1)?),
+            10 => BkvValue::Array(self.read_array(depth + 1)?),
             t => return Err(BkvError::InvalidNodeType(t)),
         };
         Ok((name, value))
     }
 
-    fn read_object(&mut self) -> Result<BTreeMap<String, BkvValue>, BkvError> {
+    fn read_object(&mut self, depth: usize) -> Result<BTreeMap<String, BkvValue>, BkvError> {
+        if depth > MAX_BKV_DEPTH {
+            return Err(BkvError::Parse(format!(
+                "Maximum BKV nesting depth ({}) exceeded",
+                MAX_BKV_DEPTH
+            )));
+        }
         let mut map = BTreeMap::new();
         loop {
             let node_type = self.peek_u8()?;
@@ -103,13 +119,19 @@ impl<R: Read + Seek> BkvReader<R> {
                 let _name = self.read_null_terminated_string()?;
                 break;
             }
-            let (child_name, child_value) = self.read_node()?;
+            let (child_name, child_value) = self.read_node(depth)?;
             map.insert(child_name, child_value);
         }
         Ok(map)
     }
 
-    fn read_array(&mut self) -> Result<Vec<BkvValue>, BkvError> {
+    fn read_array(&mut self, depth: usize) -> Result<Vec<BkvValue>, BkvError> {
+        if depth > MAX_BKV_DEPTH {
+            return Err(BkvError::Parse(format!(
+                "Maximum BKV nesting depth ({}) exceeded",
+                MAX_BKV_DEPTH
+            )));
+        }
         let mut arr = Vec::new();
         loop {
             let node_type = self.peek_u8()?;
@@ -118,34 +140,47 @@ impl<R: Read + Seek> BkvReader<R> {
                 let _name = self.read_null_terminated_string()?;
                 break;
             }
-            let (_child_name, value) = self.read_node()?;
+            let (_child_name, value) = self.read_node(depth)?;
             arr.push(value);
         }
         Ok(arr)
     }
 
+    fn read_bounded_bytes(&mut self, len: usize) -> Result<Vec<u8>, BkvError> {
+        let mut buf = Vec::with_capacity(len.min(READ_CHUNK_SIZE));
+        let mut remaining = len;
+        let mut chunk = [0u8; 4096];
+        while remaining > 0 {
+            let to_read = remaining.min(chunk.len());
+            self.read_exact_checked(&mut chunk[..to_read])?;
+            buf.extend_from_slice(&chunk[..to_read]);
+            remaining -= to_read;
+        }
+        Ok(buf)
+    }
+
     fn read_string(&mut self) -> Result<String, BkvError> {
-        let len = self.read_varint()? as usize;
-        if len > MAX_BKV_ALLOC_LEN {
+        let raw_len = self.read_varint()?;
+        if raw_len > MAX_BKV_ALLOC_LEN as u64 {
             return Err(BkvError::Parse(format!(
                 "String length {} exceeds limit",
-                len
+                raw_len
             )));
         }
-        let mut buf = vec![0u8; len];
-        self.reader.read_exact(&mut buf)?;
+        let buf = self.read_bounded_bytes(raw_len as usize)?;
         Ok(String::from_utf8(buf)?)
     }
 
     fn read_wide_string(&mut self) -> Result<String, BkvError> {
-        let len = self.read_varint()? as usize;
-        if len > MAX_BKV_ALLOC_LEN / 2 {
+        let raw_len = self.read_varint()?;
+        if raw_len > (MAX_BKV_ALLOC_LEN / 2) as u64 {
             return Err(BkvError::Parse(format!(
                 "WideString length {} exceeds limit",
-                len
+                raw_len
             )));
         }
-        let mut buf = Vec::with_capacity(len);
+        let len = raw_len as usize;
+        let mut buf = Vec::with_capacity(len.min(READ_CHUNK_SIZE / 2));
         for _ in 0..len {
             buf.push(self.read_u16_le()?);
         }
@@ -174,16 +209,14 @@ impl<R: Read + Seek> BkvReader<R> {
     }
 
     fn read_binary(&mut self) -> Result<Vec<u8>, BkvError> {
-        let len = self.read_varint()? as usize;
-        if len > MAX_BKV_ALLOC_LEN {
+        let raw_len = self.read_varint()?;
+        if raw_len > MAX_BKV_ALLOC_LEN as u64 {
             return Err(BkvError::Parse(format!(
                 "Binary length {} exceeds limit",
-                len
+                raw_len
             )));
         }
-        let mut buf = vec![0u8; len];
-        self.reader.read_exact(&mut buf)?;
-        Ok(buf)
+        self.read_bounded_bytes(raw_len as usize)
     }
 
     fn read_null_terminated_string(&mut self) -> Result<String, BkvError> {
@@ -193,6 +226,12 @@ impl<R: Read + Seek> BkvReader<R> {
             if b == 0 {
                 break;
             }
+            if buf.len() >= MAX_BKV_NAME_LEN {
+                return Err(BkvError::Parse(format!(
+                    "Node name length exceeds limit ({})",
+                    MAX_BKV_NAME_LEN
+                )));
+            }
             buf.push(b);
         }
         Ok(String::from_utf8(buf)?)
@@ -200,9 +239,12 @@ impl<R: Read + Seek> BkvReader<R> {
 
     fn read_varint(&mut self) -> Result<u64, BkvError> {
         let mut result = 0u64;
-        let mut shift = 0;
+        let mut shift = 0u32;
         loop {
             let byte = self.read_u8()?;
+            if shift == 63 && (byte & 0x7F) > 1 {
+                return Err(BkvError::Parse("VarInt overflow".into()));
+            }
             result |= ((byte & 0x7F) as u64) << shift;
             if byte & 0x80 == 0 {
                 break;
@@ -215,21 +257,31 @@ impl<R: Read + Seek> BkvReader<R> {
         Ok(result)
     }
 
+    fn read_exact_checked(&mut self, buf: &mut [u8]) -> Result<(), BkvError> {
+        self.reader.read_exact(buf).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                BkvError::UnexpectedEof
+            } else {
+                BkvError::Io(e)
+            }
+        })
+    }
+
     fn read_u8(&mut self) -> Result<u8, BkvError> {
         let mut buf = [0u8; 1];
-        self.reader.read_exact(&mut buf)?;
+        self.read_exact_checked(&mut buf)?;
         Ok(buf[0])
     }
 
     fn read_u16_le(&mut self) -> Result<u16, BkvError> {
         let mut buf = [0u8; 2];
-        self.reader.read_exact(&mut buf)?;
+        self.read_exact_checked(&mut buf)?;
         Ok(u16::from_le_bytes(buf))
     }
 
     fn read_u32_le(&mut self) -> Result<u32, BkvError> {
         let mut buf = [0u8; 4];
-        self.reader.read_exact(&mut buf)?;
+        self.read_exact_checked(&mut buf)?;
         Ok(u32::from_le_bytes(buf))
     }
 
@@ -244,14 +296,14 @@ impl<R: Read + Seek> BkvReader<R> {
 /// Parse a BKV file from disk
 pub fn parse_bkv_file<P: AsRef<Path>>(path: P) -> Result<BkvValue, BkvError> {
     let file = std::fs::File::open(path)?;
-    let mut reader = BkvReader::new(file);
+    let mut reader = BkvReader::new(BufReader::new(file));
     reader.parse()
 }
 
 /// Extract achievements from a parsed UserGameStats BKV
 pub fn extract_achievements(bkv: &BkvValue) -> BTreeMap<String, AchievementData> {
     let mut achievements = BTreeMap::new();
-    extract_achievements_recursive(bkv, &mut achievements);
+    extract_achievements_recursive(bkv, &mut achievements, 0);
     achievements
 }
 
@@ -264,7 +316,14 @@ pub struct AchievementData {
     pub max_progress: Option<i32>,
 }
 
-fn extract_achievements_recursive(value: &BkvValue, out: &mut BTreeMap<String, AchievementData>) {
+fn extract_achievements_recursive(
+    value: &BkvValue,
+    out: &mut BTreeMap<String, AchievementData>,
+    depth: usize,
+) {
+    if depth > MAX_BKV_DEPTH {
+        return;
+    }
     match value {
         BkvValue::Object(map) => {
             // Check if this is an achievement node
@@ -276,8 +335,10 @@ fn extract_achievements_recursive(value: &BkvValue, out: &mut BTreeMap<String, A
                     unlocked: *unlocked != 0,
                     ..Default::default()
                 };
-                if let Some(BkvValue::Int32(t)) = map.get("unlockTime") {
-                    ach.unlock_time = Some(*t as u32);
+                match map.get("unlockTime") {
+                    Some(BkvValue::Int32(t)) => ach.unlock_time = Some(*t as u32),
+                    Some(BkvValue::UInt64(t)) => ach.unlock_time = u32::try_from(*t).ok(),
+                    _ => {}
                 }
                 if let Some(BkvValue::Int32(p)) = map.get("progress") {
                     ach.progress = Some(*p);
@@ -289,12 +350,12 @@ fn extract_achievements_recursive(value: &BkvValue, out: &mut BTreeMap<String, A
             }
             // Recurse into children
             for v in map.values() {
-                extract_achievements_recursive(v, out);
+                extract_achievements_recursive(v, out, depth + 1);
             }
         }
         BkvValue::Array(arr) => {
             for v in arr {
-                extract_achievements_recursive(v, out);
+                extract_achievements_recursive(v, out, depth + 1);
             }
         }
         _ => {}
@@ -308,11 +369,14 @@ pub fn find_user_game_stats_file(
     app_id: u32,
 ) -> Option<std::path::PathBuf> {
     let pattern = format!("UserGameStats_{}_{}.bin", account_id, app_id);
-    let depot_cache = steam_config_dir.parent()?.join("depotcache");
-    if depot_cache.exists() {
-        let path = depot_cache.join(&pattern);
-        if path.exists() {
-            return Some(path);
+    if let Some(parent) = steam_config_dir.parent() {
+        let appcache_stats = parent.join("appcache").join("stats").join(&pattern);
+        if appcache_stats.exists() {
+            return Some(appcache_stats);
+        }
+        let depot_cache = parent.join("depotcache").join(&pattern);
+        if depot_cache.exists() {
+            return Some(depot_cache);
         }
     }
     // Also check config directory
@@ -420,5 +484,77 @@ mod tests {
         } else {
             panic!("Expected object");
         }
+    }
+
+    #[test]
+    fn test_rejects_excessive_nesting_depth() {
+        let mut data = vec![b'B', b'K', b'V', 0];
+        for _ in 0..(MAX_BKV_DEPTH + 5) {
+            data.push(9); // Object
+            data.push(0); // empty name
+        }
+        let mut cursor = Cursor::new(data);
+        let mut reader = BkvReader::new(&mut cursor);
+        let err = reader.parse().unwrap_err();
+        assert!(matches!(err, BkvError::Parse(_)));
+    }
+
+    #[test]
+    fn test_varint_overflow_on_10th_byte() {
+        // 9 continuation bytes + 10th byte with value 2 (overflows u64)
+        let data = vec![0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02];
+        let mut cursor = Cursor::new(data);
+        let mut reader = BkvReader::new(&mut cursor);
+        assert!(matches!(reader.read_varint(), Err(BkvError::Parse(_))));
+
+        // u64::MAX should still decode cleanly
+        let max_bytes = vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01];
+        let mut cursor_max = Cursor::new(max_bytes);
+        let mut reader_max = BkvReader::new(&mut cursor_max);
+        assert_eq!(reader_max.read_varint().unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn test_truncated_large_length_returns_unexpected_eof_without_oom() {
+        // Claims a 32 MiB string in a 12-byte buffer
+        let mut data = vec![b'B', b'K', b'V', 0, 1, b's', 0];
+        // varint for 33_554_432 (0x0200_0000): 0x80, 0x80, 0x80, 0x10
+        data.extend_from_slice(&[0x80, 0x80, 0x80, 0x10]);
+        data.extend_from_slice(b"abc");
+
+        let mut cursor = Cursor::new(data);
+        let mut reader = BkvReader::new(&mut cursor);
+        assert!(matches!(reader.parse(), Err(BkvError::UnexpectedEof)));
+    }
+
+    #[test]
+    fn test_extract_achievements_and_find_stats_file() {
+        let mut ach = BTreeMap::new();
+        ach.insert("name".into(), BkvValue::String("ACH_FIRST_BLOOD".into()));
+        ach.insert("unlocked".into(), BkvValue::Int32(1));
+        ach.insert("unlockTime".into(), BkvValue::UInt64(1_700_000_000));
+        ach.insert("progress".into(), BkvValue::Int32(5));
+        ach.insert("maxProgress".into(), BkvValue::Int32(10));
+
+        let root = BkvValue::Array(vec![BkvValue::Object(ach)]);
+        let extracted = extract_achievements(&root);
+        let item = extracted.get("ACH_FIRST_BLOOD").expect("achievement");
+        assert!(item.unlocked);
+        assert_eq!(item.unlock_time, Some(1_700_000_000));
+        assert_eq!(item.progress, Some(5));
+        assert_eq!(item.max_progress, Some(10));
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        let appcache_stats = dir.path().join("appcache").join("stats");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&appcache_stats).unwrap();
+
+        let stats_file = appcache_stats.join("UserGameStats_123_456.bin");
+        std::fs::write(&stats_file, b"BKV\0").unwrap();
+        assert_eq!(
+            find_user_game_stats_file(&config_dir, 123, 456),
+            Some(stats_file)
+        );
     }
 }

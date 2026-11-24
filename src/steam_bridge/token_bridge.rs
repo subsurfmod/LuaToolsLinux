@@ -4,10 +4,30 @@
 //! Provides URI parsing, scheme registration, and integration with the Steam client.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex_str) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(val) = u8::from_str_radix(hex_str, 16) {
+                    out.push(val);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
 
 /// BST URI structure parsed from a `bst://` URI.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BstUri {
     /// The app ID associated with this URI.
     pub app_id: u32,
@@ -20,12 +40,20 @@ pub struct BstUri {
 }
 
 impl BstUri {
-    /// Parse a `bst://` URI string.
+    /// Parse a `bst://` URI string (case-insensitive scheme, strips `#fragment`, percent-decodes values).
     ///
     /// Supports both query strings (`bst://<appid>/<token>?k1=v1&k2=v2`) and
     /// slash-delimited `key=value` segments (`bst://<appid>/<token>/k1=v1`).
     pub fn parse(uri: &str) -> Option<Self> {
-        let rest = uri.strip_prefix("bst://")?;
+        let trimmed = uri.trim();
+        let (scheme, rest_full) = trimmed.split_once("://")?;
+        if !scheme.eq_ignore_ascii_case("bst") {
+            return None;
+        }
+        // Strip optional URI fragment (`#...`)
+        let rest = rest_full
+            .split_once('#')
+            .map_or(rest_full, |(before, _)| before);
         if rest.is_empty() {
             return None;
         }
@@ -48,10 +76,12 @@ impl BstUri {
         let mut params = HashMap::new();
 
         if parts.len() > 1 {
-            token = parts[1].to_string();
+            token = percent_decode(parts[1]);
             for part in parts.iter().skip(2) {
                 if let Some((k, v)) = part.split_once('=') {
-                    params.insert(k.to_string(), v.to_string());
+                    if !k.is_empty() {
+                        params.insert(percent_decode(k), percent_decode(v));
+                    }
                 }
             }
         }
@@ -60,16 +90,23 @@ impl BstUri {
             for pair in query.split('&') {
                 if let Some((k, v)) = pair.split_once('=') {
                     if !k.is_empty() {
-                        params.insert(k.to_string(), v.to_string());
+                        params.insert(percent_decode(k), percent_decode(v));
                     }
                 }
             }
         }
 
+        let version = params
+            .get("v")
+            .or_else(|| params.get("version"))
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(1);
+
         Some(BstUri {
             app_id,
             token,
-            version: 1,
+            version,
             params,
         })
     }
@@ -86,7 +123,7 @@ pub type BstUriHandler = Box<dyn Fn(&BstUri) -> Option<BstUri> + Send + Sync>;
 /// TokenBridge service that handles `bst://` URI requests.
 pub struct TokenBridge {
     /// Registered URI handlers.
-    handlers: Arc<Mutex<Vec<BstUriHandler>>>,
+    handlers: Arc<RwLock<Vec<BstUriHandler>>>,
 }
 
 impl Default for TokenBridge {
@@ -99,22 +136,38 @@ impl TokenBridge {
     /// Create a new TokenBridge instance.
     pub fn new() -> Self {
         TokenBridge {
-            handlers: Arc::new(Mutex::new(Vec::new())),
+            handlers: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
     /// Register a handler for `bst://` URIs.
     pub fn register_handler(&mut self, handler: BstUriHandler) {
         self.handlers
-            .lock()
+            .write()
             .unwrap_or_else(|e| e.into_inner())
             .push(handler);
+    }
+
+    /// Remove all registered handlers.
+    pub fn clear_handlers(&mut self) {
+        self.handlers
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// Return the number of registered handlers.
+    pub fn handler_count(&self) -> usize {
+        self.handlers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     /// Handle a `bst://` URI request by dispatching through registered handlers.
     pub fn handle_uri(&self, uri: &str) -> Option<BstUri> {
         let parsed = BstUri::parse(uri)?;
-        let handlers = self.handlers.lock().unwrap_or_else(|e| e.into_inner());
+        let handlers = self.handlers.read().unwrap_or_else(|e| e.into_inner());
         for handler in handlers.iter() {
             if let Some(handled) = handler(&parsed) {
                 return Some(handled);
@@ -133,6 +186,7 @@ mod tests {
         let uri = BstUri::parse("bst://12345/abc123token").unwrap();
         assert_eq!(uri.app_id, 12345);
         assert_eq!(uri.token, "abc123token");
+        assert_eq!(uri.version, 1);
         assert!(uri.is_valid());
     }
 
@@ -146,8 +200,27 @@ mod tests {
     }
 
     #[test]
+    fn test_bst_uri_case_insensitive_fragment_percent_decode_and_version() {
+        let uri = BstUri::parse("  BST://730/tok%2F1/mode=online?v=2&note=hello%20world#section  ")
+            .unwrap();
+        assert_eq!(uri.app_id, 730);
+        assert_eq!(uri.token, "tok/1");
+        assert_eq!(uri.version, 2);
+        assert_eq!(uri.params.get("mode").map(String::as_str), Some("online"));
+        assert_eq!(
+            uri.params.get("note").map(String::as_str),
+            Some("hello world")
+        );
+        assert!(uri.is_valid());
+    }
+
+    #[test]
     fn test_bst_uri_invalid() {
         assert!(BstUri::parse("http://example.com").is_none());
+        assert!(BstUri::parse("bst://").is_none());
+        assert!(BstUri::parse("bst://#onlyfrag").is_none());
+        let bad_app = BstUri::parse("bst://notanumber/tok").unwrap();
+        assert!(!bad_app.is_valid());
     }
 
     #[test]
@@ -157,11 +230,18 @@ mod tests {
     }
 
     #[test]
-    fn test_token_bridge_dispatch() {
+    fn test_token_bridge_dispatch_fallback_and_clear() {
         let mut bridge = TokenBridge::new();
+        bridge.register_handler(Box::new(|_| None));
         bridge.register_handler(Box::new(|u| Some(u.clone())));
+        assert_eq!(bridge.handler_count(), 2);
+
         let out = bridge.handle_uri("bst://730/sessiontok").unwrap();
         assert_eq!(out.app_id, 730);
         assert_eq!(out.token, "sessiontok");
+
+        bridge.clear_handlers();
+        assert_eq!(bridge.handler_count(), 0);
+        assert!(bridge.handle_uri("bst://730/sessiontok").is_none());
     }
 }

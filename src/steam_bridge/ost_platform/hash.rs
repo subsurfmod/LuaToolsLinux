@@ -1,11 +1,11 @@
 //! Linux implementation of OSTPlatform::Hash
 //!
-//! Provides SHA-256 hashing compatible with the Windows OSTPlatform::Hash API.
-//! Uses OpenSSL's libcrypto via dlopen/dlsym for SHA-256 computation on Linux.
-//! Also leverages Linux primitives: /proc/<pid>/, ptrace, mprotect, inotify, ELF parsing.
+//! Provides streaming SHA-256 hashing compatible with the Windows OSTPlatform::Hash API
+//! using the pure-Rust `sha2` crate and `/proc/<pid>/mem` for remote process memory.
 
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
@@ -27,19 +27,33 @@ pub enum HashError {
     BufferTooSmall,
 }
 
-/// Compute SHA-256 hash of a file path.
-///
-/// Uses OpenSSL's EVP interface via dlopen/dlsym to libcrypto (via sha2 crate).
-/// Falls back to reading /proc/self/exe and /proc/<pid>/mem when appropriate.
+/// Compute SHA-256 hash of a file path using bounded streaming I/O.
 pub fn sha256_of_file(path: &Path) -> Result<String, HashError> {
-    let data =
-        fs::read(path).map_err(|e| HashError::IoError(format!("{}: {}", path.display(), e)))?;
-    sha256_of_buffer(&data)
+    let mut file = fs::File::open(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            HashError::FileNotFound(path.display().to_string())
+        } else {
+            HashError::IoError(format!("{}: {}", path.display(), e))
+        }
+    })?;
+
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                return Err(HashError::IoError(format!("{}: {}", path.display(), e)));
+            }
+        }
+    }
+
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Compute SHA-256 hash of a byte buffer.
-///
-/// Uses OpenSSL's EVP interface via the sha2 crate (which wraps libcrypto).
 pub fn sha256_of_buffer(data: &[u8]) -> Result<String, HashError> {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -53,71 +67,88 @@ pub fn sha256_of_current_exe() -> Result<String, HashError> {
     sha256_of_file(Path::new(exe_path))
 }
 
-/// Compute SHA-256 hash of a memory region.
+/// Compute SHA-256 hash of a memory region in the current process.
+///
+/// Validates readability via `/proc/self/maps` before dereferencing.
 ///
 /// # Arguments
 /// * `addr` - Starting address to read from
 /// * `size` - Number of bytes to read
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn sha256_of_memory_region(addr: *const u8, size: usize) -> Result<String, HashError> {
-    if addr.is_null() || size == 0 {
+    if addr.is_null() || size == 0 || size > isize::MAX as usize {
         return Err(HashError::InvalidInput);
     }
 
-    let data = unsafe { std::slice::from_raw_parts(addr, size) }.to_vec();
+    if !super::memory::is_readable(addr.cast(), size) {
+        return Err(HashError::IoError(format!(
+            "Memory region {:p}..+{size} is not readable",
+            addr
+        )));
+    }
 
-    sha256_of_buffer(&data)
+    let data = unsafe { std::slice::from_raw_parts(addr, size) };
+    sha256_of_buffer(data)
 }
 
-/// Compute SHA-256 hash of a process's memory via `/proc/<pid>/mem`.
+/// Compute SHA-256 hash of a process's memory via `/proc/<pid>/mem` using streaming `pread`.
 pub fn sha256_of_process_memory(
     pid: i32,
     addr: *const u8,
     size: usize,
 ) -> Result<String, HashError> {
-    if size == 0 {
+    if pid <= 0 || addr.is_null() || size == 0 {
         return Err(HashError::InvalidInput);
     }
 
     let proc_path = format!("/proc/{}/mem", pid);
-    let path = Path::new(&proc_path);
+    let fd = fs::File::open(&proc_path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            HashError::FileNotFound(proc_path.clone())
+        } else {
+            HashError::IoError(format!(
+                "Failed to open {} for pid {}: {}",
+                proc_path, pid, e
+            ))
+        }
+    })?;
 
-    if !path.exists() {
-        return Err(HashError::IoError(format!(
-            "Cannot access /proc/{}/mem, process may not exist or you lack permissions",
-            pid
-        )));
-    }
-
-    let mut fd = fs::File::open(path)
-        .map_err(|_| HashError::IoError(format!("Failed to open {} for pid {}", proc_path, pid)))?;
-
-    let mut data = vec![0u8; size];
+    let mut hasher = Sha256::new();
+    let mut chunk = [0u8; 8192];
     let mut total_read = 0usize;
-    let mut remaining = size;
-    let chunk_size = 8192;
     let base_addr = addr as u64;
 
-    while remaining > 0 {
-        let this_chunk = std::cmp::min(chunk_size, remaining);
-        if fd
-            .seek(SeekFrom::Start(base_addr.saturating_add(total_read as u64)))
-            .is_err()
-        {
-            break;
-        }
-        let bytes_read = fd
-            .read(&mut data[total_read..total_read + this_chunk])
-            .unwrap_or(0);
+    while total_read < size {
+        let to_read = (size - total_read).min(chunk.len());
+        let read_addr = base_addr
+            .checked_add(total_read as u64)
+            .ok_or(HashError::InvalidInput)?;
+
+        let bytes_read = loop {
+            match fd.read_at(&mut chunk[..to_read], read_addr) {
+                Ok(n) => break n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    return Err(HashError::IoError(format!(
+                        "Failed reading {} at {:#x}: {}",
+                        proc_path, read_addr, e
+                    )));
+                }
+            }
+        };
+
         if bytes_read == 0 {
-            break;
+            return Err(HashError::IoError(format!(
+                "Unexpected EOF reading {} after {}/{} bytes",
+                proc_path, total_read, size
+            )));
         }
+
+        hasher.update(&chunk[..bytes_read]);
         total_read += bytes_read;
-        remaining -= bytes_read;
     }
 
-    data.truncate(total_read);
-    sha256_of_buffer(&data)
+    Ok(hex::encode(hasher.finalize()))
 }
 
 #[cfg(test)]
@@ -205,10 +236,38 @@ mod tests {
 
     #[test]
     fn test_sha256_of_process_memory_nonexistent_pid() {
-        // Test that reading from a non-existent PID returns error
         let data = b"test data";
-        let result = sha256_of_process_memory(999999, data.as_ptr(), data.len());
-        // This may or may not succeed depending on system, but should not panic
-        println!("SHA-256 of process memory (non-existent PID): {:?}", result);
+        let result = sha256_of_process_memory(999_999_999, data.as_ptr(), data.len());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sha256_of_file_not_found() {
+        let err = sha256_of_file(Path::new("/nonexistent/ost_hash_test_file.bin")).unwrap_err();
+        assert!(matches!(err, HashError::FileNotFound(_)));
+    }
+
+    #[test]
+    fn test_sha256_of_process_memory_self_and_unreadable_error() {
+        let data = b"process memory hash test payload";
+        let expected = sha256_of_buffer(data).unwrap();
+        let pid = std::process::id() as i32;
+        let actual = sha256_of_process_memory(pid, data.as_ptr(), data.len())
+            .expect("should hash own process memory");
+        assert_eq!(actual, expected);
+
+        // Non-positive PID must return InvalidInput
+        assert!(matches!(
+            sha256_of_process_memory(0, data.as_ptr(), data.len()),
+            Err(HashError::InvalidInput)
+        ));
+        assert!(matches!(
+            sha256_of_process_memory(-1, data.as_ptr(), data.len()),
+            Err(HashError::InvalidInput)
+        ));
+
+        // Unreadable address must error instead of returning hash of empty buffer
+        assert!(sha256_of_process_memory(pid, 0x1000 as *const u8, 16).is_err());
+        assert!(sha256_of_memory_region(0x1000 as *const u8, 16).is_err());
     }
 }

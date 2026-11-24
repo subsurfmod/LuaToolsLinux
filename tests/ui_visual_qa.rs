@@ -390,7 +390,7 @@ fn headless_papercut_views_render_cleanly_at_wide_and_narrow_resolutions() {
         }
         if fname == "09_settings_updates.png" {
             app.update_banner = luatools_linux::ui::state::UpdateBannerState::Available {
-                badge: "Update v2.9.0-beta".into(),
+                badge: format!("Update v{}", luatools_linux::VERSION),
                 tooltip: "New commits available on GitHub".into(),
             };
         } else {
@@ -469,4 +469,162 @@ fn headless_papercut_views_render_cleanly_at_wide_and_narrow_resolutions() {
             }
         }
     }
+}
+
+#[test]
+fn modals_render_cleanly_and_dismiss_with_escape() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = egui::Context::default();
+    let mut app = LuaToolsApp::new_headless_demo(&ctx, tmp.path());
+
+    let run_frame = |ctx: &egui::Context, app: &mut LuaToolsApp, send_esc: bool| {
+        let mut events = Vec::new();
+        if send_esc {
+            events.push(egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        let raw = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0))),
+            events,
+            ..Default::default()
+        };
+        let full = ctx.run(raw, |ctx| app.render_shell(ctx));
+        let prims = ctx.tessellate(full.shapes, 1.0);
+        assert!(!prims.is_empty());
+    };
+
+    // 1. About modal renders and closes on Escape
+    app.about_modal_open = true;
+    run_frame(&ctx, &mut app, false);
+    assert!(app.about_modal_open);
+    run_frame(&ctx, &mut app, true);
+    assert!(!app.about_modal_open);
+
+    // 2. Add-by-AppID modal renders (even with u32::MAX text) and closes on Escape
+    app.add_appid_modal.open = true;
+    app.add_appid_modal.app_id_input = u32::MAX.to_string();
+    app.add_appid_modal.template_idx = 2;
+    run_frame(&ctx, &mut app, false);
+    run_frame(&ctx, &mut app, true);
+    assert!(!app.add_appid_modal.open);
+
+    // 3. GameDetail modal renders with syntax-highlighted Lua and closes on Escape
+    app.open_game_detail_modal(1245620, "ELDEN RING".into());
+    app.game_detail_modal.lua_text = "addappid(1245620)\n".into();
+    run_frame(&ctx, &mut app, false);
+    assert!(app.game_detail_modal.open);
+    run_frame(&ctx, &mut app, true);
+    assert!(!app.game_detail_modal.open);
+
+    // 4. LaunchOptions modal renders and closes on Escape
+    app.open_launch_options_modal(1245620, "ELDEN RING".into());
+    run_frame(&ctx, &mut app, false);
+    assert!(app.launch_options_modal.open);
+    run_frame(&ctx, &mut app, true);
+    assert!(!app.launch_options_modal.open);
+
+    // 5. DepotDetail modal renders with copy buttons and closes on Escape
+    app.depot_detail_modal.open = true;
+    app.depot_detail_modal.entry = app
+        .depots_lua
+        .as_ref()
+        .and_then(|l| l.entries.first().cloned());
+    run_frame(&ctx, &mut app, false);
+    run_frame(&ctx, &mut app, true);
+    assert!(!app.depot_detail_modal.open);
+
+    // 6. TextPrompt modal renders and closes on Escape
+    app.text_prompt_modal.open = true;
+    app.text_prompt_modal.kind = "preset".into();
+    app.text_prompt_modal.title = "Save Preset".into();
+    app.text_prompt_modal.prompt = "Label:".into();
+    run_frame(&ctx, &mut app, false);
+    run_frame(&ctx, &mut app, true);
+    assert!(!app.text_prompt_modal.open);
+
+    // 7. Guide screenshot zoom modal renders and closes on Escape
+    app.guide_zoom_screenshot = Some(("01_home_overview", "Home Workspace"));
+    run_frame(&ctx, &mut app, false);
+    run_frame(&ctx, &mut app, true);
+    assert!(app.guide_zoom_screenshot.is_none());
+
+    // 8. First-run telemetry consent modal must NOT be skipped by Escape
+    app.settings_service.settings.telemetry_consent_seen = false;
+    run_frame(&ctx, &mut app, true);
+    assert!(!app.settings_service.settings.telemetry_consent_seen);
+}
+
+#[test]
+fn cover_cooldown_prevents_retry_storms_and_protects_high_res_urls() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = egui::Context::default();
+    let mut app = LuaToolsApp::new_headless_demo(&ctx, tmp.path());
+
+    let aid = 999_999;
+    let hi_url = "https://cdn.example.invalid/apps/999999/header.jpg".to_string();
+    let lo_url = "https://cdn.example.invalid/apps/999999/capsule_sm_120.jpg".to_string();
+
+    // Simulate a previous failure for the known high-res URL
+    app.cover_known_urls.insert(aid, hi_url.clone());
+    app.cover_failed_at.insert(aid, std::time::Instant::now());
+
+    // Passing the same failed URL again within 45s must NOT re-trigger an in-flight fetch
+    app.ensure_cover_requested(aid, Some(hi_url.clone()), &ctx);
+    assert!(
+        !app.cover_in_flight.contains(&aid),
+        "Failed cover URL must respect 45s cooldown instead of spawning retry storms"
+    );
+
+    // Passing a low-res thumbnail URL must NOT downgrade the known high-res URL or bypass cooldown
+    app.ensure_cover_requested(aid, Some(lo_url), &ctx);
+    assert_eq!(app.cover_known_urls.get(&aid), Some(&hi_url));
+    assert!(!app.cover_in_flight.contains(&aid));
+
+    // When a fetch IS already in flight, passing the same URL again must NOT populate cover_retry_urls
+    app.cover_in_flight.insert(aid);
+    app.ensure_cover_requested(aid, Some(hi_url.clone()), &ctx);
+    assert!(
+        !app.cover_retry_urls.contains_key(&aid),
+        "Identical URL must not queue a duplicate immediate retry"
+    );
+
+    // A genuinely new high-res URL while in flight SHOULD be queued for retry
+    let newer_url = "https://cdn.example.invalid/apps/999999/header_v2.jpg".to_string();
+    app.ensure_cover_requested(aid, Some(newer_url.clone()), &ctx);
+    assert_eq!(app.cover_retry_urls.get(&aid), Some(&newer_url));
+}
+
+#[test]
+fn lua_editor_widget_renders_with_validation_and_version_matches_release() {
+    assert_eq!(luatools_linux::VERSION, "2.9.1-beta");
+
+    let ctx = egui::Context::default();
+    let mut editor = luatools_linux::ui::lua_editor::LuaEditor::new();
+    editor.edit_live = true;
+    editor.set_text(
+        "addappid(1245620) -- ELDEN RING\naddappid(1245621, 1, \"shortkey\")\n".into(),
+        1245620,
+    );
+    assert!(!editor.has_errors());
+    assert!(editor
+        .warnings
+        .iter()
+        .any(|w| w.contains("invalid decryption key")));
+
+    let raw = RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+        ..Default::default()
+    };
+    let full = ctx.run(raw, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = editor.render(ui);
+        });
+    });
+    let prims = ctx.tessellate(full.shapes, 1.0);
+    assert!(!prims.is_empty());
 }

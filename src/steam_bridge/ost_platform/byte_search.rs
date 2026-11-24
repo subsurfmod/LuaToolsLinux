@@ -46,7 +46,7 @@ pub fn find_with_mask(bytes: &[u8], pattern: &[u8], mask: &[u8]) -> Option<usize
 pub fn find_in_file(path: &Path, pattern: &[u8], chunk_bytes: usize) -> Option<u64> {
     let file = File::open(path).ok()?;
     let file_size = file.metadata().ok()?.len();
-    find_in_file_range(path, 0, file_size, pattern, chunk_bytes)
+    find_in_open_file(file, 0, file_size, pattern, chunk_bytes)
 }
 
 /// Find a byte pattern in a file within a specific range `[offset, offset + size)`.
@@ -62,42 +62,74 @@ pub fn find_in_file_range(
         return None;
     }
 
-    let mut file = File::open(path).ok()?;
+    let file = File::open(path).ok()?;
+    find_in_open_file(file, offset, size, pattern, chunk_bytes)
+}
+
+fn find_in_open_file(
+    mut file: File,
+    offset: u64,
+    size: u64,
+    pattern: &[u8],
+    chunk_bytes: usize,
+) -> Option<u64> {
+    const DEFAULT_CHUNK_BYTES: usize = 64 * 1024;
+    const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+
+    if pattern.is_empty() || size < pattern.len() as u64 {
+        return None;
+    }
+
     file.seek(SeekFrom::Start(offset)).ok()?;
 
-    let chunk_size = chunk_bytes.max(pattern.len() * 2).min(size as usize);
-    let mut buffer = vec![0u8; chunk_size];
+    let requested_chunk = if chunk_bytes == 0 {
+        DEFAULT_CHUNK_BYTES
+    } else {
+        chunk_bytes
+    };
+    let size_usize = usize::try_from(size).unwrap_or(usize::MAX);
+    let chunk_size = requested_chunk
+        .max(pattern.len().saturating_mul(2))
+        .min(MAX_CHUNK_BYTES)
+        .min(size_usize);
+    let max_overlap = pattern.len().saturating_sub(1);
+
+    // Single reusable buffer: [0..overlap_len] holds tail from previous chunk,
+    // [overlap_len..overlap_len + bytes_read] receives newly read bytes.
+    let buf_len = max_overlap.checked_add(chunk_size)?;
+    let mut buffer = vec![0u8; buf_len];
+    let mut overlap_len = 0usize;
     let mut bytes_remaining = size;
     let mut file_offset = offset;
-    let max_overlap = pattern.len().saturating_sub(1);
-    let mut overlap: Vec<u8> = Vec::with_capacity(max_overlap);
 
     while bytes_remaining > 0 {
-        let to_read = chunk_size.min(bytes_remaining as usize);
-        let bytes_read = file.read(&mut buffer[..to_read]).ok()?;
+        let to_read = chunk_size.min(usize::try_from(bytes_remaining).unwrap_or(usize::MAX));
+        let bytes_read = loop {
+            match file.read(&mut buffer[overlap_len..overlap_len + to_read]) {
+                Ok(n) => break n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            }
+        };
         if bytes_read == 0 {
             break;
         }
 
-        let mut search_buffer = Vec::with_capacity(overlap.len() + bytes_read);
-        search_buffer.extend_from_slice(&overlap);
-        search_buffer.extend_from_slice(&buffer[..bytes_read]);
-
-        if let Some(pos) = search_buffer
-            .windows(pattern.len())
-            .position(|w| w == pattern)
-        {
-            let match_offset = file_offset - (overlap.len() as u64) + (pos as u64);
+        let valid_len = overlap_len + bytes_read;
+        if let Some(pos) = find(&buffer[..valid_len], pattern) {
+            let match_offset = file_offset
+                .checked_sub(overlap_len as u64)?
+                .checked_add(pos as u64)?;
             return Some(match_offset);
         }
 
         if max_overlap > 0 {
-            let keep = search_buffer.len().min(max_overlap);
-            overlap.clear();
-            overlap.extend_from_slice(&search_buffer[search_buffer.len() - keep..]);
+            let keep = valid_len.min(max_overlap);
+            buffer.copy_within(valid_len - keep..valid_len, 0);
+            overlap_len = keep;
         }
 
-        file_offset += bytes_read as u64;
+        file_offset = file_offset.checked_add(bytes_read as u64)?;
         bytes_remaining -= bytes_read as u64;
     }
 
@@ -168,5 +200,23 @@ mod tests {
             Some(5)
         );
         assert_eq!(find_in_file_range(&file_path, 0, 5, b"56789", 4096), None);
+    }
+
+    #[test]
+    fn test_find_in_file_zero_chunk_and_boundary_cases() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("boundary.bin");
+        let mut file = File::create(&file_path).unwrap();
+        file.write_all(b"aaaaaabbbbbTARGETccccc").unwrap();
+        file.flush().unwrap();
+
+        // chunk_bytes = 0 should fall back to default chunk size cleanly
+        assert_eq!(find_in_file(&file_path, b"TARGET", 0), Some(11));
+        // Single-byte pattern with tiny chunk
+        assert_eq!(find_in_file(&file_path, b"T", 1), Some(11));
+        // Pattern spanning exact chunk boundary
+        assert_eq!(find_in_file(&file_path, b"TARGET", 6), Some(11));
+        // Short mask should return None safely
+        assert_eq!(find_with_mask(b"abcd", b"ab", &[0xFF]), None);
     }
 }

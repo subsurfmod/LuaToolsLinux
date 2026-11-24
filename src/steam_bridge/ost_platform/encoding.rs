@@ -33,10 +33,12 @@ pub fn wide_to_utf8(value: &[u16]) -> Result<String, EncodingError> {
     String::from_utf16(value).map_err(|e| EncodingError::InvalidUtf16(format!("{:?}", e)))
 }
 
-/// Convert a UTF-16 (wide) string to UTF-8, returning empty string on error.
-/// Convenience wrapper for cases where silent failure is acceptable.
+/// Convert a UTF-16 (wide) string to UTF-8, replacing invalid UTF-16 sequences with U+FFFD.
 pub fn wide_to_utf8_lossy(value: &[u16]) -> String {
-    wide_to_utf8(value).unwrap_or_default()
+    if value.is_empty() {
+        return String::new();
+    }
+    String::from_utf16_lossy(value)
 }
 
 /// Convert a UTF-8 string to UTF-16 (wide) string.
@@ -66,21 +68,20 @@ pub fn utf8_to_wide_lossy(value: &str) -> Vec<u16> {
 }
 
 /// Convert a null-terminated UTF-16 string to UTF-8.
-/// Stops at the first null character.
+/// Stops at the first null character and replaces unpaired surrogates with U+FFFD.
 pub fn wide_to_utf8_cstr(value: &[u16]) -> String {
     let len = value.iter().position(|&c| c == 0).unwrap_or(value.len());
-    wide_to_utf8(&value[..len]).unwrap_or_default()
+    String::from_utf16_lossy(&value[..len])
 }
 
 /// Convert a null-terminated UTF-8 string to wide string.
-/// This is typically not needed on Linux but provided for API compatibility.
+/// Stops at the first embedded null character (if any).
 pub fn utf8_to_wide_cstr(value: &str) -> Vec<u16> {
     if value.is_empty() {
         return Vec::new();
     }
 
-    // Find the first null character (if any) and encode that portion
-    let len = value.len();
+    let len = value.find('\0').unwrap_or(value.len());
     let s = &value[..len];
     utf8_to_wide(s).unwrap_or_default()
 }
@@ -245,5 +246,33 @@ mod tests {
         let input: &[u16] = &[0xD800];
         let result = wide_to_utf8(input);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_wide_to_utf8_lossy_preserves_valid_chars() {
+        let input: &[u16] = &[b'a' as u16, 0xD800, b'b' as u16];
+        let result = wide_to_utf8_lossy(input);
+        assert_eq!(result, "a\u{FFFD}b");
+    }
+
+    #[test]
+    fn test_utf8_to_wide_cstr_stops_at_null() {
+        let wide = utf8_to_wide_cstr("hello\0world");
+        assert_eq!(
+            wide,
+            vec![
+                b'h' as u16,
+                b'e' as u16,
+                b'l' as u16,
+                b'l' as u16,
+                b'o' as u16
+            ]
+        );
+    }
+
+    #[test]
+    fn test_wide_to_utf8_cstr_lossy_before_null() {
+        let input: &[u16] = &[b'x' as u16, 0xDC00, b'y' as u16, 0, b'z' as u16];
+        assert_eq!(wide_to_utf8_cstr(input), "x\u{FFFD}y");
     }
 }

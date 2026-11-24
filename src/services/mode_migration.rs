@@ -62,8 +62,8 @@ impl ModeMigration {
     /// Migrate a legacy mode string to the current mode system.
     /// Returns the new mode and whether onboarding must be re-shown.
     pub fn migrate(&self, stored: Option<&str>) -> MigrationResult {
-        let stored = match stored {
-            Some(s) if !s.trim().is_empty() => s,
+        let stored = match stored.map(str::trim) {
+            Some(s) if !s.is_empty() => s,
             _ => return MigrationResult::new(UnlockerMode::None, false),
         };
 
@@ -72,13 +72,13 @@ impl ModeMigration {
             return MigrationResult::new(current, false);
         }
 
-        match stored {
+        match stored.to_ascii_lowercase().as_str() {
             // Both were branded "BetterSteamTools" in the UI, so BST is what these users think they run.
-            "OpenSteamTools" | "OpenSteamToolsNightly" => {
+            "opensteamtools" | "opensteamtoolsnightly" => {
                 MigrationResult::new(UnlockerMode::Bst, false)
             }
 
-            // SteamTools and the CloudRedirect fix are retired with nothing to map onto.
+            // Unknown or retired modes with nothing to map onto:
             // Clear the mode and send them back through onboarding.
             _ => MigrationResult::new(UnlockerMode::None, true),
         }
@@ -95,7 +95,7 @@ impl ModeMigration {
 
     /// Check if a mode migration is needed
     pub fn needs_migration(stored: Option<&str>) -> bool {
-        matches!(stored, Some(s) if !s.trim().is_empty() && UnlockerMode::try_from(s).is_err())
+        matches!(stored.map(str::trim), Some(s) if !s.is_empty() && UnlockerMode::try_from(s).is_err())
     }
 }
 
@@ -109,13 +109,15 @@ impl TryFrom<&str> for UnlockerMode {
     type Error = String;
 
     fn try_from(s: &str) -> Result<Self, Self::Error> {
-        match s {
-            "SteamTools" => Ok(UnlockerMode::SteamTools),
-            "Bst" | "BetterSteamTools" | "OpenSteamTool" | "OpenSteamTools" => {
+        let trimmed = s.trim();
+        match trimmed.to_ascii_lowercase().as_str() {
+            "steamtools" => Ok(UnlockerMode::SteamTools),
+            "bst" | "bettersteamtools" | "opensteamtool" | "opensteamtools" => {
                 Ok(UnlockerMode::Bst)
             }
-            "Custom" => Ok(UnlockerMode::Custom),
-            _ => Err(format!("Unknown mode: {}", s)),
+            "custom" => Ok(UnlockerMode::Custom),
+            "none" => Ok(UnlockerMode::None),
+            _ => Err(format!("Unknown mode: {}", trimmed)),
         }
     }
 }
@@ -138,6 +140,10 @@ mod tests {
         let result = migration.migrate(Some("OpenSteamTools"));
         assert_eq!(result.new_mode, UnlockerMode::Bst);
         assert!(!result.reset_onboarding);
+
+        let nightly = migration.migrate(Some("OpenSteamToolsNightly"));
+        assert_eq!(nightly.new_mode, UnlockerMode::Bst);
+        assert!(!nightly.reset_onboarding);
     }
 
     #[test]
@@ -149,17 +155,35 @@ mod tests {
     }
 
     #[test]
-    fn test_migrate_none() {
+    fn test_migrate_none_and_whitespace() {
         let migration = ModeMigration::new();
         let result = migration.migrate(None);
         assert_eq!(result.new_mode, UnlockerMode::None);
         assert!(!result.reset_onboarding);
+
+        let none_str = migration.migrate(Some("None"));
+        assert_eq!(none_str.new_mode, UnlockerMode::None);
+        assert!(!none_str.reset_onboarding);
+
+        let padded = migration.migrate(Some("  bst  "));
+        assert_eq!(padded.new_mode, UnlockerMode::Bst);
+        assert!(!padded.reset_onboarding);
     }
 
     #[test]
-    fn test_needs_migration() {
+    fn test_needs_migration_and_apply() {
         assert!(!ModeMigration::needs_migration(None));
+        assert!(!ModeMigration::needs_migration(Some("   ")));
         assert!(!ModeMigration::needs_migration(Some("Bst")));
+        assert!(!ModeMigration::needs_migration(Some("None")));
+        assert!(ModeMigration::needs_migration(Some(
+            "OpenSteamToolsNightly"
+        )));
         assert!(ModeMigration::needs_migration(Some("UnknownMode")));
+
+        let mut applied = UnlockerMode::None;
+        let reset = ModeMigration::new().apply(Some("OpenSteamToolsNightly"), |m| applied = m);
+        assert_eq!(applied, UnlockerMode::Bst);
+        assert!(!reset);
     }
 }

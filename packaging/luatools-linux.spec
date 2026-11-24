@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           luatools-linux
-Version:        2.9.0
+Version:        2.9.1
 Release:        0.1.beta%{?dist}
 Summary:        Native Rust workstation for Steam stplug-in lua manifests, depots, and fixes
 License:        MIT
@@ -20,7 +20,7 @@ Recommends:     bzip2
 Recommends:     p7zip
 
 %description
-LuaTools Linux v2.0.0 is a lightweight, zero-Python native Rust rewrite of LuaTools
+LuaTools Linux is a lightweight, zero-Python native Rust rewrite of LuaTools
 featuring a sharp-edged monotone + cobalt blue UI, Steam Store & Hubcap manifest
 acquisition, content-addressed LuaVault variant switching, DepotDownloaderMod
 integration, SHA-256 backed game fixes, SLSsteam YAML sync, and binary appinfo.vdf editing.
@@ -48,6 +48,8 @@ install -m 0644 %{_sourcedir}/luatools.desktop %{buildroot}%{_datadir}/applicati
 %{_datadir}/icons/hicolor/scalable/apps/luatools.svg
 
 %changelog
+* Tue Nov 24 2026 LuaTools Linux Contributors <noreply@lua.tools> - 2.9.1-0.1.beta
+- Beta v2.9.1-beta: Individual file-by-file audit & improvements across all 78 files changed since v2.6.1 (339/339 tests passing, 0 clippy warnings), installer/uninstaller shared-library staging fixes, and emoji-free Leonida-formatted README.md
 * Tue Nov 24 2026 LuaTools Linux Contributors <noreply@lua.tools> - 2.9.0-0.1.beta
 - Beta v2.9.0-beta: Merge & audit beta/v2.7.3-beta, beta/v2.8.2-beta, and 2.8.4-beta; remove duplicate nested repo copy and 32 stray/redundant files; restore hardened bridge_lib/src/lib.rs; fix all compile/runtime/UB bugs across interop, netpacket, credentials, token_bridge, and OSTPlatform Linux modules
 * Tue Nov 24 2026 LuaTools Linux Contributors <noreply@lua.tools> - 2.7.3-0.1.beta

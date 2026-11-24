@@ -59,11 +59,24 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn is_safe_fix_id(fix_id: &str) -> bool {
+    let s = fix_id.trim();
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && !s.contains("..")
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct FixesService;
 
 impl FixesService {
     pub fn is_fix_applied(install_dir: &Path, fix_id: &str) -> bool {
+        if !is_safe_fix_id(fix_id) {
+            return false;
+        }
         install_dir
             .join(FIX_DIR_NAME)
             .join(format!("{}.json", fix_id))
@@ -82,7 +95,15 @@ impl FixesService {
     where
         F: FnMut(f32, String),
     {
-        let tmp = std::env::temp_dir().join(format!("luatools_fix_mf_{}_{}", app_id, fix.id));
+        if !is_safe_fix_id(&fix.id) {
+            return FixApplicationResult::err("Invalid fix ID.");
+        }
+        let tmp = std::env::temp_dir().join(format!(
+            "luatools_fix_mf_{}_{}_{}",
+            std::process::id(),
+            app_id,
+            fix.id
+        ));
         let _ = fs::create_dir_all(&tmp);
         let fallback = fix
             .manifest_filename
@@ -134,6 +155,9 @@ impl FixesService {
     where
         F: FnMut(f32, String),
     {
+        if !is_safe_fix_id(&fix.id) {
+            return FixApplicationResult::err("Invalid fix ID.");
+        }
         if !install_dir.exists() {
             return FixApplicationResult::err(format!(
                 "Game directory does not exist: {}",
@@ -141,7 +165,12 @@ impl FixesService {
             ));
         }
 
-        let tmp = std::env::temp_dir().join(format!("luatools_fix_dl_{}_{}", app_id, fix.id));
+        let tmp = std::env::temp_dir().join(format!(
+            "luatools_fix_dl_{}_{}_{}",
+            std::process::id(),
+            app_id,
+            fix.id
+        ));
         let extract_dir = tmp.join("extract");
         let _ = fs::remove_dir_all(&tmp);
         if let Err(e) = fs::create_dir_all(&extract_dir) {
@@ -178,8 +207,15 @@ impl FixesService {
                 return FixApplicationResult::err("Invalid fix .zip archive.");
             };
             for i in 0..archive.len() {
-                let Ok(mut entry) = archive.by_index(i) else {
-                    continue;
+                let mut entry = match archive.by_index(i) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        let _ = fs::remove_dir_all(&tmp);
+                        return FixApplicationResult::err(format!(
+                            "Failed to read archive entry {}: {}",
+                            i, e
+                        ));
+                    }
                 };
                 if entry.is_dir() {
                     continue;
@@ -190,19 +226,60 @@ impl FixesService {
                 }
                 let target = extract_dir.join(&rel);
                 if let Some(p) = target.parent() {
-                    let _ = fs::create_dir_all(p);
+                    if let Err(e) = fs::create_dir_all(p) {
+                        let _ = fs::remove_dir_all(&tmp);
+                        return FixApplicationResult::err(format!(
+                            "Failed to create extraction directory: {}",
+                            e
+                        ));
+                    }
                 }
-                if let Ok(mut out) = File::create(&target) {
-                    let _ = io::copy(&mut entry, &mut out);
+                let mut out = match File::create(&target) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let _ = fs::remove_dir_all(&tmp);
+                        return FixApplicationResult::err(format!(
+                            "Failed to create extracted file '{}': {}",
+                            rel.display(),
+                            e
+                        ));
+                    }
+                };
+                if let Err(e) = io::copy(&mut entry, &mut out) {
+                    let _ = fs::remove_dir_all(&tmp);
+                    return FixApplicationResult::err(format!(
+                        "Failed to extract '{}': {}",
+                        rel.display(),
+                        e
+                    ));
                 }
             }
         } else if let Some(fname) = dl_path.file_name() {
-            let _ = fs::copy(&dl_path, extract_dir.join(fname));
+            if let Err(e) = fs::copy(&dl_path, extract_dir.join(fname)) {
+                let _ = fs::remove_dir_all(&tmp);
+                return FixApplicationResult::err(format!("Failed to stage fix file: {}", e));
+            }
         }
 
         let res = Self::apply_extracted_with_backup(app_id, &fix.id, &extract_dir, install_dir);
         let _ = fs::remove_dir_all(&tmp);
         res
+    }
+
+    fn rollback_partial_apply(game_dir: &Path, fix_meta_dir: &Path, records: &[FixFileEntry]) {
+        for entry in records.iter().rev() {
+            let dst = game_dir.join(&entry.relative_path);
+            if entry.action == "added" {
+                let _ = fs::remove_file(&dst);
+            } else if entry.action == "modified" {
+                if let Some(ref bkp_rel) = entry.backup_path {
+                    let bkp = fix_meta_dir.join(bkp_rel);
+                    if bkp.is_file() {
+                        let _ = fs::copy(&bkp, &dst);
+                    }
+                }
+            }
+        }
     }
 
     pub fn apply_extracted_with_backup(
@@ -211,14 +288,28 @@ impl FixesService {
         extract_dir: &Path,
         game_dir: &Path,
     ) -> FixApplicationResult {
+        if !is_safe_fix_id(fix_id) {
+            return FixApplicationResult::err("Invalid fix ID.");
+        }
+        if Self::is_fix_applied(game_dir, fix_id) {
+            return FixApplicationResult::err(format!(
+                "Fix '{}' is already applied. Revert it before re-applying to preserve original backups.",
+                fix_id
+            ));
+        }
+
+        let mut files_to_apply = Vec::new();
+        collect_files_recursive(extract_dir, &mut files_to_apply);
+        files_to_apply.sort();
+        if files_to_apply.is_empty() {
+            return FixApplicationResult::err("Fix archive contained no files to apply.");
+        }
+
         let fix_meta_dir = game_dir.join(FIX_DIR_NAME);
         let backup_dir = fix_meta_dir.join("backups").join(fix_id);
         if let Err(e) = fs::create_dir_all(&backup_dir) {
             return FixApplicationResult::err(e.to_string());
         }
-
-        let mut files_to_apply = Vec::new();
-        collect_files_recursive(extract_dir, &mut files_to_apply);
 
         let mut records = Vec::new();
         let mut applied = Vec::new();
@@ -227,14 +318,23 @@ impl FixesService {
             let Ok(rel) = src.strip_prefix(extract_dir) else {
                 continue;
             };
+            if !LuaInstaller::is_safe_relative_path(rel) {
+                continue;
+            }
             let rel_posix = rel.to_string_lossy().replace('\\', "/");
             let dst = game_dir.join(rel);
             if let Some(parent) = dst.parent() {
-                let _ = fs::create_dir_all(parent);
+                if let Err(e) = fs::create_dir_all(parent) {
+                    Self::rollback_partial_apply(game_dir, &fix_meta_dir, &records);
+                    let _ = fs::remove_dir_all(&backup_dir);
+                    return FixApplicationResult::err(format!("Failed to create folder: {}", e));
+                }
             }
 
             if dst.exists() {
                 let Ok(hash_before) = sha256_file(&dst) else {
+                    Self::rollback_partial_apply(game_dir, &fix_meta_dir, &records);
+                    let _ = fs::remove_dir_all(&backup_dir);
                     return FixApplicationResult::err(format!(
                         "Failed to hash existing file {}",
                         rel_posix
@@ -242,15 +342,27 @@ impl FixesService {
                 };
                 let bkp_file = backup_dir.join(rel);
                 if let Some(bp) = bkp_file.parent() {
-                    let _ = fs::create_dir_all(bp);
+                    if let Err(e) = fs::create_dir_all(bp) {
+                        Self::rollback_partial_apply(game_dir, &fix_meta_dir, &records);
+                        let _ = fs::remove_dir_all(&backup_dir);
+                        return FixApplicationResult::err(format!("Backup dir failed: {}", e));
+                    }
                 }
                 if let Err(e) = fs::copy(&dst, &bkp_file) {
+                    Self::rollback_partial_apply(game_dir, &fix_meta_dir, &records);
+                    let _ = fs::remove_dir_all(&backup_dir);
                     return FixApplicationResult::err(format!("Backup failed: {}", e));
                 }
                 if let Err(e) = fs::copy(&src, &dst) {
+                    let _ = fs::copy(&bkp_file, &dst);
+                    Self::rollback_partial_apply(game_dir, &fix_meta_dir, &records);
+                    let _ = fs::remove_dir_all(&backup_dir);
                     return FixApplicationResult::err(format!("Apply failed: {}", e));
                 }
                 let Ok(hash_after) = sha256_file(&dst) else {
+                    let _ = fs::copy(&bkp_file, &dst);
+                    Self::rollback_partial_apply(game_dir, &fix_meta_dir, &records);
+                    let _ = fs::remove_dir_all(&backup_dir);
                     return FixApplicationResult::err("Post-apply hash failed.");
                 };
                 records.push(FixFileEntry {
@@ -262,9 +374,14 @@ impl FixesService {
                 });
             } else {
                 if let Err(e) = fs::copy(&src, &dst) {
+                    Self::rollback_partial_apply(game_dir, &fix_meta_dir, &records);
+                    let _ = fs::remove_dir_all(&backup_dir);
                     return FixApplicationResult::err(format!("Apply failed: {}", e));
                 }
                 let Ok(hash_after) = sha256_file(&dst) else {
+                    let _ = fs::remove_file(&dst);
+                    Self::rollback_partial_apply(game_dir, &fix_meta_dir, &records);
+                    let _ = fs::remove_dir_all(&backup_dir);
                     return FixApplicationResult::err("Post-apply hash failed.");
                 };
                 records.push(FixFileEntry {
@@ -282,13 +399,21 @@ impl FixesService {
             app_id,
             fix_id: fix_id.to_string(),
             applied_at: Utc::now().to_rfc3339(),
-            files: records,
+            files: records.clone(),
         };
         let record_file = fix_meta_dir.join(format!("{}.json", fix_id));
-        if let Ok(js) = serde_json::to_string_pretty(&record) {
-            if let Err(e) = fs::write(&record_file, js) {
+        let js = match serde_json::to_string_pretty(&record) {
+            Ok(s) => s,
+            Err(e) => {
+                Self::rollback_partial_apply(game_dir, &fix_meta_dir, &records);
+                let _ = fs::remove_dir_all(&backup_dir);
                 return FixApplicationResult::err(e.to_string());
             }
+        };
+        if let Err(e) = fs::write(&record_file, js) {
+            Self::rollback_partial_apply(game_dir, &fix_meta_dir, &records);
+            let _ = fs::remove_dir_all(&backup_dir);
+            return FixApplicationResult::err(e.to_string());
         }
 
         FixApplicationResult {
@@ -299,6 +424,9 @@ impl FixesService {
     }
 
     pub fn unfix_game(game_dir: &Path, fix_id: &str) -> FixApplicationResult {
+        if !is_safe_fix_id(fix_id) {
+            return FixApplicationResult::err("Invalid fix ID.");
+        }
         let fix_meta_dir = game_dir.join(FIX_DIR_NAME);
         let record_file = fix_meta_dir.join(format!("{}.json", fix_id));
         let Ok(raw) = fs::read_to_string(&record_file) else {
@@ -308,7 +436,14 @@ impl FixesService {
             return FixApplicationResult::err("Corrupted fix record JSON.");
         };
 
+        // Pre-flight validation: verify paths, external modification hashes, and backup presence
         for entry in &record.files {
+            if !LuaInstaller::is_safe_relative_path(Path::new(&entry.relative_path)) {
+                return FixApplicationResult::err(format!(
+                    "Unsafe path '{}' in fix record.",
+                    entry.relative_path
+                ));
+            }
             let dst = game_dir.join(&entry.relative_path);
             if dst.exists() {
                 if let Ok(curr_hash) = sha256_file(&dst) {
@@ -320,25 +455,60 @@ impl FixesService {
                     }
                 }
             }
+            if entry.action == "modified" {
+                let Some(bkp_rel) = &entry.backup_path else {
+                    return FixApplicationResult::err(format!(
+                        "Missing backup path metadata for '{}'.",
+                        entry.relative_path
+                    ));
+                };
+                if !LuaInstaller::is_safe_relative_path(Path::new(bkp_rel)) {
+                    return FixApplicationResult::err(format!(
+                        "Unsafe backup path '{}' in fix record.",
+                        bkp_rel
+                    ));
+                }
+                let bkp = fix_meta_dir.join(bkp_rel);
+                if !bkp.is_file() {
+                    return FixApplicationResult::err(format!(
+                        "Backup file for '{}' is missing; cannot revert safely.",
+                        entry.relative_path
+                    ));
+                }
+            }
         }
 
         let mut reverted = Vec::new();
         for entry in &record.files {
             let dst = game_dir.join(&entry.relative_path);
             if entry.action == "added" {
-                let _ = fs::remove_file(&dst);
+                if dst.exists() {
+                    if let Err(e) = fs::remove_file(&dst) {
+                        return FixApplicationResult::err(format!(
+                            "Failed to remove added file '{}': {}",
+                            entry.relative_path, e
+                        ));
+                    }
+                }
                 reverted.push(entry.relative_path.clone());
             } else if entry.action == "modified" {
                 if let Some(bkp_rel) = &entry.backup_path {
                     let bkp = fix_meta_dir.join(bkp_rel);
-                    if bkp.exists() {
-                        if let Some(p) = dst.parent() {
-                            let _ = fs::create_dir_all(p);
-                        }
-                        if fs::copy(&bkp, &dst).is_ok() {
-                            reverted.push(entry.relative_path.clone());
+                    if let Some(p) = dst.parent() {
+                        if let Err(e) = fs::create_dir_all(p) {
+                            return FixApplicationResult::err(format!(
+                                "Failed to recreate directory for '{}': {}",
+                                entry.relative_path, e
+                            ));
                         }
                     }
+                    if let Err(e) = fs::copy(&bkp, &dst) {
+                        return FixApplicationResult::err(format!(
+                            "Failed to restore backup for '{}': {}",
+                            entry.relative_path, e
+                        ));
+                    }
+                    reverted.push(entry.relative_path.clone());
                 }
             }
         }
@@ -358,10 +528,16 @@ fn collect_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
         return;
     };
     for e in entries.flatten() {
+        let Ok(ft) = e.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
+            continue;
+        }
         let p = e.path();
-        if p.is_dir() {
+        if ft.is_dir() {
             collect_files_recursive(&p, out);
-        } else if p.is_file() {
+        } else if ft.is_file() {
             out.push(p);
         }
     }
@@ -392,6 +568,11 @@ mod tests {
         );
         assert!(FixesService::is_fix_applied(&game_dir, "fix1"));
 
+        // Re-applying the same fix_id must be rejected so original backups aren't overwritten
+        let dup =
+            FixesService::apply_extracted_with_backup(1245620, "fix1", &extract_dir, &game_dir);
+        assert!(!dup.ok);
+
         let rev = FixesService::unfix_game(&game_dir, "fix1");
         assert!(rev.ok);
         assert_eq!(
@@ -400,5 +581,48 @@ mod tests {
         );
         assert!(!game_dir.join("steam_settings.ini").exists());
         assert!(!FixesService::is_fix_applied(&game_dir, "fix1"));
+    }
+
+    #[test]
+    fn blocks_fix_id_traversal_empty_apply_and_missing_backup_revert() {
+        let dir = tempfile::tempdir().unwrap();
+        let game_dir = dir.path().join("game");
+        let extract_dir = dir.path().join("extract");
+        fs::create_dir_all(&game_dir).unwrap();
+        fs::create_dir_all(&extract_dir).unwrap();
+
+        // Reject traversal fix_ids
+        assert!(!FixesService::is_fix_applied(&game_dir, "../escape"));
+        assert!(
+            !FixesService::apply_extracted_with_backup(
+                1245620,
+                "../escape",
+                &extract_dir,
+                &game_dir
+            )
+            .ok
+        );
+        assert!(!FixesService::unfix_game(&game_dir, "../escape").ok);
+
+        // Empty extract_dir must fail rather than writing an empty fix record
+        let empty = FixesService::apply_extracted_with_backup(
+            1245620,
+            "empty-fix",
+            &extract_dir,
+            &game_dir,
+        );
+        assert!(!empty.ok);
+        assert!(!FixesService::is_fix_applied(&game_dir, "empty-fix"));
+
+        // Missing backup file must abort revert AND preserve fix record
+        fs::write(game_dir.join("app.dll"), b"ORIG").unwrap();
+        fs::write(extract_dir.join("app.dll"), b"MOD").unwrap();
+        assert!(
+            FixesService::apply_extracted_with_backup(1245620, "fix2", &extract_dir, &game_dir).ok
+        );
+        fs::remove_file(game_dir.join(".luatools-fix/backups/fix2/app.dll")).unwrap();
+        let bad_rev = FixesService::unfix_game(&game_dir, "fix2");
+        assert!(!bad_rev.ok);
+        assert!(FixesService::is_fix_applied(&game_dir, "fix2"));
     }
 }

@@ -8,6 +8,7 @@ use std::fmt;
 use std::os::raw::c_void;
 use std::sync::{Arc, LazyLock, Mutex};
 
+use crate::steam_bridge::manifest_hooks::parse_pattern_and_mask;
 use crate::steam_bridge::memory_patch::JMP_ABS64_LEN;
 use crate::steam_bridge::pattern_db::{BinaryComponent, PatternChannel};
 
@@ -21,14 +22,22 @@ pub enum IpcInterface {
     IClientNetworkingSocketsSerialized = 46,
 }
 
+impl IpcInterface {
+    /// Strict conversion that returns `None` for unknown interface IDs instead of
+    /// silently aliasing them onto `IClientUser`.
+    pub fn try_from_u32(v: u32) -> Option<Self> {
+        match v {
+            1 => Some(IpcInterface::IClientUser),
+            2 => Some(IpcInterface::IClientUtils),
+            46 => Some(IpcInterface::IClientNetworkingSocketsSerialized),
+            _ => None,
+        }
+    }
+}
+
 impl From<u32> for IpcInterface {
     fn from(v: u32) -> Self {
-        match v {
-            1 => IpcInterface::IClientUser,
-            2 => IpcInterface::IClientUtils,
-            46 => IpcInterface::IClientNetworkingSocketsSerialized,
-            _ => IpcInterface::IClientUser,
-        }
+        Self::try_from_u32(v).unwrap_or(IpcInterface::IClientUser)
     }
 }
 
@@ -125,6 +134,14 @@ pub fn register_handler(handler: ResolvedHandler) {
         .insert(key, handler);
 }
 
+/// Unregister a handler for `(interface_id, func_hash)`.
+pub fn unregister_handler(iface: IpcInterface, func_hash: FuncHash) -> Option<ResolvedHandler> {
+    handlers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(iface, func_hash))
+}
+
 /// Register multiple handlers at once.
 pub fn register_handlers(handlers_list: Vec<ResolvedHandler>) {
     let mut map = handlers().lock().unwrap_or_else(|e| e.into_inner());
@@ -154,7 +171,8 @@ pub fn parse_ipc_message(data: &[u8]) -> Option<(IpcMessageType, IpcInterface, F
         _ => return None,
     };
 
-    Some((msg_type, IpcInterface::from(iface_id), func_hash))
+    let iface = IpcInterface::try_from_u32(iface_id)?;
+    Some((msg_type, iface, func_hash))
 }
 
 /// Dispatch an IPC message to registered handlers.
@@ -186,16 +204,20 @@ pub fn dispatch_ipc_message(
     };
 
     if let Some(pre) = &handler.pre_handler {
-        if let Err(e) = pre(&mut ctx) {
-            log::warn!("Pre-handler error for {}: {}", handler.name, e);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pre(&mut ctx)));
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::warn!("Pre-handler error for {}: {}", handler.name, e),
+            Err(_) => log::warn!("Pre-handler panicked for {}", handler.name),
         }
     }
 
-    write_buf.clone_from(&ctx.write_buffer);
-
     if let Some(post) = &handler.post_handler {
-        if let Err(e) = post(&mut ctx) {
-            log::warn!("Post-handler error for {}: {}", handler.name, e);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| post(&mut ctx)));
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::warn!("Post-handler error for {}: {}", handler.name, e),
+            Err(_) => log::warn!("Post-handler panicked for {}", handler.name),
         }
     }
 
@@ -247,8 +269,9 @@ pub fn resolve_ipc_function(
         .ok_or_else(|| "Module not loaded in current process".to_string())?;
 
     let vaddr = if let Some(pattern_hex) = &entry.pattern {
-        let pattern_bytes = parse_hex_pattern(pattern_hex);
-        let mask_bytes = entry.mask.as_ref().map(|m| parse_hex_pattern(m));
+        let (pattern_bytes, mask_bytes) =
+            parse_pattern_and_mask(pattern_hex, entry.mask.as_deref())
+                .ok_or_else(|| "Malformed hex pattern or mask".to_string())?;
         let offset = entry.offset.unwrap_or(0);
         binary.resolve_pattern_address(&pattern_bytes, mask_bytes.as_deref(), offset, None)
     } else {
@@ -259,12 +282,6 @@ pub fn resolve_ipc_function(
     binary
         .vaddr_to_runtime_addr(vaddr, &mapping, JMP_ABS64_LEN)
         .ok_or_else(|| "Resolved address not in executable memory".to_string())
-}
-
-fn parse_hex_pattern(hex: &str) -> Vec<u8> {
-    hex.split_whitespace()
-        .filter_map(|s| u8::from_str_radix(s, 16).ok())
-        .collect()
 }
 
 /// Helper to create a `ResolvedHandler` entry.
@@ -313,26 +330,82 @@ mod tests {
     }
 
     #[test]
-    fn test_handler_registration() {
+    fn test_handler_registration_dispatch_and_unregistration() {
+        let test_hash = fnv1a_hash("TestDispatchMethod_Unique");
         let h = make_handler(
-            IpcInterface::IClientUser,
-            fnv1a_hash("GetSteamID"),
-            "IClientUser::GetSteamID",
+            IpcInterface::IClientUtils,
+            test_hash,
+            "IClientUtils::TestDispatchMethod_Unique",
             0,
             2,
-            None,
-            Some(Arc::new(|_| Ok(()))),
+            Some(Arc::new(|ctx| {
+                ctx.write_buffer.push(0xAA);
+                Ok(())
+            })),
+            Some(Arc::new(|ctx| {
+                ctx.write_buffer.push(0xBB);
+                Ok(())
+            })),
         );
         register_handler(h);
 
-        let found = find_handler(IpcInterface::IClientUser, fnv1a_hash("GetSteamID"));
+        let found = find_handler(IpcInterface::IClientUtils, test_hash);
         assert!(found.is_some());
-        assert_eq!(found.unwrap().name, "IClientUser::GetSteamID");
+        assert_eq!(
+            found.unwrap().name,
+            "IClientUtils::TestDispatchMethod_Unique"
+        );
+
+        let mut read_buf = Vec::new();
+        read_buf.extend_from_slice(&1u32.to_le_bytes()); // InterfaceCall
+        read_buf.extend_from_slice(&(IpcInterface::IClientUtils as u32).to_le_bytes());
+        read_buf.extend_from_slice(&test_hash.to_le_bytes());
+
+        let mut write_buf = Vec::new();
+        assert!(dispatch_ipc_message(
+            &read_buf,
+            &mut write_buf,
+            std::ptr::null_mut()
+        ));
+        assert_eq!(write_buf, vec![0xAA, 0xBB]);
+
+        assert!(unregister_handler(IpcInterface::IClientUtils, test_hash).is_some());
+        assert!(find_handler(IpcInterface::IClientUtils, test_hash).is_none());
+    }
+
+    #[test]
+    fn test_parse_ipc_message_rejects_unknown_interface_and_command() {
+        assert!(parse_ipc_message(&[0u8; 8]).is_none());
+
+        // Unknown interface 999 must be rejected instead of mapping to IClientUser
+        let mut unknown_iface = Vec::new();
+        unknown_iface.extend_from_slice(&1u32.to_le_bytes());
+        unknown_iface.extend_from_slice(&999u32.to_le_bytes());
+        unknown_iface.extend_from_slice(&0x1234u32.to_le_bytes());
+        assert!(parse_ipc_message(&unknown_iface).is_none());
+
+        // Unknown command 99 must be rejected
+        let mut unknown_cmd = Vec::new();
+        unknown_cmd.extend_from_slice(&99u32.to_le_bytes());
+        unknown_cmd.extend_from_slice(&1u32.to_le_bytes());
+        unknown_cmd.extend_from_slice(&0x1234u32.to_le_bytes());
+        assert!(parse_ipc_message(&unknown_cmd).is_none());
+
+        // Valid Handshake
+        let mut hs = Vec::new();
+        hs.extend_from_slice(&0u32.to_le_bytes());
+        hs.extend_from_slice(&1u32.to_le_bytes());
+        hs.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            parse_ipc_message(&hs),
+            Some((IpcMessageType::Handshake, IpcInterface::IClientUser, 0))
+        );
     }
 
     #[test]
     fn test_parse_hex_pattern() {
-        let p = parse_hex_pattern("48 89 5C 24 08");
+        let (p, m) = parse_pattern_and_mask("48 89 5C 24 08", None).unwrap();
         assert_eq!(p, vec![0x48, 0x89, 0x5C, 0x24, 0x08]);
+        assert!(m.is_none());
     }
 }

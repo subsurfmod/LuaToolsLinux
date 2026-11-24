@@ -32,15 +32,21 @@ pub enum PreloadError {
 
 pub const LD_SO_PRELOAD_PATH: &str = "/etc/ld.so.preload";
 
+/// Strip Linux `/proc/<pid>/exe` trailing `" (deleted)"` marker after live binary updates.
+fn clean_exe_name(exe_path: Option<&Path>) -> &str {
+    let raw = exe_path
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    raw.strip_suffix(" (deleted)").unwrap_or(raw)
+}
+
 /// Returns `true` only when `/proc/<pid>/comm` and `/proc/<pid>/exe` identify the actual
 /// Steam client binary (`steam`), excluding `steamwebhelper`, launcher wrappers, `steam.sh`,
 /// `steam-sls`, `luatools`, shells, and Steam Runtime helper processes.
 pub fn is_steam_client_process(comm: &str, exe_path: Option<&Path>) -> bool {
     let comm_trim = comm.trim();
-    let exe_name = exe_path
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let exe_name = clean_exe_name(exe_path);
 
     // Explicitly exclude helper / browser / wrapper processes even if they contain "steam"
     let lower_comm = comm_trim.to_ascii_lowercase();
@@ -115,11 +121,7 @@ pub fn find_steam_pid() -> Option<u32> {
 /// itself, unrelated browsers, IDEs, shells, and non-Steam sandboxes.
 pub fn is_any_steam_process(comm: &str, exe_path: Option<&Path>, cmdline: &str) -> bool {
     let comm_lower = comm.trim().to_ascii_lowercase();
-    let exe_name_lower = exe_path
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let exe_name_lower = clean_exe_name(exe_path).to_ascii_lowercase();
     let exe_full_lower = exe_path
         .map(|p| p.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
@@ -265,7 +267,14 @@ pub fn kill_all_steam_instances() -> Result<usize, String> {
     let send_sig =
         |pids: &[u32], sig: libc::c_int, terminated: &mut HashSet<u32>, perm_denied: &mut bool| {
             for &pid in pids {
-                let rc = unsafe { libc::kill(pid as libc::pid_t, sig) };
+                // Guard against PID <= 1 or overflow into negative pid_t (which signals process groups / all processes).
+                let Ok(pid_t) = libc::pid_t::try_from(pid) else {
+                    continue;
+                };
+                if pid_t <= 1 {
+                    continue;
+                }
+                let rc = unsafe { libc::kill(pid_t, sig) };
                 if rc == 0 {
                     terminated.insert(pid);
                 } else {
@@ -315,6 +324,9 @@ pub fn kill_all_steam_instances() -> Result<usize, String> {
 }
 
 pub fn is_loaded(pid: u32, lib_name: &str) -> bool {
+    if pid == 0 || lib_name.is_empty() {
+        return false;
+    }
     let maps_path = format!("/proc/{}/maps", pid);
     if let Ok(maps) = fs::read_to_string(&maps_path) {
         maps.lines().any(|l| l.contains(lib_name))
@@ -323,38 +335,83 @@ pub fn is_loaded(pid: u32, lib_name: &str) -> bool {
     }
 }
 
-pub fn enable_system_preload(lib_path: &Path) -> Result<(), PreloadError> {
-    let lib_str = lib_path.to_string_lossy().to_string();
-    let current = fs::read_to_string(LD_SO_PRELOAD_PATH).unwrap_or_default();
+fn map_preload_io_err(err: std::io::Error) -> PreloadError {
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        PreloadError::PermissionDenied
+    } else {
+        PreloadError::Io(err)
+    }
+}
+
+fn enable_system_preload_at(preload_file: &Path, lib_path: &Path) -> Result<(), PreloadError> {
+    let lib_str = lib_path.to_string_lossy().trim().to_string();
+    if lib_str.is_empty() {
+        return Err(PreloadError::IntegrationLibNotFound(
+            "empty library path".into(),
+        ));
+    }
+    let current = match fs::read_to_string(preload_file) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(map_preload_io_err(e)),
+    };
     if current.lines().any(|l| l.trim() == lib_str) {
         return Ok(());
     }
     let new_content = if current.trim().is_empty() {
         format!("{}\n", lib_str)
     } else {
-        format!("{}\n{}\n", current.trim(), lib_str)
+        format!("{}\n{}\n", current.trim_end(), lib_str)
     };
-    fs::write(LD_SO_PRELOAD_PATH, new_content)?;
+    fs::write(preload_file, new_content).map_err(map_preload_io_err)?;
     Ok(())
 }
 
-pub fn disable_system_preload(lib_path: &Path) -> Result<(), PreloadError> {
-    let lib_str = lib_path.to_string_lossy().to_string();
-    let current = fs::read_to_string(LD_SO_PRELOAD_PATH).unwrap_or_default();
+fn disable_system_preload_at(preload_file: &Path, lib_path: &Path) -> Result<(), PreloadError> {
+    let lib_str = lib_path.to_string_lossy().trim().to_string();
+    let current = match fs::read_to_string(preload_file) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(map_preload_io_err(e)),
+    };
     let filtered: String = current
         .lines()
         .filter(|l| l.trim() != lib_str && !l.trim().is_empty())
         .collect::<Vec<_>>()
         .join("\n");
     fs::write(
-        LD_SO_PRELOAD_PATH,
+        preload_file,
         if filtered.is_empty() {
             String::new()
         } else {
             filtered + "\n"
         },
-    )?;
+    )
+    .map_err(map_preload_io_err)?;
     Ok(())
+}
+
+pub fn enable_system_preload(lib_path: &Path) -> Result<(), PreloadError> {
+    enable_system_preload_at(Path::new(LD_SO_PRELOAD_PATH), lib_path)
+}
+
+pub fn disable_system_preload(lib_path: &Path) -> Result<(), PreloadError> {
+    disable_system_preload_at(Path::new(LD_SO_PRELOAD_PATH), lib_path)
+}
+
+/// Escape characters that are special inside POSIX shell double-quoted strings.
+fn escape_sh_double_quoted(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '\\' | '"' | '$' | '`' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Generates a rootless `LD_PRELOAD` Steam launcher script supporting `--gdb` and `--lldb`
@@ -364,13 +421,19 @@ pub fn generate_ld_preload_launcher(
     lib_path: &Path,
     output_script: &Path,
 ) -> Result<(), PreloadError> {
-    let steam_str = steam_exe.to_string_lossy().to_string();
-    let lib_str = lib_path.to_string_lossy().to_string();
-    let lib_dir = lib_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .to_string_lossy()
-        .to_string();
+    let steam_str = escape_sh_double_quoted(&steam_exe.to_string_lossy());
+    let lib_str = escape_sh_double_quoted(&lib_path.to_string_lossy());
+    let lib_dir = escape_sh_double_quoted(
+        &lib_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_string_lossy(),
+    );
+
+    if let Some(parent) = output_script.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
 
     let script = format!(
         "#!/bin/sh\n\
@@ -558,5 +621,52 @@ mod tests {
         assert!(txt.contains("${LD_PRELOAD:+:$LD_PRELOAD}"));
         assert!(txt.contains("--gdb)"));
         assert!(txt.contains("--lldb)"));
+    }
+
+    #[test]
+    fn recognizes_deleted_steam_exe_after_live_update() {
+        assert!(is_steam_client_process(
+            "steam",
+            Some(Path::new(
+                "/home/u/.local/share/Steam/steamrt64/steam (deleted)"
+            ))
+        ));
+        assert!(is_any_steam_process(
+            "steamwebhelper",
+            Some(Path::new(
+                "/home/u/.local/share/Steam/ubuntu12_64/steamwebhelper (deleted)"
+            )),
+            ""
+        ));
+        assert!(!is_loaded(std::process::id(), ""));
+    }
+
+    #[test]
+    fn system_preload_file_roundtrip_and_launcher_shell_escaping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let preload = tmp.path().join("ld.so.preload");
+        let lib = Path::new("/opt/luatools/libsteam_integration.so");
+
+        enable_system_preload_at(&preload, lib).unwrap();
+        // Idempotent second call must not duplicate entry
+        enable_system_preload_at(&preload, lib).unwrap();
+        assert_eq!(
+            fs::read_to_string(&preload).unwrap(),
+            "/opt/luatools/libsteam_integration.so\n"
+        );
+
+        disable_system_preload_at(&preload, lib).unwrap();
+        assert_eq!(fs::read_to_string(&preload).unwrap(), "");
+
+        let escaped_script = tmp.path().join("nested/launcher.sh");
+        generate_ld_preload_launcher(
+            Path::new("/home/u/My $Steam/steam.sh"),
+            Path::new("/home/u/lib`dir\"/libsteam_integration.so"),
+            &escaped_script,
+        )
+        .unwrap();
+        let txt = fs::read_to_string(&escaped_script).unwrap();
+        assert!(txt.contains("My \\$Steam/steam.sh"));
+        assert!(txt.contains("lib\\`dir\\\"/libsteam_integration.so"));
     }
 }

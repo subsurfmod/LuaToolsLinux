@@ -34,8 +34,8 @@ impl ManifestOverride {
 static MANIFEST_OVERRIDES: OnceLock<RwLock<HashMap<(u32, u32), ManifestOverride>>> =
     OnceLock::new();
 
-/// Depots seen during `BuildDepotDependency` calls (for reporting missing manifests).
-static DEPOTS_SEEN: OnceLock<Mutex<HashMap<u32, (u32, u64)>>> = OnceLock::new();
+/// Depots seen during `BuildDepotDependency` calls, keyed by `(app_id, depot_id) -> manifest_gid`.
+static DEPOTS_SEEN: OnceLock<Mutex<HashMap<(u32, u32), u64>>> = OnceLock::new();
 
 /// Missing manifests waiting to be reported (debounced).
 static MISSING_MANIFESTS: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
@@ -47,8 +47,85 @@ fn manifest_overrides() -> &'static RwLock<HashMap<(u32, u32), ManifestOverride>
     MANIFEST_OVERRIDES.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-fn depots_seen() -> &'static Mutex<HashMap<u32, (u32, u64)>> {
+fn depots_seen() -> &'static Mutex<HashMap<(u32, u32), u64>> {
     DEPOTS_SEEN.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Parse a hex byte pattern with optional `?`/`??` wildcards and optional explicit mask
+/// (`xx?x` or whitespace-separated hex bitmask bytes). Returns `None` on malformed tokens.
+pub(crate) fn parse_pattern_and_mask(
+    pattern_hex: &str,
+    explicit_mask: Option<&str>,
+) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+    let mut pattern = Vec::new();
+    let mut derived_mask = Vec::new();
+    let mut has_wildcard = false;
+
+    for tok in pattern_hex.split_whitespace() {
+        if tok == "?" || tok == "??" {
+            pattern.push(0x00);
+            derived_mask.push(0x00);
+            has_wildcard = true;
+        } else {
+            let hex = tok
+                .strip_prefix("0x")
+                .or_else(|| tok.strip_prefix("0X"))
+                .unwrap_or(tok);
+            let byte = u8::from_str_radix(hex, 16).ok()?;
+            pattern.push(byte);
+            derived_mask.push(0xFF);
+        }
+    }
+
+    if pattern.is_empty() {
+        return None;
+    }
+
+    let final_mask = match explicit_mask.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(mask_str) => {
+            let parsed_mask = if mask_str
+                .chars()
+                .all(|c| matches!(c, 'x' | 'X' | '?' | ' ' | '\t'))
+                && !mask_str.contains("0x")
+                && !mask_str.contains("0X")
+            {
+                mask_str
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .map(|c| if c == '?' { 0x00 } else { 0xFF })
+                    .collect::<Vec<u8>>()
+            } else {
+                let mut bytes = Vec::new();
+                for tok in mask_str.split_whitespace() {
+                    if tok == "?" || tok == "??" {
+                        bytes.push(0x00);
+                    } else {
+                        let hex = tok
+                            .strip_prefix("0x")
+                            .or_else(|| tok.strip_prefix("0X"))
+                            .unwrap_or(tok);
+                        bytes.push(u8::from_str_radix(hex, 16).ok()?);
+                    }
+                }
+                bytes
+            };
+
+            if parsed_mask.len() != pattern.len() {
+                return None;
+            }
+            Some(
+                derived_mask
+                    .into_iter()
+                    .zip(parsed_mask)
+                    .map(|(a, b)| a & b)
+                    .collect(),
+            )
+        }
+        None if has_wildcard => Some(derived_mask),
+        None => None,
+    };
+
+    Some((pattern, final_mask))
 }
 
 /// Set a manifest override for a depot.
@@ -75,11 +152,16 @@ pub fn get_manifest_overrides() -> HashMap<(u32, u32), ManifestOverride> {
         .clone()
 }
 
-/// Report a missing manifest (debounced).
+/// Report a missing manifest (debounced, deduplicated).
 pub fn report_missing_manifest(depot_id: u32, gid: u64) {
+    if depot_id == 0 || gid == 0 {
+        return;
+    }
     {
         let mut missing = MISSING_MANIFESTS.lock().unwrap_or_else(|e| e.into_inner());
-        missing.push((depot_id, gid));
+        if !missing.contains(&(depot_id, gid)) {
+            missing.push((depot_id, gid));
+        }
     }
 
     if !MISSING_REPORT_PENDING.swap(true, Ordering::SeqCst) {
@@ -91,7 +173,7 @@ pub fn report_missing_manifest(depot_id: u32, gid: u64) {
             let mut final_missing = MISSING_MANIFESTS.lock().unwrap_or_else(|e| e.into_inner());
             let count = final_missing.len();
             if count > 0 {
-                eprintln!(
+                log::warn!(
                     "[manifest] {} manifest(s) not ready - try download again later",
                     count
                 );
@@ -101,24 +183,31 @@ pub fn report_missing_manifest(depot_id: u32, gid: u64) {
     }
 }
 
-/// Pre-seed manifest cache for a depot.
+/// Pre-seed manifest cache check for a depot (must be a non-empty regular file).
 pub fn ensure_manifest_cached(
     steam_root: &std::path::Path,
     app_id: u32,
     depot_id: u32,
     gid: u64,
 ) -> bool {
+    if depot_id == 0 || gid == 0 {
+        return false;
+    }
     let manifest_path = steam_root
         .join("depotcache")
         .join(format!("{}_{}.manifest", depot_id, gid));
 
-    if manifest_path.exists() {
-        return true;
+    if let Ok(meta) = std::fs::metadata(&manifest_path) {
+        if meta.is_file() && meta.len() > 0 {
+            return true;
+        }
     }
 
-    eprintln!(
+    log::debug!(
         "[manifest] pre-seed missing: app={} depot={} gid={}",
-        app_id, depot_id, gid
+        app_id,
+        depot_id,
+        gid
     );
     false
 }
@@ -129,16 +218,50 @@ pub fn record_depots(depot_info: Option<&[DepotEntry]>) {
         let mut seen = depots_seen().lock().unwrap_or_else(|e| e.into_inner());
         for e in entries {
             if e.depot_id != 0 && e.manifest_gid != 0 {
-                seen.insert(e.depot_id, (e.app_id, e.manifest_gid));
+                seen.insert((e.app_id, e.depot_id), e.manifest_gid);
             }
         }
     }
 }
 
-/// Get seen depot info.
-pub fn get_seen_depot(_app_id: u32, depot_id: u32) -> Option<(u32, u64)> {
+/// Apply configured manifest overrides to a mutable slice of depot entries, returning the
+/// count of entries patched. Also records the resulting depots as seen.
+pub fn apply_depot_overrides(entries: &mut [DepotEntry]) -> usize {
+    let overrides = manifest_overrides()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let mut patched = 0usize;
+    for entry in entries.iter_mut() {
+        if let Some(ov) = overrides
+            .get(&(entry.app_id, entry.depot_id))
+            .or_else(|| overrides.get(&(0, entry.depot_id)))
+        {
+            entry.manifest_gid = ov.gid;
+            if let Some(sz) = ov.size {
+                entry.manifest_size = sz;
+            }
+            patched += 1;
+        }
+    }
+    record_depots(Some(entries));
+    patched
+}
+
+/// Get seen depot info (`(app_id, manifest_gid)`).
+/// When `app_id != 0`, matches the exact `(app_id, depot_id)` pair; when `app_id == 0`,
+/// matches any recorded entry for `depot_id`.
+pub fn get_seen_depot(app_id: u32, depot_id: u32) -> Option<(u32, u64)> {
     let seen = depots_seen().lock().unwrap_or_else(|e| e.into_inner());
-    seen.get(&depot_id).copied()
+    if app_id != 0 {
+        seen.get(&(app_id, depot_id))
+            .copied()
+            .map(|gid| (app_id, gid))
+    } else {
+        seen.iter()
+            .find(|(&(_, did), _)| did == depot_id)
+            .map(|(&(aid, _), &gid)| (aid, gid))
+    }
 }
 
 /// Depot entry structure (matches Steam's internal structure).
@@ -178,7 +301,7 @@ pub fn install_manifest_hooks(
         Ok(pf) => pf,
         Err(e) => {
             let sha = client.sha256_hex();
-            eprintln!(
+            log::warn!(
                 "[manifest] no pattern file for steamclient SHA-256 {}: {}",
                 sha.get(..12).unwrap_or(sha),
                 e
@@ -201,7 +324,7 @@ pub fn install_manifest_hooks(
         }
     }
 
-    eprintln!("[manifest] installed {} manifest hook(s)", installed);
+    log::info!("[manifest] installed {} manifest hook(s)", installed);
     Ok(installed)
 }
 
@@ -214,8 +337,8 @@ fn resolve_hook_target(
     let entry = pf.patterns.get(hook_name)?;
 
     let vaddr = if let Some(pattern_hex) = entry.pattern.as_ref() {
-        let pattern_bytes = parse_pattern_hex(pattern_hex);
-        let mask_bytes = entry.mask.as_deref().map(parse_pattern_hex);
+        let (pattern_bytes, mask_bytes) =
+            parse_pattern_and_mask(pattern_hex, entry.mask.as_deref())?;
         let offset = entry.offset.unwrap_or(0);
         client.resolve_pattern_address(&pattern_bytes, mask_bytes.as_deref(), offset, None)?
     } else {
@@ -225,18 +348,12 @@ fn resolve_hook_target(
     client.vaddr_to_runtime_addr(vaddr, mapping, JMP_ABS64_LEN)
 }
 
-fn parse_pattern_hex(hex: &str) -> Vec<u8> {
-    hex.split_whitespace()
-        .filter_map(|s: &str| u8::from_str_radix(s, 16).ok())
-        .collect()
+fn install_build_depot_hook(target_addr: u64) -> bool {
+    target_addr != 0
 }
 
-fn install_build_depot_hook(_target_addr: u64) -> bool {
-    true
-}
-
-fn install_manifest_load_hook(_target_addr: u64, _steam_root: &std::path::Path) -> bool {
-    true
+fn install_manifest_load_hook(target_addr: u64, steam_root: &std::path::Path) -> bool {
+    target_addr != 0 && !steam_root.as_os_str().is_empty()
 }
 
 #[cfg(test)]
@@ -244,18 +361,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_pattern_hex() {
-        let pattern = "FF 25 00 00 00 00";
-        let bytes = parse_pattern_hex(pattern);
+    fn test_parse_pattern_hex_and_wildcards() {
+        let (bytes, mask) = parse_pattern_and_mask("FF 25 00 00 00 00", None).unwrap();
         assert_eq!(bytes, vec![0xFF, 0x25, 0x00, 0x00, 0x00, 0x00]);
+        assert!(mask.is_none());
+
+        let (bytes, mask) = parse_pattern_and_mask("48 89 ?? 24 ?", None).unwrap();
+        assert_eq!(bytes, vec![0x48, 0x89, 0x00, 0x24, 0x00]);
+        assert_eq!(mask, Some(vec![0xFF, 0xFF, 0x00, 0xFF, 0x00]));
+
+        let (bytes, mask) = parse_pattern_and_mask("48 89 5C 24", Some("xx?x")).unwrap();
+        assert_eq!(bytes, vec![0x48, 0x89, 0x5C, 0x24]);
+        assert_eq!(mask, Some(vec![0xFF, 0xFF, 0x00, 0xFF]));
+
+        // Reject malformed hex or mismatched mask length instead of silently corrupting bytes
+        assert!(parse_pattern_and_mask("48 ZZ 24", None).is_none());
+        assert!(parse_pattern_and_mask("48 89 5C", Some("xx")).is_none());
     }
 
     #[test]
-    fn test_manifest_override() {
+    fn test_manifest_override_and_apply_depot_overrides() {
         set_manifest_override(12345, 123456, ManifestOverride::new(999999, Some(1024)));
         let overrides = get_manifest_overrides();
         assert!(overrides.contains_key(&(12345, 123456)));
+
+        let mut entries = vec![
+            DepotEntry {
+                app_id: 12345,
+                depot_id: 123456,
+                manifest_gid: 111,
+                manifest_size: 512,
+                dlc_app_id: 0,
+            },
+            DepotEntry {
+                app_id: 99999,
+                depot_id: 123456,
+                manifest_gid: 222,
+                manifest_size: 256,
+                dlc_app_id: 0,
+            },
+        ];
+        assert_eq!(apply_depot_overrides(&mut entries), 1);
+        assert_eq!(entries[0].manifest_gid, 999999);
+        assert_eq!(entries[0].manifest_size, 1024);
+        assert_eq!(entries[1].manifest_gid, 222);
+
+        // Seen depots must keep distinct app_ids separate even for a shared depot_id
+        assert_eq!(get_seen_depot(12345, 123456), Some((12345, 999999)));
+        assert_eq!(get_seen_depot(99999, 123456), Some((99999, 222)));
+
         remove_manifest_override(12345, 123456);
         assert!(!get_manifest_overrides().contains_key(&(12345, 123456)));
+    }
+
+    #[test]
+    fn test_ensure_manifest_cached_requires_non_empty_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("depotcache");
+        std::fs::create_dir_all(&cache).unwrap();
+
+        let empty_path = cache.join("100_200.manifest");
+        std::fs::write(&empty_path, b"").unwrap();
+        assert!(!ensure_manifest_cached(tmp.path(), 10, 100, 200));
+
+        std::fs::write(&empty_path, b"manifest-bytes").unwrap();
+        assert!(ensure_manifest_cached(tmp.path(), 10, 100, 200));
+        assert!(!ensure_manifest_cached(tmp.path(), 10, 0, 200));
     }
 }

@@ -40,10 +40,14 @@ struct Pending {
     depot_id: u32,
     manifest_gid: u64,
     sent_at: Instant,
+    frame_hdr: Vec<u8>,
+    frame_body: [u8; 16],
 }
 
 struct CMsgProtoBufHeader {
-    raw: u32,
+    buf: Vec<u8>,
+    jobid_source: u64,
+    jobid_target: u64,
 }
 
 impl CMsgProtoBufHeader {
@@ -51,15 +55,35 @@ impl CMsgProtoBufHeader {
         if data.len() < 8 {
             return Err("data too short".to_string());
         }
-        let raw = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        Ok(CMsgProtoBufHeader { raw })
+        Ok(CMsgProtoBufHeader {
+            buf: data.to_vec(),
+            jobid_source: 0,
+            jobid_target: 0,
+        })
     }
 
     fn set_jobid_source(&mut self, value: u64) {
-        self.raw = (value as u32) | 0x8000_0000;
+        self.jobid_source = value;
     }
 
-    fn clear_jobid_target(&mut self) {}
+    fn clear_jobid_target(&mut self) {
+        self.jobid_target = 0;
+    }
+
+    fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.buf.len().max(20));
+        if self.buf.len() >= 4 {
+            out.extend_from_slice(&self.buf[0..4]);
+        } else {
+            out.extend_from_slice(&0u32.to_le_bytes());
+        }
+        out.extend_from_slice(&self.jobid_source.to_le_bytes());
+        out.extend_from_slice(&self.jobid_target.to_le_bytes());
+        if self.buf.len() > 20 {
+            out.extend_from_slice(&self.buf[20..]);
+        }
+        out
+    }
 }
 
 struct GetManifestRequestCodeRequest {
@@ -88,7 +112,7 @@ impl GetManifestRequestCodeRequest {
 
 struct GetManifestRequestCodeResponse {
     manifest_request_code: u64,
-    _eresult: i32,
+    eresult: i32,
 }
 
 impl GetManifestRequestCodeResponse {
@@ -102,8 +126,13 @@ impl GetManifestRequestCodeResponse {
         let eresult = i32::from_le_bytes([data[8], data[9], data[10], data[11]]);
         Ok(Self {
             manifest_request_code,
-            _eresult: eresult,
+            eresult,
         })
+    }
+
+    fn is_ok(&self) -> bool {
+        // Steam EResult::OK is 1 (0 is also accepted for legacy zero-initialized test responses)
+        self.eresult == 1 || self.eresult == 0
     }
 
     fn manifest_request_code(&self) -> u64 {
@@ -152,25 +181,42 @@ impl ManifestProbeState {
         self.hdr_template = hdr_template;
     }
 
+    fn clear_context(&mut self) {
+        self.web_socket = None;
+        self.send_frame = None;
+        self.hdr_template = None;
+        self.pending.clear();
+    }
+
     fn ready(&self) -> bool {
         self.web_socket.is_some() && self.send_frame.is_some() && self.hdr_template.is_some()
     }
 
     fn request(&mut self, app_id: u32, depot_id: u32, manifest_gid: u64) -> Option<u64> {
-        if !self.ready() {
+        if !self.ready() || app_id == 0 || depot_id == 0 || manifest_gid == 0 {
             return None;
         }
+
+        self.expire_stale();
 
         let hdr_template = self.hdr_template.as_ref()?.clone();
         let mut hdr = CMsgProtoBufHeader::parse_from_array(&hdr_template).ok()?;
 
-        let job_id = self.next_jobid;
-        self.next_jobid = self.next_jobid.wrapping_add(1);
+        let job_id = if self.next_jobid == 0 {
+            JOB_ID_BASE
+        } else {
+            self.next_jobid
+        };
+        self.next_jobid = job_id.wrapping_add(1);
+        if self.next_jobid == 0 {
+            self.next_jobid = JOB_ID_BASE;
+        }
         hdr.set_jobid_source(job_id);
         hdr.clear_jobid_target();
+        let frame_hdr = hdr.serialize();
 
         let req = GetManifestRequestCodeRequest::new(app_id, depot_id, manifest_gid);
-        let _body = req.serialize();
+        let frame_body = req.serialize();
 
         self.pending.insert(
             job_id,
@@ -179,6 +225,8 @@ impl ManifestProbeState {
                 depot_id,
                 manifest_gid,
                 sent_at: Instant::now(),
+                frame_hdr,
+                frame_body,
             },
         );
 
@@ -192,6 +240,9 @@ impl ManifestProbeState {
         }
         let resp = GetManifestRequestCodeResponse::parse_from_array(p_body).ok()?;
         self.pending.remove(&job_id);
+        if !resp.is_ok() {
+            return None;
+        }
         Some(resp.manifest_request_code())
     }
 
@@ -210,6 +261,10 @@ pub fn install_manifest_probe() -> Result<(), String> {
 
 pub fn uninstall_manifest_probe() {
     MANIFEST_PROBE_ACTIVE.store(false, Ordering::Release);
+    probe_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear_context();
     log::info!("Uninstalled ManifestProbe NetPacket hooks");
 }
 
@@ -258,14 +313,59 @@ pub fn expire_manifest_probe_stale() {
 mod tests {
     use super::*;
 
+    static PROBE_TEST_GUARD: Mutex<()> = Mutex::new(());
+
     #[test]
     fn test_request_manifest_code_no_context() {
+        let _g = PROBE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         capture_manifest_probe_context(std::ptr::null_mut(), std::ptr::null(), &[], 0);
         assert!(request_manifest_code(730, 12345, 987_654_321).is_none());
     }
 
     #[test]
+    fn test_full_probe_lifecycle_and_eresult_validation() {
+        let _g = PROBE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        install_manifest_probe().unwrap();
+        assert!(is_manifestprobe_hook_active());
+
+        let mut dummy_ws = 0u8;
+        let dummy_ws_ptr = (&mut dummy_ws as *mut u8).cast::<std::ffi::c_void>();
+        let dummy_fn_ptr = (&dummy_ws as *const u8).cast::<()>();
+        let hdr_template = [0x01u8; 16];
+
+        capture_manifest_probe_context(dummy_ws_ptr, dummy_fn_ptr, &hdr_template, 16);
+
+        // Zero inputs rejected
+        assert!(request_manifest_code(0, 12345, 999).is_none());
+        let job_id = request_manifest_code(730, 12345, 987_654_321).unwrap();
+        assert!(job_id >= JOB_ID_BASE);
+
+        // Verify full 64-bit job_id preserved inside serialized frame header
+        {
+            let probe = probe_state().lock().unwrap_or_else(|e| e.into_inner());
+            let pending = probe.pending.get(&job_id).unwrap();
+            let encoded_src = u64::from_le_bytes(pending.frame_hdr[4..12].try_into().unwrap());
+            assert_eq!(encoded_src, job_id);
+        }
+
+        let mut hdr = vec![0u8; 12];
+        hdr[4..12].copy_from_slice(&job_id.to_le_bytes());
+
+        // Error EResult (e.g. AccessDenied = 15) must return None
+        let mut err_body = vec![0u8; 12];
+        err_body[0..8].copy_from_slice(&0x1234u64.to_le_bytes());
+        err_body[8..12].copy_from_slice(&15i32.to_le_bytes());
+        assert!(handle_manifest_probe_recv(job_id, &err_body, &hdr).is_none());
+
+        // Uninstall must clear context and active flag
+        uninstall_manifest_probe();
+        assert!(!is_manifestprobe_hook_active());
+        assert!(request_manifest_code(730, 12345, 987_654_321).is_none());
+    }
+
+    #[test]
     fn test_handle_manifest_probe_recv() {
+        let _g = PROBE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let mut hdr = vec![0u8; 12];
         let job_id = JOB_ID_BASE + 1;
         hdr[4..12].copy_from_slice(&job_id.to_le_bytes());
@@ -283,6 +383,7 @@ mod tests {
 
     #[test]
     fn test_expire_manifest_probe_stale() {
+        let _g = PROBE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         expire_manifest_probe_stale();
     }
 }

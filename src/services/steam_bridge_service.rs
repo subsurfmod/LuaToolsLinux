@@ -176,15 +176,30 @@ impl SteamBridgeService {
         status.steam_root = installation.as_ref().map(|i| i.root.clone());
         status.steam_pid = find_steam_pid();
         status.integration_lib_installed = self.lib_target_path.is_file();
+        status.integration_lib_path = self
+            .lib_target_path
+            .is_file()
+            .then(|| self.lib_target_path.clone());
         status.launcher_installed = self.launcher_path.is_file();
         status.system_preload_enabled = is_in_ld_so_preload(&self.lib_target_path);
         status.integration_active = check_ipc_or_maps_active();
+        // Reset per-installation scan metadata so stale state never leaks across roots
+        status.steam_client_found = false;
+        status.steam_ui_found = false;
+        status.steam_client_sha256 = None;
+        status.steam_ui_sha256 = None;
+        status.patterns_loaded = false;
+        status.steam_client_patterns = None;
+        status.steam_ui_patterns = None;
         if let Some(inst) = &installation {
             let mut store = self.ticket_store.lock().unwrap_or_else(|e| e.into_inner());
             *store = TicketStore::new(&inst.config_path);
             let _ = store.load();
             status.tickets_loaded = true;
             status.apps_with_tickets = store.list_app_ids().unwrap_or_default();
+        } else {
+            status.tickets_loaded = false;
+            status.apps_with_tickets.clear();
         }
     }
 
@@ -198,7 +213,13 @@ impl SteamBridgeService {
             let _ = fs::create_dir_all(parent);
         }
         if let Ok(js) = serde_json::to_string_pretty(ov) {
-            let _ = fs::write(&self.overrides_path, js);
+            let tmp = self
+                .overrides_path
+                .with_extension(format!("json.tmp.{}", std::process::id()));
+            if fs::write(&tmp, &js).is_ok() && fs::rename(&tmp, &self.overrides_path).is_err() {
+                let _ = fs::remove_file(&tmp);
+                let _ = fs::write(&self.overrides_path, &js);
+            }
         }
     }
 
@@ -225,10 +246,24 @@ impl SteamBridgeService {
                 .path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or("");
-            if name.contains("steamclient") {
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let path_low = binary.path.to_string_lossy().to_ascii_lowercase();
+            let is_64 = path_low.contains("linux64") || path_low.contains("x86_64");
+            if name == "steamclient.so" {
+                if steam_client.is_none() || is_64 {
+                    steam_client = Some(binary.clone());
+                }
+            } else if name == "steamui.so" {
+                if steam_ui.is_none() || is_64 {
+                    steam_ui = Some(binary.clone());
+                }
+            } else if steam_client.is_none()
+                && name.contains("steamclient")
+                && name.ends_with(".so")
+            {
                 steam_client = Some(binary.clone());
-            } else if name.contains("steamui") {
+            } else if steam_ui.is_none() && name.contains("steamui") && name.ends_with(".so") {
                 steam_ui = Some(binary.clone());
             }
         }
@@ -421,7 +456,15 @@ impl SteamBridgeService {
         status.install_status = "Scanning Steam binaries...".to_string();
         drop(status);
 
-        let lib_path = self.ensure_integration_lib_staged()?;
+        let lib_path = match self.ensure_integration_lib_staged() {
+            Ok(p) => p,
+            Err(e) => {
+                let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+                status.install_progress = 0.0;
+                status.install_status = format!("Install failed: {}", e);
+                return Err(e);
+            }
+        };
 
         {
             let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
@@ -436,10 +479,22 @@ impl SteamBridgeService {
         };
 
         if let Some(parent) = self.launcher_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            if let Err(e) = fs::create_dir_all(parent) {
+                let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+                status.install_progress = 0.0;
+                status.install_status = format!("Install failed: {}", e);
+                return Err(e.to_string());
+            }
         }
-        preload_loader::generate_ld_preload_launcher(&steam_exe, &lib_path, &self.launcher_path)
-            .map_err(|e| format!("Failed to generate launcher: {}", e))?;
+        if let Err(e) =
+            preload_loader::generate_ld_preload_launcher(&steam_exe, &lib_path, &self.launcher_path)
+        {
+            let msg = format!("Failed to generate launcher: {}", e);
+            let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+            status.install_progress = 0.0;
+            status.install_status = msg.clone();
+            return Err(msg);
+        }
 
         {
             let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
@@ -502,17 +557,22 @@ impl SteamBridgeService {
                 .map_err(|e| format!("Failed to clean /etc/ld.so.preload (needs root): {}", e))?;
         }
         if self.launcher_path.exists() {
-            let _ = fs::remove_file(&self.launcher_path);
+            fs::remove_file(&self.launcher_path)
+                .map_err(|e| format!("Failed to remove launcher: {}", e))?;
         }
         if self.lib_target_path.exists() {
-            let _ = fs::remove_file(&self.lib_target_path);
+            fs::remove_file(&self.lib_target_path)
+                .map_err(|e| format!("Failed to remove integration library: {}", e))?;
         }
         let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
         status.integration_active = false;
-        status.integration_lib_installed = false;
-        status.integration_lib_path = None;
-        status.launcher_installed = false;
-        status.system_preload_enabled = false;
+        status.integration_lib_installed = self.lib_target_path.is_file();
+        status.integration_lib_path = self
+            .lib_target_path
+            .is_file()
+            .then(|| self.lib_target_path.clone());
+        status.launcher_installed = self.launcher_path.is_file();
+        status.system_preload_enabled = is_in_ld_so_preload(&self.lib_target_path);
         Ok(())
     }
 
@@ -572,6 +632,11 @@ impl SteamBridgeService {
     }
 
     pub fn set_legacy_cd_key(&self, app_id: u32, key: String) {
+        let key = key.trim().to_string();
+        if key.is_empty() {
+            self.remove_legacy_cd_key(app_id);
+            return;
+        }
         {
             let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
             ov.legacy_cd_keys.insert(app_id, key.clone());
@@ -599,6 +664,11 @@ impl SteamBridgeService {
     }
 
     pub fn set_depot_key(&self, depot_id: u32, key: String) {
+        let key = key.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            self.remove_depot_key(depot_id);
+            return;
+        }
         {
             let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
             ov.depot_keys.insert(depot_id, key.clone());
@@ -616,7 +686,20 @@ impl SteamBridgeService {
         let _ = self.send_ipc_message(IpcMessage::RemoveDepotKey { depot_id });
     }
 
+    pub fn get_depot_key(&self, depot_id: u32) -> Option<String> {
+        self.overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .depot_keys
+            .get(&depot_id)
+            .cloned()
+    }
+
     pub fn set_stat(&self, app_id: u32, stat_name: String, stat_value: String) {
+        let stat_name = stat_name.trim().to_string();
+        if stat_name.is_empty() {
+            return;
+        }
         {
             let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
             ov.stats
@@ -633,6 +716,7 @@ impl SteamBridgeService {
     }
 
     pub fn remove_stat(&self, app_id: u32, stat_name: &str) {
+        let stat_name = stat_name.trim();
         {
             let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(map) = ov.stats.get_mut(&app_id) {
@@ -672,11 +756,16 @@ impl SteamBridgeService {
         let steam_id = data.steam_id.clone();
         let app_ticket = data.app_ticket.clone();
         let e_ticket = data.e_ticket.clone();
-        self.ticket_store
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .set(data)
-            .map_err(|e| e.to_string())?;
+        let apps_with_tickets = {
+            let mut store = self.ticket_store.lock().unwrap_or_else(|e| e.into_inner());
+            store.set(data).map_err(|e| e.to_string())?;
+            store.list_app_ids().unwrap_or_default()
+        };
+        {
+            let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+            status.tickets_loaded = true;
+            status.apps_with_tickets = apps_with_tickets;
+        }
         let _ = self.send_ipc_message(IpcMessage::SetTicket {
             app_id,
             steam_id,
@@ -687,11 +776,15 @@ impl SteamBridgeService {
     }
 
     pub fn remove_tickets(&self, app_id: u32) -> Result<(), String> {
-        self.ticket_store
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(app_id)
-            .map_err(|e| e.to_string())?;
+        let apps_with_tickets = {
+            let mut store = self.ticket_store.lock().unwrap_or_else(|e| e.into_inner());
+            store.remove(app_id).map_err(|e| e.to_string())?;
+            store.list_app_ids().unwrap_or_default()
+        };
+        {
+            let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+            status.apps_with_tickets = apps_with_tickets;
+        }
         let _ = self.send_ipc_message(IpcMessage::RemoveTicket { app_id });
         Ok(())
     }
@@ -786,5 +879,44 @@ mod tests {
         reloaded.remove_redirect_app(1245620);
         assert!(!reloaded.is_redirect_app(1245620));
         assert!(reloaded.get_stats(1245620).is_empty());
+        assert_eq!(
+            reloaded.get_depot_key(1245621).as_deref(),
+            Some("ab".repeat(32).as_str())
+        );
+    }
+
+    #[test]
+    fn set_steam_installation_none_clears_stale_status_and_tickets_sync_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut svc = SteamBridgeService::with_paths(None, Some(tmp.path().to_path_buf()));
+
+        let ticket = AppTicketData {
+            app_id: 730,
+            steam_id: Some("76561198000000001".into()),
+            app_ticket: Some("aa".repeat(32)),
+            e_ticket: None,
+            last_update: None,
+        };
+        svc.set_tickets(ticket).unwrap();
+        assert!(svc.status().apps_with_tickets.contains(&730));
+
+        svc.remove_tickets(730).unwrap();
+        assert!(!svc.status().apps_with_tickets.contains(&730));
+
+        // Clearing Steam installation must wipe stale detection/pattern/ticket status
+        {
+            let mut st = svc.status.lock().unwrap();
+            st.steam_client_found = true;
+            st.patterns_loaded = true;
+            st.tickets_loaded = true;
+            st.apps_with_tickets = vec![730];
+        }
+        svc.set_steam_installation(None);
+        let cleared = svc.status();
+        assert!(!cleared.steam_detected);
+        assert!(!cleared.steam_client_found);
+        assert!(!cleared.patterns_loaded);
+        assert!(!cleared.tickets_loaded);
+        assert!(cleared.apps_with_tickets.is_empty());
     }
 }

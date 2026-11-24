@@ -93,34 +93,51 @@ pub fn get_app_ticket(app_id: u32) -> Result<Option<AppOwnershipTicket>, TicketE
     read_app_ticket(app_id)
 }
 
-/// Writes an e-ticket for an app to the `localconfig.vdf` store.
-pub fn write_e_ticket(app_id: u32, e_ticket: String) -> Result<(), TicketError> {
-    let store = TicketStore::default_path();
-    let mut ts = TicketStore::new(&store);
+/// Writes an e-ticket for an app to a specific Steam config directory while preserving
+/// existing `steam_id` and `app_ticket` fields.
+pub fn write_e_ticket_to(
+    config_dir: &Path,
+    app_id: u32,
+    e_ticket: String,
+) -> Result<(), TicketError> {
+    let mut ts = TicketStore::new(config_dir);
     ts.load()?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let mut data = ts.get(app_id).unwrap_or(AppTicketData {
-        app_id,
-        ..Default::default()
-    });
+    let mut data = match ts.get(app_id) {
+        Ok(existing) => existing,
+        Err(TicketError::NotFound(_)) => AppTicketData {
+            app_id,
+            ..Default::default()
+        },
+        Err(e) => return Err(e),
+    };
     data.e_ticket = Some(e_ticket);
     data.last_update = Some(now);
     ts.set(data)
 }
 
-/// Gets an e-ticket for an app from the `localconfig.vdf` store.
-pub fn get_e_ticket(app_id: u32) -> Result<Option<String>, TicketError> {
-    let store = TicketStore::default_path();
-    let mut ts = TicketStore::new(&store);
+/// Writes an e-ticket for an app to the default `localconfig.vdf` store.
+pub fn write_e_ticket(app_id: u32, e_ticket: String) -> Result<(), TicketError> {
+    write_e_ticket_to(&TicketStore::default_path(), app_id, e_ticket)
+}
+
+/// Gets an e-ticket for an app from a specific Steam config directory.
+pub fn get_e_ticket_from(config_dir: &Path, app_id: u32) -> Result<Option<String>, TicketError> {
+    let mut ts = TicketStore::new(config_dir);
     ts.load()?;
     match ts.get(app_id) {
         Ok(data) => Ok(data.e_ticket),
         Err(TicketError::NotFound(_)) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// Gets an e-ticket for an app from the default `localconfig.vdf` store.
+pub fn get_e_ticket(app_id: u32) -> Result<Option<String>, TicketError> {
+    get_e_ticket_from(&TicketStore::default_path(), app_id)
 }
 
 #[cfg(test)]
@@ -206,5 +223,36 @@ mod tests {
         assert!(ids.contains(&1245620));
         assert!(ids.contains(&2778580));
         assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
+    fn test_write_and_get_e_ticket_preserves_existing_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_path = tmp.path();
+
+        assert_eq!(get_e_ticket_from(store_path, 730).unwrap(), None);
+
+        write_app_ticket_to(
+            store_path,
+            AppTicketData {
+                app_id: 730,
+                steam_id: Some("76561198028121353".into()),
+                app_ticket: Some("deadbeef".into()),
+                e_ticket: None,
+                last_update: None,
+            },
+        )
+        .unwrap();
+
+        write_e_ticket_to(store_path, 730, "cafebabe".into()).unwrap();
+        assert_eq!(
+            get_e_ticket_from(store_path, 730).unwrap().as_deref(),
+            Some("cafebabe")
+        );
+
+        let full = read_app_ticket_from(store_path, 730).unwrap().unwrap();
+        assert_eq!(full.steam_id.as_deref(), Some("76561198028121353"));
+        assert_eq!(full.app_ticket.as_deref(), Some("deadbeef"));
+        assert_eq!(full.e_ticket.as_deref(), Some("cafebabe"));
     }
 }

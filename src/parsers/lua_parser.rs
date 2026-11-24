@@ -117,6 +117,7 @@ impl LuaFileParser {
     }
 
     pub fn parse_text(text: &str, app_id_from_name: u32) -> LuaContents {
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let mut order: Vec<u32> = Vec::new();
         let mut key_by_id: BTreeMap<u32, Option<String>> = BTreeMap::new();
         let mut comment_by_id: BTreeMap<u32, String> = BTreeMap::new();
@@ -172,7 +173,10 @@ impl LuaFileParser {
             let Some(m) = add_appid_re().captures(line_to_match) else {
                 continue;
             };
-            let Ok(entry_id) = m.get(1).unwrap().as_str().parse::<u32>() else {
+            let Some(id_m) = m.get(1) else {
+                continue;
+            };
+            let Ok(entry_id) = id_m.as_str().parse::<u32>() else {
                 continue;
             };
 
@@ -253,6 +257,7 @@ impl LuaFileParser {
     }
 
     pub fn comment_out_manifest_pins(lua_text: &str) -> String {
+        let lua_text = lua_text.strip_prefix('\u{feff}').unwrap_or(lua_text);
         let re = comment_pin_re();
         let mut out: Vec<String> = Vec::new();
         for line in lua_text.lines() {
@@ -274,8 +279,9 @@ impl LuaFileParser {
         depot_id: u32,
         fallback_manifest_id: Option<&str>,
     ) -> (String, bool) {
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let pattern = format!(
-            r"(?i)^(\s*)(--\s*)?(setManifestid\s*\(\s*{}\s*,.*)$",
+            r"(?i)^(\s*)((?:--+\s*)+)?(setManifestid\s*\(\s*{}\s*,.*)$",
             depot_id
         );
         let Ok(re) = Regex::new(&pattern) else {
@@ -301,20 +307,24 @@ impl LuaFileParser {
         }
 
         if !changed {
-            if let Some(gid) = fallback_manifest_id.filter(|s| !s.is_empty()) {
+            if let Some(gid) = fallback_manifest_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+            {
                 new_lines.push(format!("setManifestid({}, \"{}\")", depot_id, gid));
                 changed = true;
             }
         }
 
         let mut res = new_lines.join("\n");
-        if text.ends_with('\n') || text.is_empty() {
+        if text.ends_with('\n') || (text.is_empty() && changed) {
             res.push('\n');
         }
         (res, changed)
     }
 
     pub fn infer_app_id_from_text(lua_text: &str) -> Option<u32> {
+        let lua_text = lua_text.strip_prefix('\u{feff}').unwrap_or(lua_text);
         let re = infer_appid_re();
         for line in lua_text.lines() {
             let trimmed = line.trim();
@@ -333,10 +343,15 @@ impl LuaFileParser {
     }
 
     pub fn default_lua_template(app_id: u32, game_name: &str) -> String {
-        let header = if game_name.trim().is_empty() {
+        let safe_name: String = game_name
+            .chars()
+            .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })
+            .collect();
+        let trimmed = safe_name.trim();
+        let header = if trimmed.is_empty() {
             String::new()
         } else {
-            format!(" -- {}", game_name.trim())
+            format!(" -- {}", trimmed)
         };
         format!(
             "-- LuaTools stplug-in configuration for AppID {app_id}{header}\n\
@@ -394,5 +409,50 @@ mod tests {
         assert!(ch2);
         let p2 = LuaFileParser::parse_text(&t2, 1245620);
         assert!(p2.active_pins.contains_key(&1245621));
+    }
+
+    #[test]
+    fn handles_utf8_bom_multi_dash_pins_and_empty_toggle() {
+        let bom_lua =
+            "\u{feff}addappid(730) -- CS2\n---- setManifestid(731, \"999888777\", 1024)\n";
+        let parsed = LuaFileParser::parse_text(bom_lua, 0);
+        assert_eq!(parsed.base_app_id, 730);
+        assert_eq!(LuaFileParser::infer_app_id_from_text(bom_lua), Some(730));
+        assert_eq!(
+            parsed.commented_pins.get(&731).map(String::as_str),
+            Some("999888777")
+        );
+
+        let (toggled, changed) = LuaFileParser::toggle_manifest_pin_in_text(bom_lua, 731, None);
+        assert!(changed);
+        let reparsed = LuaFileParser::parse_text(&toggled, 730);
+        assert_eq!(
+            reparsed.active_pins.get(&731).map(String::as_str),
+            Some("999888777")
+        );
+
+        // Empty text with no fallback must not inject a stray newline
+        let (empty_out, empty_changed) = LuaFileParser::toggle_manifest_pin_in_text("", 731, None);
+        assert!(!empty_changed);
+        assert_eq!(empty_out, "");
+
+        // Reject non-numeric fallback manifest IDs (prevents Lua injection)
+        let (bad_out, bad_changed) =
+            LuaFileParser::toggle_manifest_pin_in_text("", 731, Some("123\"); os.execute(\"id"));
+        assert!(!bad_changed);
+        assert_eq!(bad_out, "");
+
+        let (good_out, good_changed) =
+            LuaFileParser::toggle_manifest_pin_in_text("", 731, Some("123456789"));
+        assert!(good_changed);
+        assert_eq!(good_out, "setManifestid(731, \"123456789\")\n");
+    }
+
+    #[test]
+    fn default_lua_template_sanitizes_newlines_in_game_name() {
+        let tpl = LuaFileParser::default_lua_template(440, "Team Fortress\naddappid(999)");
+        let parsed = LuaFileParser::parse_text(&tpl, 440);
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.base_app_id, 440);
     }
 }

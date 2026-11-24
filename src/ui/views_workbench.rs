@@ -11,6 +11,7 @@ use eframe::egui::{
 use egui_extras::{Column, Size, StripBuilder, TableBuilder};
 
 use crate::parsers::lua_parser::LuaFileParser;
+use crate::parsers::steam_link::SteamLinkParser;
 use crate::services::api_client::HubcapService;
 use crate::services::cef_bridge::CefBridgeService;
 use crate::services::cloud_redirect_service::CloudRedirectStatus;
@@ -20,7 +21,8 @@ use crate::services::fixes_service::FixesService;
 use crate::services::protocol_service::ProtocolService;
 use crate::services::update_service::UpdateService;
 use crate::ui::app::LuaToolsApp;
-use crate::ui::state::{AppMessage, DepotsSubTab, SettingsSubTab, ToastKind};
+use crate::ui::lua_editor::validate_lua_text;
+use crate::ui::state::{AppMessage, DepotsSubTab, SettingsSubTab, ToastKind, UpdateBannerState};
 use crate::ui::theme::{
     chip_button, danger_button, display_font, draw_rem_medallion, format_bytes, ghost_button,
     inset_paper_sheet, lua_layouter, paper_card, paper_card_padded, pick_directory_native,
@@ -54,6 +56,7 @@ impl LuaToolsApp {
         // Clean Active Title & Mode Bar (non-overlapping Sides)
         let mut switch_to_app: Option<u32> = None;
         let mut jump_to_app: Option<u32> = None;
+        let mut jump_invalid = false;
         let mut new_subtab: Option<DepotsSubTab> = None;
         let cur_label = match self.depots_app_id {
             Some(aid) => format!("{}  (#{})", self.resolve_game_title(aid), aid),
@@ -99,13 +102,20 @@ impl LuaToolsApp {
                         [115.0, 28.0],
                         TextEdit::singleline(&mut self.depots_jump_input)
                             .margin(Margin::symmetric(8, 5))
-                            .hint_text("Jump AppID…"),
+                            .hint_text("AppID or URL…"),
                     );
                     if (jump.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                         || ghost_button(ui, "Load").clicked()
                     {
-                        if let Ok(aid) = self.depots_jump_input.trim().parse::<u32>() {
-                            jump_to_app = Some(aid);
+                        let raw = self.depots_jump_input.trim();
+                        if !raw.is_empty() {
+                            if let Some(aid) =
+                                SteamLinkParser::app_id_from(raw).filter(|&id| id > 0)
+                            {
+                                jump_to_app = Some(aid);
+                            } else {
+                                jump_invalid = true;
+                            }
                         }
                     }
                 },
@@ -158,6 +168,11 @@ impl LuaToolsApp {
         if let Some(aid) = switch_to_app.or(jump_to_app) {
             self.depots_jump_input.clear();
             self.open_game_in_depots(aid, ui.ctx());
+        } else if jump_invalid {
+            self.notify(
+                "Enter a valid numeric AppID or Steam Store URL.",
+                ToastKind::Warning,
+            );
         }
 
         ui.add_space(16.0);
@@ -239,23 +254,25 @@ impl LuaToolsApp {
                     [110.0, 30.0],
                     TextEdit::singleline(&mut self.binding_depot_input)
                         .margin(Margin::symmetric(8, 6))
-                        .hint_text(format!("{}", app_id + 1)),
+                        .hint_text(format!("{}", app_id.saturating_add(1))),
                 );
                 ui.label("Manifest GID:");
-                ui.add_sized(
+                let gid_resp = ui.add_sized(
                     [230.0, 30.0],
                     TextEdit::singleline(&mut self.binding_gid_input)
                         .margin(Margin::symmetric(8, 6))
                         .hint_text("19-digit Steam manifest GID"),
                 );
                 ui.label("Size:");
-                ui.add_sized(
+                let size_resp = ui.add_sized(
                     [125.0, 30.0],
                     TextEdit::singleline(&mut self.binding_size_input)
                         .margin(Margin::symmetric(8, 6))
                         .hint_text("Bytes (optional)"),
                 );
-                if primary_button(ui, "+ Add Manifest Pin").clicked() {
+                let enter = (gid_resp.lost_focus() || size_resp.lost_focus())
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if enter || primary_button(ui, "+ Add Manifest Pin").clicked() {
                     do_add_pin = true;
                 }
             });
@@ -272,11 +289,26 @@ impl LuaToolsApp {
             );
         }
         if do_add_pin {
-            let depot_opt = self.binding_depot_input.trim().parse::<u32>().ok();
+            let depot_opt = self
+                .binding_depot_input
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|&d| d > 0);
             let gid = self.binding_gid_input.trim().to_string();
-            let sz = self.binding_size_input.trim().parse::<u64>().unwrap_or(0);
+            let sz_raw = self.binding_size_input.trim();
+            let sz_res = if sz_raw.is_empty() {
+                Ok(0u64)
+            } else {
+                sz_raw.parse::<u64>()
+            };
             if let Some(did) = depot_opt {
-                if !gid.is_empty() {
+                if gid.is_empty() || !gid.chars().all(|c| c.is_ascii_digit()) {
+                    self.notify(
+                        "Manifest GID must be a numeric Steam manifest ID.",
+                        ToastKind::Warning,
+                    );
+                } else if let Ok(sz) = sz_res {
                     let active =
                         self.manifest_binding_service
                             .set_pin(app_id, did, gid.clone(), sz);
@@ -297,10 +329,16 @@ impl LuaToolsApp {
                         ToastKind::Success,
                     );
                 } else {
-                    self.notify("Enter a Manifest GID to pin.", ToastKind::Warning);
+                    self.notify(
+                        "Size must be a valid byte count (or left blank).",
+                        ToastKind::Warning,
+                    );
                 }
             } else {
-                self.notify("Enter a valid numeric Depot ID.", ToastKind::Warning);
+                self.notify(
+                    "Enter a valid positive numeric Depot ID.",
+                    ToastKind::Warning,
+                );
             }
         }
 
@@ -466,17 +504,19 @@ impl LuaToolsApp {
                                     let is_sel = self.depots_selected_variant_hash.as_deref()
                                         == Some(v.hash.as_str());
                                     let meta = if is_live {
-                                        "Live".to_string()
+                                        "● Live".to_string()
                                     } else if v.is_pinned() {
                                         format!("{} pinned", v.manifest_ids.len())
                                     } else {
                                         format!("{} depots", v.depot_count)
                                     };
+                                    let row_selected = is_sel
+                                        || (self.depots_selected_variant_hash.is_none() && is_live);
                                     let resp = clean_list_row(
                                         ui,
                                         &v.display_label(),
                                         &meta,
-                                        is_sel || is_live,
+                                        row_selected,
                                     );
                                     if resp.clicked() {
                                         self.depots_selected_variant_hash = Some(v.hash.clone());
@@ -535,6 +575,11 @@ impl LuaToolsApp {
                                     format!("Applied LuaVault variant for AppID {}", app_id),
                                     ToastKind::Success,
                                 );
+                            } else {
+                                self.notify(
+                                    "Failed to apply LuaVault variant — verify Steam stplug-in path.",
+                                    ToastKind::Warning,
+                                );
                             }
                         }
                         if let Some((h, cur)) = rename_hash {
@@ -589,9 +634,19 @@ impl LuaToolsApp {
                                 ui.add_space(8.0);
                                 if primary_button(ui, "Create Starter .lua").clicked() {
                                     let tpl = LuaFileParser::default_lua_template(app_id, "");
-                                    let _ = self.lua_vault.write_live(app_id, &tpl);
-                                    self.reload_depots_local(app_id);
-                                    self.refresh_all_local_state();
+                                    if self.lua_vault.write_live(app_id, &tpl) {
+                                        self.reload_depots_local(app_id);
+                                        self.refresh_all_local_state();
+                                        self.notify(
+                                            format!("Created starter {}.lua", app_id),
+                                            ToastKind::Success,
+                                        );
+                                    } else {
+                                        self.notify(
+                                            "Failed to write starter .lua — check Steam path in Settings.",
+                                            ToastKind::Warning,
+                                        );
+                                    }
                                 }
                             });
                             return;
@@ -686,6 +741,9 @@ impl LuaToolsApp {
                             let (updated, changed) =
                                 LuaFileParser::toggle_manifest_pin_in_text(&raw, did, None);
                             if changed && self.lua_vault.write_live(app_id, &updated) {
+                                if !enable_pin {
+                                    self.manifest_binding_service.remove_pin(app_id, did);
+                                }
                                 self.reload_depots_local(app_id);
                                 self.notify(
                                     format!(
@@ -698,6 +756,11 @@ impl LuaToolsApp {
                                         did
                                     ),
                                     ToastKind::Info,
+                                );
+                            } else if changed {
+                                self.notify(
+                                    "Failed to update stplug-in .lua file on disk.",
+                                    ToastKind::Warning,
                                 );
                             }
                         }
@@ -785,7 +848,15 @@ impl LuaToolsApp {
                             format!("Saved {}.lua and synced SLSsteam.", app_id),
                             ToastKind::Success,
                         );
+                    } else {
+                        self.notify(
+                            res.error
+                                .unwrap_or_else(|| format!("Failed to save {}.lua", app_id)),
+                            ToastKind::Warning,
+                        );
                     }
+                } else {
+                    self.notify("Steam installation not detected.", ToastKind::Warning);
                 }
             }
             if act_save_preset {
@@ -800,7 +871,57 @@ impl LuaToolsApp {
                 self.reload_depots_local(app_id);
             }
 
-            ui.add_space(12.0);
+            ui.add_space(8.0);
+            let report = validate_lua_text(&self.depots_editor_text, app_id);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                ui.label(
+                    RichText::new(format!(
+                        "{} entries · {} depots · {} DLCs",
+                        report.parsed.entries.len(),
+                        report.parsed.depot_count(),
+                        report.parsed.dlc_count()
+                    ))
+                    .size(12.0)
+                    .color(Palette::TEXT_MUTED),
+                );
+                if report.parsed.has_active_pins() {
+                    ui.label(
+                        RichText::new(format!("{} active pin(s)", report.parsed.active_pins.len()))
+                            .size(12.0)
+                            .color(Palette::GO_TEXT),
+                    );
+                }
+                if !report.parsed.commented_pins.is_empty() {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} commented pin(s)",
+                            report.parsed.commented_pins.len()
+                        ))
+                        .size(12.0)
+                        .color(Palette::WARN_TEXT),
+                    );
+                }
+            });
+            if let Some(ref err) = report.error_message {
+                ui.label(
+                    RichText::new(format!("Syntax error: {}", err))
+                        .size(12.0)
+                        .color(Palette::DANGER_TEXT),
+                );
+            } else if let Some(first_warn) = report
+                .warnings
+                .iter()
+                .find(|w| !w.contains("commented out"))
+            {
+                ui.label(
+                    RichText::new(format!("Warning: {}", first_warn))
+                        .size(12.0)
+                        .color(Palette::WARN_TEXT),
+                );
+            }
+
+            ui.add_space(6.0);
             let mut layouter =
                 |ui: &egui::Ui, string: &str, wrap_width: f32| lua_layouter(ui, string, wrap_width);
             let editor_h = (ui.available_height() - 12.0).max(180.0);
@@ -1027,7 +1148,7 @@ impl LuaToolsApp {
             if self.depots_downloading {
                 ui.add_space(6.0);
                 ui.add(
-                    ProgressBar::new(self.depots_dl_pct / 100.0)
+                    ProgressBar::new((self.depots_dl_pct / 100.0).clamp(0.0, 1.0))
                         .show_percentage()
                         .corner_radius(CornerRadius::same(3)),
                 );
@@ -1039,6 +1160,13 @@ impl LuaToolsApp {
         let Some(app_id) = self.depots_app_id else {
             return;
         };
+        if self.depots_dest_dir.trim().is_empty() {
+            self.notify(
+                "Choose a valid output folder before downloading depots.",
+                ToastKind::Warning,
+            );
+            return;
+        }
         let selections: Vec<DepotSelection> = self
             .depots_picks
             .iter()
@@ -1067,6 +1195,7 @@ impl LuaToolsApp {
         let mut dd = self.depot_downloader.clone();
         dd.steam_installation = self.steam_service.installation.clone();
         dd.slssteam_service = Some(self.slssteam_service.clone());
+        dd.with_bridge(self.steam_bridge_service.clone());
         let tx = self.msg_tx.clone();
         let ctx_c = ctx.clone();
 
@@ -1209,7 +1338,11 @@ impl LuaToolsApp {
                                     let aid_num = g.app_id.parse::<u32>().ok();
                                     let sel =
                                         aid_num.is_some() && self.fixes_current_app == aid_num;
-                                    let meta = format!("{} fix", g.fix_count);
+                                    let meta = if g.fix_count == 1 {
+                                        "1 fix".to_string()
+                                    } else {
+                                        format!("{} fixes", g.fix_count)
+                                    };
                                     if clean_list_row(ui, &g.name, &meta, sel).clicked() {
                                         clicked_fix_game = aid_num;
                                     }
@@ -1252,6 +1385,14 @@ impl LuaToolsApp {
                                 .id_salt("fix_items_cards_scroll")
                                 .show(ui, |ui| {
                                     ui.spacing_mut().item_spacing.y = 10.0;
+                                    if items.is_empty() {
+                                        ui.add_space(24.0);
+                                        ui.label(
+                                            RichText::new("No fixes loaded for this title yet.")
+                                                .size(13.0)
+                                                .color(Palette::TEXT_MUTED),
+                                        );
+                                    }
                                     for fx in &items {
                                         let applied = install_dir
                                             .as_ref()
@@ -1296,39 +1437,45 @@ impl LuaToolsApp {
                                                 );
                                             }
                                             ui.add_space(10.0);
-                                            ui.horizontal(|ui| {
-                                                ui.spacing_mut().item_spacing.x = 8.0;
-                                                if fx.has_manifest
-                                                    && secondary_button(ui, "Install Manifest")
-                                                        .clicked()
-                                                {
-                                                    act_mf = Some(fx.clone());
-                                                }
-                                                if fx.has_fix {
-                                                    ui.add_enabled_ui(
-                                                        install_dir.is_some(),
-                                                        |ui| {
-                                                            if primary_button(ui, "Apply Fix")
-                                                                .clicked()
-                                                            {
-                                                                if let Some(dir) = &install_dir {
-                                                                    act_fix = Some((
-                                                                        fx.clone(),
-                                                                        dir.clone(),
-                                                                    ));
+                                            ui.add_enabled_ui(!self.fixes_busy, |ui| {
+                                                ui.horizontal(|ui| {
+                                                    ui.spacing_mut().item_spacing.x = 8.0;
+                                                    if fx.has_manifest
+                                                        && secondary_button(ui, "Install Manifest")
+                                                            .clicked()
+                                                    {
+                                                        act_mf = Some(fx.clone());
+                                                    }
+                                                    if fx.has_fix {
+                                                        ui.add_enabled_ui(
+                                                            install_dir.is_some(),
+                                                            |ui| {
+                                                                if primary_button(ui, "Apply Fix")
+                                                                    .clicked()
+                                                                {
+                                                                    if let Some(dir) = &install_dir
+                                                                    {
+                                                                        act_fix = Some((
+                                                                            fx.clone(),
+                                                                            dir.clone(),
+                                                                        ));
+                                                                    }
                                                                 }
+                                                            },
+                                                        );
+                                                    }
+                                                    if applied {
+                                                        if let Some(dir) = &install_dir {
+                                                            if danger_button(ui, "Revert").clicked()
+                                                            {
+                                                                act_rev = Some((
+                                                                    fx.id.clone(),
+                                                                    dir.clone(),
+                                                                ));
                                                             }
-                                                        },
-                                                    );
-                                                }
-                                                if applied {
-                                                    if let Some(dir) = &install_dir {
-                                                        if danger_button(ui, "Revert").clicked() {
-                                                            act_rev =
-                                                                Some((fx.id.clone(), dir.clone()));
                                                         }
                                                     }
-                                                }
+                                                });
                                             });
                                         });
                                     }
@@ -1381,7 +1528,7 @@ impl LuaToolsApp {
                         if self.fixes_busy {
                             ui.add_space(8.0);
                             ui.add(
-                                ProgressBar::new(self.fixes_progress)
+                                ProgressBar::new(self.fixes_progress.clamp(0.0, 1.0))
                                     .show_percentage()
                                     .corner_radius(CornerRadius::same(3)),
                             );
@@ -1583,6 +1730,15 @@ impl LuaToolsApp {
                     let _ = self
                         .play_unowned_service
                         .sync_plugin_file(&self.slssteam_service);
+                    let msg = self.status_text.clone();
+                    self.notify(
+                        msg,
+                        if self.steam_service.is_available() {
+                            ToastKind::Success
+                        } else {
+                            ToastKind::Warning
+                        },
+                    );
                 }
                 if secondary_button(ui, "Donate Keys Now").clicked() {
                     self.trigger_donate_keys(ui.ctx());
@@ -1654,7 +1810,10 @@ impl LuaToolsApp {
                     let auth = self.auth_service.clone();
                     let tx = self.msg_tx.clone();
                     let ctx = ui.ctx().clone();
-                    self.status_text = "Waiting for Discord OAuth in browser…".into();
+                    self.notify(
+                        "Opening browser for Discord OAuth sign-in…",
+                        ToastKind::Info,
+                    );
                     thread::spawn(move || {
                         match auth.sign_in_with_browser(180) {
                             Ok(s) => {
@@ -1681,7 +1840,7 @@ impl LuaToolsApp {
                 if self.auth_service.is_signed_in() && danger_button(ui, "Sign Out").clicked() {
                     self.auth_service.sign_out();
                     self.settings_usage_text.clear();
-                    self.status_text = "Signed out.".into();
+                    self.notify("Signed out of Discord account.", ToastKind::Info);
                 }
             });
         });
@@ -2013,6 +2172,7 @@ impl LuaToolsApp {
         let cloud_apps = self.cloud_redirect_service.list_cloud_apps();
         let mut sync_cloud = false;
         let mut add_cloud_app: Option<u32> = None;
+        let mut add_cloud_invalid = false;
         let mut toggle_cloud: Option<(u32, bool)> = None;
 
         paper_card(ui, |ui| {
@@ -2052,15 +2212,19 @@ impl LuaToolsApp {
                 .color(Palette::TEXT_MUTED),
             );
             ui.horizontal(|ui| {
-                ui.add_sized(
+                let cloud_edit = ui.add_sized(
                     [150.0, 28.0],
                     TextEdit::singleline(&mut self.cloud_app_input)
                         .margin(Margin::symmetric(8, 5))
                         .hint_text("AppID (e.g. 1245620)"),
                 );
-                if secondary_button(ui, "+ Enable Cloud App").clicked() {
-                    if let Ok(aid) = self.cloud_app_input.trim().parse::<u32>() {
-                        add_cloud_app = Some(aid);
+                let submit_cloud = (cloud_edit.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    || secondary_button(ui, "+ Enable Cloud App").clicked();
+                if submit_cloud {
+                    match self.cloud_app_input.trim().parse::<u32>() {
+                        Ok(aid) if aid > 0 => add_cloud_app = Some(aid),
+                        _ => add_cloud_invalid = true,
                     }
                 }
                 if primary_button(ui, "Sync to CloudRedirect").clicked() {
@@ -2082,16 +2246,22 @@ impl LuaToolsApp {
             if !candidate_ids.is_empty() {
                 inset_paper_sheet(ui, Margin::symmetric(10, 8), |ui| {
                     ui.set_width(ui.available_width());
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(14.0, 6.0);
-                        for (aid, name) in candidate_ids.iter().take(12) {
-                            let mut enabled = self.cloud_redirect_service.is_cloud_enabled(*aid);
-                            let lbl = format!("{} (#{})", name, aid);
-                            if ui.checkbox(&mut enabled, lbl).changed() {
-                                toggle_cloud = Some((*aid, enabled));
-                            }
-                        }
-                    });
+                    ScrollArea::vertical()
+                        .id_salt("cloud_redirect_apps_scroll")
+                        .max_height(150.0)
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(14.0, 6.0);
+                                for (aid, name) in &candidate_ids {
+                                    let mut enabled =
+                                        self.cloud_redirect_service.is_cloud_enabled(*aid);
+                                    let lbl = format!("{} (#{})", name, aid);
+                                    if ui.checkbox(&mut enabled, lbl).changed() {
+                                        toggle_cloud = Some((*aid, enabled));
+                                    }
+                                }
+                            });
+                        });
                 });
             }
         });
@@ -2102,6 +2272,11 @@ impl LuaToolsApp {
             self.notify(
                 format!("Enabled CloudRedirect sync for AppID {}.", aid),
                 ToastKind::Info,
+            );
+        } else if add_cloud_invalid {
+            self.notify(
+                "Enter a valid positive numeric AppID for CloudRedirect.",
+                ToastKind::Warning,
             );
         }
         if let Some((aid, on)) = toggle_cloud {
@@ -2204,9 +2379,13 @@ impl LuaToolsApp {
                         .hint_text("https://github.com/subsurfmod/LuaToolsLinux.git (default)"),
                 );
             });
-            let repo_hint = UpdateService::discover_repo_dir("")
-                .map(|p| format!("Auto-detected ({})", p.display()))
-                .unwrap_or_else(|| "Auto-detected (~/.local/share/luatools/repo)".into());
+            let repo_hint = if self.settings_service.settings.update_repo_dir.is_empty() {
+                UpdateService::discover_repo_dir("")
+                    .map(|p| format!("Auto-detected ({})", p.display()))
+                    .unwrap_or_else(|| "Auto-detected (~/.local/share/luatools/repo)".into())
+            } else {
+                "Custom local Git repository path".into()
+            };
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Local Repo:")
@@ -2232,16 +2411,19 @@ impl LuaToolsApp {
                 }
             });
 
+            let is_updating = matches!(self.update_banner, UpdateBannerState::Updating { .. });
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
-                if secondary_button(ui, "Check for Updates").clicked() {
-                    let _ = self.settings_service.save();
-                    self.check_app_update_once_async(ui.ctx());
-                }
-                if primary_button(ui, "Pull & Update Now").clicked() {
-                    let _ = self.settings_service.save();
-                    self.trigger_git_self_update(ui.ctx());
-                }
+                ui.add_enabled_ui(!is_updating, |ui| {
+                    if secondary_button(ui, "Check for Updates").clicked() {
+                        let _ = self.settings_service.save();
+                        self.check_app_update_once_async(ui.ctx());
+                    }
+                    if primary_button(ui, "Pull & Update Now").clicked() {
+                        let _ = self.settings_service.save();
+                        self.trigger_git_self_update(ui.ctx());
+                    }
+                });
             });
         });
 
@@ -2793,10 +2975,14 @@ impl LuaToolsApp {
             }
 
             // Progress bar for installation
+            if self.bridge_busy {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(100));
+            }
             if st.install_progress > 0.0 && st.install_progress < 100.0 {
                 ui.add_space(4.0);
                 ui.add(
-                    egui::ProgressBar::new(st.install_progress / 100.0)
+                    egui::ProgressBar::new((st.install_progress / 100.0).clamp(0.0, 1.0))
                         .text(format!("{}%", st.install_progress as u32))
                         .animate(true),
                 );

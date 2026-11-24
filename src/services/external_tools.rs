@@ -163,8 +163,8 @@ impl ExternalToolsManager {
             _ => {}
         }
 
-        let mut version = String::new();
         for d in &search_dirs {
+            let mut version = String::new();
             if let Ok(raw) = fs::read_to_string(d.join("meta.json")) {
                 if let Ok(v) = serde_json::from_str::<Value>(&raw) {
                     if let Some(ver) = v.get("version").and_then(|x| x.as_str()) {
@@ -211,18 +211,28 @@ impl ExternalToolsManager {
         }
 
         let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
             .timeout(Duration::from_secs(90))
             .build();
         let ua = format!("LuaToolsLinux/{}", crate::VERSION);
+        let mut last_err: Option<String> = None;
 
         for repo in repos {
             progress_cb(0.05, format!("Querying GitHub releases ({})...", repo));
             let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
-            let Ok(resp) = agent.get(&url).set("User-Agent", &ua).call() else {
-                continue;
+            let resp = match agent.get(&url).set("User-Agent", &ua).call() {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = Some(format!("GitHub API error ({}): {}", repo, e));
+                    continue;
+                }
             };
-            let Ok(rel) = resp.into_json::<Value>() else {
-                continue;
+            let rel = match resp.into_json::<Value>() {
+                Ok(v) => v,
+                Err(e) => {
+                    last_err = Some(format!("Invalid release JSON ({}): {}", repo, e));
+                    continue;
+                }
             };
             let tag = rel
                 .get("tag_name")
@@ -277,22 +287,40 @@ impl ExternalToolsManager {
             let Some(dl_url) = asset.get("browser_download_url").and_then(|v| v.as_str()) else {
                 continue;
             };
-            let aname = asset
+            let raw_aname = asset
                 .get("name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("tool.zip");
-            let archive_path = tool_dir.join(aname);
+            let safe_aname = Path::new(raw_aname)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+                .unwrap_or("tool.zip");
+            let archive_path = tool_dir.join(safe_aname);
 
             progress_cb(0.1, format!("Downloading {} {}...", spec.name, tag));
-            let Ok(dl_resp) = agent.get(dl_url).set("User-Agent", &ua).call() else {
-                continue;
+            let dl_resp = match agent.get(dl_url).set("User-Agent", &ua).call() {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = Some(format!("Download failed ({}): {}", repo, e));
+                    continue;
+                }
             };
-            stream_response_to_file(dl_resp, &archive_path, &mut progress_cb)?;
+            if let Err(e) = stream_response_to_file(dl_resp, &archive_path, &mut |frac, msg| {
+                progress_cb((0.1 + frac.clamp(0.0, 1.0) * 0.78).clamp(0.1, 0.88), msg);
+            }) {
+                let _ = fs::remove_file(&archive_path);
+                last_err = Some(format!("Download stream failed ({}): {}", repo, e));
+                continue;
+            }
 
             progress_cb(0.9, "Extracting archive...".into());
             let extract_res = extract_archive(&archive_path, &tool_dir);
             let _ = fs::remove_file(&archive_path);
-            extract_res?;
+            if let Err(e) = extract_res {
+                last_err = Some(format!("Extraction failed ({}): {}", repo, e));
+                continue;
+            }
 
             if key == "goldberg" {
                 stage_goldberg_layout(&tool_dir, &self.goldberg_root());
@@ -323,19 +351,30 @@ impl ExternalToolsManager {
             }
         }
 
-        Err(format!(
-            "Failed to locate compatible release binary for {}",
-            spec.name
-        ))
+        Err(last_err.unwrap_or_else(|| {
+            format!(
+                "Failed to locate compatible release binary for {}",
+                spec.name
+            )
+        }))
     }
 
     pub fn launch_steamautopatch(&self, app_id: u32, folder: &Path) -> Result<String, String> {
+        if !folder.exists() {
+            return Err(format!(
+                "Target directory does not exist: {}",
+                folder.display()
+            ));
+        }
         let info = self.inspect_tool("steamautopatch");
         let exe = info.exe_path.ok_or_else(|| {
             "SteamAutoPatch is not installed yet. Install Goldberg Emulator (Native Linux) or SteamAutoPatch in Settings › Updates & Toolchain.".to_string()
         })?;
         let prefix = DepotDownloaderService::build_invocation(&exe)?;
-        let mut cmd = Command::new(&prefix[0]);
+        let Some(first) = prefix.first() else {
+            return Err("Failed to construct SteamAutoPatch command invocation.".into());
+        };
+        let mut cmd = Command::new(first);
         for p in &prefix[1..] {
             cmd.arg(p);
         }
@@ -362,12 +401,21 @@ impl ExternalToolsManager {
     }
 
     pub fn launch_stub_remover(&self, target_exe: &Path) -> Result<String, String> {
+        if !target_exe.is_file() {
+            return Err(format!(
+                "Target executable does not exist: {}",
+                target_exe.display()
+            ));
+        }
         let info = self.inspect_tool("stub_remover");
         let exe = info.exe_path.ok_or_else(|| {
             "StubRemover is not installed yet. Click INSTALL / UPDATE first.".to_string()
         })?;
         let prefix = DepotDownloaderService::build_invocation(&exe)?;
-        let mut cmd = Command::new(&prefix[0]);
+        let Some(first) = prefix.first() else {
+            return Err("Failed to construct StubRemover command invocation.".into());
+        };
+        let mut cmd = Command::new(first);
         for p in &prefix[1..] {
             cmd.arg(p);
         }
@@ -393,12 +441,17 @@ fn stage_goldberg_layout(extracted: &Path, goldberg_root: &Path) {
         let Some(fname) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
+        let fname_lower = fname.to_ascii_lowercase();
         let full_lower = path.to_string_lossy().to_ascii_lowercase();
         let is_exp = full_lower.contains("experimental");
-        let is_x86 =
-            full_lower.contains("/x32/") || full_lower.contains("/x86/") || fname == "steam_api.so";
+        let is_x86 = full_lower.contains("/x32/")
+            || full_lower.contains("/x86/")
+            || full_lower.contains("/linux32/")
+            || full_lower.contains("/i386/")
+            || full_lower.contains("/i686/")
+            || fname_lower == "steam_api.so";
 
-        match fname {
+        match fname_lower.as_str() {
             "libsteam_api.so" | "steam_api64.so" | "steam_api.so" => {
                 let dst_dir = match (is_x86, is_exp) {
                     (false, false) => &reg_x64,
@@ -431,25 +484,44 @@ mod walkdir_lite {
     use std::fs;
     use std::path::{Path, PathBuf};
 
+    const MAX_DEPTH: usize = 8;
+
     pub fn collect_files_recursive(dir: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
+        collect_depth(dir, 0, &mut out);
+        out
+    }
+
+    fn collect_depth(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        if depth > MAX_DEPTH {
+            return;
+        }
         let Ok(entries) = fs::read_dir(dir) else {
-            return out;
+            return;
         };
         for e in entries.flatten() {
+            let Ok(ft) = e.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                continue;
+            }
             let p = e.path();
-            if p.is_dir() {
-                out.extend(collect_files_recursive(&p));
-            } else if p.is_file() {
+            if ft.is_dir() {
+                collect_depth(&p, depth + 1, out);
+            } else if ft.is_file() {
                 out.push(p);
             }
         }
-        out
     }
 }
 
 fn find_candidate_recursive(dir: &Path, candidates: &[&str]) -> Option<PathBuf> {
-    if !dir.exists() {
+    find_candidate_depth(dir, candidates, 0)
+}
+
+fn find_candidate_depth(dir: &Path, candidates: &[&str], depth: usize) -> Option<PathBuf> {
+    if depth > 6 || !dir.is_dir() {
         return None;
     }
     for &c in candidates {
@@ -460,9 +532,8 @@ fn find_candidate_recursive(dir: &Path, candidates: &[&str]) -> Option<PathBuf> 
     }
     let entries = fs::read_dir(dir).ok()?;
     for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            if let Some(found) = find_candidate_recursive(&p, candidates) {
+        if e.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            if let Some(found) = find_candidate_depth(&e.path(), candidates, depth + 1) {
                 return Some(found);
             }
         }
@@ -501,5 +572,80 @@ fn runtime_note_for(exe: &Path) -> String {
             }
         }
         _ => "Native Linux".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stage_goldberg_layout_separates_x64_x86_linux32_and_experimental() {
+        let tmp = tempfile::tempdir().unwrap();
+        let extracted = tmp.path().join("extracted");
+        let gb_root = tmp.path().join("goldberg");
+
+        fs::create_dir_all(extracted.join("release/regular/x64")).unwrap();
+        fs::create_dir_all(extracted.join("release/regular/linux32")).unwrap();
+        fs::create_dir_all(extracted.join("release/experimental/x64")).unwrap();
+        fs::write(
+            extracted.join("release/regular/x64/libsteam_api.so"),
+            b"X64_REG",
+        )
+        .unwrap();
+        fs::write(
+            extracted.join("release/regular/linux32/libsteam_api.so"),
+            b"X86_REG",
+        )
+        .unwrap();
+        fs::write(
+            extracted.join("release/experimental/x64/Steam_api64.dll"),
+            b"X64_EXP_DLL",
+        )
+        .unwrap();
+
+        stage_goldberg_layout(&extracted, &gb_root);
+
+        assert_eq!(
+            fs::read(gb_root.join("regular/x64/libsteam_api.so")).unwrap(),
+            b"X64_REG"
+        );
+        assert_eq!(
+            fs::read(gb_root.join("regular/x86/steam_api.so")).unwrap(),
+            b"X86_REG"
+        );
+        assert_eq!(
+            fs::read(gb_root.join("experimental/x64/steam_api64.dll")).unwrap(),
+            b"X64_EXP_DLL"
+        );
+    }
+
+    #[test]
+    fn inspect_tool_does_not_leak_version_from_empty_dir_and_validates_launch_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools_dir = tmp.path().join("tools");
+        let mgr = ExternalToolsManager::new(Some(tools_dir.clone()));
+
+        // Stale meta.json in primary dir with no binary
+        fs::create_dir_all(tools_dir.join("stub_remover")).unwrap();
+        fs::write(
+            tools_dir.join("stub_remover/meta.json"),
+            r#"{"version":"stale-0.1"}"#,
+        )
+        .unwrap();
+        // Actual binary in legacy dir without meta.json
+        fs::create_dir_all(tools_dir.join("steamless")).unwrap();
+        fs::write(tools_dir.join("steamless/Steamless.CLI.exe"), b"MZ").unwrap();
+
+        let status = mgr.inspect_tool("stub_remover");
+        assert!(status.installed);
+        assert_eq!(status.version, "Local");
+
+        assert!(mgr
+            .launch_stub_remover(&tmp.path().join("missing.exe"))
+            .is_err());
+        assert!(mgr
+            .launch_steamautopatch(1245620, &tmp.path().join("missing_dir"))
+            .is_err());
     }
 }

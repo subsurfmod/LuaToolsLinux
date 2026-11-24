@@ -88,6 +88,9 @@ impl LuaToolsApp {
                     }
                     let (rect, resp) =
                         ui.allocate_exact_size(Vec2::new(draw_w, draw_h), Sense::click());
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                    }
                     ui.painter().image(
                         tex.id(),
                         rect,
@@ -103,6 +106,12 @@ impl LuaToolsApp {
                     if resp.clicked() {
                         close = true;
                     }
+                } else {
+                    ui.label(
+                        RichText::new("Preview image unavailable.")
+                            .size(13.0)
+                            .color(Palette::TEXT_MUTED),
+                    );
                 }
                 ui.add_space(8.0);
                 egui::Sides::new().show(
@@ -185,7 +194,7 @@ impl LuaToolsApp {
         ui.add_space(16.0);
 
         ScrollArea::vertical()
-            .id_salt("how_to_use_scroll")
+            .id_salt(("how_to_use_scroll", self.guide_topic as usize))
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.set_max_width(940.0);
@@ -369,6 +378,10 @@ impl LuaToolsApp {
                 (
                     "Start / restart Steam with bridge",
                     "Top-right pill: Launch Steam w/ Bridge (or Restart Steam w/ Bridge)",
+                ),
+                (
+                    "Force-close all Steam processes",
+                    "Top-right 'Kill Steam' button (or Settings › General & Steam › Kill Steam)",
                 ),
                 (
                     "One-click setup for a game",
@@ -570,22 +583,10 @@ impl LuaToolsApp {
 
         ui.add_space(14.0);
 
+        let mut copy_sample: Option<String> = None;
         paper_card(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 8.0;
-            ui.label(
-                RichText::new("Annotated stplug-in .lua Format Reference")
-                    .font(display_font(17.5))
-                    .color(Palette::TEXT_PRIMARY),
-            );
-            ui.label(
-                RichText::new(
-                    "Understanding each directive inside ~/.local/share/Steam/config/stplug-in/<appid>.lua:",
-                )
-                .size(12.5)
-                .color(Palette::TEXT_MUTED),
-            );
-
             let mut sample = String::from(
                 "-- 1. Base game entitlement\n\
                  addappid(1245620) -- ELDEN RING\n\n\
@@ -598,6 +599,29 @@ impl LuaToolsApp {
                  -- 4. Optional app ownership token (synced to SLSsteam AppTokens)\n\
                  addtoken(1245620, \"YOUR_OPTIONAL_APP_TOKEN\")",
             );
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    ui.label(
+                        RichText::new("Annotated stplug-in .lua Format Reference")
+                            .font(display_font(17.5))
+                            .color(Palette::TEXT_PRIMARY),
+                    );
+                },
+                |ui| {
+                    if ghost_button(ui, "Copy Example .lua").clicked() {
+                        copy_sample = Some(sample.clone());
+                    }
+                },
+            );
+            ui.label(
+                RichText::new(
+                    "Understanding each directive inside ~/.local/share/Steam/config/stplug-in/<appid>.lua:",
+                )
+                .size(12.5)
+                .color(Palette::TEXT_MUTED),
+            );
+
             let mut layouter =
                 |ui: &egui::Ui, string: &str, wrap_width: f32| lua_layouter(ui, string, wrap_width);
             inset_paper_sheet(ui, Margin::same(12), |ui| {
@@ -612,6 +636,13 @@ impl LuaToolsApp {
                 );
             });
         });
+        if let Some(txt) = copy_sample {
+            ui.ctx().copy_text(txt);
+            self.notify(
+                "Copied example .lua template to clipboard.",
+                ToastKind::Info,
+            );
+        }
     }
 
     fn render_guide_depots_and_vault(&mut self, ui: &mut egui::Ui) {
@@ -922,7 +953,7 @@ impl LuaToolsApp {
                 ),
                 ("Ctrl + 6  /  F1", "Open this How to Use manual"),
                 ("Ctrl + 7  /  Ctrl + ,", "Open Preferences & Settings"),
-                ("Esc", "Close active screenshot preview modal"),
+                ("Esc", "Close active modal or screenshot preview"),
                 ("Ctrl + Q", "Quit LuaTools Linux"),
             ];
 

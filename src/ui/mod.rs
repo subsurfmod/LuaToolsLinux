@@ -1,4 +1,4 @@
-//! Sharp Monotone + Cobalt Blue Native GUI (`eframe` / `egui`) for LuaTools Linux v2.0.0.
+//! Papercut Monotone-Dark Native GUI (`eframe` / `egui`) for LuaTools Linux.
 
 pub mod app;
 pub mod dialogs;
