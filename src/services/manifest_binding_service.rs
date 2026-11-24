@@ -118,6 +118,9 @@ impl ManifestBindingService {
     pub fn sync_from_lua(&self, app_id: u32, lua: &LuaContents) {
         let mut guard = self.pins.lock().unwrap();
         let mut changed = false;
+        let mut sls = SlssteamService::default();
+        let mut sls_changed = false;
+
         for entry in &lua.entries {
             if let Some(ref gid) = entry.manifest_id {
                 let key = (app_id, entry.id);
@@ -142,10 +145,15 @@ impl ManifestBindingService {
                     );
                     changed = true;
                 }
+                sls.set_manifest_override(entry.id, gid.clone());
+                sls_changed = true;
             }
         }
         if changed {
             self.persist(&guard);
+        }
+        if sls_changed {
+            let _ = sls.save();
         }
     }
 

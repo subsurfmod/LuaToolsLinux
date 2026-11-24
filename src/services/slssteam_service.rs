@@ -23,9 +23,14 @@ const KNOWN_KEYS: &[&str] = &[
     "ManifestOverrides",
     "ManifestPins",
     "Manifests",
+    "ManifestIds",
     "ProcessMap",
     "ForceDenuvo",
     "PinnedApps",
+    "CDKeys",
+    "DenuvoGames",
+    "GameTitles",
+    "SteamIdOverride",
 ];
 
 #[derive(Debug, Clone)]
@@ -174,7 +179,7 @@ impl SlssteamService {
                         }
                     }
                 }
-                "ManifestOverrides" | "ManifestPins" | "Manifests" => {
+                "ManifestOverrides" | "ManifestPins" | "Manifests" | "ManifestIds" => {
                     if let Value::Mapping(sub) = v {
                         for (dk, mv) in sub {
                             if let (Some(did), Some(gid)) =
@@ -184,6 +189,55 @@ impl SlssteamService {
                             }
                         }
                     }
+                }
+                "CDKeys" => {
+                    if let Value::Mapping(sub) = v {
+                        for (ak, kv) in sub {
+                            if let (Some(aid), Some(kstr)) =
+                                (Self::value_to_u32(ak), Self::value_to_string(kv))
+                            {
+                                cfg.cd_keys.insert(aid, kstr);
+                            }
+                        }
+                    }
+                }
+                "DenuvoGames" => {
+                    if let Value::Mapping(sub) = v {
+                        for (sid_k, app_seq) in sub {
+                            let sid_opt = match sid_k {
+                                Value::Number(n) => n.as_u64(),
+                                Value::String(s) => s.trim().parse::<u64>().ok(),
+                                _ => None,
+                            };
+                            if let (Some(sid), Value::Sequence(seq)) = (sid_opt, app_seq) {
+                                let mut aids = Vec::new();
+                                for it in seq {
+                                    if let Some(aid) = Self::value_to_u32(it) {
+                                        aids.push(aid);
+                                    }
+                                }
+                                cfg.denuvo_games.insert(sid, aids);
+                            }
+                        }
+                    }
+                }
+                "GameTitles" => {
+                    if let Value::Mapping(sub) = v {
+                        for (ak, tv) in sub {
+                            if let (Some(aid), Some(title)) =
+                                (Self::value_to_u32(ak), Self::value_to_string(tv))
+                            {
+                                cfg.game_titles.insert(aid, title);
+                            }
+                        }
+                    }
+                }
+                "SteamIdOverride" => {
+                    cfg.steam_id_override = match v {
+                        Value::Number(n) => n.as_u64(),
+                        Value::String(s) => s.trim().parse::<u64>().ok(),
+                        _ => None,
+                    };
                 }
                 "ProcessMap" => {
                     if let Value::Mapping(sub) = v {
@@ -291,8 +345,13 @@ impl SlssteamService {
         if !cfg.app_tokens.is_empty() {
             lines.push("AppTokens:".into());
             for (aid, tok) in &cfg.app_tokens {
-                let escaped = tok.replace('\\', "\\\\").replace('"', "\\\"");
-                lines.push(format!("  {}: \"{}\"", aid, escaped));
+                let clean_tok = tok.trim().trim_matches('"');
+                if clean_tok.chars().all(|c| c.is_ascii_digit()) && !clean_tok.is_empty() {
+                    lines.push(format!("  {}: {}", aid, clean_tok));
+                } else {
+                    let escaped = clean_tok.replace('\\', "\\\\").replace('"', "\\\"");
+                    lines.push(format!("  {}: \"{}\"", aid, escaped));
+                }
             }
             lines.push(String::new());
         }
@@ -333,7 +392,7 @@ impl SlssteamService {
         }
 
         if !cfg.manifest_overrides.is_empty() {
-            lines.push("ManifestOverrides:".into());
+            lines.push("ManifestIds:".into());
             for (did, gid) in &cfg.manifest_overrides {
                 let clean_gid = gid.trim().trim_matches('"');
                 lines.push(format!("  {}: \"{}\"", did, clean_gid));
@@ -370,6 +429,39 @@ impl SlssteamService {
                 lines.push(format!("  - {}", aid));
             }
             lines.push(String::new());
+        }
+
+        if !cfg.cd_keys.is_empty() {
+            lines.push("CDKeys:".into());
+            for (aid, key) in &cfg.cd_keys {
+                let clean_key = key.trim().trim_matches('"');
+                lines.push(format!("  {}: \"{}\"", aid, clean_key));
+            }
+            lines.push(String::new());
+        }
+
+        if !cfg.denuvo_games.is_empty() {
+            lines.push("DenuvoGames:".into());
+            for (sid, aids) in &cfg.denuvo_games {
+                lines.push(format!("  {}:", sid));
+                for aid in aids {
+                    lines.push(format!("    - {}", aid));
+                }
+            }
+            lines.push(String::new());
+        }
+
+        if !cfg.game_titles.is_empty() {
+            lines.push("GameTitles:".into());
+            for (aid, title) in &cfg.game_titles {
+                let clean_title = title.trim().trim_matches('"');
+                lines.push(format!("  {}: \"{}\"", aid, clean_title));
+            }
+            lines.push(String::new());
+        }
+
+        if let Some(sid) = cfg.steam_id_override {
+            lines.push(format!("SteamIdOverride: {}", sid));
         }
 
         lines.push(format!(
@@ -514,6 +606,38 @@ impl SlssteamService {
         self.config.pinned_apps.contains(&app_id)
     }
 
+    pub fn set_cd_key(&mut self, app_id: u32, key: String) {
+        self.config.cd_keys.insert(app_id, key);
+    }
+
+    pub fn get_cd_key(&self, app_id: u32) -> Option<&str> {
+        self.config.cd_keys.get(&app_id).map(String::as_str)
+    }
+
+    pub fn remove_cd_key(&mut self, app_id: u32) -> bool {
+        self.config.cd_keys.remove(&app_id).is_some()
+    }
+
+    pub fn set_game_title(&mut self, app_id: u32, title: String) {
+        self.config.game_titles.insert(app_id, title);
+    }
+
+    pub fn get_game_title(&self, app_id: u32) -> Option<&str> {
+        self.config.game_titles.get(&app_id).map(String::as_str)
+    }
+
+    pub fn remove_game_title(&mut self, app_id: u32) -> bool {
+        self.config.game_titles.remove(&app_id).is_some()
+    }
+
+    pub fn set_denuvo_games(&mut self, steam_id: u64, app_ids: Vec<u32>) {
+        self.config.denuvo_games.insert(steam_id, app_ids);
+    }
+
+    pub fn set_steam_id_override(&mut self, steam_id: Option<u64>) {
+        self.config.steam_id_override = steam_id;
+    }
+
     /// Synchronizes manifest pins into SLSsteam's `ManifestOverrides` so they take effect under SLSsteam.so.
     pub fn sync_manifest_pins(&mut self, pins: &[(u32, String)]) {
         for (depot_id, gid) in pins {
@@ -628,7 +752,7 @@ mod tests {
         // Check that depot keys and manifest overrides are properly quoted in output YAML
         let raw_yaml = fs::read_to_string(&cfg_path).unwrap();
         assert!(raw_yaml.contains(&format!("  1245621: \"{}\"", "a".repeat(64))));
-        assert!(raw_yaml.contains("  1245621: \"8888777766665555444\""));
+        assert!(raw_yaml.contains("ManifestIds:\n  1245621: \"8888777766665555444\""));
         assert!(raw_yaml.contains("  1245620: \"eldenring.exe\""));
         assert!(raw_yaml.contains("ForceDenuvo:\n  - 1245620"));
         assert!(raw_yaml.contains("PinnedApps:\n  - 1245620"));

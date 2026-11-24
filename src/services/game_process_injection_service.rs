@@ -293,8 +293,8 @@ impl GameProcessInjectionService {
         })
     }
 
-    /// Launches `app_id` via `steam -applaunch <app_id>` (or a discovered binary in `install_dir`)
-    /// with `LD_PRELOAD` set to the configured integration library.
+    /// Launches `app_id` via `steam-sls -applaunch <app_id>` (or a discovered binary in `install_dir`)
+    /// with `LD_PRELOAD` set to the configured integration library without crashing 32-bit Steam.
     pub fn launch_with_integration(
         &self,
         app_id: u32,
@@ -311,20 +311,57 @@ impl GameProcessInjectionService {
             );
         }
 
+        // Detect if install_dir contains a Windows .exe binary
+        let detected_binary = install_dir.and_then(Self::find_game_binary_in_dir);
+        let is_windows_game = detected_binary
+            .as_ref()
+            .and_then(|p| p.extension().and_then(|e| e.to_str()))
+            .map(|e| e.eq_ignore_ascii_case("exe"))
+            .unwrap_or(false);
+
+        // Find steam-sls launcher (or fallback to luatools-steam-launcher or steam)
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let candidates = [
+            home.join(".local/bin/steam-sls"),
+            home.join(".local/bin/luatools-steam-launcher"),
+            PathBuf::from("/usr/local/bin/luatools-steam-launcher"),
+            PathBuf::from("steam-sls"),
+            PathBuf::from("steam"),
+        ];
+        let launcher = candidates
+            .iter()
+            .find(|p| p.is_file() || p.as_os_str() == "steam-sls" || p.as_os_str() == "steam")
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("steam"));
+
         let extra = vec!["-applaunch".to_string(), app_id.to_string()];
-        let mut cmd = self.build_launch_command(app_id, Path::new("steam"), &extra)?;
+        let mut cmd = self.build_launch_command(app_id, &launcher, &extra)?;
         if let Some(dir) = install_dir.filter(|d| d.is_dir()) {
             cmd.current_dir(dir);
         }
+
+        // If launching Steam to run a Windows game, ensure WINEDLLOVERRIDES is set
+        if is_windows_game {
+            let existing_overrides = std::env::var("WINEDLLOVERRIDES").unwrap_or_default();
+            let new_overrides = if existing_overrides.is_empty() {
+                "steam_api=n,b;steam_api64=n,b;version=n,b".to_string()
+            } else if !existing_overrides.contains("steam_api") {
+                format!("steam_api=n,b;steam_api64=n,b;{}", existing_overrides)
+            } else {
+                existing_overrides
+            };
+            cmd.env("WINEDLLOVERRIDES", new_overrides);
+        }
+
         cmd.spawn().map_err(|e| {
             self.statuses
                 .lock()
                 .unwrap()
                 .insert(app_id, InjectionStatus::Failed(e.to_string()));
-            format!("Failed to launch Steam with LD_PRELOAD: {}", e)
+            format!("Failed to launch Steam with integration: {}", e)
         })?;
         Ok(format!(
-            "Launched AppID {} via Steam with LD_PRELOAD integration.",
+            "Launched AppID {} via steam-sls with integration.",
             app_id
         ))
     }

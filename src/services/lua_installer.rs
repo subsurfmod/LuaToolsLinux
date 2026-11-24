@@ -484,6 +484,22 @@ impl LuaInstaller {
             if let Some(sls) = sls_svc {
                 sls.remove_additional_app(app_id);
                 sls.remove_fake_app_id(app_id);
+                sls.remove_token(app_id);
+                sls.remove_cd_key(app_id);
+                sls.remove_game_title(app_id);
+                sls.remove_process_mapping(app_id);
+                sls.remove_force_denuvo(app_id);
+                sls.remove_pinned_app(app_id);
+                sls.config.dlc_data.remove(&app_id);
+
+                // If installed lua exists or was read, clean up depot keys & manifest overrides
+                if let Some(txt) = self.read_lua_text(app_id) {
+                    let parsed = LuaFileParser::parse_text(&txt, app_id);
+                    for entry in &parsed.entries {
+                        sls.config.depot_keys.remove(&entry.id);
+                        sls.remove_manifest_override(entry.id);
+                    }
+                }
                 let _ = sls.save();
             }
         }
@@ -515,13 +531,100 @@ impl LuaInstaller {
                     .or_default()
                     .insert(entry.id, dlc_name);
             }
+            if let Some(ref gid) = entry.manifest_id {
+                sls.set_manifest_override(entry.id, gid.clone());
+            }
         }
 
         for (&tok_aid, tok_val) in &lua.tokens {
             sls.set_token(tok_aid, tok_val.clone());
         }
 
+        for (aid, cdkey) in &lua.legacy_cd_keys {
+            sls.set_cd_key(*aid, cdkey.clone());
+        }
+
+        let proc_map: Vec<_> = lua.process_map.iter().map(|(k, v)| (*k, v.clone())).collect();
+        let force_den: Vec<_> = lua.force_denuvo.iter().copied().collect();
+        let pinned: Vec<_> = lua.pinned_apps.iter().copied().collect();
+        sls.sync_parsed_lua_extended(&proc_map, &force_den, &pinned);
+
+        if !force_den.is_empty() {
+            sls.set_denuvo_games(0, force_den);
+        }
+
         let _ = sls.save();
+
+        // Also persist AppTicket / ETicket to TicketStore if present
+        if !lua.app_tickets.is_empty() || !lua.e_tickets.is_empty() {
+            let mut store = crate::steam_bridge::ticket_store::TicketStore::default();
+            for (&aid, app_ticket) in &lua.app_tickets {
+                let e_ticket = lua.e_tickets.get(&aid).cloned();
+                let _ = store.set(crate::steam_bridge::ticket_store::AppTicketData {
+                    app_id: aid,
+                    app_ticket: Some(app_ticket.clone()),
+                    e_ticket,
+                    ..Default::default()
+                });
+            }
+            for (&aid, e_ticket) in &lua.e_tickets {
+                if !lua.app_tickets.contains_key(&aid) {
+                    let _ = store.set(crate::steam_bridge::ticket_store::AppTicketData {
+                        app_id: aid,
+                        e_ticket: Some(e_ticket.clone()),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        // Try writing depot keys to <Steam>/config/config.vdf if writable so upstream AceSLS/SLSsteam reads them
+        if let Some(home) = dirs::home_dir() {
+            let config_vdf_paths = [
+                home.join(".steam/steam/config/config.vdf"),
+                home.join(".local/share/Steam/config/config.vdf"),
+            ];
+            for path in &config_vdf_paths {
+                if path.is_file() {
+                    let _ = Self::write_depot_keys_to_config_vdf(path, &lua.entries);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn write_depot_keys_to_config_vdf(path: &Path, entries: &[crate::parsers::lua_parser::LuaEntry]) -> bool {
+        let Ok(content) = fs::read_to_string(path) else {
+            return false;
+        };
+        let mut keys_to_write = Vec::new();
+        for entry in entries {
+            if let Some(ref k) = entry.key {
+                if !content.contains(&format!("\"{}\"", entry.id)) {
+                    keys_to_write.push((entry.id, k.clone()));
+                }
+            }
+        }
+        if keys_to_write.is_empty() {
+            return true;
+        }
+
+        // Check if "depots" section exists
+        if let Some(pos) = content.find("\"depots\"") {
+            if let Some(brace_pos) = content[pos..].find('{') {
+                let insert_idx = pos + brace_pos + 1;
+                let mut snippet = String::from("\n");
+                for (did, key) in keys_to_write {
+                    snippet.push_str(&format!("\t\t\t\t\"{}\"\n\t\t\t\t{{\n\t\t\t\t\t\"DecryptionKey\"\t\t\"{}\"\n\t\t\t\t}}\n", did, key));
+                }
+                let mut new_content = String::with_capacity(content.len() + snippet.len());
+                new_content.push_str(&content[..insert_idx]);
+                new_content.push_str(&snippet);
+                new_content.push_str(&content[insert_idx..]);
+                return fs::write(path, new_content).is_ok();
+            }
+        }
+        false
     }
 }
 

@@ -56,9 +56,41 @@ impl TicketStore {
     }
 
     pub fn default_path() -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".steam/steam/config")
+        // Resolve active userdata/<account_id>/config/localconfig.vdf if present
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let steam_roots = [
+            home.join(".steam/steam"),
+            home.join(".local/share/Steam"),
+            home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam"),
+        ];
+
+        for root in &steam_roots {
+            let userdata = root.join("userdata");
+            if let Ok(entries) = fs::read_dir(&userdata) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                            if name.chars().all(|c| c.is_ascii_digit()) && name != "0" {
+                                let localcfg_dir = p.join("config");
+                                if localcfg_dir.join("localconfig.vdf").exists() {
+                                    return localcfg_dir;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for root in &steam_roots {
+            let cfg_dir = root.join("config");
+            if cfg_dir.join("localconfig.vdf").exists() {
+                return cfg_dir;
+            }
+        }
+
+        steam_roots[0].join("config")
     }
 
     pub fn load(&mut self) -> Result<(), TicketError> {
