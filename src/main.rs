@@ -175,22 +175,47 @@ fn main() -> eframe::Result<()> {
             "--tray-locked" => {
                 tray_locked = true;
             }
+            "--autostart-enable" | "--enable-autostart" => {
+                let mut settings = SettingsService::default();
+                match settings.set_autostart(true) {
+                    Ok(_) => println!("OK :: LuaTools autostart enabled (~/.config/autostart/luatools.desktop)"),
+                    Err(e) => {
+                        eprintln!("ERROR :: Failed to enable autostart: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+                return Ok(());
+            }
+            "--autostart-disable" | "--disable-autostart" => {
+                let mut settings = SettingsService::default();
+                match settings.set_autostart(false) {
+                    Ok(_) => println!("OK :: LuaTools autostart disabled"),
+                    Err(e) => {
+                        eprintln!("ERROR :: Failed to disable autostart: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+                return Ok(());
+            }
             "-h" | "--help" => {
                 println!(
                     "LuaTools Linux v{}\n\n\
-                     Usage: luatools [OPTIONS] [luatools://...]\n\n\
+                     Usage: luatools [OPTIONS] [luatools://... | bst://...]\n\n\
                      Options:\n  \
-                       --check        Verify binary and Steam discovery without opening GUI\n  \
-                       --update       Pull latest source from Git and rebuild/install native binary\n  \
-                       --minimized    Launch minimized\n  \
-                       --tray-locked  Keep running in background/tray on close\n  \
-                       -v,--version   Print version\n  \
-                       -h,--help      Show help",
+                       --check               Verify binary and Steam discovery without opening GUI\n  \
+                       --update              Pull latest source from Git and rebuild/install native binary\n  \
+                       --minimized           Launch minimized\n  \
+                       --tray-locked         Keep running in background/tray on close\n  \
+                       --autostart-enable    Enable login autostart (~/.config/autostart/luatools.desktop)\n  \
+                       --autostart-disable   Disable login autostart\n  \
+                       -v,--version          Print version\n  \
+                       -h,--help             Show help",
                     VERSION
                 );
                 return Ok(());
             }
-            other if other.to_ascii_lowercase().starts_with("luatools://") => {
+            other if other.to_ascii_lowercase().starts_with("luatools://")
+                || other.to_ascii_lowercase().starts_with("bst://") => {
                 initial_protocol_url = Some(other.to_string());
             }
             _ => {}
@@ -296,7 +321,7 @@ fn main() -> eframe::Result<()> {
                                 } else if let Some(url) = trimmed.strip_prefix("URL ") {
                                     let _ = tx.send(IpcCommand::Url(url.trim().to_string()));
                                     repaint_ctx.request_repaint();
-                                } else if trimmed.starts_with("luatools://") {
+                                } else if trimmed.starts_with("luatools://") || trimmed.starts_with("bst://") {
                                     let _ = tx.send(IpcCommand::Url(trimmed.to_string()));
                                     repaint_ctx.request_repaint();
                                 }

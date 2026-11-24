@@ -449,6 +449,12 @@ pub fn resolve(
     Ok(Some(synthesized))
 }
 
+/// Generate a deterministic legacy CD key given app_id and a 64-bit Steam ID.
+pub fn generate_legacy_cdkey(app_id: u32, steam_id: u64) -> String {
+    let account_id = (steam_id & 0xFFFF_FFFF) as u32;
+    synthesize(app_id, account_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

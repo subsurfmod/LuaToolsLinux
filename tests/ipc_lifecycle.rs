@@ -129,3 +129,56 @@ fn test_steam_service_api() {
     let res = SteamService::relaunch_steam_sls(Some(&tmp.path().to_path_buf()));
     assert!(res.is_ok(), "relaunch with mock steam executable should succeed: {:?}", res);
 }
+
+#[test]
+fn test_bst_protocol_parsing_and_ipc() {
+    let act = ProtocolService::parse("bst://1245620/token?source=hubcap").expect("parse bst");
+    assert_eq!(act.kind, "install");
+    assert_eq!(act.app_id, 1245620);
+    assert_eq!(act.source.as_deref(), Some("hubcap"));
+    assert!(!act.silent);
+
+    let act_silent = ProtocolService::parse("bst://install/silent/730").expect("parse bst silent");
+    assert_eq!(act_silent.kind, "install");
+    assert_eq!(act_silent.app_id, 730);
+    assert!(act_silent.silent);
+    assert_eq!(act_silent.source.as_deref(), Some("bst"));
+}
+
+#[test]
+fn test_steam_ui_language_detection_and_mapping() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let reg_vdf = tmp.path().join("registry.vdf");
+    std::fs::write(
+        &reg_vdf,
+        "\"Registry\" { \"HKCU\" { \"Software\" { \"Valve\" { \"Steam\" { \"Language\" \"schinese\" } } } } }",
+    )
+    .expect("write reg vdf");
+
+    let lang = SteamService::detect_steam_language(Some(tmp.path()));
+    assert_eq!(lang, Some("schinese".to_string()));
+
+    let code = SteamService::detect_steam_ui_language_code(Some(tmp.path()));
+    assert_eq!(code, Some("zh".to_string()));
+
+    assert_eq!(SteamService::steam_lang_to_ui_code("russian"), "ru");
+    assert_eq!(SteamService::steam_lang_to_ui_code("english"), "en");
+    assert_eq!(SteamService::steam_lang_to_ui_code("spanish"), "es");
+    assert_eq!(SteamService::steam_lang_to_ui_code("german"), "de");
+    assert_eq!(SteamService::steam_lang_to_ui_code("french"), "fr");
+    assert_eq!(SteamService::steam_lang_to_ui_code("brazilian"), "pt");
+    assert_eq!(SteamService::steam_lang_to_ui_code("japanese"), "ja");
+    assert_eq!(SteamService::steam_lang_to_ui_code("italian"), "it");
+    assert_eq!(SteamService::steam_lang_to_ui_code("koreana"), "ko");
+}
+
+#[test]
+fn test_settings_autostart_logic() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = tmp.path().join("settings.json");
+    let svc = luatools_linux::services::settings_service::SettingsService::new(Some(cfg));
+    assert!(!svc.settings.autostart);
+
+    let desktop_p = luatools_linux::services::settings_service::SettingsService::autostart_desktop_path();
+    assert!(desktop_p.is_some());
+}

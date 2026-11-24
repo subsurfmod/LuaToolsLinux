@@ -1191,7 +1191,12 @@ pub extern "C" fn get_pinned_manifest_id(app_id: u32, depot_id: u32) -> u64 {
 
 /// Reader function for legacy CD keys
 pub fn get_legacy_cd_key(app_id: u32) -> Option<String> {
-    read_lock(legacy_cdkeys()).get(&app_id).cloned()
+    if let Some(key) = read_lock(legacy_cdkeys()).get(&app_id).cloned() {
+        return Some(key);
+    }
+    // Fall back to deterministically synthesized key
+    let steam_id = resolve_spoof_steam_id(Some(app_id)).unwrap_or(76_561_197_960_287_930);
+    Some(luatools_linux::steam_bridge::credentials::legacycdkey::generate_legacy_cdkey(app_id, steam_id))
 }
 
 /// Exported C reader for legacy CD keys
@@ -1202,7 +1207,7 @@ pub unsafe extern "C" fn get_legacy_cdkey(
     max_len: u32,
 ) -> bool {
     panic::catch_unwind(AssertUnwindSafe(|| {
-        if let Some(key) = read_lock(legacy_cdkeys()).get(&app_id) {
+        if let Some(key) = get_legacy_cd_key(app_id) {
             if !buf.is_null() && max_len > 0 {
                 let bytes = key.as_bytes();
                 let n = (max_len as usize - 1).min(bytes.len());

@@ -62,4 +62,65 @@ impl SettingsService {
         self.settings.loaded_app_ids.truncate(20);
         let _ = self.save();
     }
+
+    /// Path to user login autostart desktop entry: `~/.config/autostart/luatools.desktop`
+    pub fn autostart_desktop_path() -> Option<PathBuf> {
+        let home = dirs::home_dir()?;
+        Some(home.join(".config/autostart/luatools.desktop"))
+    }
+
+    /// Checks if autostart desktop entry exists on the filesystem.
+    pub fn is_autostart_enabled() -> bool {
+        Self::autostart_desktop_path()
+            .map(|p| p.is_file())
+            .unwrap_or(false)
+    }
+
+    /// Enables or disables login autostart by writing or removing `~/.config/autostart/luatools.desktop` with `--minimized`.
+    pub fn set_autostart(&mut self, enable: bool) -> Result<(), String> {
+        self.settings.autostart = enable;
+        let _ = self.save();
+
+        let path = Self::autostart_desktop_path()
+            .ok_or_else(|| "Could not determine home directory".to_string())?;
+
+        if enable {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let exe = std::env::current_exe()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "luatools".to_string());
+            let content = format!(
+                "[Desktop Entry]\n\
+                 Type=Application\n\
+                 Version=1.0\n\
+                 Name=LuaTools Linux\n\
+                 Comment=Steam manifest and lua configuration manager\n\
+                 Exec=\"{}\" --minimized\n\
+                 Icon=luatools\n\
+                 Terminal=false\n\
+                 Categories=Game;Utility;\n\
+                 X-GNOME-Autostart-enabled=true\n",
+                exe
+            );
+            fs::write(&path, content).map_err(|e| e.to_string())?;
+        } else if path.exists() {
+            let _ = fs::remove_file(&path);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_autostart_desktop_path_resolution() {
+        let p = SettingsService::autostart_desktop_path();
+        assert!(p.is_some());
+        let path = p.unwrap();
+        assert!(path.ends_with(".config/autostart/luatools.desktop"));
+    }
 }

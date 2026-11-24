@@ -121,7 +121,12 @@ impl CloudRedirectService {
             req_body.len()
         );
 
-        Some((Vec::new(), 1))
+        let mut resp = Vec::new();
+        if method == "EMsgClientFSGetFileParams" || method == "147" || method == "EMsgClientFSGetFileParamsResponse" {
+            resp.extend_from_slice(&1u32.to_le_bytes());
+            resp.extend_from_slice(&0u32.to_le_bytes());
+        }
+        Some((resp, 1))
     }
 
     /// Notify that an app is running or stopped.

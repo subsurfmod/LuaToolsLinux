@@ -183,6 +183,75 @@ impl SteamService {
         let root = override_root.or_else(|| self.installation.as_ref().map(|i| i.root.as_path()));
         Self::relaunch_steam_sls(root)
     }
+
+    /// Extracts language string from VDF text (matches `"Language"\s+"([^"]+)"` or `"language"\s+"([^"]+)"`).
+    pub fn parse_language_from_vdf_text(content: &str) -> Option<String> {
+        let re = regex::Regex::new(r#"(?i)"language"\s+"([^"]+)""#).ok()?;
+        re.captures(content)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().trim().to_ascii_lowercase())
+    }
+
+    /// Reads Steam UI language from `registry.vdf` or `config.vdf`.
+    pub fn detect_steam_language(override_root: Option<&Path>) -> Option<String> {
+        let mut candidate_files = Vec::new();
+
+        if let Some(root) = override_root {
+            candidate_files.push(root.join("registry.vdf"));
+            candidate_files.push(root.join("config").join("config.vdf"));
+        }
+
+        if let Some(home) = dirs::home_dir() {
+            candidate_files.push(home.join(".local/share/Steam/registry.vdf"));
+            candidate_files.push(home.join(".local/share/Steam/config/config.vdf"));
+            candidate_files.push(home.join(".steam/steam/registry.vdf"));
+            candidate_files.push(home.join(".steam/steam/config/config.vdf"));
+            candidate_files.push(home.join(".steam/debian-installation/registry.vdf"));
+            candidate_files.push(home.join(".steam/debian-installation/config/config.vdf"));
+        }
+
+        for p in candidate_files {
+            if p.is_file() {
+                if let Ok(raw) = fs::read_to_string(&p) {
+                    if let Some(lang) = Self::parse_language_from_vdf_text(&raw) {
+                        if !lang.is_empty() {
+                            return Some(lang);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Maps Steam's internal language string (`schinese`, `russian`, `english`, etc.)
+    /// to 2-letter UI language code (`zh`, `ru`, `en`, etc.).
+    pub fn steam_lang_to_ui_code(steam_lang: &str) -> &'static str {
+        match steam_lang.trim().to_ascii_lowercase().as_str() {
+            "schinese" | "tchinese" | "chinese" | "zh" => "zh",
+            "russian" | "ru" => "ru",
+            "spanish" | "es" => "es",
+            "german" | "de" => "de",
+            "french" | "fr" => "fr",
+            "brazilian" | "portuguese" | "pt" => "pt",
+            "japanese" | "ja" => "ja",
+            "italian" | "it" => "it",
+            "koreana" | "korean" | "ko" => "ko",
+            _ => "en",
+        }
+    }
+
+    /// Detects Steam UI language and returns the normalized 2-letter code (e.g. "zh", "ru", "en").
+    pub fn detect_steam_ui_language_code(override_root: Option<&Path>) -> Option<String> {
+        Self::detect_steam_language(override_root)
+            .map(|l| Self::steam_lang_to_ui_code(&l).to_string())
+    }
+
+    /// Instance method returning detected Steam UI language code.
+    pub fn ui_language_code(&self) -> Option<String> {
+        let root = self.installation.as_ref().map(|i| i.root.as_path());
+        Self::detect_steam_ui_language_code(root)
+    }
 }
 
 #[cfg(test)]
@@ -195,5 +264,34 @@ mod tests {
         let _ = svc.detect(None);
         let _ = svc.is_available();
         let _ = svc.scan_all_games();
+    }
+
+    #[test]
+    fn test_parse_language_from_vdf() {
+        let registry_vdf = r#"
+"Registry"
+{
+    "HKCU"
+    {
+        "Software"
+        {
+            "Valve"
+            {
+                "Steam"
+                {
+                    "Language"		"schinese"
+                }
+            }
+        }
+    }
+}
+"#;
+        assert_eq!(
+            SteamService::parse_language_from_vdf_text(registry_vdf),
+            Some("schinese".to_string())
+        );
+        assert_eq!(SteamService::steam_lang_to_ui_code("schinese"), "zh");
+        assert_eq!(SteamService::steam_lang_to_ui_code("russian"), "ru");
+        assert_eq!(SteamService::steam_lang_to_ui_code("english"), "en");
     }
 }

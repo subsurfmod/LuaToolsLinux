@@ -23,6 +23,9 @@ const KNOWN_KEYS: &[&str] = &[
     "ManifestOverrides",
     "ManifestPins",
     "Manifests",
+    "ProcessMap",
+    "ForceDenuvo",
+    "PinnedApps",
 ];
 
 #[derive(Debug, Clone)]
@@ -182,6 +185,73 @@ impl SlssteamService {
                         }
                     }
                 }
+                "ProcessMap" => {
+                    if let Value::Mapping(sub) = v {
+                        for (ak, ev) in sub {
+                            if let (Some(aid), Some(exe)) =
+                                (Self::value_to_u32(ak), Self::value_to_string(ev))
+                            {
+                                cfg.process_map.insert(aid, exe);
+                            }
+                        }
+                    }
+                }
+                "ForceDenuvo" => match v {
+                    Value::Sequence(seq) => {
+                        for item in seq {
+                            if let Some(aid) = Self::value_to_u32(item) {
+                                if !cfg.force_denuvo.contains(&aid) {
+                                    cfg.force_denuvo.push(aid);
+                                }
+                            }
+                        }
+                    }
+                    Value::String(s) => {
+                        for tok in s.split_whitespace() {
+                            if let Ok(aid) = tok.parse::<u32>() {
+                                if !cfg.force_denuvo.contains(&aid) {
+                                    cfg.force_denuvo.push(aid);
+                                }
+                            }
+                        }
+                    }
+                    Value::Number(_) => {
+                        if let Some(aid) = Self::value_to_u32(v) {
+                            if !cfg.force_denuvo.contains(&aid) {
+                                cfg.force_denuvo.push(aid);
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                "PinnedApps" => match v {
+                    Value::Sequence(seq) => {
+                        for item in seq {
+                            if let Some(aid) = Self::value_to_u32(item) {
+                                if !cfg.pinned_apps.contains(&aid) {
+                                    cfg.pinned_apps.push(aid);
+                                }
+                            }
+                        }
+                    }
+                    Value::String(s) => {
+                        for tok in s.split_whitespace() {
+                            if let Ok(aid) = tok.parse::<u32>() {
+                                if !cfg.pinned_apps.contains(&aid) {
+                                    cfg.pinned_apps.push(aid);
+                                }
+                            }
+                        }
+                    }
+                    Value::Number(_) => {
+                        if let Some(aid) = Self::value_to_u32(v) {
+                            if !cfg.pinned_apps.contains(&aid) {
+                                    cfg.pinned_apps.push(aid);
+                            }
+                        }
+                    }
+                    _ => {}
+                },
                 "PlayNotOwnedGames" | "playNotOwnedGames" => {
                     if let Some(b) = v.as_bool() {
                         cfg.play_not_owned = b;
@@ -267,6 +337,37 @@ impl SlssteamService {
             for (did, gid) in &cfg.manifest_overrides {
                 let clean_gid = gid.trim().trim_matches('"');
                 lines.push(format!("  {}: \"{}\"", did, clean_gid));
+            }
+            lines.push(String::new());
+        }
+
+        if !cfg.process_map.is_empty() {
+            lines.push("ProcessMap:".into());
+            for (aid, exe) in &cfg.process_map {
+                let clean_exe = exe.trim().trim_matches('"');
+                lines.push(format!("  {}: \"{}\"", aid, clean_exe));
+            }
+            lines.push(String::new());
+        }
+
+        if !cfg.force_denuvo.is_empty() {
+            let mut sorted = cfg.force_denuvo.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            lines.push("ForceDenuvo:".into());
+            for aid in sorted {
+                lines.push(format!("  - {}", aid));
+            }
+            lines.push(String::new());
+        }
+
+        if !cfg.pinned_apps.is_empty() {
+            let mut sorted = cfg.pinned_apps.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            lines.push("PinnedApps:".into());
+            for aid in sorted {
+                lines.push(format!("  - {}", aid));
             }
             lines.push(String::new());
         }
@@ -373,6 +474,46 @@ impl SlssteamService {
         self.config.manifest_overrides.remove(&depot_id).is_some()
     }
 
+    pub fn set_process_mapping(&mut self, app_id: u32, exe: String) {
+        self.config.process_map.insert(app_id, exe);
+    }
+
+    pub fn get_process_mapping(&self, app_id: u32) -> Option<&str> {
+        self.config.process_map.get(&app_id).map(String::as_str)
+    }
+
+    pub fn remove_process_mapping(&mut self, app_id: u32) -> bool {
+        self.config.process_map.remove(&app_id).is_some()
+    }
+
+    pub fn add_force_denuvo(&mut self, app_id: u32) {
+        if !self.config.force_denuvo.contains(&app_id) {
+            self.config.force_denuvo.push(app_id);
+        }
+    }
+
+    pub fn remove_force_denuvo(&mut self, app_id: u32) {
+        self.config.force_denuvo.retain(|&x| x != app_id);
+    }
+
+    pub fn is_force_denuvo(&self, app_id: u32) -> bool {
+        self.config.force_denuvo.contains(&app_id)
+    }
+
+    pub fn add_pinned_app(&mut self, app_id: u32) {
+        if !self.config.pinned_apps.contains(&app_id) {
+            self.config.pinned_apps.push(app_id);
+        }
+    }
+
+    pub fn remove_pinned_app(&mut self, app_id: u32) {
+        self.config.pinned_apps.retain(|&x| x != app_id);
+    }
+
+    pub fn is_pinned_app(&self, app_id: u32) -> bool {
+        self.config.pinned_apps.contains(&app_id)
+    }
+
     /// Synchronizes manifest pins into SLSsteam's `ManifestOverrides` so they take effect under SLSsteam.so.
     pub fn sync_manifest_pins(&mut self, pins: &[(u32, String)]) {
         for (depot_id, gid) in pins {
@@ -434,6 +575,25 @@ impl SlssteamService {
         }
         self.save()
     }
+
+    /// Synchronizes extended directives (`process_map`, `force_denuvo`, `pinned_apps`) from parsed Lua.
+    pub fn sync_parsed_lua_extended(
+        &mut self,
+        process_map: &[(u32, String)],
+        force_denuvo: &[u32],
+        pinned_apps: &[u32],
+    ) -> bool {
+        for (aid, exe) in process_map {
+            self.set_process_mapping(*aid, exe.clone());
+        }
+        for &aid in force_denuvo {
+            self.add_force_denuvo(aid);
+        }
+        for &aid in pinned_apps {
+            self.add_pinned_app(aid);
+        }
+        self.save()
+    }
 }
 
 #[cfg(test)]
@@ -453,6 +613,9 @@ mod tests {
         svc.set_token(1245620, "tok_abc".into());
         svc.set_depot_key(1245621, "a".repeat(64));
         svc.set_manifest_override(1245621, "8888777766665555444".into());
+        svc.set_process_mapping(1245620, "eldenring.exe".into());
+        svc.add_force_denuvo(1245620);
+        svc.add_pinned_app(1245620);
         svc.add_additional_app(1245620);
         svc.add_additional_app(1091500);
         svc.config
@@ -466,6 +629,9 @@ mod tests {
         let raw_yaml = fs::read_to_string(&cfg_path).unwrap();
         assert!(raw_yaml.contains(&format!("  1245621: \"{}\"", "a".repeat(64))));
         assert!(raw_yaml.contains("  1245621: \"8888777766665555444\""));
+        assert!(raw_yaml.contains("  1245620: \"eldenring.exe\""));
+        assert!(raw_yaml.contains("ForceDenuvo:\n  - 1245620"));
+        assert!(raw_yaml.contains("PinnedApps:\n  - 1245620"));
 
         let svc2 = SlssteamService::new(Some(cfg_path));
         assert!(svc2.config.play_not_owned);
@@ -474,6 +640,9 @@ mod tests {
         assert_eq!(svc2.get_fake_app_id(1245620), Some(480));
         assert_eq!(svc2.get_token(1245620), Some("tok_abc"));
         assert_eq!(svc2.get_manifest_override(1245621), Some("8888777766665555444"));
+        assert_eq!(svc2.get_process_mapping(1245620), Some("eldenring.exe"));
+        assert!(svc2.is_force_denuvo(1245620));
+        assert!(svc2.is_pinned_app(1245620));
         assert_eq!(svc2.config.additional_apps, vec![1091500, 1245620]);
         assert_eq!(svc2.config.dlc_data[&1245620][&2778580], "Shadow \"DLC\"");
     }

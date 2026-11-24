@@ -18,14 +18,16 @@ pub struct ProtocolService;
 impl ProtocolService {
     pub fn parse(raw_url: &str) -> Option<ProtocolAction> {
         let trimmed = raw_url.trim();
-        if !trimmed.to_ascii_lowercase().starts_with("luatools://") {
+        let trimmed_lower = trimmed.to_ascii_lowercase();
+        let is_luatools = trimmed_lower.starts_with("luatools://");
+        let is_bst = trimmed_lower.starts_with("bst://");
+        if !is_luatools && !is_bst {
             return None;
         }
+
         let parsed = Url::parse(trimmed).ok()?;
-        let kind = parsed.host_str()?.to_ascii_lowercase();
-        if !matches!(kind.as_str(), "game" | "install" | "manage" | "fix") {
-            return None;
-        }
+        let host_raw = parsed.host_str().unwrap_or("");
+        let host_lower = host_raw.to_ascii_lowercase();
 
         let segments: Vec<&str> = parsed
             .path_segments()
@@ -37,22 +39,42 @@ impl ProtocolService {
                 && (v == "1" || v.eq_ignore_ascii_case("true") || v.is_empty())
         });
 
-        let mut app_id = None;
-        for seg in segments {
-            if seg.eq_ignore_ascii_case("silent") {
-                silent = true;
-            } else if app_id.is_none() {
-                if let Ok(id) = seg.parse::<u32>() {
-                    app_id = Some(id);
+        let (kind, app_id) = if matches!(host_lower.as_str(), "game" | "install" | "manage" | "fix") {
+            let mut aid = None;
+            for seg in &segments {
+                if seg.eq_ignore_ascii_case("silent") {
+                    silent = true;
+                } else if aid.is_none() {
+                    if let Ok(id) = seg.parse::<u32>() {
+                        aid = Some(id);
+                    }
                 }
             }
-        }
+            (host_lower, aid?)
+        } else if let Ok(aid) = host_lower.parse::<u32>() {
+            for seg in &segments {
+                if seg.eq_ignore_ascii_case("silent") {
+                    silent = true;
+                }
+            }
+            let q_kind = parsed
+                .query_pairs()
+                .find(|(k, _)| k == "kind" || k == "action")
+                .map(|(_, v)| v.to_ascii_lowercase())
+                .unwrap_or_else(|| "install".to_string());
+            (q_kind, aid)
+        } else {
+            return None;
+        };
 
-        let app_id = app_id?;
-        let source = parsed
+        let mut source = parsed
             .query_pairs()
             .find(|(k, _)| k == "source")
             .map(|(_, v)| v.to_string());
+
+        if source.is_none() && is_bst {
+            source = Some("bst".to_string());
+        }
 
         Some(ProtocolAction {
             kind,
@@ -82,7 +104,7 @@ impl ProtocolService {
              Terminal=false\n\
              Type=Application\n\
              Categories=Game;Utility;\n\
-             MimeType=x-scheme-handler/luatools;\n",
+             MimeType=x-scheme-handler/luatools;x-scheme-handler/bst;\n",
             exe
         );
 
@@ -90,9 +112,12 @@ impl ProtocolService {
         let _ = Command::new("xdg-mime")
             .args(["default", "luatools.desktop", "x-scheme-handler/luatools"])
             .output();
+        let _ = Command::new("xdg-mime")
+            .args(["default", "luatools.desktop", "x-scheme-handler/bst"])
+            .output();
 
         Ok(format!(
-            "Registered luatools:// handler at {}",
+            "Registered luatools:// and bst:// handlers at {}",
             desktop_file.display()
         ))
     }
@@ -129,5 +154,29 @@ mod tests {
         assert_eq!(c.kind, "install");
         assert_eq!(c.app_id, 1245620);
         assert!(c.silent);
+    }
+
+    #[test]
+    fn parses_bst_protocol_urls() {
+        let a = ProtocolService::parse("bst://install/1245620").unwrap();
+        assert_eq!(a.kind, "install");
+        assert_eq!(a.app_id, 1245620);
+        assert_eq!(a.source.as_deref(), Some("bst"));
+        assert!(!a.silent);
+
+        let b = ProtocolService::parse("bst://1245620/token?source=hubcap").unwrap();
+        assert_eq!(b.kind, "install");
+        assert_eq!(b.app_id, 1245620);
+        assert_eq!(b.source.as_deref(), Some("hubcap"));
+        assert!(!b.silent);
+
+        let c = ProtocolService::parse("bst://install/silent/730").unwrap();
+        assert_eq!(c.kind, "install");
+        assert_eq!(c.app_id, 730);
+        assert!(c.silent);
+
+        let d = ProtocolService::parse("bst://fix/480").unwrap();
+        assert_eq!(d.kind, "fix");
+        assert_eq!(d.app_id, 480);
     }
 }

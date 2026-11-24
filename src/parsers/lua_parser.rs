@@ -1,6 +1,6 @@
 //! Lua file parser & manipulator (`addappid`, `setManifestid`, `addtoken`, pin toggling).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -35,6 +35,9 @@ pub struct LuaContents {
     pub commented_pins: BTreeMap<u32, String>,
     pub disabled_entries: Vec<LuaEntry>,
     pub tokens: BTreeMap<u32, String>,
+    pub process_map: BTreeMap<u32, String>,
+    pub force_denuvo: BTreeSet<u32>,
+    pub pinned_apps: BTreeSet<u32>,
 }
 
 impl LuaContents {
@@ -86,6 +89,27 @@ fn add_token_re() -> &'static Regex {
     })
 }
 
+fn add_process_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?i)^addprocess\s*\(\s*(\d+)\s*,\s*["']([^"']+)["']\s*\)"#).unwrap()
+    })
+}
+
+fn force_denuvo_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?i)^forcedenuvo\s*\(\s*(\d+)\s*\)"#).unwrap()
+    })
+}
+
+fn pin_app_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?i)^pinApp\s*\(\s*(\d+)\s*\)"#).unwrap()
+    })
+}
+
 fn comment_tail_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\s*\(\d+\)\s*\S*\s*$").unwrap())
@@ -127,6 +151,9 @@ impl LuaFileParser {
         let mut disabled_order: Vec<u32> = Vec::new();
         let mut disabled_key_by_id: BTreeMap<u32, Option<String>> = BTreeMap::new();
         let mut tokens: BTreeMap<u32, String> = BTreeMap::new();
+        let mut process_map: BTreeMap<u32, String> = BTreeMap::new();
+        let mut force_denuvo: BTreeSet<u32> = BTreeSet::new();
+        let mut pinned_apps: BTreeSet<u32> = BTreeSet::new();
 
         for raw_line in text.lines() {
             let line = raw_line.trim();
@@ -145,6 +172,30 @@ impl LuaFileParser {
                     if let (Some(id_m), Some(tok_m)) = (cap.get(1), cap.get(2)) {
                         if let Ok(aid) = id_m.as_str().parse::<u32>() {
                             tokens.insert(aid, tok_m.as_str().to_string());
+                        }
+                    }
+                }
+
+                if let Some(cap) = add_process_re().captures(line_to_match) {
+                    if let (Some(id_m), Some(exe_m)) = (cap.get(1), cap.get(2)) {
+                        if let Ok(aid) = id_m.as_str().parse::<u32>() {
+                            process_map.insert(aid, exe_m.as_str().to_string());
+                        }
+                    }
+                }
+
+                if let Some(cap) = force_denuvo_re().captures(line_to_match) {
+                    if let Some(id_m) = cap.get(1) {
+                        if let Ok(aid) = id_m.as_str().parse::<u32>() {
+                            force_denuvo.insert(aid);
+                        }
+                    }
+                }
+
+                if let Some(cap) = pin_app_re().captures(line_to_match) {
+                    if let Some(id_m) = cap.get(1) {
+                        if let Ok(aid) = id_m.as_str().parse::<u32>() {
+                            pinned_apps.insert(aid);
                         }
                     }
                 }
@@ -253,6 +304,9 @@ impl LuaFileParser {
             commented_pins: commented_manifests,
             disabled_entries,
             tokens,
+            process_map,
+            force_denuvo,
+            pinned_apps,
         }
     }
 
@@ -323,6 +377,63 @@ impl LuaFileParser {
         (res, changed)
     }
 
+    pub fn toggle_dlc_depot_in_text(text: &str, depot_id: u32) -> (String, bool) {
+        Self::toggle_dlc_depot(text, depot_id, None)
+    }
+
+    pub fn toggle_dlc_depot(
+        text: &str,
+        depot_id: u32,
+        enabled: Option<bool>,
+    ) -> (String, bool) {
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+        let pattern = format!(
+            r"(?i)^(\s*)((?:--+\s*)+)?(addappid\s*\(\s*{}(?:\s*,\s*[^)]*|\s*)\).*)",
+            depot_id
+        );
+        let Ok(re) = Regex::new(&pattern) else {
+            return (text.to_string(), false);
+        };
+
+        let mut changed = false;
+        let mut new_lines: Vec<String> = Vec::new();
+        for line in text.lines() {
+            if let Some(cap) = re.captures(line) {
+                let indent = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+                let is_commented = cap.get(2).is_some();
+                let body = cap.get(3).map(|m| m.as_str()).unwrap_or("");
+
+                let should_enable = match enabled {
+                    Some(e) => e,
+                    None => is_commented,
+                };
+
+                if should_enable && is_commented {
+                    new_lines.push(format!("{}{}", indent, body));
+                    changed = true;
+                } else if !should_enable && !is_commented {
+                    new_lines.push(format!("{}-- {}", indent, body));
+                    changed = true;
+                } else {
+                    new_lines.push(line.to_string());
+                }
+            } else {
+                new_lines.push(line.to_string());
+            }
+        }
+
+        if !changed && enabled == Some(true) {
+            new_lines.push(format!("addappid({})", depot_id));
+            changed = true;
+        }
+
+        let mut res = new_lines.join("\n");
+        if text.ends_with('\n') || (text.is_empty() && changed) {
+            res.push('\n');
+        }
+        (res, changed)
+    }
+
     pub fn infer_app_id_from_text(lua_text: &str) -> Option<u32> {
         let lua_text = lua_text.strip_prefix('\u{feff}').unwrap_or(lua_text);
         let re = infer_appid_re();
@@ -380,7 +491,10 @@ mod tests {
             addappid(1245623, \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\")\n\
             -- setManifestid(1245622, \"1111222233334444555\", 2048)\n\
             addappid(2778580) -- DLC\n\
-            addtoken(1245620, \"secret_tok\")\n";
+            addtoken(1245620, \"secret_tok\")\n\
+            addprocess(1245620, \"eldenring.exe\")\n\
+            forcedenuvo(1245620)\n\
+            pinApp(1245620)\n";
 
         let parsed = LuaFileParser::parse_text(sample, 1245620);
         assert_eq!(parsed.base_app_id, 1245620);
@@ -398,6 +512,12 @@ mod tests {
             parsed.tokens.get(&1245620).map(String::as_str),
             Some("secret_tok")
         );
+        assert_eq!(
+            parsed.process_map.get(&1245620).map(String::as_str),
+            Some("eldenring.exe")
+        );
+        assert!(parsed.force_denuvo.contains(&1245620));
+        assert!(parsed.pinned_apps.contains(&1245620));
 
         let (t1, ch1) = LuaFileParser::toggle_manifest_pin_in_text(sample, 1245621, None);
         assert!(ch1);

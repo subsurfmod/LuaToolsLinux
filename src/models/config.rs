@@ -45,6 +45,9 @@ pub struct SlssteamConfig {
     pub additional_apps: Vec<u32>,
     pub depot_keys: BTreeMap<u32, String>,
     pub manifest_overrides: BTreeMap<u32, String>,
+    pub process_map: BTreeMap<u32, String>,
+    pub force_denuvo: Vec<u32>,
+    pub pinned_apps: Vec<u32>,
     pub play_not_owned: bool,
     pub limit_downloads: bool,
     pub workshop_path: String,
@@ -61,6 +64,9 @@ impl Default for SlssteamConfig {
             additional_apps: Vec::new(),
             depot_keys: BTreeMap::new(),
             manifest_overrides: BTreeMap::new(),
+            process_map: BTreeMap::new(),
+            force_denuvo: Vec::new(),
+            pinned_apps: Vec::new(),
             play_not_owned: true,
             limit_downloads: false,
             workshop_path: String::new(),
@@ -125,6 +131,8 @@ pub struct AppSettings {
     pub telemetry_endpoint_url: String,
     #[serde(default)]
     pub telemetry_install_id: String,
+    #[serde(default)]
+    pub autostart: bool,
 }
 
 impl Default for AppSettings {
@@ -148,6 +156,7 @@ impl Default for AppSettings {
             telemetry_consent_seen: false,
             telemetry_endpoint_url: String::new(),
             telemetry_install_id: String::new(),
+            autostart: false,
         }
     }
 }

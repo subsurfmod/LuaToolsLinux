@@ -173,6 +173,25 @@ impl GameProcessInjectionService {
         };
         cmd.env("LD_PRELOAD", new_preload);
 
+        // Configure Wine/Proton DLL overrides if executable is a Windows binary
+        let is_windows_binary = game_exe
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("exe"))
+            .unwrap_or(false);
+
+        if is_windows_binary {
+            let existing_overrides = std::env::var("WINEDLLOVERRIDES").unwrap_or_default();
+            let new_overrides = if existing_overrides.is_empty() {
+                "steam_api=n,b;steam_api64=n,b;version=n,b".to_string()
+            } else if !existing_overrides.contains("steam_api") {
+                format!("steam_api=n,b;steam_api64=n,b;{}", existing_overrides)
+            } else {
+                existing_overrides
+            };
+            cmd.env("WINEDLLOVERRIDES", new_overrides);
+        }
+
         for (k, v) in &config.env_vars {
             cmd.env(k, v);
         }
@@ -190,6 +209,88 @@ impl GameProcessInjectionService {
         let _ = self.notify_bridge(app_id, true);
 
         Ok(cmd)
+    }
+
+    /// Finds game binary in installation directory. Prefers Linux binaries then `.exe`.
+    pub fn find_game_binary_in_dir(dir: &Path) -> Option<PathBuf> {
+        if !dir.is_dir() {
+            return None;
+        }
+        let entries = fs::read_dir(dir).ok()?;
+        let mut exe_fallback = None;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    if ext.eq_ignore_ascii_case("exe") && exe_fallback.is_none() {
+                        exe_fallback = Some(path.clone());
+                    }
+                } else {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Ok(meta) = path.metadata() {
+                            if meta.permissions().mode() & 0o111 != 0 {
+                                return Some(path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        exe_fallback
+    }
+
+    /// Spawns a background daemon thread that monitors running processes for `expected_exe` (or AppID).
+    pub fn spawn_process_watcher(
+        &self,
+        app_id: u32,
+        expected_exe: Option<String>,
+    ) -> std::thread::JoinHandle<()> {
+        let this = self.clone();
+        std::thread::spawn(move || {
+            let target_exe = expected_exe.unwrap_or_default();
+            for _ in 0..60 {
+                // Poll every 500ms up to 30s
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let mut found_pid: Option<u32> = None;
+                if let Ok(proc_entries) = fs::read_dir("/proc") {
+                    for entry in proc_entries.flatten() {
+                        let path = entry.path();
+                        if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
+                            if let Ok(pid) = fname.parse::<u32>() {
+                                let comm_path = path.join("comm");
+                                if let Ok(comm) = fs::read_to_string(&comm_path) {
+                                    let comm_trim = comm.trim();
+                                    if !target_exe.is_empty()
+                                        && comm_trim.eq_ignore_ascii_case(&target_exe)
+                                    {
+                                        found_pid = Some(pid);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(pid) = found_pid {
+                    log::info!(
+                        "[process_watcher] Found target process {} (PID {}) for AppID {}",
+                        target_exe,
+                        pid,
+                        app_id
+                    );
+                    let _ = this.inject_into_running(pid, &this.default_library);
+                    this.statuses
+                        .lock()
+                        .unwrap()
+                        .insert(app_id, InjectionStatus::Injected);
+                    let _ = this.notify_bridge(app_id, true);
+                    break;
+                }
+            }
+        })
     }
 
     /// Launches `app_id` via `steam -applaunch <app_id>` (or a discovered binary in `install_dir`)
@@ -284,5 +385,15 @@ mod tests {
             .build_launch_command(1245620, Path::new("/usr/bin/steam"), &[])
             .is_ok());
         assert_eq!(reloaded.get_status(1245620), InjectionStatus::Injected);
+
+        // Windows binary test for WINEDLLOVERRIDES
+        let wine_cmd = reloaded
+            .build_launch_command(1245620, Path::new("eldenring.exe"), &[])
+            .unwrap();
+        let envs: Vec<_> = wine_cmd.get_envs().collect();
+        let has_wine_override = envs.iter().any(|(k, v)| {
+            *k == "WINEDLLOVERRIDES" && v.map(|s| s.to_string_lossy().contains("steam_api=n,b")).unwrap_or(false)
+        });
+        assert!(has_wine_override);
     }
 }
