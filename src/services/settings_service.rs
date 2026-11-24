@@ -49,11 +49,16 @@ impl SettingsService {
         let Ok(json) = serde_json::to_string_pretty(&self.settings) else {
             return false;
         };
-        let tmp = self.config_path.with_extension("tmp");
-        if fs::write(&tmp, json).is_err() {
+        let tmp_path = self.config_path.with_extension("tmp");
+        if fs::write(&tmp_path, json).is_err() {
             return false;
         }
-        fs::rename(&tmp, &self.config_path).is_ok()
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
+        }
+        fs::rename(&tmp_path, &self.config_path).is_ok()
     }
 
     pub fn record_loaded_app(&mut self, app_id: u32) {
@@ -97,7 +102,7 @@ impl SettingsService {
                  Version=1.0\n\
                  Name=LuaTools Linux\n\
                  Comment=Steam manifest and lua configuration manager\n\
-                 Exec=\"{}\" --minimized\n\
+                 Exec=\"{}\" --minimized --tray-locked\n\
                  Icon=luatools\n\
                  Terminal=false\n\
                  Categories=Game;Utility;\n\
@@ -122,5 +127,17 @@ mod tests {
         assert!(p.is_some());
         let path = p.unwrap();
         assert!(path.ends_with(".config/autostart/luatools.desktop"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_save_enforces_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("settings.json");
+        let svc = SettingsService::new(Some(cfg_path.clone()));
+        assert!(svc.save());
+        let mode = fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

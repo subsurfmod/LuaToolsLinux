@@ -7,7 +7,7 @@
 set -euo pipefail
 
 APP_NAME="luatools"
-APP_VERSION="2.9.2-beta"
+APP_VERSION="2.9.3-beta"
 REPO_URL="https://github.com/subsurfmod/LuaToolsLinux.git"
 SCRIPT_DIR=""
 if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
@@ -234,8 +234,14 @@ install_files() {
         run_privileged install -m 0644 "$tmp_desktop" "${apps_dir}/luatools.desktop"
         rm -f "$tmp_desktop"
         command -v update-desktop-database >/dev/null 2>&1 && run_privileged update-desktop-database "$apps_dir" || true
-        if command -v xdg-mime >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ]; then
-            xdg-mime default luatools.desktop x-scheme-handler/luatools || true
+        if command -v xdg-mime >/dev/null 2>&1; then
+            if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+                sudo -u "$SUDO_USER" xdg-mime default luatools.desktop x-scheme-handler/luatools || true
+                sudo -u "$SUDO_USER" xdg-mime default luatools.desktop x-scheme-handler/bst || true
+            elif [ "$(id -u)" -ne 0 ]; then
+                xdg-mime default luatools.desktop x-scheme-handler/luatools || true
+                xdg-mime default luatools.desktop x-scheme-handler/bst || true
+            fi
         fi
         INSTALLED_BIN="${bin_dir}/${APP_NAME}"
     else
@@ -260,7 +266,13 @@ install_files() {
         chmod 0644 "${apps_dir}/luatools.desktop"
 
         if command -v xdg-mime >/dev/null 2>&1; then
-            xdg-mime default luatools.desktop x-scheme-handler/luatools || true
+            if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+                sudo -u "$SUDO_USER" xdg-mime default luatools.desktop x-scheme-handler/luatools || true
+                sudo -u "$SUDO_USER" xdg-mime default luatools.desktop x-scheme-handler/bst || true
+            else
+                xdg-mime default luatools.desktop x-scheme-handler/luatools || true
+                xdg-mime default luatools.desktop x-scheme-handler/bst || true
+            fi
         fi
         if command -v update-desktop-database >/dev/null 2>&1; then
             update-desktop-database "$apps_dir" >/dev/null 2>&1 || true

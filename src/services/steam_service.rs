@@ -139,7 +139,7 @@ impl SteamService {
     }
 
     /// Cleanly terminates any running Steam instances and relaunches Steam via `steam-sls`
-    /// (with `LD_AUDIT=SLSsteam.so`) so SLSsteam is retained without 32-bit / 64-bit LD_PRELOAD crashes.
+    /// (with `LD_AUDIT=library-inject.so:SLSsteam.so`) so SLSsteam is retained without 32-bit / 64-bit LD_PRELOAD crashes.
     pub fn relaunch_steam_sls(override_root: Option<&Path>) -> Result<(), String> {
         // 1. Terminate all running Steam processes
         let _ = Self::terminate_steam_instances();
@@ -154,17 +154,33 @@ impl SteamService {
         let mut cmd = if steam_sls_bin.is_file() {
             std::process::Command::new(&steam_sls_bin)
         } else {
-            // Find steam binary (steam.sh or fallback to PATH)
+            // Find steam binary (override_root/steam.sh, native ~/.local/share/Steam/steam.sh,
+            // Flatpak ~/.var/app/com.valvesoftware.Steam/.local/share/Steam/steam.sh, or fallback to PATH)
+            let native_steam_sh = home.join(".local/share/Steam/steam.sh");
+            let flatpak_steam_sh =
+                home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam/steam.sh");
+
             let steam_bin = override_root
                 .map(|r| r.join("steam.sh"))
                 .filter(|p| p.is_file())
+                .or_else(|| native_steam_sh.is_file().then_some(native_steam_sh))
+                .or_else(|| flatpak_steam_sh.is_file().then_some(flatpak_steam_sh))
                 .unwrap_or_else(|| PathBuf::from("steam"));
             let mut c = std::process::Command::new(steam_bin);
 
-            // Retain SLSsteam.so via LD_AUDIT
-            let sls_so = home.join(".local/share/SLSsteam/SLSsteam.so");
+            // Retain library-inject.so + SLSsteam.so via LD_AUDIT
+            let sls_dir = home.join(".local/share/SLSsteam");
+            let lib_inject_so = sls_dir.join("library-inject.so");
+            let sls_so = sls_dir.join("SLSsteam.so");
+            let mut audit_entries = Vec::new();
+            if lib_inject_so.is_file() {
+                audit_entries.push(lib_inject_so.to_string_lossy().into_owned());
+            }
             if sls_so.is_file() {
-                c.env("LD_AUDIT", &sls_so);
+                audit_entries.push(sls_so.to_string_lossy().into_owned());
+            }
+            if !audit_entries.is_empty() {
+                c.env("LD_AUDIT", audit_entries.join(":"));
             }
             c
         };

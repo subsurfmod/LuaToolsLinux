@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 
 use eframe::egui;
+use luatools_linux::services::protocol_service::ProtocolService;
 use luatools_linux::services::settings_service::SettingsService;
 use luatools_linux::services::steam_service::detect_steam_install;
 use luatools_linux::services::update_service::UpdateService;
@@ -16,6 +17,7 @@ use luatools_linux::VERSION;
 
 enum IpcCommand {
     Focus,
+    TrayLock,
     Url(String),
 }
 
@@ -86,10 +88,18 @@ impl eframe::App for AppWrapper {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
+                IpcCommand::TrayLock => {
+                    self.tray_locked = true;
+                }
                 IpcCommand::Url(url) => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    let is_silent = ProtocolService::parse(&url)
+                        .map(|a| a.silent)
+                        .unwrap_or(false);
+                    if !is_silent {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
                     self.inner.handle_protocol_url(&url, ctx);
                 }
             }
@@ -230,17 +240,26 @@ fn main() -> eframe::Result<()> {
     let instance_lock = match InstanceLock::try_acquire(&lock_path) {
         Ok(lock) => lock,
         Err(_) => {
-            // Another instance holds the flock lock; forward protocol action or focus window
-            let msg = if let Some(url) = &initial_protocol_url {
-                format!("URL {}\n", url)
-            } else {
-                "FOCUS\n".to_string()
-            };
+            // Another instance holds the flock lock; forward protocol action, tray-lock, or focus window
+            let mut msgs: Vec<String> = Vec::new();
+            if tray_locked {
+                msgs.push("TRAYLOCK\n".to_string());
+            }
+            if let Some(url) = &initial_protocol_url {
+                msgs.push(format!("URL {}\n", url));
+            } else if !minimized {
+                msgs.push("FOCUS\n".to_string());
+            }
 
+            if msgs.is_empty() {
+                return Ok(());
+            }
+
+            let payload = msgs.join("");
             let mut connected = false;
             for _ in 0..10 {
                 if let Ok(mut stream) = UnixStream::connect(&sock_path) {
-                    let _ = stream.write_all(msg.as_bytes());
+                    let _ = stream.write_all(payload.as_bytes());
                     let _ = stream.flush();
                     connected = true;
                     break;
@@ -259,6 +278,9 @@ fn main() -> eframe::Result<()> {
             return Ok(());
         }
     };
+
+    // LT-10: Self-heal luatools:// and bst:// XDG desktop handlers on startup
+    let _ = ProtocolService::register_desktop_handler();
 
     // We acquired the single-instance lock. Clean up any stale socket and bind listener.
     let _ = std::fs::remove_file(&sock_path);
@@ -311,12 +333,14 @@ fn main() -> eframe::Result<()> {
                 std::thread::spawn(move || {
                     for stream in listener.incoming() {
                         if let Ok(stream) = stream {
-                            let mut reader = BufReader::new(stream);
-                            let mut line = String::new();
-                            if reader.read_line(&mut line).is_ok() {
+                            let reader = BufReader::new(stream);
+                            for line in reader.lines().map_while(Result::ok) {
                                 let trimmed = line.trim();
                                 if trimmed == "FOCUS" {
                                     let _ = tx.send(IpcCommand::Focus);
+                                    repaint_ctx.request_repaint();
+                                } else if trimmed == "TRAYLOCK" {
+                                    let _ = tx.send(IpcCommand::TrayLock);
                                     repaint_ctx.request_repaint();
                                 } else if let Some(url) = trimmed.strip_prefix("URL ") {
                                     let _ = tx.send(IpcCommand::Url(url.trim().to_string()));

@@ -1,9 +1,30 @@
 //! ProtocolService — parses `luatools://` URIs and registers `luatools.desktop` via `xdg-mime`.
 
+use std::collections::HashMap;
 use std::fs;
+use std::ops::Deref;
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 use url::Url;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProtocolActionExt {
+    pub token: Option<String>,
+    pub redeem_code: Option<String>,
+}
+
+type ExtKey = (String, u32, Option<String>, bool);
+
+fn ext_store() -> &'static Mutex<HashMap<ExtKey, &'static ProtocolActionExt>> {
+    static STORE: OnceLock<Mutex<HashMap<ExtKey, &'static ProtocolActionExt>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+static EMPTY_EXT: ProtocolActionExt = ProtocolActionExt {
+    token: None,
+    redeem_code: None,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtocolAction {
@@ -11,6 +32,43 @@ pub struct ProtocolAction {
     pub app_id: u32,
     pub source: Option<String>,
     pub silent: bool,
+}
+
+impl ProtocolAction {
+    fn record_ext(&self, token: Option<String>, redeem_code: Option<String>) {
+        let key = (
+            self.kind.clone(),
+            self.app_id,
+            self.source.clone(),
+            self.silent,
+        );
+        let leaked: &'static ProtocolActionExt = Box::leak(Box::new(ProtocolActionExt {
+            token,
+            redeem_code,
+        }));
+        if let Ok(mut map) = ext_store().lock() {
+            map.insert(key, leaked);
+        }
+    }
+}
+
+impl Deref for ProtocolAction {
+    type Target = ProtocolActionExt;
+
+    fn deref(&self) -> &Self::Target {
+        let key = (
+            self.kind.clone(),
+            self.app_id,
+            self.source.clone(),
+            self.silent,
+        );
+        if let Ok(map) = ext_store().lock() {
+            if let Some(&ext) = map.get(&key) {
+                return ext;
+            }
+        }
+        &EMPTY_EXT
+    }
 }
 
 pub struct ProtocolService;
@@ -39,6 +97,23 @@ impl ProtocolService {
                 && (v == "1" || v.eq_ignore_ascii_case("true") || v.is_empty())
         });
 
+        if host_lower == "redeem" {
+            let code = segments.first()?.trim();
+            if code.is_empty() {
+                return None;
+            }
+            let act = ProtocolAction {
+                kind: "game".to_string(),
+                app_id: 0,
+                source: None,
+                silent,
+            };
+            act.record_ext(None, Some(code.to_string()));
+            return Some(act);
+        }
+
+        let mut token: Option<String> = None;
+
         let (kind, app_id) = if matches!(host_lower.as_str(), "game" | "install" | "manage" | "fix") {
             let mut aid = None;
             for seg in &segments {
@@ -48,6 +123,8 @@ impl ProtocolService {
                     if let Ok(id) = seg.parse::<u32>() {
                         aid = Some(id);
                     }
+                } else if token.is_none() {
+                    token = Some((*seg).to_string());
                 }
             }
             (host_lower, aid?)
@@ -55,6 +132,8 @@ impl ProtocolService {
             for seg in &segments {
                 if seg.eq_ignore_ascii_case("silent") {
                     silent = true;
+                } else if token.is_none() {
+                    token = Some((*seg).to_string());
                 }
             }
             let q_kind = parsed
@@ -67,6 +146,14 @@ impl ProtocolService {
             return None;
         };
 
+        if token.is_none() {
+            token = parsed
+                .query_pairs()
+                .find(|(k, _)| k.eq_ignore_ascii_case("token"))
+                .map(|(_, v)| v.to_string())
+                .filter(|s| !s.is_empty());
+        }
+
         let mut source = parsed
             .query_pairs()
             .find(|(k, _)| k == "source")
@@ -76,12 +163,14 @@ impl ProtocolService {
             source = Some("bst".to_string());
         }
 
-        Some(ProtocolAction {
+        let act = ProtocolAction {
             kind,
             app_id,
             source,
             silent,
-        })
+        };
+        act.record_ext(token, None);
+        Some(act)
     }
 
     pub fn register_desktop_handler() -> Result<String, String> {
@@ -115,6 +204,9 @@ impl ProtocolService {
         let _ = Command::new("xdg-mime")
             .args(["default", "luatools.desktop", "x-scheme-handler/bst"])
             .output();
+        let _ = Command::new("update-desktop-database")
+            .arg(&apps_dir)
+            .status();
 
         Ok(format!(
             "Registered luatools:// and bst:// handlers at {}",
@@ -168,6 +260,7 @@ mod tests {
         assert_eq!(b.kind, "install");
         assert_eq!(b.app_id, 1245620);
         assert_eq!(b.source.as_deref(), Some("hubcap"));
+        assert_eq!(b.token.as_deref(), Some("token"));
         assert!(!b.silent);
 
         let c = ProtocolService::parse("bst://install/silent/730").unwrap();
@@ -178,5 +271,13 @@ mod tests {
         let d = ProtocolService::parse("bst://fix/480").unwrap();
         assert_eq!(d.kind, "fix");
         assert_eq!(d.app_id, 480);
+
+        let e = ProtocolService::parse("bst://redeem/VIP-CODE-2026").unwrap();
+        assert_eq!(e.kind, "game");
+        assert_eq!(e.app_id, 0);
+        assert_eq!(e.source, None);
+        assert!(!e.silent);
+        assert_eq!(e.token, None);
+        assert_eq!(e.redeem_code.as_deref(), Some("VIP-CODE-2026"));
     }
 }
