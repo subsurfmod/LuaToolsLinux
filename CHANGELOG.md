@@ -25,6 +25,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Fixed `install.sh` / `uninstall.sh` to install and remove `libsteam_integration.so` and `libsteam_auto_patch_linux.so` cleanly on both prebuilt and `--system` installs, and cleaned up `packaging/build-packages.sh` & `packaging/luatools-linux.spec`.
   - Reformatted `README.md` to match the Leonida layout with zero emojis while preserving all LuaTools Linux documentation and screenshots.
 
+### Complete File Audit List (`v2.6.1` → `v2.9.1-beta`)
+- **Config, Packaging & Docs (10)**:
+  - Modified: `Cargo.toml`, `Cargo.lock`, `bridge_lib/Cargo.toml`, `steam_auto_patch_linux/Cargo.toml`, `install.sh`, `uninstall.sh`, `packaging/build-packages.sh`, `packaging/luatools-linux.spec`, `README.md`, `CHANGELOG.md`
+- **Parsers & Services (21)**:
+  - Modified: `src/parsers/lua_parser.rs`, `src/services/api_client.rs`, `src/services/caches.rs`, `src/services/depot_downloader.rs`, `src/services/donate_keys.rs`, `src/services/external_tools.rs`, `src/services/fixes_service.rs`, `src/services/mod.rs`, `src/services/steam_auto_crack_service.rs`, `src/services/steam_bridge_service.rs`
+  - Added: `src/services/analytics_service.rs`, `src/services/asset_hash.rs`, `src/services/doh_resolver.rs`, `src/services/file_hash.rs`, `src/services/github_proxy.rs`, `src/services/mode_migration.rs`, `src/services/plugin_add_service.rs`, `src/services/plugin_installer_service.rs`, `src/services/plugin_log.rs`, `src/services/proxied_file_downloader.rs`, `src/services/steamless_service.rs`
+- **Steam Bridge Core, Credentials, Interop & NetPacket (23)**:
+  - Modified: `src/steam_bridge/ipc.rs`, `src/steam_bridge/mod.rs`, `src/steam_bridge/preload_loader.rs`, `src/steam_bridge/ticket_store.rs`
+  - Added: `src/steam_bridge/cloud_redirect.rs`, `src/steam_bridge/denuvo_auth.rs`, `src/steam_bridge/manifest_hooks.rs`, `src/steam_bridge/token_bridge.rs`, `src/steam_bridge/credentials/appticket.rs`, `src/steam_bridge/credentials/eticketclient.rs`, `src/steam_bridge/credentials/legacycdkey.rs`, `src/steam_bridge/credentials/mod.rs`, `src/steam_bridge/interop/interop_ipc.rs`, `src/steam_bridge/interop/interop_ipc_isteamuser.rs`, `src/steam_bridge/interop/interop_ipc_isteamutils.rs`, `src/steam_bridge/interop/interop_misc.rs`, `src/steam_bridge/interop/ipc.rs`, `src/steam_bridge/interop/mod.rs`, `src/steam_bridge/netpacket/mod.rs`, `src/steam_bridge/netpacket/netpacket_eticket.rs`, `src/steam_bridge/netpacket/netpacket_manifestprobe.rs`, `src/steam_bridge/netpacket/netpacket_ownershipticket.rs`, `src/steam_bridge/netpacket/userstats.rs`
+- **OSTPlatform Linux Backend (17)**:
+  - Added: `src/steam_bridge/ost_platform/bkv_parser.rs`, `src/steam_bridge/ost_platform/byte_search.rs`, `src/steam_bridge/ost_platform/dialog.rs`, `src/steam_bridge/ost_platform/directory_watch.rs`, `src/steam_bridge/ost_platform/dynamic_library.rs`, `src/steam_bridge/ost_platform/encoding.rs`, `src/steam_bridge/ost_platform/hash.rs`, `src/steam_bridge/ost_platform/http.rs`, `src/steam_bridge/ost_platform/memory.rs`, `src/steam_bridge/ost_platform/mod.rs`, `src/steam_bridge/ost_platform/numbers.rs`, `src/steam_bridge/ost_platform/pe.rs`, `src/steam_bridge/ost_platform/process.rs`, `src/steam_bridge/ost_platform/remote_process.rs`, `src/steam_bridge/ost_platform/steam_credential_store.rs`, `src/steam_bridge/ost_platform/thread.rs`, `src/steam_bridge/ost_platform/trap.rs`
+- **UI & Visual QA (8)**:
+  - Modified: `src/ui/app.rs`, `src/ui/dialogs.rs`, `src/ui/mod.rs`, `src/ui/views_guide.rs`, `src/ui/views_primary.rs`, `src/ui/views_workbench.rs`, `tests/ui_visual_qa.rs`
+  - Added: `src/ui/lua_editor.rs`
+
 ---
 
 ## [2.9.0-beta] - 2026-11-24
