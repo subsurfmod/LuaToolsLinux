@@ -282,8 +282,17 @@ fn run_steamless(cli: &Path, exe: &Path) -> Result<bool, Box<dyn std::error::Err
         .output()?;
 
     if output.status.success() {
-        let unpacked = unpacked_output_path(exe);
-        if unpacked.is_file() {
+        let unpacked_full = unpacked_output_path(exe);
+        let unpacked_stem = exe.with_extension("unpacked.exe");
+        let unpacked = if unpacked_full.is_file() {
+            Some(unpacked_full)
+        } else if unpacked_stem.is_file() {
+            Some(unpacked_stem)
+        } else {
+            None
+        };
+
+        if let Some(unpacked) = unpacked {
             let backup = backup_output_path(exe);
             if !backup.exists() {
                 fs::copy(exe, &backup)?;

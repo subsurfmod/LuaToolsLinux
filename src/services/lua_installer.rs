@@ -2,7 +2,7 @@
 //! captures variants in `LuaVault`, and synchronizes `SLSsteam` `config.yaml`.
 
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
@@ -244,9 +244,54 @@ impl LuaInstaller {
         mut settings_svc: Option<&mut SettingsService>,
         mut sls_svc: Option<&mut SlssteamService>,
     ) -> InstallResult {
-        let Ok(file) = File::open(zip_path) else {
+        let Ok(mut file) = File::open(zip_path) else {
             return InstallResult::err(format!("Cannot open archive {}", zip_path.display()));
         };
+
+        // Check magic bytes: ZIP archives must start with PK (0x50, 0x4B)
+        let mut magic = [0u8; 4];
+        let mut is_zip_magic = false;
+        if let Ok(n) = file.read(&mut magic) {
+            if n >= 2 && magic[0] == 0x50 && magic[1] == 0x4B {
+                is_zip_magic = true;
+            }
+        }
+
+        if !is_zip_magic {
+            // Bare uncompressed .lua file passed to install_zip or file with .zip extension that is raw lua
+            if let Ok(content) = fs::read_to_string(zip_path) {
+                let fname = zip_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let num_lua_re = Regex::new(r"(?i)^(\d+)(?:_(\d+))?").unwrap();
+                let mut aid = expected_app_id;
+                let mut build_id = None;
+                if let Some(cap) = num_lua_re.captures(fname) {
+                    if let Some(id_m) = cap.get(1) {
+                        aid = id_m.as_str().parse::<u32>().ok().or(aid);
+                    }
+                    build_id = cap.get(2).map(|m| m.as_str().to_string());
+                }
+                if aid.is_none() {
+                    aid = LuaFileParser::infer_app_id_from_text(&content);
+                }
+                if let Some(target_aid) = aid {
+                    return self.install_lua(
+                        target_aid,
+                        &content,
+                        force_locked,
+                        build_id,
+                        source,
+                        settings_svc,
+                        sls_svc,
+                    );
+                }
+            }
+            return InstallResult::err("Invalid .zip archive (missing PK magic bytes)");
+        }
+
+        if let Err(e) = file.seek(SeekFrom::Start(0)) {
+            return InstallResult::err(format!("Failed to seek archive: {}", e));
+        }
+
         let Ok(mut archive) = ZipArchive::new(file) else {
             return InstallResult::err("Invalid .zip archive");
         };
@@ -352,6 +397,32 @@ impl LuaInstaller {
         let lower = fname.to_ascii_lowercase();
 
         if lower.ends_with(".zip") {
+            // Check magic bytes to detect bare uncompressed .lua file masquerading as .zip
+            let mut magic = [0u8; 4];
+            let is_zip_magic = File::open(path)
+                .and_then(|mut f| {
+                    f.read(&mut magic).map(|n| n >= 2 && magic[0] == 0x50 && magic[1] == 0x4B)
+                })
+                .unwrap_or(false);
+
+            if !is_zip_magic {
+                if let Ok(txt) = fs::read_to_string(path) {
+                    let aid = expected_app_id.or_else(|| LuaFileParser::infer_app_id_from_text(&txt));
+                    if let Some(target_aid) = aid {
+                        let build_id = Self::build_id_from_filename(path);
+                        return self.install_lua(
+                            target_aid,
+                            &txt,
+                            force_locked,
+                            build_id,
+                            source,
+                            settings_svc,
+                            sls_svc,
+                        );
+                    }
+                }
+            }
+
             return self.install_zip(
                 path,
                 expected_app_id,
@@ -517,5 +588,34 @@ mod tests {
         );
         assert!(sls.get_token(1245620).is_none());
         assert_eq!(vault.get_variants(1245620).len(), 1);
+
+        // Test bare uncompressed .lua file passed to install_zip and install_any with .zip extension
+        let bare_zip_path = dir.path().join("bare_lua_masquerading.zip");
+        fs::write(
+            &bare_zip_path,
+            b"addappid(730)\naddappid(731, 1, \"11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff\")\n",
+        )
+        .unwrap();
+
+        let bare_res = installer.install_zip(
+            &bare_zip_path,
+            Some(730),
+            false,
+            Some("bare-test"),
+            Some(&mut settings),
+            Some(&mut sls),
+        );
+        assert!(bare_res.ok && bare_res.lua_installed);
+        assert_eq!(bare_res.app_id, Some(730));
+
+        let any_res = installer.install_any(
+            &bare_zip_path,
+            Some(730),
+            false,
+            Some("bare-any-test"),
+            Some(&mut settings),
+            Some(&mut sls),
+        );
+        assert!(any_res.ok && any_res.lua_installed);
     }
 }

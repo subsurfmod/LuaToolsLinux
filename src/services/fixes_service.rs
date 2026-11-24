@@ -33,6 +33,8 @@ pub struct AppliedFixRecord {
     pub fix_id: String,
     pub applied_at: String,
     pub files: Vec<FixFileEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wine_dll_overrides: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,14 +61,14 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn is_safe_fix_id(fix_id: &str) -> bool {
+pub fn is_safe_fix_id(fix_id: &str) -> bool {
     let s = fix_id.trim();
     !s.is_empty()
         && s != "."
         && s != ".."
         && !s.contains("..")
         && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -395,11 +397,43 @@ impl FixesService {
             applied.push(rel_posix);
         }
 
+        let mut dll_overrides = Vec::new();
+        for r in &records {
+            let p = Path::new(&r.relative_path);
+            if p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("dll"))
+                .unwrap_or(false)
+            {
+                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                    let s_lower = stem.to_ascii_lowercase();
+                    if !s_lower.is_empty() && !dll_overrides.contains(&s_lower) {
+                        dll_overrides.push(s_lower);
+                    }
+                }
+            }
+        }
+
+        let wine_overrides_str = if !dll_overrides.is_empty() {
+            let val = dll_overrides
+                .iter()
+                .map(|d| format!("{}=n,b", d))
+                .collect::<Vec<_>>()
+                .join(";");
+            let env_content = format!("WINEDLLOVERRIDES=\"{}\"\n", val);
+            let _ = fs::write(fix_meta_dir.join("winedlloverrides.env"), &env_content);
+            Self::configure_wine_registry_overrides(game_dir, app_id, &dll_overrides);
+            Some(val)
+        } else {
+            None
+        };
+
         let record = AppliedFixRecord {
             app_id,
             fix_id: fix_id.to_string(),
             applied_at: Utc::now().to_rfc3339(),
             files: records.clone(),
+            wine_dll_overrides: wine_overrides_str,
         };
         let record_file = fix_meta_dir.join(format!("{}.json", fix_id));
         let js = match serde_json::to_string_pretty(&record) {
@@ -513,6 +547,10 @@ impl FixesService {
             }
         }
 
+        let _ = fs::remove_file(fix_meta_dir.join("winedlloverrides.env"));
+        if let Some(ref overrides_str) = record.wine_dll_overrides {
+            Self::remove_wine_registry_overrides(game_dir, record.app_id, overrides_str);
+        }
         let _ = fs::remove_file(&record_file);
         let _ = fs::remove_dir_all(fix_meta_dir.join("backups").join(fix_id));
         FixApplicationResult {
@@ -520,6 +558,70 @@ impl FixesService {
             error: None,
             applied_files: reverted,
         }
+    }
+
+    pub fn configure_wine_registry_overrides(game_dir: &Path, app_id: u32, dlls: &[String]) {
+        if dlls.is_empty() {
+            return;
+        }
+        let pfx_reg = game_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("compatdata").join(app_id.to_string()).join("pfx/user.reg"));
+        if let Some(reg_path) = pfx_reg {
+            if reg_path.is_file() {
+                if let Ok(content) = fs::read_to_string(&reg_path) {
+                    let mut new_content = content.clone();
+                    let section = "[Software\\\\Wine\\\\DllOverrides]";
+                    if !new_content.contains(section) {
+                        new_content.push_str(&format!("\n{}\n", section));
+                    }
+                    for dll in dlls {
+                        let entry = format!("\"{}\"=\"native,builtin\"", dll);
+                        if !new_content.contains(&entry) {
+                            if let Some(pos) = new_content.find(section) {
+                                let insert_pos = pos + section.len();
+                                new_content.insert_str(insert_pos, &format!("\n{}", entry));
+                            }
+                        }
+                    }
+                    let _ = fs::write(&reg_path, new_content);
+                }
+            }
+        }
+    }
+
+    pub fn remove_wine_registry_overrides(game_dir: &Path, app_id: u32, overrides_str: &str) {
+        let pfx_reg = game_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("compatdata").join(app_id.to_string()).join("pfx/user.reg"));
+        if let Some(reg_path) = pfx_reg {
+            if reg_path.is_file() {
+                if let Ok(content) = fs::read_to_string(&reg_path) {
+                    let mut lines = content.lines().map(String::from).collect::<Vec<_>>();
+                    for part in overrides_str.split(';') {
+                        let dll_stem = part.split('=').next().unwrap_or("").trim();
+                        if !dll_stem.is_empty() {
+                            let prefix = format!("\"{}\"=", dll_stem);
+                            lines.retain(|l| !l.trim().starts_with(&prefix));
+                        }
+                    }
+                    let _ = fs::write(&reg_path, lines.join("\n"));
+                }
+            }
+        }
+    }
+
+    pub fn get_wine_dll_overrides(game_dir: &Path, fix_id: &str) -> Option<String> {
+        if !is_safe_fix_id(fix_id) {
+            return None;
+        }
+        let fix_meta_dir = game_dir.join(FIX_DIR_NAME);
+        let record_file = fix_meta_dir.join(format!("{}.json", fix_id));
+        let raw = fs::read_to_string(&record_file).ok()?;
+        let record = serde_json::from_str::<AppliedFixRecord>(&raw).ok()?;
+        record.wine_dll_overrides
     }
 }
 
@@ -624,5 +726,42 @@ mod tests {
         let bad_rev = FixesService::unfix_game(&game_dir, "fix2");
         assert!(!bad_rev.ok);
         assert!(FixesService::is_fix_applied(&game_dir, "fix2"));
+    }
+
+    #[test]
+    fn online_fix_id_with_colon_and_winedlloverrides_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let game_dir = dir.path().join("game");
+        let extract_dir = dir.path().join("extract");
+        fs::create_dir_all(&game_dir).unwrap();
+        fs::create_dir_all(&extract_dir).unwrap();
+
+        let online_fix_id = "online-fix:6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+        assert!(is_safe_fix_id(online_fix_id));
+
+        fs::write(extract_dir.join("winmm.dll"), b"ONLINEFIX_HOOK").unwrap();
+        fs::write(extract_dir.join("OnlineFix64.dll"), b"ONLINEFIX_DLL").unwrap();
+
+        let res = FixesService::apply_extracted_with_backup(1245620, online_fix_id, &extract_dir, &game_dir);
+        assert!(res.ok);
+        assert!(FixesService::is_fix_applied(&game_dir, online_fix_id));
+
+        let env_file = game_dir.join(FIX_DIR_NAME).join("winedlloverrides.env");
+        assert!(env_file.exists());
+        let env_content = fs::read_to_string(&env_file).unwrap();
+        assert!(env_content.contains("winmm=n,b"));
+        assert!(env_content.contains("onlinefix64=n,b"));
+
+        let overrides = FixesService::get_wine_dll_overrides(&game_dir, online_fix_id);
+        assert!(overrides.is_some());
+        let ov = overrides.unwrap();
+        assert!(ov.contains("winmm=n,b"));
+        assert!(ov.contains("onlinefix64=n,b"));
+
+        let unfix = FixesService::unfix_game(&game_dir, online_fix_id);
+        assert!(unfix.ok);
+        assert!(!env_file.exists());
+        assert!(!game_dir.join("winmm.dll").exists());
+        assert!(!FixesService::is_fix_applied(&game_dir, online_fix_id));
     }
 }

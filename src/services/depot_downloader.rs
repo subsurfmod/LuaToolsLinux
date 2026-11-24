@@ -153,12 +153,28 @@ impl DepotDownloaderService {
             return None;
         }
         // When system `dotnet` is installed (e.g. Fedora 44/45 with native glibc 2.44 / OpenSSL 3.5),
-        // prefer `DepotDownloader.dll` so it runs on the host .NET runtime instead of an older bundled runtime.
+        // prefer `DepotDownloader.dll` / `DepotDownloaderMod.dll` so it runs on the host .NET runtime instead of an older bundled runtime.
         let has_system_dotnet = which_in_path("dotnet").is_some();
         let candidates: &[&str] = if has_system_dotnet {
-            &["DepotDownloader.dll", "DepotDownloader", "depotdownloader"]
+            &[
+                "DepotDownloaderMod.dll",
+                "DepotDownloader.dll",
+                "DepotDownloaderMod",
+                "DepotDownloader",
+                "depotdownloader",
+                "DepotDownloaderMod.exe",
+                "DepotDownloader.exe",
+            ]
         } else {
-            &["DepotDownloader", "depotdownloader", "DepotDownloader.dll"]
+            &[
+                "DepotDownloaderMod",
+                "DepotDownloader",
+                "depotdownloader",
+                "DepotDownloaderMod.dll",
+                "DepotDownloader.dll",
+                "DepotDownloaderMod.exe",
+                "DepotDownloader.exe",
+            ]
         };
 
         for name in candidates {
@@ -168,12 +184,19 @@ impl DepotDownloaderService {
             }
         }
         if let Ok(entries) = fs::read_dir(dir) {
+            let mut subdirs = Vec::new();
             for e in entries.flatten() {
-                // Skip symlinks to prevent directory traversal loops
-                if e.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                    if let Some(sub) = Self::scan_dir_for_bin_depth(&e.path(), depth + 1) {
-                        return Some(sub);
+                if let Ok(ft) = e.file_type() {
+                    let is_dir = ft.is_dir() || (ft.is_symlink() && e.path().is_dir());
+                    if is_dir {
+                        subdirs.push(e.path());
                     }
+                }
+            }
+            subdirs.sort();
+            for sub in subdirs {
+                if let Some(found) = Self::scan_dir_for_bin_depth(&sub, depth + 1) {
+                    return Some(found);
                 }
             }
         }
@@ -247,7 +270,7 @@ impl DepotDownloaderService {
             download_dir,
             steam_username,
             depot_keys_file,
-            false,
+            true,
         )
     }
 
@@ -274,8 +297,12 @@ impl DepotDownloaderService {
             args.push("-manifest".to_string());
             args.push(gid.to_string());
         }
-        if is_mod {
-            if let Some(mp) = selection.manifest_path.as_deref().filter(|p| p.is_file()) {
+        if is_mod || selection.manifest_path.is_some() {
+            if let Some(mp) = selection
+                .manifest_path
+                .as_deref()
+                .filter(|p| !p.as_os_str().is_empty())
+            {
                 args.push("-manifestfile".to_string());
                 args.push(mp.to_string_lossy().to_string());
             }
@@ -903,12 +930,26 @@ mod tests {
             None,
         );
         assert!(!args.iter().any(|a| a == "-depotkey" || a == "-depotkeys"));
-        assert!(!args.iter().any(|a| a == "-manifestfile"));
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["-manifestfile", "/tmp/3321461_1669007755731719796.manifest"]));
         assert!(!args.iter().any(|a| a == "-username"));
         assert!(args.windows(2).any(|w| w == ["-max-downloads", "8"]));
         assert!(args
             .windows(2)
             .any(|w| w == ["-manifest", "1669007755731719796"]));
+    }
+
+    #[test]
+    fn scan_dir_for_bin_depth_finds_depotdownloadermod_nested() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("sub/net8.0");
+        fs::create_dir_all(&nested).unwrap();
+        let mod_bin = nested.join("DepotDownloaderMod.dll");
+        fs::write(&mod_bin, b"MZ").unwrap();
+
+        let found = DepotDownloaderService::scan_dir_for_bin_depth(dir.path(), 0);
+        assert_eq!(found, Some(mod_bin));
     }
 
     #[test]

@@ -252,9 +252,12 @@ impl ExternalToolsManager {
                     || n.ends_with(".7z")
             };
 
-            let chosen = assets
-                .iter()
-                .find(|a| {
+            let mut assets_to_download = Vec::new();
+            if key == "goldberg" {
+                // For Goldberg Emulator (LT-99, Section 1.3 #7), download both Linux (.so)
+                // and Windows (emu-win-release.7z / steam_api.dll / steam_api64.dll) so Proton
+                // Windows games can be cracked offline.
+                let linux_asset = assets.iter().find(|a| {
                     let n = a
                         .get("name")
                         .and_then(|v| v.as_str())
@@ -264,61 +267,111 @@ impl ExternalToolsManager {
                         && n.contains("linux")
                         && !n.contains("arm")
                         && !n.contains("debug")
-                })
-                .or_else(|| {
-                    assets.iter().find(|a| {
+                });
+                let win_asset = assets.iter().find(|a| {
+                    let n = a
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    is_supported_archive(&n)
+                        && (n.contains("emu-win") || n.contains("win"))
+                        && !n.contains("arm")
+                        && !n.contains("debug")
+                });
+                if let Some(la) = linux_asset {
+                    assets_to_download.push(la);
+                }
+                if let Some(wa) = win_asset {
+                    if !assets_to_download.iter().any(|a| a.get("name") == wa.get("name")) {
+                        assets_to_download.push(wa);
+                    }
+                }
+            } else {
+                let chosen = assets
+                    .iter()
+                    .find(|a| {
                         let n = a
                             .get("name")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_ascii_lowercase();
                         is_supported_archive(&n)
-                            && !n.contains("osx")
-                            && !n.contains("macos")
-                            && !n.contains("darwin")
+                            && n.contains("linux")
                             && !n.contains("arm")
                             && !n.contains("debug")
                     })
-                });
-
-            let Some(asset) = chosen else {
-                continue;
-            };
-            let Some(dl_url) = asset.get("browser_download_url").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let raw_aname = asset
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("tool.zip");
-            let safe_aname = Path::new(raw_aname)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .filter(|s| !s.is_empty() && *s != "." && *s != "..")
-                .unwrap_or("tool.zip");
-            let archive_path = tool_dir.join(safe_aname);
-
-            progress_cb(0.1, format!("Downloading {} {}...", spec.name, tag));
-            let dl_resp = match agent.get(dl_url).set("User-Agent", &ua).call() {
-                Ok(r) => r,
-                Err(e) => {
-                    last_err = Some(format!("Download failed ({}): {}", repo, e));
-                    continue;
+                    .or_else(|| {
+                        assets.iter().find(|a| {
+                            let n = a
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_ascii_lowercase();
+                            is_supported_archive(&n)
+                                && !n.contains("osx")
+                                && !n.contains("macos")
+                                && !n.contains("darwin")
+                                && !n.contains("arm")
+                                && !n.contains("debug")
+                        })
+                    });
+                if let Some(c) = chosen {
+                    assets_to_download.push(c);
                 }
-            };
-            if let Err(e) = stream_response_to_file(dl_resp, &archive_path, &mut |frac, msg| {
-                progress_cb((0.1 + frac.clamp(0.0, 1.0) * 0.78).clamp(0.1, 0.88), msg);
-            }) {
-                let _ = fs::remove_file(&archive_path);
-                last_err = Some(format!("Download stream failed ({}): {}", repo, e));
+            }
+
+            if assets_to_download.is_empty() {
                 continue;
             }
 
-            progress_cb(0.9, "Extracting archive...".into());
-            let extract_res = extract_archive(&archive_path, &tool_dir);
-            let _ = fs::remove_file(&archive_path);
-            if let Err(e) = extract_res {
-                last_err = Some(format!("Extraction failed ({}): {}", repo, e));
+            let mut dl_failed = false;
+            for (idx, asset) in assets_to_download.iter().enumerate() {
+                let Some(dl_url) = asset.get("browser_download_url").and_then(|v| v.as_str()) else {
+                    dl_failed = true;
+                    break;
+                };
+                let raw_aname = asset
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("tool.zip");
+                let safe_aname = Path::new(raw_aname)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+                    .unwrap_or("tool.zip");
+                let archive_path = tool_dir.join(safe_aname);
+
+                let base_pct = 0.1 + (idx as f32) * 0.4;
+                progress_cb(base_pct, format!("Downloading {} {} ({})", spec.name, tag, safe_aname));
+                let dl_resp = match agent.get(dl_url).set("User-Agent", &ua).call() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        last_err = Some(format!("Download failed ({}): {}", repo, e));
+                        dl_failed = true;
+                        break;
+                    }
+                };
+                if let Err(e) = stream_response_to_file(dl_resp, &archive_path, &mut |frac, msg| {
+                    progress_cb((base_pct + frac.clamp(0.0, 1.0) * 0.35).clamp(0.1, 0.88), msg);
+                }) {
+                    let _ = fs::remove_file(&archive_path);
+                    last_err = Some(format!("Download stream failed ({}): {}", repo, e));
+                    dl_failed = true;
+                    break;
+                }
+
+                progress_cb(0.85 + (idx as f32) * 0.05, format!("Extracting {}...", safe_aname));
+                let extract_res = extract_archive(&archive_path, &tool_dir);
+                let _ = fs::remove_file(&archive_path);
+                if let Err(e) = extract_res {
+                    last_err = Some(format!("Extraction failed ({}): {}", repo, e));
+                    dl_failed = true;
+                    break;
+                }
+            }
+
+            if dl_failed {
                 continue;
             }
 
@@ -420,11 +473,59 @@ impl ExternalToolsManager {
             cmd.arg(p);
         }
         cmd.arg(target_exe);
-        cmd.spawn().map_err(|e| e.to_string())?;
-        Ok(format!(
-            "Launched StubRemover on {}",
-            target_exe.file_name().unwrap_or_default().to_string_lossy()
-        ))
+
+        // Wait for Steamless.CLI.exe process completion (LT-106, Section 1.3 #8)
+        let output = cmd.output().map_err(|e| format!("Failed to execute StubRemover: {}", e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let msg = if !stderr.trim().is_empty() {
+                stderr.trim()
+            } else if !stdout.trim().is_empty() {
+                stdout.trim()
+            } else {
+                "Unknown Steamless error"
+            };
+            return Err(format!(
+                "StubRemover exited with code {}: {}",
+                output.status.code().unwrap_or(-1),
+                msg
+            ));
+        }
+
+        // Steamless produces `<target_exe>.unpacked.exe` or `<target_exe_stem>.unpacked.exe`
+        let full_unpacked = PathBuf::from(format!("{}.unpacked.exe", target_exe.display()));
+        let stem_unpacked = target_exe.with_extension("unpacked.exe");
+        let unpacked = if full_unpacked.is_file() {
+            Some(full_unpacked)
+        } else if stem_unpacked.is_file() {
+            Some(stem_unpacked)
+        } else {
+            None
+        };
+
+        if let Some(unpacked_path) = unpacked {
+            let backup_path = PathBuf::from(format!("{}.orig.bak", target_exe.display()));
+            if !backup_path.exists() {
+                let _ = fs::copy(target_exe, &backup_path);
+            }
+            fs::rename(&unpacked_path, target_exe).map_err(|e| {
+                format!(
+                    "Failed to replace '{}' with unpacked executable: {}",
+                    target_exe.display(),
+                    e
+                )
+            })?;
+            Ok(format!(
+                "Successfully unpacked SteamStub and replaced {}",
+                target_exe.file_name().unwrap_or_default().to_string_lossy()
+            ))
+        } else {
+            Ok(format!(
+                "StubRemover completed on {} (no .unpacked.exe output detected; file may not be protected with SteamStub)",
+                target_exe.file_name().unwrap_or_default().to_string_lossy()
+            ))
+        }
     }
 }
 

@@ -152,7 +152,8 @@ fn full_workstation_end_to_end_pipeline() {
         Some(ProtocolAction {
             kind: "install".into(),
             app_id: 1245620,
-            source: Some("hubcap".into())
+            source: Some("hubcap".into()),
+            silent: false,
         })
     );
     let valid_hc = format!("smm_{}", "0123456789abcdef".repeat(6));
