@@ -3,7 +3,7 @@ members = [".", "bridge_lib", "steam_auto_patch_linux"]
 
 [package]
 name = "luatools-linux"
-version = "2.7.3-beta"
+version = "2.9.0-beta"
 edition = "2021"
 description = "Native lightweight Rust workstation for Steam stplug-in lua manifests, LuaVault variants, depot downloads, and game fixes"
 license = "MIT"
@@ -41,6 +41,7 @@ base64 = "0.22"
 hex = "0.4"
 thiserror = "2.0"
 toml = "0.8"
+log = "0.4"
 libc = "0.2"
 inotify = "0.10"
 rand = "0.8"

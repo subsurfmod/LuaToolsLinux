@@ -5,13 +5,20 @@
 
 pub mod bkv_parser;
 pub mod byte_search;
+pub mod dialog;
 pub mod directory_watch;
 pub mod dynamic_library;
 pub mod encoding;
+pub mod hash;
+pub mod http;
 pub mod memory;
+pub mod numbers;
+pub mod pe;
 pub mod process;
 pub mod remote_process;
 pub mod steam_credential_store;
+pub mod thread;
+pub mod trap;
 
 // Re-export all dynamic_library symbols with full API compatibility
 pub use dynamic_library::{

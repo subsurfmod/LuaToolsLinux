@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.9.0-beta] - 2026-11-24
+
+### Merged & Cleaned
+- **Consolidated `beta/v2.7.3-beta`, `beta/v2.8.2-beta`, and `2.8.4-beta`**:
+  - Preserved all `v2.7.3-beta` fixes (Steam cover image resolution via hashed `appdetails` + local `librarycache`, `Kill Steam` all-instance terminator, and hardened `bridge_lib/src/lib.rs`) alongside the new Linux interop, NetPacket, credentials, `TokenBridge`, and `OSTPlatform` modules.
+  - Removed the accidentally committed duplicate `LuaToolsLinux-beta-v2.7.3-beta/` repository copy, `workflows/integrate-modules.json`, and 31 redundant/stray `.md` / `.txt` status dump files so only canonical repository docs (`README.md`, `CHANGELOG.md`, `LICENSE`) remain at root.
+
+### Audited & Fixed
+- **Restored `bridge_lib/src/lib.rs` & `steam_bridge_service.rs`**: Reverted the accidental truncation of `bridge_lib/src/lib.rs` (from 1,058 lines down to 98 lines) and broken imports in `src/services/steam_bridge_service.rs`, and restored `BridgeState` / `state()` / `set_integrated()` / `is_integrated()` in `src/steam_bridge/mod.rs`.
+- **`OSTPlatform` Linux Modules (`pe.rs`, `hash.rs`, `numbers.rs`, `http.rs`, `dialog.rs`, `trap.rs`, `thread.rs`)**:
+  - Eliminated double-free UB in `pe::ByteBuffer::new`, fixed infinite loop and missing address seek in `hash::sha256_of_process_memory`, fixed `numbers.rs` missing implementations & invalid `Self::`/UTF-16 byte pushes, migrated `http.rs` to valid `ureq 2.12` APIs (`send_bytes`, `request`, timeouts, `:port` URL parsing, UTF-8-safe truncation), fixed `dialog.rs` `Command::output()` `Result` matching & `zenity` flags, added missing `HANDLER` atomic + Box reclamation in `trap.rs`, and fixed `thread.rs` test assertion.
+- **Interop, NetPacket, Credentials & TokenBridge (`interop/*`, `netpacket/*`, `credentials/*`, `ticket_store.rs`, `token_bridge.rs`)**:
+  - Removed duplicate broken `call_original` transmute in `interop_ipc.rs`, replaced `fnv` dependency with `const fn fnv1a_hash`, switched handler callbacks to `Arc<dyn Fn>` + manual `Debug`, eliminated double `patch.install()` and non-`Send` raw pointer statics in `interop_misc.rs`, fixed response buffer slices in `interop_ipc_isteamuser.rs` so mutations write back to caller buffers, fixed inverted protobuf varint continuation bit in `netpacket_eticket.rs`, fixed `ManifestProbeState` static/thread-safety & 8-byte `jobid_target` reads in `netpacket_manifestprobe.rs`, fixed `TicketStore` methods pasted outside `impl TicketStore` + added `TicketStore::global()`, fixed `legacycdkey.rs` reserved keyword `override` & C++ syntax bugs, isolated `appticket.rs` tests from `$HOME`, and fixed `bst://` query-string parsing and handler dispatch in `token_bridge.rs`.
+
+---
+
 ## [2.7.3-beta] - 2026-11-24
 
 ### Added

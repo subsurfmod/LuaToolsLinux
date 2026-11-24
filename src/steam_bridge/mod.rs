@@ -6,14 +6,18 @@
 
 pub mod binary_reader;
 pub mod cloud_redirect;
+pub mod credentials;
 pub mod denuvo_auth;
+pub mod interop;
 pub mod ipc;
 pub mod manifest_hooks;
 pub mod memory_patch;
+pub mod netpacket;
 pub mod ost_platform;
 pub mod pattern_db;
 pub mod preload_loader;
 pub mod ticket_store;
+pub mod token_bridge;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;

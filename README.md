@@ -1,4 +1,4 @@
-# LuaTools Linux v2.7.3-beta (Native Rust Edition)
+# LuaTools Linux v2.9.0-beta (Native Rust Edition)
 
 A complete native Rust rewrite of LuaTools Linux (`eframe` / `egui`) featuring rootless Steam Client Interop (`libsteam_integration.so`), one-click game setup, native Linux Goldberg `SteamAutoPatch`, `LuaVault` build switching, `DepotDownloader` QR & depot-key automation, and an illustrated in-app **How to Use** manual.
 
@@ -55,13 +55,13 @@ cd LuaToolsLinux
 ```
 
 Outputs self-contained distributables into `dist/`:
-- **Fedora / RHEL / openSUSE**: `sudo dnf install ./dist/luatools-linux-2.7.3-0.1.beta.*.rpm`
-- **Ubuntu / Debian / Pop!_OS**: `sudo apt install ./dist/luatools-linux_2.7.3-beta_amd64.deb`
-- **Any Linux Distro (No root required)**: extract `dist/luatools-linux-2.7.3-beta-x86_64.tar.gz` and run `./install.sh --yes --skip-deps`
+- **Fedora / RHEL / openSUSE**: `sudo dnf install ./dist/luatools-linux-2.9.0-0.1.beta.*.rpm`
+- **Ubuntu / Debian / Pop!_OS**: `sudo apt install ./dist/luatools-linux_2.9.0-beta_amd64.deb`
+- **Any Linux Distro (No root required)**: extract `dist/luatools-linux-2.9.0-beta-x86_64.tar.gz` and run `./install.sh --yes --skip-deps`
 
 ---
 
-## Full v2.7.3-beta Feature Matrix
+## Full v2.9.0-beta Feature Matrix
 
 | Workspace | Capabilities |
 |-----------|--------------|

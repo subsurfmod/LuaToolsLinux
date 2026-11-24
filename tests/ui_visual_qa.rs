@@ -390,7 +390,7 @@ fn headless_papercut_views_render_cleanly_at_wide_and_narrow_resolutions() {
         }
         if fname == "09_settings_updates.png" {
             app.update_banner = luatools_linux::ui::state::UpdateBannerState::Available {
-                badge: "Update v2.7.3-beta".into(),
+                badge: "Update v2.9.0-beta".into(),
                 tooltip: "New commits available on GitHub".into(),
             };
         } else {

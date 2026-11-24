@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 /// Error type for ticket store operations.
 #[derive(Debug, thiserror::Error)]
@@ -33,13 +34,20 @@ pub struct AppTicketData {
 pub struct TicketStore {
     config_dir: PathBuf,
     cache: BTreeMap<u32, AppTicketData>,
+    async_calls: BTreeMap<u64, u32>,
 }
 
 impl TicketStore {
+    pub fn global() -> &'static Mutex<TicketStore> {
+        static GLOBAL_TICKET_STORE: OnceLock<Mutex<TicketStore>> = OnceLock::new();
+        GLOBAL_TICKET_STORE.get_or_init(|| Mutex::new(TicketStore::default()))
+    }
+
     pub fn new(config_dir: &Path) -> Self {
         Self {
             config_dir: config_dir.to_path_buf(),
             cache: BTreeMap::new(),
+            async_calls: BTreeMap::new(),
         }
     }
 
@@ -422,6 +430,37 @@ impl TicketStore {
     pub fn list_app_ids(&mut self) -> Result<Vec<u32>, TicketError> {
         self.load()?;
         Ok(self.cache.keys().copied().collect())
+    }
+
+    /// Record an async call handle for encrypted ticket tracking.
+    pub fn record_async_call(&mut self, async_call: u64, app_id: u32) {
+        self.async_calls.insert(async_call, app_id);
+    }
+
+    /// Consume an async call handle and return the associated app_id.
+    pub fn take_async_call(&mut self, async_call: u64) -> Option<u32> {
+        self.async_calls.remove(&async_call)
+    }
+
+    /// Get encrypted ticket (ETicket) bytes for an app.
+    pub fn get_encrypted_ticket(&mut self, app_id: u32) -> Option<Vec<u8>> {
+        self.load().ok()?;
+        self.cache
+            .get(&app_id)
+            .and_then(|d| d.e_ticket.as_ref())
+            .and_then(|s| hex::decode(s).ok())
+    }
+
+    /// Get spoofed SteamID for an app (returns 0 when unset or invalid).
+    pub fn get_spoof_steam_id(&mut self, app_id: u32) -> u64 {
+        if self.load().is_err() {
+            return 0;
+        }
+        self.cache
+            .get(&app_id)
+            .and_then(|d| d.steam_id.as_ref())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
     }
 }
 
