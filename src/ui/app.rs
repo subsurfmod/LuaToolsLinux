@@ -1,10 +1,12 @@
 //! Main `LuaToolsApp` state coordinator & Papercut Monotone-Dark window shell (`eframe::App`).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+
+use serde::{Deserialize, Serialize};
 
 use eframe::egui::{
     self, Align, Color32, ColorImage, CornerRadius, CursorIcon, FontFamily, FontId, Frame, Key,
@@ -59,6 +61,28 @@ use crate::ui::theme::{
     primary_button, semibold_font, Palette,
 };
 use crate::VERSION;
+
+#[derive(Debug, Clone, Default)]
+pub struct OverwriteDiffModal {
+    pub open: bool,
+    pub app_id: u32,
+    pub source_label: String,
+    pub old_content: String,
+    pub new_content: String,
+    pub added_lines: Vec<String>,
+    pub removed_lines: Vec<String>,
+    pub pending_package_path: Option<PathBuf>,
+    pub cleanup_parent: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadHistoryEntry {
+    pub app_id: u32,
+    pub label: String,
+    pub source: String,
+    pub status: String,
+    pub timestamp: String,
+}
 
 pub struct LuaToolsApp {
     // Core Services
@@ -185,6 +209,12 @@ pub struct LuaToolsApp {
     pub guide_topic: GuideTopic,
     pub guide_textures: HashMap<&'static str, TextureHandle>,
     pub guide_zoom_screenshot: Option<(&'static str, &'static str)>,
+    pub last_hot_reload_key: Option<String>,
+    pub first_run_quick_setup: bool,
+    pub overwrite_diff_modal: OverwriteDiffModal,
+    pub download_history: VecDeque<DownloadHistoryEntry>,
+    pub download_history_path: PathBuf,
+    pub pics_drift_checked: bool,
 
     // Modals & QA
     pub add_appid_modal: AddByAppIdModal,
@@ -383,6 +413,15 @@ impl LuaToolsApp {
             guide_topic: GuideTopic::QuickStart,
             guide_textures: HashMap::new(),
             guide_zoom_screenshot: None,
+            last_hot_reload_key: None,
+            first_run_quick_setup: true,
+            overwrite_diff_modal: OverwriteDiffModal::default(),
+            download_history: Self::load_download_history_from(
+                &crate::models::config::default_luatools_data_dir().join("download_history.json"),
+            ),
+            download_history_path: crate::models::config::default_luatools_data_dir()
+                .join("download_history.json"),
+            pics_drift_checked: false,
             add_appid_modal: AddByAppIdModal::default(),
             game_detail_modal: GameDetailModal::default(),
             integration_modal: IntegrationModal::default(),
@@ -592,6 +631,15 @@ impl LuaToolsApp {
             guide_topic: GuideTopic::QuickStart,
             guide_textures: HashMap::new(),
             guide_zoom_screenshot: None,
+            last_hot_reload_key: None,
+            first_run_quick_setup: true,
+            overwrite_diff_modal: OverwriteDiffModal::default(),
+            download_history: Self::load_download_history_from(
+                &crate::models::config::default_luatools_data_dir().join("download_history.json"),
+            ),
+            download_history_path: crate::models::config::default_luatools_data_dir()
+                .join("download_history.json"),
+            pics_drift_checked: false,
             add_appid_modal: AddByAppIdModal::default(),
             game_detail_modal: GameDetailModal::default(),
             integration_modal: IntegrationModal::default(),
@@ -854,7 +902,18 @@ impl LuaToolsApp {
                 });
             }
 
+            if let Some(ev) = self.hot_reload_service.recent_events().first() {
+                self.last_hot_reload_key = Some(format!(
+                    "{}:{}:{}",
+                    ev.timestamp,
+                    ev.event_type.as_str(),
+                    ev.path.display()
+                ));
+            }
             self.refresh_all_local_state();
+            if let Some(aid) = self.depots_app_id.filter(|&id| id > 0) {
+                self.reload_depots_local(aid);
+            }
             self.status_text = format!(
                 "Steam connected at {} ({} library folder(s))",
                 inst.root.display(),
@@ -887,6 +946,44 @@ impl LuaToolsApp {
             self.steam_service.libraries().len(),
             self.slssteam_service.config.exists(),
         );
+        if let Some(inst) = &self.steam_service.installation {
+            let _ = SteamLibraryService::migrate_depotcache_dir(
+                &inst.root.join("config/depotcache"),
+                &inst.root.join("depotcache"),
+            );
+            if !self.pics_drift_checked {
+                self.pics_drift_checked = true;
+                let store = crate::parsers::vdf_binary::LaunchModStore::default();
+                let mods = store.load_mods();
+                if !mods.is_empty() {
+                    let svc = crate::parsers::vdf_binary::LaunchOptionsService::new(inst.root.clone());
+                    let mut drifted_apps = 0usize;
+                    for (&aid, m) in &mods {
+                        let live_entries = svc.get_launch_entries(aid);
+                        if store.check_drift(aid, &live_entries) {
+                            let _ = store.rebase_if_needed(
+                                aid,
+                                m.change_number.wrapping_add(1),
+                                live_entries,
+                            );
+                            if svc.save_launch_entries(aid, &m.desired).is_ok() {
+                                drifted_apps += 1;
+                            }
+                        }
+                    }
+                    if drifted_apps > 0 {
+                        self.notify(
+                            format!(
+                                "Detected Steam PICS update on {} app(s); launch options rebased.",
+                                drifted_apps
+                            ),
+                            ToastKind::Info,
+                        );
+                    }
+                }
+            }
+        }
+        let _ = self.steam_library_service.migrate_depotcache();
         if let Some(installer) = &self.lua_installer {
             self.recent_installed = installer.enumerate_installed();
         }
@@ -1627,6 +1724,100 @@ impl LuaToolsApp {
         });
     }
 
+    pub fn run_steamless_on_game_async(
+        &mut self,
+        app_id: u32,
+        install_dir: PathBuf,
+        ctx: &egui::Context,
+    ) {
+        self.tool_busy.insert("stub_remover".to_string(), true);
+        self.status_text = format!(
+            "Running Steamless on AppID {} ({})…",
+            app_id,
+            install_dir.display()
+        );
+        let mgr = self.tools_manager.clone();
+        let tx = self.msg_tx.clone();
+        let ctx_c = ctx.clone();
+
+        thread::spawn(move || {
+            let mut exes = Vec::new();
+            for entry in walkdir::WalkDir::new(&install_dir)
+                .max_depth(4)
+                .into_iter()
+                .flatten()
+            {
+                let p = entry.path();
+                if entry.file_type().is_file() {
+                    if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                        let low = name.to_ascii_lowercase();
+                        if low.ends_with(".exe")
+                            && !low.ends_with(".unpacked.exe")
+                            && !low.contains("redist")
+                            && !low.contains("vcredist")
+                            && !low.contains("directx")
+                            && !low.contains("dxsetup")
+                            && !low.contains("setup")
+                            && !low.contains("uninstall")
+                            && !low.contains("crash")
+                            && !low.contains("easyanticheat")
+                            && !low.contains("battleye")
+                        {
+                            exes.push(p.to_path_buf());
+                        }
+                    }
+                }
+            }
+            let (ok, msg) = if exes.is_empty() {
+                (
+                    false,
+                    format!(
+                        "No game .exe files found in {} for AppID {}.",
+                        install_dir.display(),
+                        app_id
+                    ),
+                )
+            } else {
+                let mut unpacked = 0usize;
+                let mut last_err = None;
+                for exe in &exes {
+                    match mgr.launch_stub_remover(exe) {
+                        Ok(_) => unpacked += 1,
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                if unpacked > 0 {
+                    (
+                        true,
+                        format!(
+                            "Steamless unpacked {}/{} executable(s) for AppID {}.",
+                            unpacked,
+                            exes.len(),
+                            app_id
+                        ),
+                    )
+                } else {
+                    (
+                        false,
+                        last_err.unwrap_or_else(|| {
+                            format!(
+                                "No SteamStub protection unpacked across {} executable(s) for AppID {}.",
+                                exes.len(),
+                                app_id
+                            )
+                        }),
+                    )
+                }
+            };
+            let _ = tx.send(AppMessage::ToolFinished {
+                tool_key: "stub_remover".to_string(),
+                ok,
+                msg,
+            });
+            ctx_c.request_repaint();
+        });
+    }
+
     pub fn trigger_donate_keys(&mut self, ctx: &egui::Context) {
         let Some(inst) = &self.steam_service.installation else {
             self.notify("Steam installation not detected.", ToastKind::Warning);
@@ -1845,6 +2036,7 @@ impl LuaToolsApp {
             let steam_sls = dirs::home_dir()
                 .map(|h| h.join(".local/bin/steam-sls"))
                 .filter(|p| p.is_file());
+            let used_steam_sls = steam_sls.is_some();
             let launch_bin = if let Some(sls) = steam_sls {
                 sls
             } else if launcher.is_file() {
@@ -1859,10 +2051,12 @@ impl LuaToolsApp {
                 .spawn()
             {
                 Ok(_) => {
-                    let _ = tx.send(AppMessage::SteamRestarted {
-                        ok: true,
-                        msg: "Steam started with libsteam_integration.so loaded.".into(),
-                    });
+                    let msg = if used_steam_sls {
+                        "Steam started via steam-sls (SLSsteam LD_AUDIT active).".into()
+                    } else {
+                        "Steam started with libsteam_integration.so loaded.".into()
+                    };
+                    let _ = tx.send(AppMessage::SteamRestarted { ok: true, msg });
                 }
                 Err(e) => {
                     let _ = tx.send(AppMessage::SteamRestarted {
@@ -1958,7 +2152,156 @@ impl LuaToolsApp {
         });
     }
 
+    pub fn load_download_history_from(path: &Path) -> VecDeque<DownloadHistoryEntry> {
+        if let Ok(raw) = fs::read_to_string(path) {
+            if let Ok(mut list) = serde_json::from_str::<VecDeque<DownloadHistoryEntry>>(&raw) {
+                while list.len() > 100 {
+                    list.pop_back();
+                }
+                return list;
+            }
+        }
+        VecDeque::new()
+    }
+
+    pub fn record_download_history(
+        &mut self,
+        app_id: u32,
+        label: impl Into<String>,
+        source: impl Into<String>,
+        status: impl Into<String>,
+    ) {
+        let entry = DownloadHistoryEntry {
+            app_id,
+            label: label.into(),
+            source: source.into(),
+            status: status.into(),
+            timestamp: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        };
+        self.download_history.push_front(entry);
+        while self.download_history.len() > 100 {
+            self.download_history.pop_back();
+        }
+        if let Some(parent) = self.download_history_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&self.download_history) {
+            let _ = fs::write(&self.download_history_path, json);
+        }
+    }
+
+    pub fn check_lua_overwrite_diff(
+        &self,
+        path: &Path,
+        expected_app_id: Option<u32>,
+    ) -> Option<(u32, String, String, Vec<String>, Vec<String>)> {
+        let installer = self.lua_installer.as_ref()?;
+        let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let lower = fname.to_ascii_lowercase();
+        let mut new_lua_text: Option<String> = None;
+        let mut aid = expected_app_id;
+
+        if lower.ends_with(".lua") {
+            let txt = fs::read_to_string(path).ok()?;
+            if aid.is_none() {
+                aid = fname
+                    .strip_suffix(".lua")
+                    .and_then(|s| s.split('_').next())
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .or_else(|| LuaFileParser::infer_app_id_from_text(&txt));
+            }
+            new_lua_text = Some(txt);
+        } else if lower.ends_with(".zip") {
+            if let Ok(f) = fs::File::open(path) {
+                if let Ok(mut zip) = zip::ZipArchive::new(f) {
+                    for i in 0..zip.len() {
+                        if let Ok(mut entry) = zip.by_index(i) {
+                            let ename = entry.name().to_string();
+                            if ename.to_ascii_lowercase().ends_with(".lua") {
+                                let mut buf = String::new();
+                                if std::io::Read::read_to_string(&mut entry, &mut buf).is_ok() {
+                                    if aid.is_none() {
+                                        let stem = Path::new(&ename)
+                                            .file_stem()
+                                            .and_then(|s| s.to_str())
+                                            .unwrap_or("");
+                                        aid = stem
+                                            .split('_')
+                                            .next()
+                                            .and_then(|s| s.parse::<u32>().ok())
+                                            .or_else(|| LuaFileParser::infer_app_id_from_text(&buf));
+                                    }
+                                    new_lua_text = Some(buf);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if new_lua_text.is_none() {
+                if let Ok(txt) = fs::read_to_string(path) {
+                    aid = aid.or_else(|| LuaFileParser::infer_app_id_from_text(&txt));
+                    new_lua_text = Some(txt);
+                }
+            }
+        }
+
+        let target_aid = aid?;
+        let new_txt = new_lua_text?;
+        let old_txt = installer.read_lua_text(target_aid)?;
+        if old_txt.trim() == new_txt.trim() {
+            return None;
+        }
+
+        let old_set: HashSet<&str> = old_txt
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        let new_set: HashSet<&str> = new_txt
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+
+        let added: Vec<String> = new_txt
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !old_set.contains(l))
+            .take(40)
+            .map(|l| format!("+ {}", l))
+            .collect();
+        let removed: Vec<String> = old_txt
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !new_set.contains(l))
+            .take(40)
+            .map(|l| format!("- {}", l))
+            .collect();
+
+        if added.is_empty() && removed.is_empty() {
+            return None;
+        }
+        Some((target_aid, old_txt, new_txt, added, removed))
+    }
+
     pub fn handle_protocol_url(&mut self, url: &str, ctx: &egui::Context) {
+        if let Some(bst) = crate::steam_bridge::token_bridge::BstUri::parse(url) {
+            if bst.is_valid() {
+                self.slssteam_service
+                    .set_token(bst.app_id, bst.token.clone());
+                let _ = self.slssteam_service.save();
+                self.notify(
+                    format!(
+                        "Saved BST token for AppID {} into SLSsteam config.yaml.",
+                        bst.app_id
+                    ),
+                    ToastKind::Success,
+                );
+            }
+        }
+
         let Some(act) = ProtocolService::parse(url) else {
             self.notify(
                 format!("Unrecognized luatools:// URL: {}", url),
@@ -1966,22 +2309,49 @@ impl LuaToolsApp {
             );
             return;
         };
+
+        if let Some(ref code) = act.redeem_code {
+            self.notify(
+                format!("Received redeem code '{}' via protocol handler.", code),
+                ToastKind::Info,
+            );
+            return;
+        }
+
+        if let Some(ref tok) = act.token {
+            if act.app_id > 0 && !tok.is_empty() {
+                self.slssteam_service.set_token(act.app_id, tok.clone());
+                let _ = self.slssteam_service.save();
+                self.notify(
+                    format!(
+                        "Persisted AppToken for AppID {} into SLSsteam config.yaml.",
+                        act.app_id
+                    ),
+                    ToastKind::Success,
+                );
+            }
+        }
+
         match act.kind.as_str() {
-            "game" | "install" => {
+            "game" => {
                 self.open_app_in_acquire(act.app_id, ctx);
                 if let Some(src) = act.source {
-                    self.acquire_selected_source = Some(src.clone());
-                    if act.silent {
-                        self.start_acquire_download(act.app_id, src, ctx);
-                    }
-                } else if act.silent {
-                    let src = if HubcapService::is_valid_key_format(&self.settings_service.settings.hubcap_api_key) {
-                        "hubcap".to_string()
-                    } else {
-                        "morrenus".to_string()
-                    };
-                    self.start_acquire_download(act.app_id, src, ctx);
+                    self.acquire_selected_source = Some(src);
                 }
+            }
+            "install" => {
+                self.open_app_in_acquire(act.app_id, ctx);
+                let src = if let Some(s) = act.source {
+                    self.acquire_selected_source = Some(s.clone());
+                    s
+                } else if HubcapService::is_valid_key_format(
+                    &self.settings_service.settings.hubcap_api_key,
+                ) {
+                    "hubcap".to_string()
+                } else {
+                    "morrenus".to_string()
+                };
+                self.start_acquire_download(act.app_id, src, ctx);
             }
             "manage" => self.open_game_in_depots(act.app_id, ctx),
             "fix" => self.open_app_in_fixes(act.app_id, ctx),
@@ -2002,6 +2372,22 @@ impl LuaToolsApp {
         let mut ok_count = 0usize;
         let mut last_err = None;
         for p in paths {
+            if let Some((aid, old_txt, new_txt, added, removed)) =
+                self.check_lua_overwrite_diff(p, None)
+            {
+                self.overwrite_diff_modal = OverwriteDiffModal {
+                    open: true,
+                    app_id: aid,
+                    source_label: "drop".into(),
+                    old_content: old_txt,
+                    new_content: new_txt,
+                    added_lines: added,
+                    removed_lines: removed,
+                    pending_package_path: Some(p.clone()),
+                    cleanup_parent: false,
+                };
+                continue;
+            }
             let res = installer.install_any(
                 p,
                 None,
@@ -2028,6 +2414,22 @@ impl LuaToolsApp {
     }
 
     fn pump_messages(&mut self, ctx: &egui::Context) {
+        if let Some(ev) = self.hot_reload_service.recent_events().first() {
+            let key = format!(
+                "{}:{}:{}",
+                ev.timestamp,
+                ev.event_type.as_str(),
+                ev.path.display()
+            );
+            if self.last_hot_reload_key.as_deref() != Some(key.as_str()) {
+                self.last_hot_reload_key = Some(key);
+                self.refresh_all_local_state();
+                if let Some(aid) = self.depots_app_id.filter(|&id| id > 0) {
+                    self.reload_depots_local(aid);
+                }
+            }
+        }
+
         while let Ok(ev) = self.rpc_rx.try_recv() {
             match ev {
                 RpcUiEvent::AddApp(aid) => self.open_app_in_acquire(aid, ctx),
@@ -2159,6 +2561,7 @@ impl LuaToolsApp {
                     msg,
                 } => {
                     self.acquire_busy = false;
+                    let game_title = self.resolve_game_title(app_id);
                     if ok {
                         if let (Some(dl), Some(installer)) =
                             (downloaded_path, self.lua_installer.clone())
@@ -2179,21 +2582,40 @@ impl LuaToolsApp {
                                     "Installed AppID {} ({} manifest file(s))",
                                     app_id, res.manifest_count
                                 );
+                                self.record_download_history(
+                                    app_id,
+                                    game_title,
+                                    &source,
+                                    "Installed",
+                                );
                                 self.acquire_status = msg.clone();
                                 self.notify(msg, ToastKind::Success);
                                 self.refresh_all_local_state();
                             } else {
                                 let err = res.error.unwrap_or_else(|| "Install failed".into());
+                                self.record_download_history(
+                                    app_id,
+                                    game_title,
+                                    &source,
+                                    format!("Failed: {}", err),
+                                );
                                 self.acquire_status = err.clone();
                                 self.notify(err, ToastKind::Warning);
                             }
                         } else {
                             let err =
                                 "Steam installation not available to install downloaded package.";
+                            self.record_download_history(app_id, game_title, &source, "No Steam");
                             self.acquire_status = err.into();
                             self.notify(err, ToastKind::Warning);
                         }
                     } else {
+                        self.record_download_history(
+                            app_id,
+                            game_title,
+                            &source,
+                            format!("Error: {}", msg),
+                        );
                         self.acquire_status = msg.clone();
                         self.notify(msg, ToastKind::Warning);
                     }
@@ -2226,6 +2648,14 @@ impl LuaToolsApp {
                     self.depots_downloading = false;
                     let ok = results.iter().filter(|r| r.ok).count();
                     let total = results.len();
+                    let aid = self.depots_app_id.unwrap_or(0);
+                    let gtitle = self.resolve_game_title(aid);
+                    self.record_download_history(
+                        aid,
+                        format!("{} ({} depots)", gtitle, total),
+                        "DepotDownloader",
+                        format!("{}/{} completed", ok, total),
+                    );
                     let first_err = results.iter().find_map(|r| r.error.as_deref());
                     if let Some(err) = first_err {
                         let summary = format!("Downloaded {}/{} depot(s) — {}", ok, total, err);
@@ -2302,6 +2732,13 @@ impl LuaToolsApp {
                             }
                         }
                     }
+                    let gtitle = self.resolve_game_title(app_id);
+                    self.record_download_history(
+                        app_id,
+                        format!("{} (Fix {})", gtitle, fix_id),
+                        "GameFix",
+                        if final_ok { "Applied" } else { "Failed" },
+                    );
                     self.notify(
                         final_msg,
                         if final_ok {
@@ -2400,10 +2837,23 @@ impl LuaToolsApp {
                     }
                 }
                 AppMessage::FilePickedForStubRemover(exe) => {
-                    match self.tools_manager.launch_stub_remover(&exe) {
-                        Ok(m) => self.notify(m, ToastKind::Info),
-                        Err(m) => self.notify(m, ToastKind::Warning),
-                    }
+                    self.tool_busy.insert("stub_remover".to_string(), true);
+                    self.status_text = format!("Running StubRemover on {}…", exe.display());
+                    let mgr = self.tools_manager.clone();
+                    let tx = self.msg_tx.clone();
+                    let ctx_c = ctx.clone();
+                    thread::spawn(move || {
+                        let (ok, msg) = match mgr.launch_stub_remover(&exe) {
+                            Ok(m) => (true, m),
+                            Err(m) => (false, m),
+                        };
+                        let _ = tx.send(AppMessage::ToolFinished {
+                            tool_key: "stub_remover".to_string(),
+                            ok,
+                            msg,
+                        });
+                        ctx_c.request_repaint();
+                    });
                 }
                 AppMessage::UpdateCheckFinished(chk) => {
                     self.settings_update_status = match &chk.latest_commit {

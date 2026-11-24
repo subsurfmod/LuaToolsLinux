@@ -29,6 +29,7 @@ impl LuaToolsApp {
             || self.depot_detail_modal.open
             || self.text_prompt_modal.open
             || self.about_modal_open
+            || self.overwrite_diff_modal.open
             || self.guide_zoom_screenshot.is_some();
         if any_modal_open {
             let screen = ctx.screen_rect();
@@ -61,6 +62,8 @@ impl LuaToolsApp {
                 self.launch_options_modal.open = false;
             } else if self.integration_modal.open {
                 self.integration_modal.open = false;
+            } else if self.overwrite_diff_modal.open {
+                self.overwrite_diff_modal.open = false;
             } else if self.telemetry_modal_open
                 && self.settings_service.settings.telemetry_consent_seen
             {
@@ -69,6 +72,7 @@ impl LuaToolsApp {
         }
 
         self.render_telemetry_consent_modal(ctx);
+        self.render_overwrite_diff_modal(ctx);
         self.render_add_by_appid_modal(ctx);
         self.render_game_detail_modal(ctx);
         self.render_integration_modal(ctx);
@@ -150,6 +154,11 @@ impl LuaToolsApp {
                 });
 
                 ui.add_space(8.0);
+                ui.checkbox(
+                    &mut self.first_run_quick_setup,
+                    "Run Guided First-Time Setup (Register URI, Stage Store Plugin & Init SLSsteam)",
+                );
+                ui.add_space(4.0);
                 ui.label(
                     RichText::new(
                         "You can inspect every recorded event, clear stored logs, or turn telemetry off at any time in Settings › Telemetry & Logs.",
@@ -177,6 +186,20 @@ impl LuaToolsApp {
                     },
                 );
             });
+
+        if (act_turn_off || act_keep_enabled || act_open_settings) && self.first_run_quick_setup {
+            let _ = crate::services::protocol_service::ProtocolService::register_desktop_handler();
+            let steam_root = self
+                .steam_service
+                .installation
+                .as_ref()
+                .map(|i| i.root.as_path());
+            let plugin_svc = crate::services::plugin_installer_service::PluginInstallerService::new(None);
+            let _ = plugin_svc.install_default_luatools_js(
+                steam_root.map(|r| r.join("steamui/LuaTools")).as_deref(),
+            );
+            let _ = self.slssteam_service.save();
+        }
 
         if act_turn_off {
             self.settings_service.settings.telemetry_enabled = false;
@@ -222,6 +245,116 @@ impl LuaToolsApp {
             self.telemetry_modal_open = false;
             self.active_view = ActiveView::Settings;
             self.settings_subtab = SettingsSubTab::Telemetry;
+        }
+    }
+
+    fn render_overwrite_diff_modal(&mut self, ctx: &egui::Context) {
+        if !self.overwrite_diff_modal.open {
+            return;
+        }
+        let app_id = self.overwrite_diff_modal.app_id;
+        let gname = self.resolve_game_title(app_id);
+        let mut do_overwrite = false;
+        let mut do_cancel = false;
+
+        egui::Window::new(format!(
+            "Confirm Overwrite — {} ({}.lua)",
+            gname, app_id
+        ))
+        .order(egui::Order::Foreground)
+        .collapsible(false)
+        .resizable(true)
+        .default_size([560.0, 380.0])
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new(format!(
+                    "An existing stplug-in/{}.lua was found with different contents. Review the changes below before overwriting:",
+                    app_id
+                ))
+                .size(12.5)
+                .color(Palette::TEXT_SECONDARY),
+            );
+            ui.add_space(8.0);
+
+            inset_paper_sheet(ui, Margin::same(10), |ui| {
+                ui.set_width(ui.available_width());
+                ScrollArea::vertical()
+                    .id_salt("overwrite_diff_scroll")
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        for rem in &self.overwrite_diff_modal.removed_lines {
+                            ui.label(
+                                RichText::new(rem)
+                                    .font(egui::FontId::new(11.5, egui::FontFamily::Monospace))
+                                    .color(Palette::DANGER_TEXT),
+                            );
+                        }
+                        for add in &self.overwrite_diff_modal.added_lines {
+                            ui.label(
+                                RichText::new(add)
+                                    .font(egui::FontId::new(11.5, egui::FontFamily::Monospace))
+                                    .color(Palette::GO_TEXT),
+                            );
+                        }
+                    });
+            });
+
+            ui.add_space(12.0);
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    if ghost_button(ui, "Cancel").clicked() {
+                        do_cancel = true;
+                    }
+                },
+                |ui| {
+                    if primary_button(ui, "Overwrite (Backup to Vault)").clicked() {
+                        do_overwrite = true;
+                    }
+                },
+            );
+        });
+
+        if do_overwrite {
+            self.lua_vault.sync_default_from_live(app_id);
+            if let (Some(pkg), Some(installer)) = (
+                self.overwrite_diff_modal.pending_package_path.clone(),
+                self.lua_installer.clone(),
+            ) {
+                let res = installer.install_any(
+                    &pkg,
+                    Some(app_id),
+                    false,
+                    Some(&self.overwrite_diff_modal.source_label),
+                    Some(&mut self.settings_service),
+                    Some(&mut self.slssteam_service),
+                );
+                if self.overwrite_diff_modal.cleanup_parent {
+                    if let Some(p) = pkg.parent() {
+                        let _ = std::fs::remove_dir_all(p);
+                    }
+                }
+                self.refresh_all_local_state();
+                if res.ok {
+                    self.notify(
+                        format!("Overwrote {}.lua (previous version backed up in LuaVault).", app_id),
+                        ToastKind::Success,
+                    );
+                } else if let Some(e) = res.error {
+                    self.notify(e, ToastKind::Warning);
+                }
+            }
+            self.overwrite_diff_modal.open = false;
+        } else if do_cancel {
+            if self.overwrite_diff_modal.cleanup_parent {
+                if let Some(ref pkg) = self.overwrite_diff_modal.pending_package_path {
+                    if let Some(p) = pkg.parent() {
+                        let _ = std::fs::remove_dir_all(p);
+                    }
+                }
+            }
+            self.overwrite_diff_modal.open = false;
         }
     }
 
@@ -751,9 +884,19 @@ impl LuaToolsApp {
 
         if do_save {
             if let Some(inst) = &self.steam_service.installation {
+                if crate::services::steam_service::SteamService::is_steam_running() {
+                    let _ = crate::services::steam_service::SteamService::terminate_steam_instances();
+                }
                 let svc = LaunchOptionsService::new(inst.root.clone());
+                let prev_entries = svc.get_launch_entries(app_id);
                 match svc.save_launch_entries(app_id, &self.launch_options_modal.entries) {
                     Ok(m) => {
+                        let _ = crate::parsers::vdf_binary::LaunchModStore::default().save_mod(
+                            app_id,
+                            0,
+                            prev_entries,
+                            self.launch_options_modal.entries.clone(),
+                        );
                         self.launch_options_modal.feedback = m.clone();
                         self.notify(m, ToastKind::Success);
                     }
@@ -769,6 +912,9 @@ impl LuaToolsApp {
         }
         if do_restore {
             if let Some(inst) = &self.steam_service.installation {
+                if crate::services::steam_service::SteamService::is_steam_running() {
+                    let _ = crate::services::steam_service::SteamService::terminate_steam_instances();
+                }
                 let svc = LaunchOptionsService::new(inst.root.clone());
                 match svc.restore_backup() {
                     Ok(m) => {
@@ -1071,6 +1217,7 @@ impl LuaToolsApp {
         let cd_key = self
             .steam_bridge_service
             .get_legacy_cd_key(app_id)
+            .or_else(|| self.slssteam_service.get_cd_key(app_id).map(ToString::to_string))
             .unwrap_or_default();
         let existing_inj = self.game_injection_service.get_config(app_id);
         let proc_enabled = existing_inj.is_some();
@@ -1121,7 +1268,10 @@ impl LuaToolsApp {
             .steam_bridge_service
             .get_app_id_spoof(app_id)
             .or_else(|| self.slssteam_service.get_fake_app_id(app_id));
-        let cur_cdkey = self.steam_bridge_service.get_legacy_cd_key(app_id);
+        let cur_cdkey = self
+            .steam_bridge_service
+            .get_legacy_cd_key(app_id)
+            .or_else(|| self.slssteam_service.get_cd_key(app_id).map(ToString::to_string));
         let cur_stats = self.steam_bridge_service.get_stats(app_id);
 
         let mut close = false;
@@ -1137,6 +1287,8 @@ impl LuaToolsApp {
         let mut rem_stat: Option<String> = None;
         let mut save_proc = false;
         let mut launch_proc = false;
+        let mut run_steamless = false;
+        let mut clean_legacy = false;
 
         egui::Window::new(format!(
             "Integration & Process Controls — {} (#{})",
@@ -1191,9 +1343,20 @@ impl LuaToolsApp {
                             .color(Palette::TEXT_MUTED),
                         );
                         ui.add_space(8.0);
-                        if primary_button(ui, "Apply Recommended Fixes Now").clicked() {
-                            apply_quick_setup = true;
-                        }
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            if primary_button(ui, "Apply Recommended Fixes Now").clicked() {
+                                apply_quick_setup = true;
+                            }
+                            if install_path.is_some() {
+                                if secondary_button(ui, "Unpack SteamStub (Steamless)").clicked() {
+                                    run_steamless = true;
+                                }
+                                if secondary_button(ui, "Clean Legacy Unlockers").clicked() {
+                                    clean_legacy = true;
+                                }
+                            }
+                        });
                     });
                     ui.add_space(8.0);
 
@@ -1452,14 +1615,19 @@ impl LuaToolsApp {
         if set_cdkey {
             let k = self.integration_modal.cd_key_input.trim().to_string();
             if !k.is_empty() {
-                self.steam_bridge_service.set_legacy_cd_key(app_id, k);
-                self.integration_modal.feedback = "Saved legacy CD key.".into();
+                self.steam_bridge_service.set_legacy_cd_key(app_id, k.clone());
+                self.slssteam_service.set_cd_key(app_id, k);
+                let _ = self.slssteam_service.save();
+                self.integration_modal.feedback =
+                    "Saved legacy CD key (Bridge + SLSsteam config.yaml).".into();
             } else {
                 self.integration_modal.feedback = "Enter a CD key before saving.".into();
             }
         }
         if rem_cdkey {
             self.steam_bridge_service.remove_legacy_cd_key(app_id);
+            self.slssteam_service.remove_cd_key(app_id);
+            let _ = self.slssteam_service.save();
             self.integration_modal.cd_key_input.clear();
             self.integration_modal.feedback = "Removed legacy CD key.".into();
         }
@@ -1561,6 +1729,37 @@ impl LuaToolsApp {
             {
                 Ok(m) => self.notify(m, ToastKind::Success),
                 Err(e) => self.notify(e, ToastKind::Warning),
+            }
+        }
+        if run_steamless {
+            if let Some(ref dir) = install_path {
+                self.run_steamless_on_game_async(app_id, dir.clone(), ctx);
+                self.integration_modal.feedback =
+                    format!("Running Steamless on {}…", dir.display());
+            }
+        }
+        if clean_legacy {
+            if let Some(ref dir) = install_path {
+                let report =
+                    crate::services::mode_migration::ModeMigration::migrate_legacy_unlockers_in_game(
+                        dir,
+                    );
+                if !report.errors.is_empty() {
+                    self.integration_modal.feedback =
+                        format!("Legacy cleanup errors: {}", report.errors.join("; "));
+                    self.notify(self.integration_modal.feedback.clone(), ToastKind::Warning);
+                } else if report.detected_files.is_empty() {
+                    self.integration_modal.feedback =
+                        "No legacy unlocker files (SmokeAPI/GreenLuma/BST) found.".into();
+                    self.notify(self.integration_modal.feedback.clone(), ToastKind::Info);
+                } else {
+                    self.integration_modal.feedback = format!(
+                        "Cleaned {} legacy unlocker file(s) and restored {} original DLL(s).",
+                        report.removed_files.len(),
+                        report.restored_files.len()
+                    );
+                    self.notify(self.integration_modal.feedback.clone(), ToastKind::Success);
+                }
             }
         }
         if apply_quick_setup {

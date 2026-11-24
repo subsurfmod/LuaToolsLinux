@@ -635,6 +635,18 @@ impl LuaToolsApp {
                                 if primary_button(ui, "Create Starter .lua").clicked() {
                                     let tpl = LuaFileParser::default_lua_template(app_id, "");
                                     if self.lua_vault.write_live(app_id, &tpl) {
+                                        let parsed = LuaFileParser::parse_text(&tpl, app_id);
+                                        if let Some(v) =
+                                            self.lua_vault.save_text(app_id, &tpl, Some("Starter"))
+                                        {
+                                            self.lua_vault
+                                                .set_edit_base(app_id, Some(v.hash));
+                                        }
+                                        crate::services::lua_installer::LuaInstaller::sync_with_slssteam(
+                                            &mut self.slssteam_service,
+                                            app_id,
+                                            &parsed,
+                                        );
                                         self.reload_depots_local(app_id);
                                         self.refresh_all_local_state();
                                         self.notify(
@@ -659,17 +671,29 @@ impl LuaToolsApp {
                             .unwrap_or_default();
 
                         let mut toggle_pin: Option<(u32, bool)> = None;
+                        let mut toggle_dlc: Option<(u32, bool)> = None;
                         let mut inspect_entry = None;
+
+                        let mut all_entries: Vec<(crate::parsers::lua_parser::LuaEntry, bool)> = lua
+                            .entries
+                            .iter()
+                            .cloned()
+                            .map(|e| (e, true))
+                            .collect();
+                        for de in &lua.disabled_entries {
+                            all_entries.push((de.clone(), false));
+                        }
 
                         TableBuilder::new(ui)
                             .striped(true)
                             .cell_layout(Layout::left_to_right(Align::Center))
+                            .column(Column::exact(36.0))
                             .column(Column::exact(95.0))
                             .column(Column::remainder().at_least(150.0))
                             .column(Column::exact(125.0))
                             .column(Column::exact(140.0))
                             .header(30.0, |mut h| {
-                                for lbl in ["ID", "Role / Label", "Pin Status", "Actions"] {
+                                for lbl in ["On", "ID", "Role / Label", "Pin Status", "Actions"] {
                                     h.col(|ui| {
                                         ui.label(
                                             RichText::new(lbl)
@@ -680,13 +704,32 @@ impl LuaToolsApp {
                                 }
                             })
                             .body(|mut body| {
-                                for e in &lua.entries {
+                                for (e, is_enabled) in &all_entries {
                                     body.row(40.0, |mut row| {
+                                        row.col(|ui| {
+                                            let mut checked = *is_enabled;
+                                            let can_toggle = e.id != app_id || !checked;
+                                            ui.add_enabled_ui(can_toggle, |ui| {
+                                                if ui
+                                                    .add(Checkbox::without_text(&mut checked))
+                                                    .on_hover_text(
+                                                        "Enable or comment out this depot / DLC declaration in stplug-in/<appid>.lua",
+                                                    )
+                                                    .changed()
+                                                {
+                                                    toggle_dlc = Some((e.id, checked));
+                                                }
+                                            });
+                                        });
                                         row.col(|ui| {
                                             ui.label(
                                                 RichText::new(e.id.to_string())
                                                     .font(FontId::new(12.5, FontFamily::Monospace))
-                                                    .color(Palette::TEXT_PRIMARY),
+                                                    .color(if *is_enabled {
+                                                        Palette::TEXT_PRIMARY
+                                                    } else {
+                                                        Palette::TEXT_MUTED
+                                                    }),
                                             );
                                         });
                                         row.col(|ui| {
@@ -700,11 +743,17 @@ impl LuaToolsApp {
                                                 "DLC / App Entitlement".into()
                                             };
                                             ui.label(
-                                                RichText::new(role).color(Palette::TEXT_PRIMARY),
+                                                RichText::new(role).color(if *is_enabled {
+                                                    Palette::TEXT_PRIMARY
+                                                } else {
+                                                    Palette::TEXT_MUTED
+                                                }),
                                             );
                                         });
                                         row.col(|ui| {
-                                            if e.manifest_id.is_some() {
+                                            if !*is_enabled {
+                                                status_badge(ui, "Disabled", BadgeTone::Muted);
+                                            } else if e.manifest_id.is_some() {
                                                 status_badge(ui, "Pinned", BadgeTone::Blue);
                                             } else if e.commented_manifest_id.is_some() {
                                                 status_badge(ui, "Auto-Update", BadgeTone::Ready);
@@ -716,14 +765,16 @@ impl LuaToolsApp {
                                         });
                                         row.col(|ui| {
                                             ui.spacing_mut().item_spacing.x = 6.0;
-                                            if e.manifest_id.is_some() {
-                                                if table_button(ui, "Unpin", false).clicked() {
-                                                    toggle_pin = Some((e.id, false));
+                                            if *is_enabled {
+                                                if e.manifest_id.is_some() {
+                                                    if table_button(ui, "Unpin", false).clicked() {
+                                                        toggle_pin = Some((e.id, false));
+                                                    }
+                                                } else if e.commented_manifest_id.is_some()
+                                                    && table_button(ui, "Pin", true).clicked()
+                                                {
+                                                    toggle_pin = Some((e.id, true));
                                                 }
-                                            } else if e.commented_manifest_id.is_some()
-                                                && table_button(ui, "Pin", true).clicked()
-                                            {
-                                                toggle_pin = Some((e.id, true));
                                             }
                                             if table_button(ui, "Info", false).clicked() {
                                                 inspect_entry = Some((
@@ -736,6 +787,45 @@ impl LuaToolsApp {
                                 }
                             });
 
+                        if let Some((did, new_enabled)) = toggle_dlc {
+                            let raw = self.lua_vault.read_live_text(app_id);
+                            let (updated, changed) =
+                                LuaFileParser::toggle_dlc_depot(&raw, did, Some(new_enabled));
+                            if changed && self.lua_vault.write_live(app_id, &updated) {
+                                let parsed = LuaFileParser::parse_text(&updated, app_id);
+                                if let Some(base_hash) = self.lua_vault.get_edit_base(app_id) {
+                                    if let Some(v) = self
+                                        .lua_vault
+                                        .update_variant(app_id, &base_hash, &updated)
+                                    {
+                                        self.lua_vault.set_edit_base(app_id, Some(v.hash));
+                                    }
+                                }
+                                crate::services::lua_installer::LuaInstaller::sync_with_slssteam(
+                                    &mut self.slssteam_service,
+                                    app_id,
+                                    &parsed,
+                                );
+                                self.depots_lua = Some(parsed);
+                                self.reload_depots_local(app_id);
+                                self.refresh_all_local_state();
+                                self.notify(
+                                    format!(
+                                        "{} depot/DLC {} in {}.lua",
+                                        if new_enabled { "Enabled" } else { "Disabled" },
+                                        did,
+                                        app_id
+                                    ),
+                                    ToastKind::Info,
+                                );
+                            } else if changed {
+                                self.notify(
+                                    "Failed to update stplug-in .lua file on disk.",
+                                    ToastKind::Warning,
+                                );
+                            }
+                        }
+
                         if let Some((did, enable_pin)) = toggle_pin {
                             let raw = self.lua_vault.read_live_text(app_id);
                             let (updated, changed) =
@@ -744,6 +834,20 @@ impl LuaToolsApp {
                                 if !enable_pin {
                                     self.manifest_binding_service.remove_pin(app_id, did);
                                 }
+                                let parsed = LuaFileParser::parse_text(&updated, app_id);
+                                if let Some(base_hash) = self.lua_vault.get_edit_base(app_id) {
+                                    if let Some(v) = self
+                                        .lua_vault
+                                        .update_variant(app_id, &base_hash, &updated)
+                                    {
+                                        self.lua_vault.set_edit_base(app_id, Some(v.hash));
+                                    }
+                                }
+                                crate::services::lua_installer::LuaInstaller::sync_with_slssteam(
+                                    &mut self.slssteam_service,
+                                    app_id,
+                                    &parsed,
+                                );
                                 self.reload_depots_local(app_id);
                                 self.notify(
                                     format!(
@@ -825,22 +929,23 @@ impl LuaToolsApp {
                 let mut live = self.lua_vault.read_live_text(app_id);
                 if live.trim().is_empty() {
                     live = LuaFileParser::default_lua_template(app_id, "");
+                } else {
+                    self.lua_vault.sync_default_from_live(app_id);
+                    if self.lua_vault.get_edit_base(app_id).is_none() {
+                        if let Some(active_h) = self.lua_vault.get_active_hash(app_id) {
+                            self.lua_vault.set_edit_base(app_id, Some(active_h));
+                        }
+                    }
                 }
                 self.depots_editor_text = live;
                 self.depots_editing_live = true;
             }
             if act_save_live {
-                if let Some(installer) = self.lua_installer.clone() {
-                    let res = installer.install_lua(
-                        app_id,
-                        &self.depots_editor_text,
-                        true,
-                        None,
-                        Some("manual-edit"),
-                        Some(&mut self.settings_service),
-                        Some(&mut self.slssteam_service),
-                    );
-                    if res.ok {
+                let mut editor = crate::ui::lua_editor::LuaEditor::new();
+                editor.set_text(self.depots_editor_text.clone(), app_id);
+                match editor.save_to_vault_and_sync(&self.lua_vault, &mut self.slssteam_service) {
+                    Ok(_) => {
+                        self.settings_service.record_loaded_app(app_id);
                         self.depots_editing_live = false;
                         self.reload_depots_local(app_id);
                         self.refresh_all_local_state();
@@ -848,15 +953,10 @@ impl LuaToolsApp {
                             format!("Saved {}.lua and synced SLSsteam.", app_id),
                             ToastKind::Success,
                         );
-                    } else {
-                        self.notify(
-                            res.error
-                                .unwrap_or_else(|| format!("Failed to save {}.lua", app_id)),
-                            ToastKind::Warning,
-                        );
                     }
-                } else {
-                    self.notify("Steam installation not detected.", ToastKind::Warning);
+                    Err(err) => {
+                        self.notify(err, ToastKind::Warning);
+                    }
                 }
             }
             if act_save_preset {
@@ -1153,6 +1253,40 @@ impl LuaToolsApp {
                         .corner_radius(CornerRadius::same(3)),
                 );
             }
+            ui.add_space(8.0);
+            egui::CollapsingHeader::new(
+                RichText::new(format!(
+                    "Download Queue & History (100-item ring · {})",
+                    self.download_history.len()
+                ))
+                .font(semibold_font(12.5))
+                .color(Palette::TEXT_SECONDARY),
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                if self.download_history.is_empty() {
+                    ui.label(
+                        RichText::new("No downloads recorded in history yet.")
+                            .size(12.0)
+                            .color(Palette::TEXT_MUTED),
+                    );
+                } else {
+                    for item in self.download_history.iter().take(25) {
+                        ui.label(
+                            RichText::new(format!(
+                                "[{}] #{} {} ({}) — {}",
+                                item.timestamp,
+                                item.app_id,
+                                item.label,
+                                item.source,
+                                item.status
+                            ))
+                            .font(FontId::new(11.5, FontFamily::Monospace))
+                            .color(Palette::TEXT_SECONDARY),
+                        );
+                    }
+                }
+            });
         });
     }
 
@@ -1191,6 +1325,8 @@ impl LuaToolsApp {
         let dl_opts = DepotDownloadOptions {
             custom_tool_path: self.slssteam_service.config.workshop_path.clone(),
             steam_username: self.settings_service.settings.steam_username.clone(),
+            hubcap_api_key: (!self.settings_service.settings.hubcap_api_key.trim().is_empty())
+                .then(|| self.settings_service.settings.hubcap_api_key.trim().to_string()),
         };
         let mut dd = self.depot_downloader.clone();
         dd.steam_installation = self.steam_service.installation.clone();
@@ -1721,6 +1857,22 @@ impl LuaToolsApp {
                 &mut self.settings_service.settings.donate_keys,
                 "Contribute newly discovered depot decryption keys from Steam config.vdf",
             );
+            if ui
+                .checkbox(
+                    &mut self.settings_service.settings.autostart,
+                    "Start LuaTools on system login (--minimized)",
+                )
+                .changed()
+            {
+                let enable = self.settings_service.settings.autostart;
+                if let Err(e) = self.settings_service.set_autostart(enable) {
+                    self.notify(
+                        format!("Failed to update login autostart: {}", e),
+                        ToastKind::Warning,
+                    );
+                }
+                let _ = self.settings_service.save();
+            }
 
             ui.add_space(6.0);
             ui.horizontal(|ui| {

@@ -261,6 +261,48 @@ impl LuaEditor {
     pub fn has_errors(&self) -> bool {
         self.error_message.is_some()
     }
+
+    /// Saves the current editor text to the live `stplug-in/<appid>.lua` file, updates or creates
+    /// a `LuaVault` variant in-place (preserving `edit_base_hash` lineage instead of duplicating
+    /// variants), and synchronizes `SLSsteam` `config.yaml` (LT-37 & LNX-02).
+    pub fn save_to_vault_and_sync(
+        &mut self,
+        vault: &crate::models::lua_vault::LuaVault,
+        sls: &mut crate::services::slssteam_service::SlssteamService,
+    ) -> Result<crate::models::lua_vault::LuaVariant, String> {
+        self.reparse();
+        if !vault.write_live(self.app_id, &self.text) {
+            return Err(format!(
+                "Failed to write live stplug-in/{}.lua on disk.",
+                self.app_id
+            ));
+        }
+        let variant = if let Some(base_hash) = vault.get_edit_base(self.app_id) {
+            vault
+                .update_variant(self.app_id, &base_hash, &self.text)
+                .map(|mut v| {
+                    if v.label.is_none() {
+                        vault.rename(self.app_id, &v.hash, Some("User Edited"));
+                        v.label = Some("User Edited".to_string());
+                    }
+                    v
+                })
+        } else {
+            vault.save_text(self.app_id, &self.text, Some("User Edited"))
+        }
+        .ok_or_else(|| "Failed to update LuaVault variant.".to_string())?;
+
+        vault.set_edit_base(self.app_id, Some(variant.hash.clone()));
+
+        if let Some(ref parsed) = self.parsed {
+            crate::services::lua_installer::LuaInstaller::sync_with_slssteam(
+                sls,
+                self.app_id,
+                parsed,
+            );
+        }
+        Ok(variant)
+    }
 }
 
 #[cfg(test)]
@@ -330,5 +372,49 @@ mod tests {
 
         ed.set_text("addappid(730)\n".into(), 730);
         assert!(!ed.has_errors());
+    }
+
+    #[test]
+    fn editor_save_to_vault_and_sync_updates_variant_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let steam_root = tmp.path().join("Steam");
+        let stplug = steam_root.join("config/stplug-in");
+        std::fs::create_dir_all(&stplug).unwrap();
+        let inst = crate::models::steam::SteamInstallation {
+            root: steam_root.clone(),
+            libraries: vec![crate::models::steam::SteamLibrary::new(steam_root.clone())],
+            config_path: steam_root.join("config"),
+            stplug_in_path: stplug,
+        };
+        let vault = crate::models::lua_vault::LuaVault::new(
+            Some(inst),
+            Some(tmp.path().join("vault")),
+        );
+        let mut sls = crate::services::slssteam_service::SlssteamService::new(Some(
+            tmp.path().join("sls.yaml"),
+        ));
+
+        let mut ed = LuaEditor::new();
+        ed.set_text("addappid(1245620)\n".into(), 1245620);
+        let v1 = ed.save_to_vault_and_sync(&vault, &mut sls).unwrap();
+        assert_eq!(vault.get_variants(1245620).len(), 1);
+        assert_eq!(vault.get_edit_base(1245620), Some(v1.hash.clone()));
+
+        // Subsequent save updates in-place instead of creating duplicate variant
+        ed.set_text(
+            "addappid(1245620)\naddappid(2778580) -- Shadow of the Erdtree\n".into(),
+            1245620,
+        );
+        let v2 = ed.save_to_vault_and_sync(&vault, &mut sls).unwrap();
+        assert_ne!(v1.hash, v2.hash);
+        assert_eq!(vault.get_variants(1245620).len(), 1);
+        assert_eq!(vault.get_edit_base(1245620), Some(v2.hash));
+        assert!(sls.config.additional_apps.contains(&1245620));
+        assert!(sls
+            .config
+            .dlc_data
+            .get(&1245620)
+            .map(|m| m.contains_key(&2778580))
+            .unwrap_or(false));
     }
 }

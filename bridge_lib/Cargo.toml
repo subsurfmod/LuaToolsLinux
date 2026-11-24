@@ -1,6 +1,6 @@
 [package]
 name = "bridge_lib"
-version = "2.9.2-beta"
+version = "2.9.3-beta"
 edition = "2021"
 description = "Steam client integration shared library (LD_PRELOAD) for Linux"
 license = "MIT"

@@ -835,6 +835,40 @@ impl LuaToolsApp {
                                             .size(12.0)
                                             .color(Palette::TEXT_MUTED),
                                     );
+                                    ui.add_space(12.0);
+                                    egui::CollapsingHeader::new(
+                                        RichText::new(format!(
+                                            "Download Queue & History (100-item ring · {})",
+                                            self.download_history.len()
+                                        ))
+                                        .font(semibold_font(12.5))
+                                        .color(Palette::TEXT_SECONDARY),
+                                    )
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        if self.download_history.is_empty() {
+                                            ui.label(
+                                                RichText::new("No downloads recorded in history yet.")
+                                                    .size(12.0)
+                                                    .color(Palette::TEXT_MUTED),
+                                            );
+                                        } else {
+                                            for item in self.download_history.iter().take(25) {
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "[{}] #{} {} ({}) — {}",
+                                                        item.timestamp,
+                                                        item.app_id,
+                                                        item.label,
+                                                        item.source,
+                                                        item.status
+                                                    ))
+                                                    .font(FontId::new(11.5, FontFamily::Monospace))
+                                                    .color(Palette::TEXT_SECONDARY),
+                                                );
+                                            }
+                                        }
+                                    });
                                     ui.add_space(16.0);
                                 } else {
                                     ui.vertical_centered(|ui| {
@@ -907,7 +941,7 @@ impl LuaToolsApp {
                 let ids: Vec<u32> = self.library_selected_ids.iter().copied().collect();
                 let mut removed = 0usize;
                 for aid in ids {
-                    let res = installer.uninstall_lua(aid, false, Some(&mut self.slssteam_service));
+                    let res = installer.uninstall_lua(aid, true, Some(&mut self.slssteam_service));
                     if res.ok {
                         removed += 1;
                     }
@@ -1019,6 +1053,8 @@ impl LuaToolsApp {
         let mut act_rem_lib: Option<u32> = None;
         let mut act_toggle_unowned: Option<(u32, bool)> = None;
         let mut act_autopatch: Option<(u32, PathBuf)> = None;
+        let mut act_steamless: Option<(u32, PathBuf)> = None;
+        let mut act_migrate_legacy: Option<(u32, PathBuf)> = None;
         let mut act_integration: Option<(u32, String, Option<PathBuf>)> = None;
         let mut act_launch_integrated: Option<(u32, Option<PathBuf>)> = None;
 
@@ -1203,6 +1239,14 @@ impl LuaToolsApp {
                                             act_autopatch = Some((r.app_id, p.clone()));
                                             ui.close_menu();
                                         }
+                                        if ui.button("Unpack SteamStub (Steamless)").clicked() {
+                                            act_steamless = Some((r.app_id, p.clone()));
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("Clean Legacy Unlockers").clicked() {
+                                            act_migrate_legacy = Some((r.app_id, p.clone()));
+                                            ui.close_menu();
+                                        }
                                         if ui.button("Open Game Folder").clicked() {
                                             let _ = Command::new("xdg-open").arg(p).spawn();
                                             ui.close_menu();
@@ -1242,7 +1286,7 @@ impl LuaToolsApp {
         }
         if let Some(aid) = act_delete {
             if let Some(installer) = self.lua_installer.clone() {
-                let res = installer.uninstall_lua(aid, false, Some(&mut self.slssteam_service));
+                let res = installer.uninstall_lua(aid, true, Some(&mut self.slssteam_service));
                 self.refresh_all_local_state();
                 if res.ok {
                     self.notify(format!("Removed {}.lua", aid), ToastKind::Info);
@@ -1322,6 +1366,40 @@ impl LuaToolsApp {
             match self.steam_auto_crack.launch_for_app(aid, &dir) {
                 Ok(m) => self.notify(m, ToastKind::Info),
                 Err(e) => self.notify(e, ToastKind::Warning),
+            }
+        }
+        if let Some((aid, dir)) = act_steamless {
+            self.run_steamless_on_game_async(aid, dir, ui.ctx());
+        }
+        if let Some((aid, dir)) = act_migrate_legacy {
+            let report =
+                crate::services::mode_migration::ModeMigration::migrate_legacy_unlockers_in_game(
+                    &dir,
+                );
+            if !report.errors.is_empty() {
+                self.notify(
+                    format!(
+                        "Legacy unlocker cleanup for AppID {} had errors: {}",
+                        aid,
+                        report.errors.join("; ")
+                    ),
+                    ToastKind::Warning,
+                );
+            } else if report.detected_files.is_empty() {
+                self.notify(
+                    format!("No legacy unlocker files found in AppID {}.", aid),
+                    ToastKind::Info,
+                );
+            } else {
+                self.notify(
+                    format!(
+                        "Cleaned {} legacy unlocker file(s) and restored {} original DLL(s) for AppID {}.",
+                        report.removed_files.len(),
+                        report.restored_files.len(),
+                        aid
+                    ),
+                    ToastKind::Success,
+                );
             }
         }
         if let Some((aid, gname, path)) = act_integration {
