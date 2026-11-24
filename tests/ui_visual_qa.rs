@@ -601,7 +601,7 @@ fn cover_cooldown_prevents_retry_storms_and_protects_high_res_urls() {
 
 #[test]
 fn lua_editor_widget_renders_with_validation_and_version_matches_release() {
-    assert_eq!(luatools_linux::VERSION, "2.9.1-beta");
+    assert_eq!(luatools_linux::VERSION, "2.9.2-beta");
 
     let ctx = egui::Context::default();
     let mut editor = luatools_linux::ui::lua_editor::LuaEditor::new();

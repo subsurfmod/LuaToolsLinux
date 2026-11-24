@@ -1,5 +1,5 @@
 <div align="center">
-  <h1>LuaTools Linux — Native Rust Edition (v2.9.1-beta)</h1>
+  <h1>LuaTools Linux — Native Rust Edition (v2.9.2-beta)</h1>
 </div>
 
 <div align="center">
@@ -96,9 +96,9 @@ Outputs self-contained distributables into `dist/`:
 
 | Target Distribution | Install Command |
 | :--- | :--- |
-| **Fedora / RHEL / openSUSE** | `sudo dnf install ./dist/luatools-linux-2.9.1-0.1.beta.*.rpm` |
-| **Ubuntu / Debian / Pop!_OS** | `sudo apt install ./dist/luatools-linux_2.9.1-beta_amd64.deb` |
-| **Any Linux Distro (No root required)** | Extract `dist/luatools-linux-2.9.1-beta-x86_64.tar.gz` and run `./install.sh --yes --skip-deps` |
+| **Fedora / RHEL / openSUSE** | `sudo dnf install ./dist/luatools-linux-2.9.2-0.1.beta.*.rpm` |
+| **Ubuntu / Debian / Pop!_OS** | `sudo apt install ./dist/luatools-linux_2.9.2-beta_amd64.deb` |
+| **Any Linux Distro (No root required)** | Extract `dist/luatools-linux-2.9.2-beta-x86_64.tar.gz` and run `./install.sh --yes --skip-deps` |
 
 ## Effortless Git Self-Updates
 

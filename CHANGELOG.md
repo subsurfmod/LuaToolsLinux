@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.9.2-beta] - 2026-11-24
+
+### Added & Fixed (Exhaustive Technical Parity with LuaTools & UsefulSteamTools Reference)
+- **Process Lifecycle, Single-Instance & IPC (`src/main.rs`, `src/services/protocol_service.rs`, `src/services/steam_service.rs`)**:
+  - Implemented single-instance mutual exclusion (`LT-01`) via `libc::flock(LOCK_EX | LOCK_NB)` on `$XDG_RUNTIME_DIR/luatools_instance_<uid>.lock`.
+  - Implemented cross-instance Unix domain socket IPC (`LT-02`) forwarding `luatools://` URLs and focus requests to the primary GUI process.
+  - Implemented `--minimized` and `--tray-locked` CLI startup flags (`LT-03`).
+  - Fixed `ProtocolService` parsing of `/silent/` and query param `?silent=1|true` (`LT-12`, `LT-13`) and wired automatic background download/installation.
+  - Hardened Steam lifecycle (`LT-18`): added `terminate_steam_instances()` and clean relaunch prioritizing `~/.local/bin/steam-sls` with `LD_AUDIT=SLSsteam.so`.
+- **HTTP Server, DonateKeys Wire Format & Browser Plugin (`src/services/http_server.rs`, `src/services/donate_keys.rs`, `src/services/cef_bridge.rs`, `src/services/plugin_installer_service.rs`)**:
+  - Implemented full CORS preflight (`OPTIONS`) handling (`LT-26`).
+  - Implemented all core and extended store-plugin endpoints (`/has`, `/add`, `/remove`, `/open/fix`, `/open/settings`, `/rpc`, and 13+ extended routes) (`LT-27`, `LT-28`).
+  - Fixed DonateKeys wire format (`LT-117`): payload now formatted as comma-separated `text/plain` `depotId:hexKey,...` to `http://167.235.229.108/donatekeys/send`.
+  - Fixed LTSP store plugin installer (`LT-19`, `LT-23`): wired `luatools.js` deployment, fixed CDP `callServerMethod` parameter forwarding, and bypassed CEF CSP.
+- **Tools, Fixes, Downloader & Extraction (`src/services/fixes_service.rs`, `src/services/lua_installer.rs`, `src/services/external_tools.rs`, `src/services/steamless_service.rs`, `src/services/depot_downloader.rs`)**:
+  - Fixed `FixesService::is_safe_fix_id` to accept colons (`:`) for `online-fix:<uuid>` (`LT-95`) and configured `WINEDLLOVERRIDES` in Proton prefix registry.
+  - Fixed bare `.lua` archive crash in `lua_installer.rs` (`LT-33`) by validating PK zip magic bytes before archive opening.
+  - Fixed Steamless (`LT-106`): wait for process exit and replace target executable with `.unpacked.exe`.
+  - Fixed Goldberg emulator (`LT-99`): downloads Windows `emu-win-release.7z` DLLs alongside Linux `.so` for Proton games.
+  - Fixed DepotDownloader (`LT-89`): added `-manifestfile` switch support and deepened `DepotDownloaderMod` binary detection.
+- **Steam Integration & SLSsteam Sync (`bridge_lib/src/lib.rs`, `assets/luatools-steam-launcher`, `install.sh`, `src/services/slssteam_service.rs`, `src/services/manifest_binding_service.rs`)**:
+  - Fixed 32-bit Steam crash: provided `assets/luatools-steam-launcher` prioritizing `steam-sls` (`LD_AUDIT=SLSsteam.so`) and stripping 64-bit `libsteam_integration.so` from `LD_PRELOAD`.
+  - Fixed Manifest Binding (`LT-86`): synchronized pins to SLSsteam `ManifestOverrides` in `~/.config/SLSsteam/config.yaml`.
+  - Wired bridge readers for legacy CD keys, stats, and pinned manifests with C exports.
+
+---
+
 ## [2.9.1-beta] - 2026-11-24
 
 ### Audited & Improved (All 78 Files Changed Since `v2.6.1`)
