@@ -125,4 +125,75 @@ impl SteamService {
         ids.dedup();
         ids
     }
+
+    /// Terminates all running Steam client, webhelper, overlay, and Steam Runtime processes cleanly.
+    /// Sends `SIGTERM` first, waits up to 2 seconds for clean exit, then sends `SIGKILL` to any
+    /// stubborn processes.
+    pub fn terminate_steam_instances() -> Result<usize, String> {
+        crate::steam_bridge::preload_loader::kill_all_steam_instances()
+    }
+
+    /// Checks whether any Steam client or helper process is currently running.
+    pub fn is_steam_running() -> bool {
+        crate::steam_bridge::preload_loader::find_steam_pid().is_some()
+    }
+
+    /// Cleanly terminates any running Steam instances and relaunches Steam via `steam-sls`
+    /// (with `LD_AUDIT=SLSsteam.so`) so SLSsteam is retained without 32-bit / 64-bit LD_PRELOAD crashes.
+    pub fn relaunch_steam_sls(override_root: Option<&Path>) -> Result<(), String> {
+        // 1. Terminate all running Steam processes
+        let _ = Self::terminate_steam_instances();
+
+        // 2. Brief grace delay for socket unbinding
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // 3. Resolve steam-sls launcher path
+        let home = dirs::home_dir().ok_or_else(|| "Cannot determine HOME directory".to_string())?;
+        let steam_sls_bin = home.join(".local/bin/steam-sls");
+
+        let mut cmd = if steam_sls_bin.is_file() {
+            std::process::Command::new(&steam_sls_bin)
+        } else {
+            // Find steam binary (steam.sh or fallback to PATH)
+            let steam_bin = override_root
+                .map(|r| r.join("steam.sh"))
+                .filter(|p| p.is_file())
+                .unwrap_or_else(|| PathBuf::from("steam"));
+            let mut c = std::process::Command::new(steam_bin);
+
+            // Retain SLSsteam.so via LD_AUDIT
+            let sls_so = home.join(".local/share/SLSsteam/SLSsteam.so");
+            if sls_so.is_file() {
+                c.env("LD_AUDIT", &sls_so);
+            }
+            c
+        };
+
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn steam-sls: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Instance method: cleanly terminates running Steam and relaunches via `steam-sls`.
+    pub fn relaunch_via_sls(&self, override_root: Option<&Path>) -> Result<(), String> {
+        let root = override_root.or_else(|| self.installation.as_ref().map(|i| i.root.as_path()));
+        Self::relaunch_steam_sls(root)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_steam_service_detection_and_query() {
+        let mut svc = SteamService::new();
+        let _ = svc.detect(None);
+        let _ = svc.is_available();
+        let _ = svc.scan_all_games();
+    }
 }

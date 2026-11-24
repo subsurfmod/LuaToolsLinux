@@ -10,6 +10,7 @@ pub struct ProtocolAction {
     pub kind: String, // "game" | "install" | "manage" | "fix"
     pub app_id: u32,
     pub source: Option<String>,
+    pub silent: bool,
 }
 
 pub struct ProtocolService;
@@ -25,8 +26,29 @@ impl ProtocolService {
         if !matches!(kind.as_str(), "game" | "install" | "manage" | "fix") {
             return None;
         }
-        let first_seg = parsed.path_segments()?.find(|s| !s.is_empty())?;
-        let app_id = first_seg.parse::<u32>().ok()?;
+
+        let segments: Vec<&str> = parsed
+            .path_segments()
+            .map(|s| s.filter(|seg| !seg.is_empty()).collect())
+            .unwrap_or_default();
+
+        let mut silent = parsed.query_pairs().any(|(k, v)| {
+            k.eq_ignore_ascii_case("silent")
+                && (v == "1" || v.eq_ignore_ascii_case("true") || v.is_empty())
+        });
+
+        let mut app_id = None;
+        for seg in segments {
+            if seg.eq_ignore_ascii_case("silent") {
+                silent = true;
+            } else if app_id.is_none() {
+                if let Ok(id) = seg.parse::<u32>() {
+                    app_id = Some(id);
+                }
+            }
+        }
+
+        let app_id = app_id?;
         let source = parsed
             .query_pairs()
             .find(|(k, _)| k == "source")
@@ -36,6 +58,7 @@ impl ProtocolService {
             kind,
             app_id,
             source,
+            silent,
         })
     }
 
@@ -85,5 +108,26 @@ mod tests {
         assert_eq!(a.kind, "install");
         assert_eq!(a.app_id, 1245620);
         assert_eq!(a.source.as_deref(), Some("morrenus"));
+        assert!(!a.silent);
+    }
+
+    #[test]
+    fn parses_silent_protocol_urls() {
+        let a = ProtocolService::parse("luatools://install/silent/1245620").unwrap();
+        assert_eq!(a.kind, "install");
+        assert_eq!(a.app_id, 1245620);
+        assert!(a.silent);
+        assert_eq!(a.source, None);
+
+        let b = ProtocolService::parse("luatools://install/silent/1245620?source=morrenus").unwrap();
+        assert_eq!(b.kind, "install");
+        assert_eq!(b.app_id, 1245620);
+        assert_eq!(b.source.as_deref(), Some("morrenus"));
+        assert!(b.silent);
+
+        let c = ProtocolService::parse("luatools://install/1245620?silent=1").unwrap();
+        assert_eq!(c.kind, "install");
+        assert_eq!(c.app_id, 1245620);
+        assert!(c.silent);
     }
 }

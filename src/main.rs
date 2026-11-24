@@ -1,6 +1,11 @@
-//! Entry point for LuaTools Linux v2.0-beta native desktop application.
+//! Entry point for LuaTools Linux native desktop application.
 
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Receiver};
 
 use eframe::egui;
 use luatools_linux::services::settings_service::SettingsService;
@@ -9,10 +14,105 @@ use luatools_linux::services::update_service::UpdateService;
 use luatools_linux::ui::app::LuaToolsApp;
 use luatools_linux::VERSION;
 
+enum IpcCommand {
+    Focus,
+    Url(String),
+}
+
+struct InstanceLock {
+    _file: std::fs::File,
+}
+
+impl InstanceLock {
+    fn try_acquire(path: &Path) -> Result<Self, ()> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|_| ())?;
+
+        let fd = file.as_raw_fd();
+        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if ret == 0 {
+            Ok(Self { _file: file })
+        } else {
+            Err(())
+        }
+    }
+}
+
+fn get_instance_paths() -> (PathBuf, PathBuf) {
+    let base = dirs::runtime_dir()
+        .or_else(|| dirs::cache_dir().map(|c| c.join("luatools")))
+        .unwrap_or_else(std::env::temp_dir);
+    let _ = std::fs::create_dir_all(&base);
+    let uid = unsafe { libc::getuid() };
+    (
+        base.join(format!("luatools_instance_{}.lock", uid)),
+        base.join(format!("luatools_instance_{}.sock", uid)),
+    )
+}
+
+struct AppWrapper {
+    inner: LuaToolsApp,
+    ipc_rx: Receiver<IpcCommand>,
+    tray_locked: bool,
+    initial_minimized: bool,
+    sock_path: PathBuf,
+    _instance_lock: InstanceLock,
+}
+
+impl Drop for AppWrapper {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.sock_path);
+    }
+}
+
+impl eframe::App for AppWrapper {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if self.initial_minimized {
+            self.initial_minimized = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+
+        let mut had_ipc = false;
+        while let Ok(cmd) = self.ipc_rx.try_recv() {
+            had_ipc = true;
+            match cmd {
+                IpcCommand::Focus => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                IpcCommand::Url(url) => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.inner.handle_protocol_url(&url, ctx);
+                }
+            }
+        }
+        if had_ipc {
+            ctx.request_repaint();
+        }
+
+        if self.tray_locked && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+
+        self.inner.update(ctx, frame);
+    }
+}
+
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut initial_protocol_url: Option<String> = None;
     let mut qa_screenshots_dir: Option<PathBuf> = None;
+    let mut minimized = false;
+    let mut tray_locked = false;
 
     let mut idx = 0;
     while idx < args.len() {
@@ -69,9 +169,23 @@ fn main() -> eframe::Result<()> {
                     idx += 1;
                 }
             }
+            "--minimized" => {
+                minimized = true;
+            }
+            "--tray-locked" => {
+                tray_locked = true;
+            }
             "-h" | "--help" => {
                 println!(
-                    "LuaTools Linux v{}\n\nUsage: luatools [OPTIONS] [luatools://...]\n\nOptions:\n  --check      Verify binary and Steam discovery without opening GUI\n  --update     Pull latest source from Git and rebuild/install native binary\n  -v,--version Print version\n  -h,--help    Show help",
+                    "LuaTools Linux v{}\n\n\
+                     Usage: luatools [OPTIONS] [luatools://...]\n\n\
+                     Options:\n  \
+                       --check        Verify binary and Steam discovery without opening GUI\n  \
+                       --update       Pull latest source from Git and rebuild/install native binary\n  \
+                       --minimized    Launch minimized\n  \
+                       --tray-locked  Keep running in background/tray on close\n  \
+                       -v,--version   Print version\n  \
+                       -h,--help      Show help",
                     VERSION
                 );
                 return Ok(());
@@ -84,13 +198,73 @@ fn main() -> eframe::Result<()> {
         idx += 1;
     }
 
-    let viewport = egui::ViewportBuilder::default()
+    // LT-01: Single-instance mutex/flock
+    // LT-02: Cross-instance IPC forwarding over Unix domain socket
+    let (lock_path, sock_path) = get_instance_paths();
+
+    let instance_lock = match InstanceLock::try_acquire(&lock_path) {
+        Ok(lock) => lock,
+        Err(_) => {
+            // Another instance holds the flock lock; forward protocol action or focus window
+            let msg = if let Some(url) = &initial_protocol_url {
+                format!("URL {}\n", url)
+            } else {
+                "FOCUS\n".to_string()
+            };
+
+            let mut connected = false;
+            for _ in 0..10 {
+                if let Ok(mut stream) = UnixStream::connect(&sock_path) {
+                    let _ = stream.write_all(msg.as_bytes());
+                    let _ = stream.flush();
+                    connected = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+
+            if connected {
+                println!("LuaTools is already running. Request forwarded to active instance.");
+            } else {
+                eprintln!(
+                    "LuaTools instance lock held, but could not connect to Unix socket at {}.",
+                    sock_path.display()
+                );
+            }
+            return Ok(());
+        }
+    };
+
+    // We acquired the single-instance lock. Clean up any stale socket and bind listener.
+    let _ = std::fs::remove_file(&sock_path);
+    let (ipc_tx, ipc_rx) = channel::<IpcCommand>();
+
+    let listener = match UnixListener::bind(&sock_path) {
+        Ok(l) => {
+            let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600));
+            Some(l)
+        }
+        Err(e) => {
+            eprintln!(
+                "Warning: failed to bind single-instance IPC socket at {}: {}",
+                sock_path.display(),
+                e
+            );
+            None
+        }
+    };
+
+    let mut viewport = egui::ViewportBuilder::default()
         .with_title(format!("LuaTools  v{}", VERSION))
         .with_app_id("luatools")
         .with_inner_size([1380.0, 860.0])
         .with_min_inner_size([1060.0, 660.0])
         .with_drag_and_drop(true)
         .with_icon(build_app_icon());
+
+    if minimized {
+        viewport = viewport.with_visible(false);
+    }
 
     // Prefer X11/XWayland when DISPLAY is available to avoid winit 0.30's wl_seat v10 pointer panic
     if std::env::var_os("WINIT_UNIX_BACKEND").is_none() && std::env::var_os("DISPLAY").is_some() {
@@ -106,11 +280,46 @@ fn main() -> eframe::Result<()> {
         "LuaTools Linux",
         native_options,
         Box::new(move |cc| {
-            Ok(Box::new(LuaToolsApp::new(
+            if let Some(listener) = listener {
+                let tx = ipc_tx.clone();
+                let repaint_ctx = cc.egui_ctx.clone();
+                std::thread::spawn(move || {
+                    for stream in listener.incoming() {
+                        if let Ok(stream) = stream {
+                            let mut reader = BufReader::new(stream);
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).is_ok() {
+                                let trimmed = line.trim();
+                                if trimmed == "FOCUS" {
+                                    let _ = tx.send(IpcCommand::Focus);
+                                    repaint_ctx.request_repaint();
+                                } else if let Some(url) = trimmed.strip_prefix("URL ") {
+                                    let _ = tx.send(IpcCommand::Url(url.trim().to_string()));
+                                    repaint_ctx.request_repaint();
+                                } else if trimmed.starts_with("luatools://") {
+                                    let _ = tx.send(IpcCommand::Url(trimmed.to_string()));
+                                    repaint_ctx.request_repaint();
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+
+            let inner = LuaToolsApp::new(
                 cc,
                 initial_protocol_url,
                 qa_screenshots_dir,
-            )))
+            );
+
+            Ok(Box::new(AppWrapper {
+                inner,
+                ipc_rx,
+                tray_locked,
+                initial_minimized: minimized,
+                sock_path,
+                _instance_lock: instance_lock,
+            }))
         }),
     )
 }
