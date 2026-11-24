@@ -43,7 +43,7 @@ impl DohResolver {
             doh_endpoint: doh_endpoint
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .unwrap_or("https://dns.google/resolve")
+                .unwrap_or("https://1.1.1.1/dns-query")
                 .to_string(),
         }
     }
@@ -210,7 +210,7 @@ mod tests {
     #[test]
     fn test_resolver_creation() {
         let resolver = DohResolver::new(None);
-        assert_eq!(resolver.endpoint(), "https://dns.google/resolve");
+        assert_eq!(resolver.endpoint(), "https://1.1.1.1/dns-query");
     }
 
     #[test]

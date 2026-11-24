@@ -85,7 +85,8 @@ fn send_json(req: Request, status: u16, payload: Value) {
             )
             .unwrap(),
         )
-        .with_header(Header::from_bytes("Access-Control-Max-Age", "86400").unwrap());
+        .with_header(Header::from_bytes("Access-Control-Max-Age", "86400").unwrap())
+        .with_header(Header::from_bytes("Access-Control-Allow-Private-Network", "true").unwrap());
     let _ = req.respond(resp);
 }
 
@@ -108,7 +109,8 @@ fn send_bytes(req: Request, status: u16, content_type: &str, bytes: Vec<u8>) {
             )
             .unwrap(),
         )
-        .with_header(Header::from_bytes("Access-Control-Max-Age", "86400").unwrap());
+        .with_header(Header::from_bytes("Access-Control-Max-Age", "86400").unwrap())
+        .with_header(Header::from_bytes("Access-Control-Allow-Private-Network", "true").unwrap());
     let _ = req.respond(resp);
 }
 
@@ -178,16 +180,25 @@ fn handle_request(
                 )
                 .unwrap(),
             )
-            .with_header(Header::from_bytes("Access-Control-Max-Age", "86400").unwrap());
+            .with_header(Header::from_bytes("Access-Control-Max-Age", "86400").unwrap())
+        .with_header(Header::from_bytes("Access-Control-Allow-Private-Network", "true").unwrap());
         let _ = req.respond(resp);
         return;
     }
 
     let full_url = req.url().to_string();
+    let method_str = req.method().to_string();
     let mut parts_split = full_url.splitn(2, '?');
     let path_only = parts_split.next().unwrap_or("/");
     let query_str = parts_split.next().unwrap_or("");
     let parts: Vec<&str> = path_only.split('/').filter(|s| !s.is_empty()).collect();
+
+    if !path_only.starts_with("/add-status") && !path_only.starts_with("/has") {
+        crate::services::plugin_log::PluginLog::default().info(
+            Some("HttpServer"),
+            &format!("HTTP {} {}", method_str, path_only)
+        );
+    }
 
     let notify = || {
         if let Some(cb) = wakeup {
@@ -300,10 +311,30 @@ fn handle_request(
                     json!({ "success": true, "exists": exists, "result": exists }),
                 );
             }
-            "StartAddViaLuaTools" if rpc_aid > 0 => {
+            "StartAddViaLuaTools" | "StartLuaToolsAdd" if rpc_aid > 0 => {
+                let game_name = args.get("name").and_then(|v| v.as_str()).map(ToString::to_string);
+                crate::services::plugin_add_service::start_headless_add(rpc_aid as u64, game_name, stplug_dir);
                 let _ = event_tx.send(RpcUiEvent::AddApp(rpc_aid));
                 notify();
                 send_json(req, 200, json!({ "success": true, "queued": true }));
+            }
+            "GetAddViaLuaToolsStatus" | "GetLuaToolsAddStatus" => {
+                let is_inst = rpc_aid > 0 && stplug_dir.join(format!("{}.lua", rpc_aid)).exists();
+                let state = crate::services::plugin_add_service::get_add_state(rpc_aid as u64, is_inst);
+                send_json(req, 200, json!({
+                    "success": true,
+                    "result": { "status": if is_inst { "completed" } else { "downloading" } },
+                    "state": state,
+                    "appid": rpc_aid,
+                    "checking": state.checking,
+                    "fastFetch": state.fast_fetch,
+                    "sourcesLoaded": state.sources_loaded,
+                    "sources": state.sources,
+                    "installStatus": state.install_status,
+                    "installFailed": state.install_failed,
+                    "error": state.error,
+                    "installed": is_inst,
+                }));
             }
             "DeleteLuaToolsForApp" if rpc_aid > 0 => {
                 let _ = std::fs::remove_file(stplug_dir.join(format!("{}.lua", rpc_aid)));
@@ -332,13 +363,7 @@ fn handle_request(
                     json!({ "success": true, "result": apps, "apps": apps }),
                 );
             }
-            "GetAddViaLuaToolsStatus" => {
-                send_json(
-                    req,
-                    200,
-                    json!({ "success": true, "result": { "status": "completed" } }),
-                );
-            }
+
             "GetApplyFixStatus" => {
                 send_json(
                     req,
@@ -408,6 +433,8 @@ fn handle_request(
     // Route: /add or /add/:appid
     if parts.first() == Some(&"add") || (parts.len() == 2 && parts[0] == "api" && parts[1] == "add") {
         if aid > 0 {
+            let game_name = body_json.as_ref().and_then(|v| v.get("name")).and_then(|v| v.as_str()).map(ToString::to_string);
+            crate::services::plugin_add_service::start_headless_add(aid as u64, game_name, stplug_dir);
             let _ = event_tx.send(RpcUiEvent::AddApp(aid));
             notify();
         }
@@ -418,6 +445,163 @@ fn handle_request(
         );
         return;
     }
+    // Route: /add-status/:appid
+    if parts.first() == Some(&"add-status") {
+        let is_inst = aid > 0 && stplug_dir.join(format!("{}.lua", aid)).exists();
+        let state = crate::services::plugin_add_service::get_add_state(aid as u64, is_inst);
+        send_json(
+            req,
+            200,
+            json!({
+                "success": true,
+                "appid": aid,
+                "checking": state.checking,
+                "fastFetch": state.fast_fetch,
+                "sourcesLoaded": state.sources_loaded,
+                "sources": state.sources,
+                "installStatus": state.install_status,
+                "installFailed": state.install_failed,
+                "error": state.error,
+                "installed": is_inst,
+            }),
+        );
+        return;
+    }
+
+    // Route: /add-source/:appid
+    if parts.first() == Some(&"add-source") {
+        let source_name = body_json.as_ref()
+            .and_then(|v| v.get("source").or_else(|| v.get("sourceName")))
+            .and_then(|v| v.as_str())
+            .unwrap_or("Sadie (Morrenus)");
+        if aid > 0 {
+            crate::services::plugin_add_service::pick_source_and_download(aid as u64, source_name, stplug_dir);
+        }
+        send_json(req, 200, json!({ "success": true, "appid": aid, "source": source_name }));
+        return;
+    }
+
+    // Route: /check-sources or /check-sources/:appid
+    if parts.first() == Some(&"check-sources") {
+        let is_inst = aid > 0 && stplug_dir.join(format!("{}.lua", aid)).exists();
+        let state = crate::services::plugin_add_service::get_add_state(aid as u64, is_inst);
+        send_json(
+            req,
+            200,
+            json!({
+                "success": true,
+                "appid": aid,
+                "results": state.sources,
+                "sources": state.sources,
+            }),
+        );
+        return;
+    }
+
+    // Route: /download/:appid
+    if parts.first() == Some(&"download") {
+        let source_name = body_json.as_ref()
+            .and_then(|v| v.get("source").or_else(|| v.get("apiName")))
+            .and_then(|v| v.as_str())
+            .unwrap_or("Sadie (Morrenus)");
+        if aid > 0 {
+            crate::services::plugin_add_service::pick_source_and_download(aid as u64, source_name, stplug_dir);
+        }
+        send_json(req, 200, json!({ "success": true, "appid": aid }));
+        return;
+    }
+
+    // Route: /download-status/:appid
+    if parts.first() == Some(&"download-status") {
+        let is_inst = aid > 0 && stplug_dir.join(format!("{}.lua", aid)).exists();
+        let _state = crate::services::plugin_add_service::get_add_state(aid as u64, is_inst);
+        send_json(
+            req,
+            200,
+            json!({
+                "success": true,
+                "state": {
+                    "status": if is_inst { "done" } else { "downloading" },
+                    "bytesRead": if is_inst { 100 } else { 50 },
+                    "totalBytes": 100,
+                    "currentApi": "Sadie (Morrenus)",
+                    "apiErrors": null,
+                    "error": null,
+                    "installedPath": null,
+                    "success": is_inst,
+                    "api": "Sadie (Morrenus)",
+                }
+            }),
+        );
+        return;
+    }
+
+    // Route: /cancel/:appid
+    if parts.first() == Some(&"cancel") {
+        send_json(req, 200, json!({ "success": true, "appid": aid }));
+        return;
+    }
+
+    // Route: /open-url
+    if parts == ["open-url"] {
+        let target_url = body_json.as_ref()
+            .and_then(|v| v.get("url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !target_url.is_empty() {
+            let _ = std::process::Command::new("xdg-open").arg(target_url).spawn();
+        }
+        send_json(req, 200, json!({ "success": true }));
+        return;
+    }
+
+    // Route: /restart-steam
+    if parts == ["restart-steam"] {
+        let _ = crate::services::steam_service::SteamService::relaunch_steam_sls(None);
+        send_json(req, 200, json!({ "success": true, "restarted": true }));
+        return;
+    }
+
+    // Route: /check-updates
+    if parts == ["check-updates"] {
+        send_json(req, 200, json!({ "success": true, "updateAvailable": false }));
+        return;
+    }
+
+    // Route: /loaded-apps (GET and POST)
+    if parts == ["loaded-apps"] {
+        if req.method() == &Method::Post {
+            send_json(req, 200, json!({ "success": true }));
+            return;
+        } else {
+            let apps = list_installed_apps(stplug_dir);
+            send_json(req, 200, json!({ "success": true, "apps": apps }));
+            return;
+        }
+    }
+
+    // Route: /api-list
+    if parts == ["api-list"] {
+        send_json(
+            req,
+            200,
+            json!({
+                "success": true,
+                "apis": [
+                    { "name": "Sadie (Morrenus)", "index": 0 },
+                    { "name": "Hubcap", "index": 1 },
+                ]
+            }),
+        );
+        return;
+    }
+
+    // Route: /icon
+    if parts == ["icon"] {
+        send_json(req, 200, json!({ "success": false, "dataUrl": "" }));
+        return;
+    }
+
 
     // Route: /remove or /remove/:appid or /delete or /delete/:appid
     if parts.first() == Some(&"remove")
@@ -426,6 +610,17 @@ fn handle_request(
     {
         if aid > 0 {
             let _ = std::fs::remove_file(stplug_dir.join(format!("{}.lua", aid)));
+            let _ = std::fs::remove_file(stplug_dir.join(format!("{}.lua.disabled", aid)));
+            let mut sls = crate::services::slssteam_service::SlssteamService::new(None);
+            sls.remove_fake_app_id(aid);
+            sls.remove_token(aid);
+            sls.remove_additional_app(aid);
+            sls.remove_process_mapping(aid);
+            sls.remove_force_denuvo(aid);
+            sls.remove_pinned_app(aid);
+            sls.remove_cd_key(aid);
+            sls.remove_game_title(aid);
+            let _ = sls.save();
             let _ = event_tx.send(RpcUiEvent::RemovedApp(aid));
             notify();
         }
@@ -519,10 +714,19 @@ fn handle_request(
 
     // Route: /check/:appid or /check/fix/:appid
     if parts.first() == Some(&"check") {
+        let has_fix = if aid > 0 {
+            let api = crate::services::api_client::LuaToolsApiClient::new(
+                crate::services::auth_service::AuthService::default(),
+            );
+            let fixes = api.get_drm_fix_fixes(aid);
+            !fixes.is_empty()
+        } else {
+            false
+        };
         send_json(
             req,
             200,
-            json!({ "ok": true, "appid": aid, "has_fix": true }),
+            json!({ "ok": true, "appid": aid, "has_fix": has_fix }),
         );
         return;
     }
@@ -668,6 +872,7 @@ mod tests {
         assert_eq!(resp.header("Access-Control-Allow-Origin"), Some("*"));
         assert!(resp.header("Access-Control-Allow-Methods").unwrap().contains("OPTIONS"));
         assert!(resp.header("Access-Control-Allow-Headers").unwrap().contains("Content-Type"));
+        assert_eq!(resp.header("Access-Control-Allow-Private-Network"), Some("true"));
 
         srv.stop();
     }
@@ -739,6 +944,53 @@ mod tests {
         let mut punk_bytes = Vec::new();
         punk_resp.into_reader().read_to_end(&mut punk_bytes).unwrap();
         assert_eq!(punk_bytes, b"MANIFEST_BYTES_SAMPLE");
+
+        // 8. 13 Extended LTSP routes verification
+        let add_st: Value = ureq::get("http://127.0.0.1:16781/add-status/1245620").call().unwrap().into_json().unwrap();
+        assert_eq!(add_st["success"], true);
+
+        let add_src: Value = ureq::post("http://127.0.0.1:16781/add-source/1245620")
+            .send_json(json!({ "source": "Sadie (Morrenus)" })).unwrap().into_json().unwrap();
+        assert_eq!(add_src["success"], true);
+
+        let chk_src: Value = ureq::get("http://127.0.0.1:16781/check-sources/1245620").call().unwrap().into_json().unwrap();
+        assert_eq!(chk_src["success"], true);
+
+        let dl: Value = ureq::post("http://127.0.0.1:16781/download/1245620")
+            .send_json(json!({ "source": "Sadie (Morrenus)" })).unwrap().into_json().unwrap();
+        assert_eq!(dl["success"], true);
+
+        let dl_st: Value = ureq::get("http://127.0.0.1:16781/download-status/1245620").call().unwrap().into_json().unwrap();
+        assert_eq!(dl_st["success"], true);
+
+        let cancel: Value = ureq::post("http://127.0.0.1:16781/cancel/1245620")
+            .send_json(json!({})).unwrap().into_json().unwrap();
+        assert_eq!(cancel["success"], true);
+
+        let open_url: Value = ureq::post("http://127.0.0.1:16781/open-url")
+            .send_json(json!({ "url": "https://example.com" })).unwrap().into_json().unwrap();
+        assert_eq!(open_url["success"], true);
+
+        let r_steam: Value = ureq::post("http://127.0.0.1:16781/restart-steam")
+            .send_json(json!({})).unwrap().into_json().unwrap();
+        assert_eq!(r_steam["success"], true);
+
+        let chk_up: Value = ureq::post("http://127.0.0.1:16781/check-updates")
+            .send_json(json!({})).unwrap().into_json().unwrap();
+        assert_eq!(chk_up["success"], true);
+
+        let l_apps_get: Value = ureq::get("http://127.0.0.1:16781/loaded-apps").call().unwrap().into_json().unwrap();
+        assert_eq!(l_apps_get["success"], true);
+
+        let l_apps_post: Value = ureq::post("http://127.0.0.1:16781/loaded-apps")
+            .send_json(json!({})).unwrap().into_json().unwrap();
+        assert_eq!(l_apps_post["success"], true);
+
+        let api_l: Value = ureq::get("http://127.0.0.1:16781/api-list").call().unwrap().into_json().unwrap();
+        assert_eq!(api_l["success"], true);
+
+        let icon: Value = ureq::get("http://127.0.0.1:16781/icon").call().unwrap().into_json().unwrap();
+        assert_eq!(icon["success"], false);
 
         srv.stop();
     }

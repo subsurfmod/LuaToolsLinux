@@ -195,7 +195,23 @@ impl HubcapService {
     ) -> Result<Vec<u8>, String> {
         let agent = Self::agent();
 
-        // 1. Primary: MANIFEST_BACKEND_URL /api/givemethemanifestpunk
+        // 1. Primary: https://lua.tools/api/givemethemanifestpunk/{depot}/{gid} (LT-44)
+        let luatools_url = format!(
+            "https://lua.tools/api/givemethemanifestpunk/{}/{}",
+            depot_id, gid
+        );
+        if let Ok(resp) = agent
+            .get(&luatools_url)
+            .set("User-Agent", MANIFEST_BACKEND_UA)
+            .call()
+        {
+            let mut bytes = Vec::new();
+            if resp.into_reader().take(64 * 1024 * 1024).read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
+                return Ok(bytes);
+            }
+        }
+
+        // 2. Secondary fallback: direct backend IP
         let primary_url = format!(
             "{}/api/givemethemanifestpunk?depotid={}&gid={}",
             MANIFEST_BACKEND_URL, depot_id, gid
@@ -270,6 +286,14 @@ impl HubcapService {
         Some(records.into_iter().map(|r| r.value).collect())
     }
 
+    /// Build an HTTP agent with DoH-assisted domain resolution fallback (LT-47).
+    pub fn doh_agent() -> ureq::Agent {
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
+            .build()
+    }
+
     /// Download with GitHub proxy and mirror fallback (LT-48).
     pub fn download_proxied(url: &str, dest_path: &Path) -> Result<(), String> {
         let proxy = GithubProxy::default();
@@ -288,7 +312,7 @@ impl HubcapService {
             }
             Err("All GitHub proxy mirrors failed".into())
         } else {
-            let resp = Self::agent().get(url).call().map_err(|e| e.to_string())?;
+            let resp = Self::agent().get(&url).call().map_err(|e| e.to_string())?;
             if let Some(parent) = dest_path.parent() {
                 let _ = fs::create_dir_all(parent);
             }
@@ -321,9 +345,12 @@ impl LuaToolsApiClient {
         if trimmed.is_empty() {
             return Ok(Vec::new());
         }
+        let lang = crate::services::steam_service::SteamService::detect_steam_language(None)
+            .unwrap_or_else(|| "english".into());
         let url = format!(
-            "https://store.steampowered.com/api/storesearch/?term={}&l=english&cc=US",
-            urlencoding::encode(trimmed)
+            "https://store.steampowered.com/api/storesearch/?term={}&l={}&cc=US",
+            urlencoding::encode(trimmed),
+            urlencoding::encode(&lang)
         );
         let val: Value = Self::agent()
             .get(&url)
@@ -373,9 +400,11 @@ impl LuaToolsApiClient {
     }
 
     pub fn get_featured(&self) -> (Vec<SteamFeaturedItem>, Vec<SteamFeaturedItem>) {
-        let url = "https://store.steampowered.com/api/featuredcategories?cc=us&l=english";
+        let lang = crate::services::steam_service::SteamService::detect_steam_language(None)
+            .unwrap_or_else(|| "english".into());
+        let url = format!("https://store.steampowered.com/api/featuredcategories?cc=us&l={}", urlencoding::encode(&lang));
         let Ok(resp) = Self::agent()
-            .get(url)
+            .get(&url)
             .set(
                 "User-Agent",
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",

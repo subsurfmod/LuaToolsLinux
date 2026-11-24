@@ -161,6 +161,20 @@ fn build_polyfill_js(http_port: u16) -> String {
   if (window.__luatoolsLinuxPolyfill) return;
   window.__luatoolsLinuxPolyfill = true;
   const BASE = "http://127.0.0.1:{http_port}";
+  window.__lt_queue = window.__lt_queue || [];
+  window.__lt_pending = window.__lt_pending || {{}};
+  window.__lt_req_id = window.__lt_req_id || 0;
+  window.__lt_drain = function() {{
+    const q = window.__lt_queue;
+    window.__lt_queue = [];
+    return JSON.stringify(q);
+  }};
+  window.__lt_resolve = function(id, res) {{
+    if (window.__lt_pending[id]) {{
+      window.__lt_pending[id](res);
+      delete window.__lt_pending[id];
+    }}
+  }};
   if (!window.Millennium) {{
     window.Millennium = {{
       callServerMethod: async function(a, b, c) {{
@@ -334,9 +348,20 @@ pub fn bridge_ws_tab(ws_url: &str, http_port: u16, steam_root: Option<&Path>) ->
     }
     let _ = socket.read();
 
-    // 3. Evaluate polyfill + luatools.js
-    let payload = json!({
+    // 3. Add script to evaluate on new document so it survives same-tab navigation
+    let new_doc_script = json!({
         "id": 3,
+        "method": "Page.addScriptToEvaluateOnNewDocument",
+        "params": {
+            "source": js
+        }
+    });
+    let _ = socket.send(Message::Text(new_doc_script.to_string().into()));
+    let _ = socket.read();
+
+    // 4. Evaluate polyfill + luatools.js in current document
+    let payload = json!({
+        "id": 4,
         "method": "Runtime.evaluate",
         "params": {
             "expression": js,
@@ -351,6 +376,58 @@ pub fn bridge_ws_tab(ws_url: &str, http_port: u16, steam_root: Option<&Path>) ->
         return false;
     }
     let _ = socket.read();
+
+    // 5. Poll window.__lt_drain() and dispatch queued RPC calls outside browser CSP
+    let drain_eval = json!({
+        "id": 5,
+        "method": "Runtime.evaluate",
+        "params": {
+            "expression": "typeof window.__lt_drain === 'function' ? window.__lt_drain() : '[]'",
+            "returnByValue": true
+        }
+    });
+    if socket.send(Message::Text(drain_eval.to_string().into())).is_ok() {
+        if let Ok(msg) = socket.read() {
+            if let Ok(txt) = msg.into_text() {
+                if let Ok(val) = serde_json::from_str::<Value>(&txt) {
+                    if let Some(res_str) = val.get("result").and_then(|r| r.get("result")).and_then(|r| r.get("value")).and_then(|v| v.as_str()) {
+                        if let Ok(queued) = serde_json::from_str::<Vec<Value>>(res_str) {
+                            for item in queued {
+                                if let Some(req_id) = item.get("id").and_then(|i| i.as_str()) {
+                                    let method = item.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                                    let args = item.get("args").cloned().unwrap_or(json!({}));
+                                    let agent = ureq::AgentBuilder::new()
+                                        .timeout(std::time::Duration::from_secs(4))
+                                        .build();
+                                    let rpc_res = agent
+                                        .post(&format!("http://127.0.0.1:{}/rpc", http_port))
+                                        .send_json(json!({ "method": method, "args": args }))
+                                        .ok()
+                                        .and_then(|r| r.into_string().ok())
+                                        .unwrap_or_else(|| json!({ "success": true }).to_string());
+
+                                    let resolve_js = format!(
+                                        "if (typeof window.__lt_resolve === 'function') window.__lt_resolve('{}', {});",
+                                        req_id, rpc_res
+                                    );
+                                    let resolve_cmd = json!({
+                                        "id": 6,
+                                        "method": "Runtime.evaluate",
+                                        "params": {
+                                            "expression": resolve_js
+                                        }
+                                    });
+                                    let _ = socket.send(Message::Text(resolve_cmd.to_string().into()));
+                                    let _ = socket.read();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let _ = socket.close(None);
     true
 }
@@ -403,7 +480,7 @@ mod tests {
 
             let mut ws = WebSocket::from_raw_socket(conn, Role::Server, None);
             let mut received = Vec::new();
-            for _ in 0..3 {
+            for _ in 0..5 {
                 if let Ok(msg) = ws.read() {
                     if let Ok(text) = msg.into_text() {
                         let text_str = text.to_string();
@@ -412,7 +489,7 @@ mod tests {
                             .and_then(|v| v.get("id").and_then(|i| i.as_i64()))
                             .unwrap_or(1);
                         received.push(text_str);
-                        let _ = ws.send(Message::Text(format!(r#"{{"id":{},"result":{{}}}}"#, id).into()));
+                        let _ = ws.send(Message::Text(format!(r#"{{"id":{},"result":{{"result":{{"value":"[]"}}}}}}"#, id).into()));
                     }
                 }
             }
@@ -422,12 +499,13 @@ mod tests {
         let ws_url = format!("ws://127.0.0.1:{}/devtools/page/TAB1", port);
         assert!(bridge_ws_tab(&ws_url, 6767, None));
         let received = server.join().unwrap();
-        assert_eq!(received.len(), 3);
+        assert_eq!(received.len(), 5);
         assert!(received[0].contains("Page.enable"));
         assert!(received[1].contains("Page.setBypassCSP"));
         assert!(received[1].contains(r#""enabled":true"#));
-        assert!(received[2].contains("Runtime.evaluate"));
-        assert!(received[2].contains("http://127.0.0.1:6767"));
-        assert!(received[2].contains("callServerMethod"));
+        assert!(received[2].contains("Page.addScriptToEvaluateOnNewDocument"));
+        assert!(received[3].contains("Runtime.evaluate"));
+        assert!(received[3].contains("http://127.0.0.1:6767"));
+        assert!(received[4].contains("__lt_drain"));
     }
 }

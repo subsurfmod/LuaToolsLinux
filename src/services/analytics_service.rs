@@ -17,7 +17,7 @@ pub struct AnalyticsService {
 
 impl Default for AnalyticsService {
     fn default() -> Self {
-        Self::with_config("https://api.umami.is", "luatools-linux")
+        Self::with_config("https://analytics.lua.tools", "820d782c-a434-424f-9f90-dee83dc6032e")
     }
 }
 
@@ -44,7 +44,7 @@ impl AnalyticsService {
             "type": "event",
             "payload": {
                 "website": self.website_id,
-                "hostname": "luatools-linux",
+                "hostname": "desktop.lua.tools",
                 "url": format!("/launch/{}", VERSION),
                 "title": "App Launch",
             },
@@ -99,7 +99,7 @@ impl AnalyticsService {
         let clean_name = scrub_pii(event_name);
         let mut payload = serde_json::json!({
             "website": self.website_id,
-            "hostname": "luatools-linux",
+            "hostname": "desktop.lua.tools",
             "url": format!("/event/{}", clean_name),
             "title": clean_name,
         });
@@ -139,25 +139,25 @@ mod tests {
     #[test]
     fn test_analytics_creation() {
         let svc = AnalyticsService::new();
-        assert_eq!(svc.umami_host, "https://api.umami.is");
-        assert_eq!(svc.website_id, "luatools-linux");
+        assert_eq!(svc.umami_host, "https://analytics.lua.tools");
+        assert_eq!(svc.website_id, "820d782c-a434-424f-9f90-dee83dc6032e");
     }
 
     #[test]
     fn test_launch_payload_uses_website_id_not_host() {
-        let svc = AnalyticsService::with_config("https://api.umami.is/", "site-uuid-123");
-        assert_eq!(svc.umami_host, "https://api.umami.is");
+        let svc = AnalyticsService::with_config("https://analytics.lua.tools/", "site-uuid-123");
+        assert_eq!(svc.umami_host, "https://analytics.lua.tools");
         let payload = svc.build_launch_payload();
         assert_eq!(payload["type"], "event");
         assert_eq!(payload["payload"]["website"], "site-uuid-123");
-        assert_eq!(payload["payload"]["hostname"], "luatools-linux");
+        assert_eq!(payload["payload"]["hostname"], "desktop.lua.tools");
         assert_eq!(payload["payload"]["url"], format!("/launch/{}", VERSION));
     }
 
     #[test]
     fn test_track_app_launch_does_not_panic() {
         // Use a closed loopback port so the test never hits external networks.
-        let svc = AnalyticsService::with_config("http://127.0.0.1:1", "luatools-linux");
+        let svc = AnalyticsService::with_config("http://127.0.0.1:1", "820d782c-a434-424f-9f90-dee83dc6032e");
         svc.track_app_launch();
     }
 
@@ -181,7 +181,7 @@ mod tests {
         assert_eq!(url, "/api/send");
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["payload"]["website"], "my-site-id");
-        assert_eq!(parsed["payload"]["hostname"], "luatools-linux");
+        assert_eq!(parsed["payload"]["hostname"], "desktop.lua.tools");
     }
 
     #[test]

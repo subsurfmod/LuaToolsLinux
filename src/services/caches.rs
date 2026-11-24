@@ -219,9 +219,12 @@ impl SteamAppInfoCache {
             .timeout_connect(Duration::from_secs(8))
             .timeout(Duration::from_secs(15))
             .build();
+        let lang = crate::services::steam_service::SteamService::detect_steam_language(None)
+            .unwrap_or_else(|| "english".into());
         let url = format!(
-            "https://store.steampowered.com/api/appdetails?appids={}&l=english",
-            app_id
+            "https://store.steampowered.com/api/appdetails?appids={}&l={}",
+            app_id,
+            urlencoding::encode(&lang)
         );
         let payload: Value = agent
             .get(&url)

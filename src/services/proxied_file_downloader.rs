@@ -140,8 +140,7 @@ mod tests {
     #[test]
     fn test_downloader_creation() {
         let downloader = ProxiedFileDownloader::new();
-        assert!(downloader.proxy.api_mirrors().is_empty());
-        assert!(downloader.proxy.download_mirrors().is_empty());
+        assert_eq!(downloader.proxy.download_mirrors().len(), 2);
     }
 
     #[test]

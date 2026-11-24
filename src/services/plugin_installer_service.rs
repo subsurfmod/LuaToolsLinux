@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -261,6 +262,64 @@ impl PluginInstallerService {
             candidates.push(h.join(".local/share/luatools/plugins/luatools/luatools.js"));
         }
         candidates.into_iter().find(|p| p.is_file())
+    }
+
+    
+    pub fn download_and_install_ltsp(
+        &self,
+        steam_root: Option<&Path>,
+    ) -> Result<PathBuf, String> {
+        let zip_url = "https://github.com/madoiscool/LTSP/releases/latest/download/plugin.zip";
+        let proxy = crate::services::github_proxy::GithubProxy::default();
+        let mut zip_bytes = Vec::new();
+
+        for candidate in proxy.candidates(zip_url) {
+            let agent = ureq::AgentBuilder::new()
+                .timeout_connect(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(15))
+                .build();
+            if let Ok(resp) = agent.get(&candidate).call() {
+                let mut buf = Vec::new();
+                if resp.into_reader().take(16 * 1024 * 1024).read_to_end(&mut buf).is_ok() && !buf.is_empty() {
+                    zip_bytes = buf;
+                    break;
+                }
+            }
+        }
+
+        if !zip_bytes.is_empty() {
+            if let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)) {
+                for i in 0..archive.len() {
+                    if let Ok(mut file) = archive.by_index(i) {
+                        let name = file.name().to_string();
+                        if name.ends_with("luatools.js") {
+                            let mut js_content = String::new();
+                            if file.read_to_string(&mut js_content).is_ok() && !js_content.is_empty() {
+                                let target = if let Some(sr) = steam_root {
+                                    sr.join("steamui/LuaTools/luatools.js")
+                                } else if let Some(h) = dirs::home_dir() {
+                                    h.join(".local/share/Steam/steamui/LuaTools/luatools.js")
+                                } else {
+                                    self.plugin_dir.join("luatools").join("luatools.js")
+                                };
+                                if let Some(parent) = target.parent() {
+                                    let _ = fs::create_dir_all(parent);
+                                }
+                                if fs::write(&target, &js_content).is_ok() {
+                                    let _ = crate::services::millennium_service::MillenniumService::register_luatools_plugin(steam_root);
+                                    return Ok(target);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback to embedded default luatools.js
+        let target = self.ensure_luatools_js_installed(steam_root)?;
+        let _ = crate::services::millennium_service::MillenniumService::register_luatools_plugin(steam_root);
+        Ok(target)
     }
 
     pub fn ensure_luatools_js_installed(&self, steam_root: Option<&Path>) -> Result<PathBuf, String> {

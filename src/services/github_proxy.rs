@@ -30,8 +30,14 @@ impl Default for GithubProxy {
             .build();
         Self {
             http,
-            api_mirrors: Vec::new(),
-            download_mirrors: Vec::new(),
+            api_mirrors: vec![
+                "https://ghfast.top/https://api.github.com".into(),
+                "https://gh-proxy.com/https://api.github.com".into(),
+            ],
+            download_mirrors: vec![
+                "https://ghfast.top/".into(),
+                "https://gh-proxy.com/".into(),
+            ],
         }
     }
 }
