@@ -20,6 +20,9 @@ const KNOWN_KEYS: &[&str] = &[
     "LimitDownloadsToSteamLibrary",
     "limitDownloadsToSteamLibrary",
     "workshop",
+    "ManifestOverrides",
+    "ManifestPins",
+    "Manifests",
 ];
 
 #[derive(Debug, Clone)]
@@ -168,6 +171,17 @@ impl SlssteamService {
                         }
                     }
                 }
+                "ManifestOverrides" | "ManifestPins" | "Manifests" => {
+                    if let Value::Mapping(sub) = v {
+                        for (dk, mv) in sub {
+                            if let (Some(did), Some(gid)) =
+                                (Self::value_to_u32(dk), Self::value_to_string(mv))
+                            {
+                                cfg.manifest_overrides.insert(did, gid);
+                            }
+                        }
+                    }
+                }
                 "PlayNotOwnedGames" | "playNotOwnedGames" => {
                     if let Some(b) = v.as_bool() {
                         cfg.play_not_owned = b;
@@ -242,7 +256,17 @@ impl SlssteamService {
         if !cfg.depot_keys.is_empty() {
             lines.push("DepotKeys:".into());
             for (did, key) in &cfg.depot_keys {
-                lines.push(format!("  {}: {}", did, key));
+                let clean_key = key.trim().trim_matches('"');
+                lines.push(format!("  {}: \"{}\"", did, clean_key));
+            }
+            lines.push(String::new());
+        }
+
+        if !cfg.manifest_overrides.is_empty() {
+            lines.push("ManifestOverrides:".into());
+            for (did, gid) in &cfg.manifest_overrides {
+                let clean_gid = gid.trim().trim_matches('"');
+                lines.push(format!("  {}: \"{}\"", did, clean_gid));
             }
             lines.push(String::new());
         }
@@ -336,6 +360,80 @@ impl SlssteamService {
     pub fn set_depot_key(&mut self, depot_id: u32, key: String) {
         self.config.depot_keys.insert(depot_id, key);
     }
+
+    pub fn get_manifest_override(&self, depot_id: u32) -> Option<&str> {
+        self.config.manifest_overrides.get(&depot_id).map(String::as_str)
+    }
+
+    pub fn set_manifest_override(&mut self, depot_id: u32, manifest_id: String) {
+        self.config.manifest_overrides.insert(depot_id, manifest_id);
+    }
+
+    pub fn remove_manifest_override(&mut self, depot_id: u32) -> bool {
+        self.config.manifest_overrides.remove(&depot_id).is_some()
+    }
+
+    /// Synchronizes manifest pins into SLSsteam's `ManifestOverrides` so they take effect under SLSsteam.so.
+    pub fn sync_manifest_pins(&mut self, pins: &[(u32, String)]) {
+        for (depot_id, gid) in pins {
+            self.set_manifest_override(*depot_id, gid.clone());
+        }
+    }
+
+    /// Synchronizes from manifest_pins.json file
+    pub fn sync_from_manifest_pins_file(&mut self, pins_path: Option<&Path>) -> bool {
+        let default_path = crate::models::config::default_luatools_data_dir().join("manifest_pins.json");
+        let path = pins_path.unwrap_or(&default_path);
+        if let Ok(raw) = fs::read_to_string(path) {
+            if let Ok(list) = serde_json::from_str::<Vec<serde_json::Value>>(&raw) {
+                let mut changed = false;
+                for item in list {
+                    if let (Some(did), Some(gid)) = (
+                        item.get("depot_id").and_then(|v| v.as_u64()).map(|v| v as u32),
+                        item.get("manifest_id").and_then(|v| v.as_str()),
+                    ) {
+                        if !gid.is_empty() {
+                            self.config.manifest_overrides.insert(did, gid.to_string());
+                            changed = true;
+                        }
+                    }
+                }
+                if changed {
+                    return self.save();
+                }
+            }
+        }
+        false
+    }
+
+    /// Synchronizes all bridge states (spoofed apps, fake app IDs, depot keys, tokens, and manifest pins)
+    /// into SLSsteam config.yaml.
+    pub fn sync_bridge_states(
+        &mut self,
+        additional_apps: &[u32],
+        fake_app_ids: &[(u32, u32)],
+        depot_keys: &[(u32, String)],
+        app_tokens: &[(u32, String)],
+        manifest_pins: &[(u32, String)],
+    ) -> bool {
+        self.config.play_not_owned = true;
+        for &app_id in additional_apps {
+            self.add_additional_app(app_id);
+        }
+        for &(app_id, target_id) in fake_app_ids {
+            self.set_fake_app_id(app_id, target_id);
+        }
+        for (depot_id, key) in depot_keys {
+            self.set_depot_key(*depot_id, key.clone());
+        }
+        for (app_id, token) in app_tokens {
+            self.set_token(*app_id, token.clone());
+        }
+        for (depot_id, gid) in manifest_pins {
+            self.set_manifest_override(*depot_id, gid.clone());
+        }
+        self.save()
+    }
 }
 
 #[cfg(test)]
@@ -354,6 +452,7 @@ mod tests {
         svc.set_fake_app_id(1245620, 480);
         svc.set_token(1245620, "tok_abc".into());
         svc.set_depot_key(1245621, "a".repeat(64));
+        svc.set_manifest_override(1245621, "8888777766665555444".into());
         svc.add_additional_app(1245620);
         svc.add_additional_app(1091500);
         svc.config
@@ -363,12 +462,18 @@ mod tests {
             .insert(2778580, "Shadow \"DLC\"".into());
         assert!(svc.save());
 
+        // Check that depot keys and manifest overrides are properly quoted in output YAML
+        let raw_yaml = fs::read_to_string(&cfg_path).unwrap();
+        assert!(raw_yaml.contains(&format!("  1245621: \"{}\"", "a".repeat(64))));
+        assert!(raw_yaml.contains("  1245621: \"8888777766665555444\""));
+
         let svc2 = SlssteamService::new(Some(cfg_path));
         assert!(svc2.config.play_not_owned);
         assert!(svc2.config.limit_downloads);
         assert_eq!(svc2.config.workshop_path, "/opt/DepotDownloaderMod");
         assert_eq!(svc2.get_fake_app_id(1245620), Some(480));
         assert_eq!(svc2.get_token(1245620), Some("tok_abc"));
+        assert_eq!(svc2.get_manifest_override(1245621), Some("8888777766665555444"));
         assert_eq!(svc2.config.additional_apps, vec![1091500, 1245620]);
         assert_eq!(svc2.config.dlc_data[&1245620][&2778580], "Shadow \"DLC\"");
     }

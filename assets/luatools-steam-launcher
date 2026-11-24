@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# LuaTools Linux — Steam Launcher Wrapper
+# Launches 32-bit Steam targeting ~/.local/bin/steam-sls (LD_AUDIT=SLSsteam.so)
+# to ensure game unlocks and manifest overrides take effect, while preventing
+# fatal ELFCLASS64 collisions from 64-bit libsteam_integration.so LD_PRELOAD.
+#
+# Supports --gdb and --lldb interactive debugger options.
+# ==============================================================================
+set -e
+
+DEBUGGER=""
+case "${1:-}" in
+  --gdb)
+    DEBUGGER="gdb"
+    shift
+    ;;
+  --lldb)
+    DEBUGGER="lldb"
+    shift
+    ;;
+esac
+
+# Clean LD_PRELOAD: strip 64-bit libsteam_integration.so so 32-bit Steam never crashes with ELFCLASS64
+if [ -n "${LD_PRELOAD:-}" ]; then
+  CLEANED_PRELOAD="$(echo "$LD_PRELOAD" | tr ':' '\n' | grep -v 'libsteam_integration.so' | tr '\n' ':' | sed 's/:$//')"
+  export LD_PRELOAD="$CLEANED_PRELOAD"
+fi
+
+STEAM_SLS="${HOME}/.local/bin/steam-sls"
+
+# If ~/.local/bin/steam-sls exists and is executable, execute it directly
+if [ -x "$STEAM_SLS" ]; then
+  if [ "$DEBUGGER" = "gdb" ]; then
+    exec gdb --args "$STEAM_SLS" "$@"
+  elif [ "$DEBUGGER" = "lldb" ]; then
+    exec lldb -- "$STEAM_SLS" "$@"
+  else
+    exec "$STEAM_SLS" "$@"
+  fi
+fi
+
+# Fallback: locate SLSsteam.so in known locations and set LD_AUDIT
+SLS_DIR=""
+for cand in \
+  "${HOME}/.local/lib/luatools/slssteam" \
+  "${HOME}/.local/share/SLSsteam" \
+  "/usr/local/lib/luatools/slssteam"; do
+  if [ -f "${cand}/SLSsteam.so" ]; then
+    SLS_DIR="$cand"
+    break
+  fi
+done
+
+if [ -n "$SLS_DIR" ]; then
+  if [ -f "${SLS_DIR}/library-inject.so" ]; then
+    AUDIT="${SLS_DIR}/library-inject.so:${SLS_DIR}/SLSsteam.so"
+  else
+    AUDIT="${SLS_DIR}/SLSsteam.so"
+  fi
+  export LD_AUDIT="${AUDIT}${LD_AUDIT:+:$LD_AUDIT}"
+fi
+
+# Locate Steam binary
+STEAM_BIN=""
+if [ -x "${HOME}/.local/share/Steam/steam.sh" ]; then
+  STEAM_BIN="${HOME}/.local/share/Steam/steam.sh"
+elif [ -x "${HOME}/.steam/steam/steam.sh" ]; then
+  STEAM_BIN="${HOME}/.steam/steam/steam.sh"
+elif command -v steam >/dev/null 2>&1; then
+  STEAM_BIN="steam"
+else
+  STEAM_BIN="steam"
+fi
+
+if [ "$DEBUGGER" = "gdb" ]; then
+  exec gdb --args "$STEAM_BIN" "$@"
+elif [ "$DEBUGGER" = "lldb" ]; then
+  exec lldb -- "$STEAM_BIN" "$@"
+else
+  exec "$STEAM_BIN" "$@"
+fi

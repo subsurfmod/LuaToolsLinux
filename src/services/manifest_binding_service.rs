@@ -84,13 +84,19 @@ impl ManifestBindingService {
         let pin = ManifestPin {
             app_id,
             depot_id,
-            manifest_id,
+            manifest_id: manifest_id.clone(),
             size,
             active_in_bridge: bound,
         };
         let mut guard = self.pins.lock().unwrap();
         guard.insert((app_id, depot_id), pin);
         self.persist(&guard);
+
+        // Connect manifest pin into SLSsteam config.yaml so overrides take effect in Steam
+        let mut sls = SlssteamService::default();
+        sls.set_manifest_override(depot_id, manifest_id);
+        let _ = sls.save();
+
         bound
     }
 
@@ -101,6 +107,11 @@ impl ManifestBindingService {
         self.persist(&guard);
         drop(guard);
         let _ = IpcClient::new().send(&IpcMessage::RemoveManifestPin { app_id, depot_id });
+
+        // Remove manifest override from SLSsteam config.yaml
+        let mut sls = SlssteamService::default();
+        sls.remove_manifest_override(depot_id);
+        let _ = sls.save();
     }
 
     /// Imports active `setManifestid(...)` declarations from a parsed `.lua` file if not already tracked.
@@ -193,7 +204,36 @@ impl ManifestBindingService {
         }
     }
 
-    pub fn sync_from_slssteam(&self, _sls: &SlssteamService) {}
+    pub fn sync_from_slssteam(&self, sls: &SlssteamService) {
+        let mut guard = self.pins.lock().unwrap();
+        let mut changed = false;
+        for (&depot_id, gid) in &sls.config.manifest_overrides {
+            let existing_key = guard.keys().find(|(_, d)| *d == depot_id).copied();
+            if let Some(key) = existing_key {
+                if let Some(p) = guard.get_mut(&key) {
+                    if p.manifest_id != *gid {
+                        p.manifest_id = gid.clone();
+                        changed = true;
+                    }
+                }
+            } else {
+                guard.insert(
+                    (0, depot_id),
+                    ManifestPin {
+                        app_id: 0,
+                        depot_id,
+                        manifest_id: gid.clone(),
+                        size: 0,
+                        active_in_bridge: false,
+                    },
+                );
+                changed = true;
+            }
+        }
+        if changed {
+            self.persist(&guard);
+        }
+    }
 }
 
 #[cfg(test)]

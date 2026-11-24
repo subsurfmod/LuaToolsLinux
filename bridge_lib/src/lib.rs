@@ -24,6 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ctor::ctor;
 use luatools_linux::parsers::lua_parser::LuaFileParser;
 use luatools_linux::services::manifest_binding_service::ManifestPin;
+use luatools_linux::services::slssteam_service::SlssteamService;
 use luatools_linux::services::steam_bridge_service::BridgeOverrides;
 use luatools_linux::steam_bridge::{
     binary_reader::{
@@ -387,7 +388,7 @@ unsafe extern "C" fn depot_decrypt_replacement(
         }
 
         if let Some(key_bytes) = key_bytes_opt {
-            if !buffer.is_null() && size == 32 {
+            if !buffer.is_null() && size >= 32 {
                 std::ptr::copy_nonoverlapping(key_bytes.as_ptr(), buffer, 32);
                 return true;
             }
@@ -489,9 +490,24 @@ fn libsteam_integration_init() {
     });
 }
 
+fn sync_to_slssteam_config<F: FnOnce(&mut SlssteamService)>(modify: F) {
+    let mut sls = SlssteamService::default();
+    modify(&mut sls);
+    let _ = sls.save();
+}
+
 fn load_persisted_state(steam_root: &Path) {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let data_dir = home.join(".local/share/luatools");
+
+    // Clear existing maps on reload to avoid append-only retention of deleted entries
+    write_lock(spoofed_apps()).clear();
+    write_lock(app_id_spoofs()).clear();
+    write_lock(legacy_cdkeys()).clear();
+    write_lock(depot_keys()).clear();
+    write_lock(stats()).clear();
+    write_lock(manifest_pins()).clear();
+    write_lock(cached_tickets()).clear();
 
     // 1. Load bridge_overrides.json
     if let Ok(raw) = fs::read_to_string(data_dir.join("bridge_overrides.json")) {
@@ -541,7 +557,48 @@ fn load_persisted_state(steam_root: &Path) {
         }
     }
 
-    // 3. Import stplug-in/*.lua entitlements, depot decryption keys, and active manifest pins
+    // 3. Load from SLSsteam config.yaml (ManifestOverrides, DepotKeys, FakeAppIds, AdditionalApps, AppTokens)
+    let sls = SlssteamService::default();
+    if sls.config_path.is_file() {
+        {
+            let mut mp = write_lock(manifest_pins());
+            for (&did, gid) in &sls.config.manifest_overrides {
+                mp.insert((0, did), gid.clone());
+            }
+        }
+        {
+            let mut dks = write_lock(depot_keys());
+            for (&did, key) in &sls.config.depot_keys {
+                dks.insert(did, key.clone());
+            }
+        }
+        {
+            let mut spoofs = write_lock(app_id_spoofs());
+            for (&aid, &did) in &sls.config.fake_app_ids {
+                spoofs.insert(aid, did);
+            }
+        }
+        {
+            let mut apps = write_lock(spoofed_apps());
+            for &aid in &sls.config.additional_apps {
+                apps.insert(aid);
+            }
+        }
+        {
+            let mut ct = write_lock(cached_tickets());
+            for (&aid, tok) in &sls.config.app_tokens {
+                ct.entry(aid).or_insert_with(|| AppTicketData {
+                    app_id: aid,
+                    steam_id: None,
+                    app_ticket: Some(tok.clone()),
+                    e_ticket: None,
+                    last_update: None,
+                });
+            }
+        }
+    }
+
+    // 4. Import stplug-in/*.lua entitlements, depot decryption keys, active manifest pins, and tokens
     let stplug_dir = steam_root.join("config/stplug-in");
     if let Ok(entries) = fs::read_dir(&stplug_dir) {
         for entry in entries.flatten() {
@@ -574,11 +631,20 @@ fn load_persisted_state(steam_root: &Path) {
                         }
                     }
                 }
+                for (aid, tok) in parsed.tokens {
+                    write_lock(cached_tickets()).entry(aid).or_insert_with(|| AppTicketData {
+                        app_id: aid,
+                        steam_id: None,
+                        app_ticket: Some(tok),
+                        e_ticket: None,
+                        last_update: None,
+                    });
+                }
             }
         }
     }
 
-    // 4. Load TicketStore cache from <steam_root>/config/localconfig.vdf
+    // 5. Load TicketStore cache from <steam_root>/config/localconfig.vdf
     let mut store = TicketStore::new(&steam_root.join("config"));
     if store.load().is_ok() {
         if let Ok(ids) = store.list_app_ids() {
@@ -933,7 +999,7 @@ fn handle_ipc_message(msg: ipc::IpcMessage) -> Option<ipc::IpcMessage> {
             let data = AppTicketData {
                 app_id,
                 steam_id,
-                app_ticket,
+                app_ticket: app_ticket.clone(),
                 e_ticket,
                 last_update: Some(
                     SystemTime::now()
@@ -944,6 +1010,11 @@ fn handle_ipc_message(msg: ipc::IpcMessage) -> Option<ipc::IpcMessage> {
             };
             write_lock(cached_tickets()).insert(app_id, data.clone());
             let _ = store.set(data);
+            if let Some(tok) = app_ticket {
+                sync_to_slssteam_config(|sls| {
+                    sls.set_token(app_id, tok);
+                });
+            }
             pong_ok()
         }
         ipc::IpcMessage::RemoveTicket { app_id } => {
@@ -952,17 +1023,32 @@ fn handle_ipc_message(msg: ipc::IpcMessage) -> Option<ipc::IpcMessage> {
             let mut store = TicketStore::new(&config_dir);
             let _ = store.load();
             let _ = store.remove(app_id);
+            sync_to_slssteam_config(|sls| {
+                sls.remove_token(app_id);
+            });
             pong_ok()
         }
         ipc::IpcMessage::AddPlayUnownedApp { app_id } => {
             write_lock(spoofed_apps()).insert(app_id);
+            sync_to_slssteam_config(|sls| {
+                sls.config.play_not_owned = true;
+                sls.add_additional_app(app_id);
+            });
             pong_ok()
         }
         ipc::IpcMessage::RemovePlayUnownedApp { app_id } => {
             write_lock(spoofed_apps()).remove(&app_id);
+            sync_to_slssteam_config(|sls| {
+                sls.remove_additional_app(app_id);
+            });
             pong_ok()
         }
-        ipc::IpcMessage::SetPlayUnowned { .. } => pong_ok(),
+        ipc::IpcMessage::SetPlayUnowned { enabled } => {
+            sync_to_slssteam_config(|sls| {
+                sls.config.play_not_owned = enabled;
+            });
+            pong_ok()
+        }
         ipc::IpcMessage::SetStat {
             app_id,
             stat_name,
@@ -984,11 +1070,17 @@ fn handle_ipc_message(msg: ipc::IpcMessage) -> Option<ipc::IpcMessage> {
             pong_ok()
         }
         ipc::IpcMessage::SetDepotKey { depot_id, key } => {
-            write_lock(depot_keys()).insert(depot_id, key);
+            write_lock(depot_keys()).insert(depot_id, key.clone());
+            sync_to_slssteam_config(|sls| {
+                sls.set_depot_key(depot_id, key);
+            });
             pong_ok()
         }
         ipc::IpcMessage::RemoveDepotKey { depot_id } => {
             write_lock(depot_keys()).remove(&depot_id);
+            sync_to_slssteam_config(|sls| {
+                sls.config.depot_keys.remove(&depot_id);
+            });
             pong_ok()
         }
         ipc::IpcMessage::FetchManifestCode { gid } => {
@@ -1000,23 +1092,42 @@ fn handle_ipc_message(msg: ipc::IpcMessage) -> Option<ipc::IpcMessage> {
             Some(ipc::IpcMessage::ManifestCodeResponse { gid, code })
         }
         ipc::IpcMessage::FetchManifestCodeEx {
-            app_id: _,
-            depot_id: _,
+            app_id,
+            depot_id,
             gid,
         } => {
+            let effective_gid = if gid.is_empty() {
+                let mp = read_lock(manifest_pins());
+                mp.get(&(app_id, depot_id))
+                    .cloned()
+                    .or_else(|| {
+                        mp.iter()
+                            .find(|((_, did), _)| *did == depot_id)
+                            .map(|(_, g)| g.clone())
+                    })
+                    .unwrap_or(gid)
+            } else {
+                gid
+            };
             let code = read_lock(manifest_codes())
-                .get(&gid)
+                .get(&effective_gid)
                 .cloned()
-                .unwrap_or_else(|| gid.clone());
-            write_lock(manifest_codes()).insert(gid.clone(), code.clone());
-            Some(ipc::IpcMessage::ManifestCodeResponse { gid, code })
+                .unwrap_or_else(|| effective_gid.clone());
+            write_lock(manifest_codes()).insert(effective_gid.clone(), code.clone());
+            Some(ipc::IpcMessage::ManifestCodeResponse { gid: effective_gid, code })
         }
         ipc::IpcMessage::SetAppIdSpoof { app_id, spoof_id } => {
             write_lock(app_id_spoofs()).insert(app_id, spoof_id);
+            sync_to_slssteam_config(|sls| {
+                sls.set_fake_app_id(app_id, spoof_id);
+            });
             pong_ok()
         }
         ipc::IpcMessage::RemoveAppIdSpoof { app_id } => {
             write_lock(app_id_spoofs()).remove(&app_id);
+            sync_to_slssteam_config(|sls| {
+                sls.remove_fake_app_id(app_id);
+            });
             pong_ok()
         }
         ipc::IpcMessage::SetManifestPin {
@@ -1026,6 +1137,9 @@ fn handle_ipc_message(msg: ipc::IpcMessage) -> Option<ipc::IpcMessage> {
             size: _,
         } => {
             write_lock(manifest_pins()).insert((app_id, depot_id), manifest_id.clone());
+            sync_to_slssteam_config(|sls| {
+                sls.set_manifest_override(depot_id, manifest_id.clone());
+            });
             Some(ipc::IpcMessage::ManifestBound {
                 app_id,
                 depot_id,
@@ -1035,6 +1149,9 @@ fn handle_ipc_message(msg: ipc::IpcMessage) -> Option<ipc::IpcMessage> {
         }
         ipc::IpcMessage::RemoveManifestPin { app_id, depot_id } => {
             write_lock(manifest_pins()).remove(&(app_id, depot_id));
+            sync_to_slssteam_config(|sls| {
+                sls.remove_manifest_override(depot_id);
+            });
             Some(ipc::IpcMessage::ManifestBound {
                 app_id,
                 depot_id,
@@ -1052,7 +1169,147 @@ fn handle_ipc_message(msg: ipc::IpcMessage) -> Option<ipc::IpcMessage> {
     }
 }
 
+/// Reader function for manifest pins
+pub fn get_pinned_manifest(app_id: u32, depot_id: u32) -> Option<String> {
+    let mp = read_lock(manifest_pins());
+    mp.get(&(app_id, depot_id))
+        .cloned()
+        .or_else(|| {
+            mp.iter()
+                .find(|((_, did), _)| *did == depot_id)
+                .map(|(_, gid)| gid.clone())
+        })
+}
+
+/// Exported C reader for pinned manifest GIDs
+#[no_mangle]
+pub extern "C" fn get_pinned_manifest_id(app_id: u32, depot_id: u32) -> u64 {
+    get_pinned_manifest(app_id, depot_id)
+        .and_then(|gid| gid.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Reader function for legacy CD keys
+pub fn get_legacy_cd_key(app_id: u32) -> Option<String> {
+    read_lock(legacy_cdkeys()).get(&app_id).cloned()
+}
+
+/// Exported C reader for legacy CD keys
+#[no_mangle]
+pub unsafe extern "C" fn get_legacy_cdkey(
+    app_id: u32,
+    buf: *mut libc::c_char,
+    max_len: u32,
+) -> bool {
+    panic::catch_unwind(AssertUnwindSafe(|| {
+        if let Some(key) = read_lock(legacy_cdkeys()).get(&app_id) {
+            if !buf.is_null() && max_len > 0 {
+                let bytes = key.as_bytes();
+                let n = (max_len as usize - 1).min(bytes.len());
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
+                *buf.add(n) = 0;
+                return true;
+            }
+        }
+        false
+    }))
+    .unwrap_or(false)
+}
+
+/// Reader function for stats
+pub fn get_stat(app_id: u32, stat_name: &str) -> Option<String> {
+    read_lock(stats()).get(&(app_id, stat_name.to_string())).cloned()
+}
+
+/// Exported C reader for stats
+#[no_mangle]
+pub unsafe extern "C" fn get_stat_override(
+    app_id: u32,
+    stat_name: *const libc::c_char,
+    buf: *mut libc::c_char,
+    max_len: u32,
+) -> bool {
+    panic::catch_unwind(AssertUnwindSafe(|| {
+        if stat_name.is_null() {
+            return false;
+        }
+        let c_str = std::ffi::CStr::from_ptr(stat_name);
+        let Ok(name_str) = c_str.to_str() else {
+            return false;
+        };
+        if let Some(val) = read_lock(stats()).get(&(app_id, name_str.to_string())) {
+            if !buf.is_null() && max_len > 0 {
+                let bytes = val.as_bytes();
+                let n = (max_len as usize - 1).min(bytes.len());
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
+                *buf.add(n) = 0;
+                return true;
+            }
+        }
+        false
+    }))
+    .unwrap_or(false)
+}
+
 #[ctor]
 fn init() {
     libsteam_integration_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_readers_and_c_exports() {
+        write_lock(manifest_pins()).insert((1245620, 1245621), "8888777766665555444".into());
+        assert_eq!(get_pinned_manifest(1245620, 1245621), Some("8888777766665555444".into()));
+        assert_eq!(get_pinned_manifest_id(1245620, 1245621), 8888777766665555444);
+
+        write_lock(legacy_cdkeys()).insert(1245620, "XXXXX-YYYYY-ZZZZZ".into());
+        assert_eq!(get_legacy_cd_key(1245620), Some("XXXXX-YYYYY-ZZZZZ".into()));
+        let mut buf = [0i8; 64];
+        assert!(unsafe { get_legacy_cdkey(1245620, buf.as_mut_ptr(), 64) });
+        let key_str = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()).to_str().unwrap() };
+        assert_eq!(key_str, "XXXXX-YYYYY-ZZZZZ");
+
+        write_lock(stats()).insert((1245620, "KILLS".into()), "42".into());
+        assert_eq!(get_stat(1245620, "KILLS"), Some("42".into()));
+        let c_stat = std::ffi::CString::new("KILLS").unwrap();
+        let mut stat_buf = [0i8; 16];
+        assert!(unsafe { get_stat_override(1245620, c_stat.as_ptr(), stat_buf.as_mut_ptr(), 16) });
+        let val_str = unsafe { std::ffi::CStr::from_ptr(stat_buf.as_ptr()).to_str().unwrap() };
+        assert_eq!(val_str, "42");
+    }
+
+    #[test]
+    fn test_ipc_manifest_and_slssteam_sync() {
+        let resp = handle_ipc_message(ipc::IpcMessage::SetManifestPin {
+            app_id: 1245630,
+            depot_id: 1245631,
+            manifest_id: "9999888877776666".into(),
+            size: 1024,
+        });
+        match resp {
+            Some(ipc::IpcMessage::ManifestBound { active, manifest_id, .. }) => {
+                assert!(active);
+                assert_eq!(manifest_id, "9999888877776666");
+            }
+            other => panic!("Unexpected response: {:?}", other),
+        }
+        assert_eq!(get_pinned_manifest(1245630, 1245631), Some("9999888877776666".into()));
+
+        // Also verify FetchManifestCodeEx reads pinned manifest
+        let code_resp = handle_ipc_message(ipc::IpcMessage::FetchManifestCodeEx {
+            app_id: 1245630,
+            depot_id: 1245631,
+            gid: String::new(),
+        });
+        match code_resp {
+            Some(ipc::IpcMessage::ManifestCodeResponse { gid, .. }) => {
+                assert_eq!(gid, "9999888877776666");
+            }
+            other => panic!("Unexpected response: {:?}", other),
+        }
+    }
 }

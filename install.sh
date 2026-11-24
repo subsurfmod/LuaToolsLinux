@@ -7,7 +7,7 @@
 set -euo pipefail
 
 APP_NAME="luatools"
-APP_VERSION="2.9.1-beta"
+APP_VERSION="2.9.2-beta"
 REPO_URL="https://github.com/subsurfmod/LuaToolsLinux.git"
 SCRIPT_DIR=""
 if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
@@ -222,6 +222,8 @@ install_files() {
         info "Installing system-wide into /usr/local..."
         run_privileged mkdir -p "$bin_dir" "$lib_dir" "$apps_dir" "$icon_dir"
         run_privileged install -m 0755 "$BIN_SOURCE" "${bin_dir}/${APP_NAME}"
+        local launcher_src="${SCRIPT_DIR}/assets/luatools-steam-launcher"
+        [ -f "$launcher_src" ] && run_privileged install -m 0755 "$launcher_src" "${bin_dir}/luatools-steam-launcher"
         [ -n "$bridge_src" ] && run_privileged install -m 0755 "$bridge_src" "${lib_dir}/libsteam_integration.so"
         [ -n "$patch_src" ] && run_privileged install -m 0755 "$patch_src" "${lib_dir}/libsteam_auto_patch_linux.so"
         run_privileged install -m 0644 "${SCRIPT_DIR}/assets/luatools.svg" "${icon_dir}/luatools.svg"
@@ -249,6 +251,8 @@ install_files() {
                  "${HOME}/.cache/luatools"
 
         install -m 0755 "$BIN_SOURCE" "${bin_dir}/${APP_NAME}"
+        local launcher_src="${SCRIPT_DIR}/assets/luatools-steam-launcher"
+        [ -f "$launcher_src" ] && install -m 0755 "$launcher_src" "${bin_dir}/luatools-steam-launcher"
         [ -n "$bridge_src" ] && install -m 0755 "$bridge_src" "${lib_dir}/libsteam_integration.so"
         [ -n "$patch_src" ] && install -m 0755 "$patch_src" "${lib_dir}/libsteam_auto_patch_linux.so"
         install -m 0644 "${SCRIPT_DIR}/assets/luatools.svg" "${icon_dir}/luatools.svg"

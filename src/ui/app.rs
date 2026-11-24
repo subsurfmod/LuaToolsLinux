@@ -1727,7 +1727,12 @@ impl LuaToolsApp {
                 }
             }
 
-            let launch_bin = if launcher.is_file() {
+            let steam_sls = dirs::home_dir()
+                .map(|h| h.join(".local/bin/steam-sls"))
+                .filter(|p| p.is_file());
+            let launch_bin = if let Some(sls) = steam_sls {
+                sls
+            } else if launcher.is_file() {
                 launcher
             } else {
                 steam_cmd
@@ -1837,7 +1842,12 @@ impl LuaToolsApp {
                     let _ = crate::steam_bridge::preload_loader::kill_all_steam_instances();
                 }
             }
-            let launch_bin = if launcher.is_file() {
+            let steam_sls = dirs::home_dir()
+                .map(|h| h.join(".local/bin/steam-sls"))
+                .filter(|p| p.is_file());
+            let launch_bin = if let Some(sls) = steam_sls {
+                sls
+            } else if launcher.is_file() {
                 launcher
             } else {
                 steam_cmd
@@ -1960,7 +1970,17 @@ impl LuaToolsApp {
             "game" | "install" => {
                 self.open_app_in_acquire(act.app_id, ctx);
                 if let Some(src) = act.source {
-                    self.acquire_selected_source = Some(src);
+                    self.acquire_selected_source = Some(src.clone());
+                    if act.silent {
+                        self.start_acquire_download(act.app_id, src, ctx);
+                    }
+                } else if act.silent {
+                    let src = if HubcapService::is_valid_key_format(&self.settings_service.settings.hubcap_api_key) {
+                        "hubcap".to_string()
+                    } else {
+                        "morrenus".to_string()
+                    };
+                    self.start_acquire_download(act.app_id, src, ctx);
                 }
             }
             "manage" => self.open_game_in_depots(act.app_id, ctx),
