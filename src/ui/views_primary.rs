@@ -39,10 +39,16 @@ impl LuaToolsApp {
                     "lets start crackin 😛",
                     "Add Steam games in one click or drop game files below",
                     |ui| {
-                        if ghost_button(ui, "Help").clicked() {
+                        if ghost_button(ui, "Help")
+                            .on_hover_text("Open the illustrated user guide and troubleshooting tips (F1)")
+                            .clicked()
+                        {
                             go_guide = true;
                         }
-                        if primary_button(ui, "Add Games").clicked() {
+                        if primary_button(ui, "Add Games")
+                            .on_hover_text("Search Steam games and install .lua manifests from cloud providers")
+                            .clicked()
+                        {
                             go_discover = true;
                         }
                     },
@@ -81,7 +87,10 @@ impl LuaToolsApp {
                             });
                         },
                         |ui| {
-                            if primary_button(ui, "Browse Files…").clicked() {
+                            if primary_button(ui, "Browse Files…")
+                                .on_hover_text("Pick local .lua, .manifest, or .zip packages from disk")
+                                .clicked()
+                            {
                                 let tx = self.msg_tx.clone();
                                 let ctx = ui.ctx().clone();
                                 thread::spawn(move || {
@@ -174,6 +183,9 @@ impl LuaToolsApp {
                                         },
                                         steam_tone,
                                     )
+                                    .on_hover_text(
+                                        "Click to open Settings › General (Steam folder path, rescan, login autostart & system tray)",
+                                    )
                                     .clicked()
                                     {
                                         click_steam_tile = true;
@@ -192,6 +204,9 @@ impl LuaToolsApp {
                                         } else {
                                             BadgeTone::Warn
                                         },
+                                    )
+                                    .on_hover_text(
+                                        "Click to open Settings › Steam Setup (1-click SLSsteam installer, Play Unowned & Cloud Save Redirect)",
                                     )
                                     .clicked()
                                     {
@@ -215,6 +230,9 @@ impl LuaToolsApp {
                                         } else {
                                             BadgeTone::Neutral
                                         },
+                                    )
+                                    .on_hover_text(
+                                        "Click to open Settings › Account (Discord sign-in, Hubcap API key & DepotDownloader QR login)",
                                     )
                                     .clicked()
                                     {
@@ -244,15 +262,27 @@ impl LuaToolsApp {
                 egui::Sides::new().show(
                     ui,
                     |ui| {
-                        ui.label(
-                            RichText::new("Recently Added Games")
-                                .font(display_font(17.5))
-                                .color(Palette::TEXT_PRIMARY),
-                        );
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            ui.label(
+                                RichText::new("Recently Added Games")
+                                    .font(display_font(17.5))
+                                    .color(Palette::TEXT_PRIMARY),
+                            );
+                            ui.label(
+                                RichText::new(
+                                    "Click Open on any game for 1-click Recommended Fixes & Integration, or Depots & DLC to manage files",
+                                )
+                                .size(12.0)
+                                .color(Palette::TEXT_MUTED),
+                            );
+                        });
                     },
                     |ui| {
                         if !self.library_rows.is_empty()
-                            && ghost_button(ui, "View All Games ›").clicked()
+                            && ghost_button(ui, "View All Games ›")
+                                .on_hover_text("Open My Games to see all added and installed titles")
+                                .clicked()
                         {
                             self.active_view = ActiveView::Library;
                         }
@@ -295,6 +325,7 @@ impl LuaToolsApp {
                         });
                     });
                 } else {
+                    let mut open_integration = None;
                     let mut open_depots = None;
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = Vec2::new(14.0, 14.0);
@@ -305,21 +336,25 @@ impl LuaToolsApp {
                                 self.cover_textures.get(&aid).cloned();
                             let loading_cover = self.cover_in_flight.contains(&aid);
                             let name = self.resolve_game_title(aid);
+                            let is_installed = self
+                                .library_rows
+                                .iter()
+                                .any(|r| r.app_id == aid && r.installed);
 
                             paper_card_padded(ui, Margin::same(12), |ui| {
-                                ui.set_width(222.0);
+                                ui.set_width(228.0);
                                 ui.vertical(|ui| {
                                     ui.spacing_mut().item_spacing.y = 6.0;
                                     let cover_resp = if let Some(t) = tex {
                                         ui.add(
                                             egui::Image::new(&t)
-                                                .fit_to_exact_size(Vec2::new(222.0, 104.0))
+                                                .fit_to_exact_size(Vec2::new(228.0, 106.0))
                                                 .corner_radius(CornerRadius::same(3))
                                                 .sense(Sense::click()),
                                         )
                                     } else {
                                         let (rect, resp) = ui.allocate_exact_size(
-                                            Vec2::new(222.0, 104.0),
+                                            Vec2::new(228.0, 106.0),
                                             Sense::click(),
                                         );
                                         ui.painter().rect_filled(
@@ -344,8 +379,13 @@ impl LuaToolsApp {
                                     if cover_resp.hovered() {
                                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                     }
-                                    if cover_resp.clicked() {
-                                        open_depots = Some(aid);
+                                    if cover_resp
+                                        .on_hover_text(
+                                            "Click to open Integration & Process Controls for this game",
+                                        )
+                                        .clicked()
+                                    {
+                                        open_integration = Some(aid);
                                     }
                                     let title_resp = ui.label(
                                         RichText::new(truncate_label(&name, 26))
@@ -365,15 +405,47 @@ impl LuaToolsApp {
                                             );
                                         },
                                         |ui| {
-                                            if table_button(ui, "Open", true).clicked() {
-                                                open_depots = Some(aid);
-                                            }
+                                            ui.label(
+                                                RichText::new(if is_installed {
+                                                    "Installed + Lua"
+                                                } else {
+                                                    "Added (.lua)"
+                                                })
+                                                .size(11.0)
+                                                .color(if is_installed {
+                                                    Palette::GO_TEXT
+                                                } else {
+                                                    Palette::BLUE_LIGHT
+                                                }),
+                                            );
                                         },
                                     );
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        if table_button(ui, "Open", true)
+                                            .on_hover_text(
+                                                "Open Integration & Process Controls (1-click Recommended Fixes, Play Unowned, AppID 480 redirect, Goldberg & game tools)",
+                                            )
+                                            .clicked()
+                                        {
+                                            open_integration = Some(aid);
+                                        }
+                                        if table_button(ui, "Depots & DLC", false)
+                                            .on_hover_text(
+                                                "Open Depots & Vault to toggle DLCs, switch saved .lua builds, pin manifests, or download depots",
+                                            )
+                                            .clicked()
+                                        {
+                                            open_depots = Some(aid);
+                                        }
+                                    });
                                 });
                             });
                         }
                     });
+                    if let Some(aid) = open_integration {
+                        self.open_integration_for_app(aid);
+                    }
                     if let Some(aid) = open_depots {
                         self.open_game_in_depots(aid, ui.ctx());
                     }
@@ -544,10 +616,14 @@ impl LuaToolsApp {
                                     self.ensure_cover_requested(aid, known_url, ui.ctx());
                                     let loading_cover = self.cover_in_flight.contains(&aid);
                                     let has_lua = self
-                                        .lua_installer
-                                        .as_ref()
-                                        .and_then(|i| i.read_installed_lua_path(aid))
-                                        .is_some();
+                                        .library_rows
+                                        .iter()
+                                        .any(|r| r.app_id == aid && r.has_lua)
+                                        || self
+                                            .lua_installer
+                                            .as_ref()
+                                            .and_then(|i| i.read_installed_lua_path(aid))
+                                            .is_some();
 
                                     ui.horizontal(|ui| {
                                         ui.spacing_mut().item_spacing.x = 16.0;
@@ -689,12 +765,23 @@ impl LuaToolsApp {
                                     });
 
                                     ui.add_space(14.0);
+                                    let selected_title = self
+                                        .acquire_details
+                                        .as_ref()
+                                        .filter(|d| d.app_id == aid && !d.name.is_empty())
+                                        .map(|d| d.name.clone())
+                                        .unwrap_or_else(|| self.resolve_game_title(aid));
                                     ui.horizontal_wrapped(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                        ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
                                         ui.add_enabled_ui(
                                             !avail_providers.is_empty() && !self.acquire_busy,
                                             |ui| {
-                                                if primary_button(ui, "Install Game").clicked() {
+                                                if primary_button(ui, "Install Game")
+                                                    .on_hover_text(
+                                                        "Download and install the .lua manifest package from the selected provider",
+                                                    )
+                                                    .clicked()
+                                                {
                                                     let chosen = self
                                                         .acquire_selected_source
                                                         .clone()
@@ -713,22 +800,53 @@ impl LuaToolsApp {
                                             },
                                         );
 
-                                        if has_lua
-                                            && secondary_button(ui, "Files & DLC").clicked()
-                                        {
-                                            self.open_game_in_depots(aid, ui.ctx());
+                                        if has_lua {
+                                            if secondary_button(ui, "Open Setup / Integration")
+                                                .on_hover_text(
+                                                    "Open Integration & Process Controls (1-click Recommended Fixes, Play Unowned, AppID 480 redirect, Goldberg)",
+                                                )
+                                                .clicked()
+                                            {
+                                                self.open_integration_for_app(aid);
+                                            }
+                                            if secondary_button(ui, "Files & DLC")
+                                                .on_hover_text(
+                                                    "Open Depots & Vault to toggle DLCs, switch saved .lua builds, pin manifests, or download depots",
+                                                )
+                                                .clicked()
+                                            {
+                                                self.open_game_in_depots(aid, ui.ctx());
+                                            }
+                                            if secondary_button(ui, "Game Fixes")
+                                                .on_hover_text(
+                                                    "Browse and apply verified DRM / online patches for this game",
+                                                )
+                                                .clicked()
+                                            {
+                                                self.open_app_in_fixes(aid, ui.ctx());
+                                            }
+                                            if secondary_button(ui, "Launch Options")
+                                                .on_hover_text(
+                                                    "View or edit Steam appinfo.vdf launch executables and arguments",
+                                                )
+                                                .clicked()
+                                            {
+                                                self.open_launch_options_modal(
+                                                    aid,
+                                                    selected_title.clone(),
+                                                );
+                                            }
                                         }
 
                                         if self.steam_service.is_available()
                                             && !self.steam_library_service.is_game_in_library(aid)
                                             && secondary_button(ui, "+ Add to Steam Library")
+                                                .on_hover_text(
+                                                    "Write Valve appmanifest_<appid>.acf so this game appears in your Steam Library (close Steam first)",
+                                                )
                                                 .clicked()
                                         {
-                                            let gname = self
-                                                .acquire_details
-                                                .as_ref()
-                                                .map(|d| d.name.clone())
-                                                .unwrap_or_else(|| self.resolve_game_title(aid));
+                                            let gname = selected_title.clone();
                                             match self.steam_library_service.add_game_to_library(
                                                 aid,
                                                 &gname,
@@ -761,6 +879,9 @@ impl LuaToolsApp {
                                                         ui,
                                                         &format!("Generate DLC (+{})", missing),
                                                     )
+                                                    .on_hover_text(
+                                                        "Generate missing DLC entries into this game's stplug-in .lua file",
+                                                    )
                                                     .clicked()
                                                     {
                                                         trigger_dlc = true;
@@ -772,7 +893,12 @@ impl LuaToolsApp {
                                             }
                                         }
 
-                                        if ghost_button(ui, "Steam Store ›").clicked() {
+                                        if ghost_button(ui, "Steam Store ›")
+                                            .on_hover_text(
+                                                "Open this game's official Steam Store page in your browser",
+                                            )
+                                            .clicked()
+                                        {
                                             let _ = Command::new("xdg-open")
                                                 .arg(format!(
                                                     "https://store.steampowered.com/app/{}",
@@ -799,7 +925,7 @@ impl LuaToolsApp {
                                     ui.add_space(12.0);
                                     egui::CollapsingHeader::new(
                                         RichText::new(format!(
-                                            "Download Queue & History (100-item ring · {})",
+                                            "Recent Downloads ({})",
                                             self.download_history.len()
                                         ))
                                         .font(semibold_font(12.5))
@@ -871,9 +997,12 @@ impl LuaToolsApp {
             ui,
             "MY GAMES",
             "My Games",
-            "Games added to Steam and LuaTools",
+            "Click Integrate for 1-click fixes & setup, Files & DLC for depots, Edit .lua for script overrides, or More",
             |ui| {
-                if ghost_button(ui, "Refresh").clicked() {
+                if ghost_button(ui, "Refresh")
+                    .on_hover_text("Rescan local Steam libraries and stplug-in .lua files")
+                    .clicked()
+                {
                     do_refresh = true;
                 }
                 if !self.library_selected_ids.is_empty()
@@ -881,11 +1010,15 @@ impl LuaToolsApp {
                         ui,
                         &format!("Remove Selected ({})", self.library_selected_ids.len()),
                     )
+                    .on_hover_text("Remove stplug-in .lua files for all checked games")
                     .clicked()
                 {
                     do_bulk_del = true;
                 }
-                if primary_button(ui, "+ Add by AppID").clicked() {
+                if primary_button(ui, "+ Add by AppID")
+                    .on_hover_text("Manually create a starter stplug-in .lua file for any Steam AppID")
+                    .clicked()
+                {
                     open_add = true;
                 }
             },
@@ -1040,14 +1173,15 @@ impl LuaToolsApp {
                 return;
             }
 
+            ui.spacing_mut().item_spacing.x = 8.0;
             TableBuilder::new(ui)
                 .striped(true)
                 .cell_layout(Layout::left_to_right(Align::Center))
-                .column(Column::exact(34.0))
-                .column(Column::remainder().at_least(200.0))
-                .column(Column::exact(150.0))
-                .column(Column::exact(145.0))
-                .column(Column::exact(236.0))
+                .column(Column::exact(30.0))
+                .column(Column::remainder().at_least(140.0))
+                .column(Column::exact(128.0))
+                .column(Column::exact(120.0))
+                .column(Column::exact(326.0))
                 .header(32.0, |mut header| {
                     header.col(|ui| {
                         let mut all_selected = !filtered.is_empty()
@@ -1096,13 +1230,26 @@ impl LuaToolsApp {
 
                             row.col(|ui| {
                                 ui.spacing_mut().item_spacing.x = 8.0;
-                                let name_resp = ui.label(
-                                    RichText::new(truncate_label(&r.name, 42))
-                                        .font(semibold_font(13.5))
-                                        .color(Palette::TEXT_PRIMARY),
+                                let name_resp = ui.add(
+                                    egui::Label::new(
+                                        RichText::new(truncate_label(&r.name, 38))
+                                            .font(semibold_font(13.5))
+                                            .color(Palette::TEXT_PRIMARY),
+                                    )
+                                    .sense(Sense::click()),
                                 );
-                                if r.name.chars().count() > 42 {
-                                    name_resp.on_hover_text(&r.name);
+                                if name_resp.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                if name_resp
+                                    .on_hover_text(format!(
+                                        "{} (#{}) — click to open Integration & Quick Setup",
+                                        r.name, r.app_id
+                                    ))
+                                    .clicked()
+                                {
+                                    act_integration =
+                                        Some((r.app_id, r.name.clone(), r.install_path.clone()));
                                 }
                                 ui.label(
                                     RichText::new(format!("#{}", r.app_id))
@@ -1141,52 +1288,99 @@ impl LuaToolsApp {
 
                             row.col(|ui| {
                                 ui.spacing_mut().item_spacing.x = 6.0;
-                                if table_button(ui, "Files & DLC", true).clicked() {
+                                if table_button(ui, "Integrate", true)
+                                    .on_hover_text(
+                                        "Open Integration & Process Controls (1-click Recommended Fixes, Play Unowned, AppID 480 redirect, keys & LD_PRELOAD)",
+                                    )
+                                    .clicked()
+                                {
+                                    act_integration = Some((
+                                        r.app_id,
+                                        r.name.clone(),
+                                        r.install_path.clone(),
+                                    ));
+                                }
+                                if table_button(ui, "Files & DLC", false)
+                                    .on_hover_text(
+                                        "Open Depots & Vault to toggle DLCs, switch saved .lua builds, pin manifests, or download depots",
+                                    )
+                                    .clicked()
+                                {
                                     act_depots = Some(r.app_id);
                                 }
-                                if table_button(ui, "Options", false).clicked() {
+                                if table_button(ui, "Edit .lua", false)
+                                    .on_hover_text(
+                                        "Edit stplug-in/<appid>.lua script, FakeAppId override, and AppToken",
+                                    )
+                                    .clicked()
+                                {
                                     act_config = Some((r.app_id, r.name.clone()));
                                 }
-                                ui.menu_button("More", |ui| {
-                                    ui.set_min_width(210.0);
-                                    if ui.button("Game Fixes…").clicked() {
-                                        act_fixes = Some(r.app_id);
-                                        ui.close_menu();
-                                    }
-                                    if ui.button("Launch Options…").clicked() {
-                                        act_launch = Some((r.app_id, r.name.clone()));
-                                        ui.close_menu();
-                                    }
-                                    if let Some(ref p) = r.install_path {
-                                        if ui.button("Open Game Folder").clicked() {
-                                            let _ = Command::new("xdg-open").arg(p).spawn();
+                                ui.scope(|ui| {
+                                    ui.spacing_mut().button_padding = Vec2::new(10.0, 5.0);
+                                    let menu_resp = ui.menu_button("More", |ui| {
+                                        ui.set_min_width(252.0);
+                                        ui.spacing_mut().item_spacing.y = 4.0;
+
+                                        ui.label(
+                                            RichText::new("FIXES & LAUNCH")
+                                                .font(semibold_font(10.5))
+                                                .color(Palette::TEXT_MUTED),
+                                        );
+                                        if ui
+                                            .button("Game Fixes…")
+                                            .on_hover_text(
+                                                "Browse and apply verified DRM / online patches with automatic SHA-256 backup",
+                                            )
+                                            .clicked()
+                                        {
+                                            act_fixes = Some(r.app_id);
                                             ui.close_menu();
                                         }
-                                    }
-                                    ui.separator();
-                                    ui.menu_button("Advanced Tools", |ui| {
-                                        ui.set_min_width(220.0);
-                                        if ui.button("Quick Fix & Overrides…").clicked() {
-                                            act_integration = Some((
-                                                r.app_id,
-                                                r.name.clone(),
-                                                r.install_path.clone(),
-                                            ));
+                                        if ui
+                                            .button("Launch Options…")
+                                            .on_hover_text(
+                                                "Edit Steam appinfo.vdf launch executables, arguments, and working directory",
+                                            )
+                                            .clicked()
+                                        {
+                                            act_launch = Some((r.app_id, r.name.clone()));
                                             ui.close_menu();
                                         }
-                                        if ui.button("Launch with Integration").clicked() {
+                                        if ui
+                                            .button("Launch Game with Bridge")
+                                            .on_hover_text(
+                                                "Start the game executable directly with per-app LD_PRELOAD library integration",
+                                            )
+                                            .clicked()
+                                        {
                                             act_launch_integrated =
                                                 Some((r.app_id, r.install_path.clone()));
                                             ui.close_menu();
                                         }
+
                                         ui.separator();
+                                        ui.label(
+                                            RichText::new("STEAM & OWNERSHIP")
+                                                .font(semibold_font(10.5))
+                                                .color(Palette::TEXT_MUTED),
+                                        );
                                         if !r.installed {
-                                            if ui.button("Add to Steam Library (ACF)").clicked() {
+                                            if ui
+                                                .button("Add Steam Library Entry")
+                                                .on_hover_text(
+                                                    "Write Valve appmanifest_<appid>.acf so this game appears in Steam (close Steam first)",
+                                                )
+                                                .clicked()
+                                            {
                                                 act_add_lib = Some((r.app_id, r.name.clone()));
                                                 ui.close_menu();
                                             }
                                         } else if ui
-                                            .button("Remove from Steam Library (ACF)")
+                                            .button("Remove Steam Library Entry")
+                                            .on_hover_text(
+                                                "Remove appmanifest_<appid>.acf registration from your Steam Library (close Steam first)",
+                                            )
                                             .clicked()
                                         {
                                             act_rem_lib = Some(r.app_id);
@@ -1200,39 +1394,112 @@ impl LuaToolsApp {
                                         } else {
                                             "Enable Play Unowned"
                                         };
-                                        if ui.button(unowned_lbl).clicked() {
+                                        if ui
+                                            .button(unowned_lbl)
+                                            .on_hover_text(
+                                                "Toggle Play-Unowned ownership bypass in play_unowned_games.lua and SLSsteam",
+                                            )
+                                            .clicked()
+                                        {
                                             act_toggle_unowned = Some((r.app_id, !is_unowned_on));
                                             ui.close_menu();
                                         }
-                                        if let Some(ref p) = r.install_path {
-                                            ui.separator();
-                                            if ui.button("Offline Patch (Goldberg)").clicked() {
+
+                                        ui.separator();
+                                        ui.label(
+                                            RichText::new("LOCAL GAME FILES")
+                                                .font(semibold_font(10.5))
+                                                .color(Palette::TEXT_MUTED),
+                                        );
+                                        let has_local = r.install_path.is_some();
+                                        let missing_local_tip = "Game files are not installed locally yet — download the game in Steam or Depots & Vault first.";
+                                        if ui
+                                            .add_enabled(
+                                                has_local,
+                                                egui::Button::new("Offline Patch (Goldberg)"),
+                                            )
+                                            .on_hover_text(
+                                                "Apply native Goldberg Steam emulator to the game folder for offline play",
+                                            )
+                                            .on_disabled_hover_text(missing_local_tip)
+                                            .clicked()
+                                        {
+                                            if let Some(ref p) = r.install_path {
                                                 act_autopatch = Some((r.app_id, p.clone()));
-                                                ui.close_menu();
                                             }
-                                            if ui.button("Remove SteamStub DRM").clicked() {
+                                            ui.close_menu();
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                has_local,
+                                                egui::Button::new(
+                                                    "Remove SteamStub DRM (Steamless)",
+                                                ),
+                                            )
+                                            .on_hover_text(
+                                                "Unpack SteamStub-protected game .exe files using Steamless",
+                                            )
+                                            .on_disabled_hover_text(missing_local_tip)
+                                            .clicked()
+                                        {
+                                            if let Some(ref p) = r.install_path {
                                                 act_steamless = Some((r.app_id, p.clone()));
-                                                ui.close_menu();
                                             }
-                                            if ui.button("Clean Old Unlockers").clicked() {
+                                            ui.close_menu();
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                has_local,
+                                                egui::Button::new("Clean Old Unlockers"),
+                                            )
+                                            .on_hover_text(
+                                                "Remove leftover SmokeAPI, GreenLuma, or Koalageddon DLLs and restore original files",
+                                            )
+                                            .on_disabled_hover_text(missing_local_tip)
+                                            .clicked()
+                                        {
+                                            if let Some(ref p) = r.install_path {
                                                 act_migrate_legacy = Some((r.app_id, p.clone()));
+                                            }
+                                            ui.close_menu();
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                has_local,
+                                                egui::Button::new("Open Game Folder"),
+                                            )
+                                            .on_hover_text(
+                                                "Open the local game installation folder in your file manager",
+                                            )
+                                            .on_disabled_hover_text(missing_local_tip)
+                                            .clicked()
+                                        {
+                                            if let Some(ref p) = r.install_path {
+                                                let _ = Command::new("xdg-open").arg(p).spawn();
+                                            }
+                                            ui.close_menu();
+                                        }
+
+                                        if r.has_lua {
+                                            ui.separator();
+                                            if ui
+                                                .button(
+                                                    RichText::new("Remove from LuaTools")
+                                                        .color(Palette::DANGER_TEXT),
+                                                )
+                                                .on_hover_text(
+                                                    "Delete stplug-in/<appid>.lua and clear this game's unlocker overrides",
+                                                )
+                                                .clicked()
+                                            {
+                                                act_delete = Some(r.app_id);
                                                 ui.close_menu();
                                             }
                                         }
                                     });
-                                    if r.has_lua {
-                                        ui.separator();
-                                        if ui
-                                            .button(
-                                                RichText::new("Remove from LuaTools")
-                                                    .color(Palette::DANGER_TEXT),
-                                            )
-                                            .clicked()
-                                        {
-                                            act_delete = Some(r.app_id);
-                                            ui.close_menu();
-                                        }
-                                    }
+                                    menu_resp.response.on_hover_text(
+                                        "More per-game tools: Game Fixes, Launch Options, Steam Library Entry, Play Unowned, Goldberg, Steamless, and folder actions",
+                                    );
                                 });
                             });
                         });

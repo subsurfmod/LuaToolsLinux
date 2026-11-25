@@ -302,19 +302,18 @@ impl LuaToolsApp {
         guide_step_card(
             ui,
             "STEP 01",
-            "Connect Steam & Install the Rootless Integration Bridge",
-            "- Click the top-right 'Install Bridge' pill (or open Settings › Steam Integration and click 'Install Integration (No Root)').\n\
-             - LuaTools stages ~/.local/lib/luatools/libsteam_integration.so and creates ~/.local/bin/luatools-steam-launcher — zero root or sudo required.\n\
-             - Optional: Open Settings › SLSsteam & Store Bridge to install ACCELA + SLSsteam natively via Wired Suite and enable 'PlayNotOwnedGames'.",
+            "Set Up Steam Unlocker (SLSsteam) or Rootless Bridge",
+            "- Click the top-right 'Setup Steam' pill (or open Settings › Steam Setup and click 'Install Steam Unlocker (SLSsteam)').\n\
+             - Optional: Open Settings › Advanced Bridge and click 'Install Integration (No Root)' to stage ~/.local/lib/luatools/libsteam_integration.so and ~/.local/bin/luatools-steam-launcher — zero root or sudo required.",
             |ui| {
-                if primary_button(ui, "Steam Integration ›").clicked() {
+                if primary_button(ui, "Steam Setup ›").clicked() {
+                    nav_target = Some((ActiveView::Settings, Some(SettingsSubTab::Integrations)));
+                }
+                if secondary_button(ui, "Advanced Bridge ›").clicked() {
                     nav_target = Some((
                         ActiveView::Settings,
                         Some(SettingsSubTab::SteamIntegration),
                     ));
-                }
-                if secondary_button(ui, "Wired & SLSsteam ›").clicked() {
-                    nav_target = Some((ActiveView::Settings, Some(SettingsSubTab::Integrations)));
                 }
             },
         );
@@ -325,14 +324,14 @@ impl LuaToolsApp {
             ui,
             "STEP 02",
             "Add a Game Manifest & Register in Your Steam Library",
-            "- Drag and drop any .zip, .lua, or .manifest package onto the Home Drop Sheet (or click 'Select Files…').\n\
-             - Or open Discover (Ctrl+2), search any Steam title, sign in with Discord or a Hubcap key, and click 'Install Manifest'.\n\
-             - Click '+ Add to Steam Library' in Discover (or 'Library › More › Register in Steam Library (ACF)') so Lua-only titles appear directly in Steam.",
+            "- Drag and drop any .zip, .lua, or .manifest package onto the Home Drop Sheet (or click 'Browse Files…').\n\
+             - Or open Add Games (Ctrl+2), search any Steam title, sign in with Discord or a Hubcap key, and click 'Install Game'.\n\
+             - Click '+ Add to Steam Library' in Add Games (or 'My Games › More › Add Steam Library Entry') so Lua-only titles appear directly in Steam.",
             |ui| {
-                if primary_button(ui, "Browse Discover ›").clicked() {
+                if primary_button(ui, "Open Add Games ›").clicked() {
                     nav_target = Some((ActiveView::Acquire, None));
                 }
-                if secondary_button(ui, "+ Create by AppID").clicked() {
+                if secondary_button(ui, "+ Add by AppID").clicked() {
                     open_create_modal = true;
                 }
             },
@@ -343,14 +342,14 @@ impl LuaToolsApp {
         guide_step_card(
             ui,
             "STEP 03",
-            "Apply Recommended Fixes & Launch Steam with Bridge",
-            "- In Library (Ctrl+3), click 'More › Integration Actions…' and click 'Apply Recommended Fixes Now' to enable Play-Unowned (Steam Inlibrary Fix), set the 480 online compatibility redirect, and apply native Goldberg SteamAutoPatch in one click.\n\
-             - Click the top-right 'Launch Steam w/ Bridge' (or 'Restart Steam w/ Bridge') pill to start Steam with libsteam_integration.so loaded.",
+            "Open Integration & Quick Setup, Then Launch Steam",
+            "- Click 'Open' on any added game card on Home, 'Integrate' on any row in My Games (Ctrl+3), or 'Open Setup / Integration' in Add Games to open the Integration & Process Controls window.\n\
+             - Click 'Apply Recommended Fixes Now' to enable Play-Unowned, set AppID 480 redirect, and apply Goldberg in one click, then click the top-right 'Launch Steam' (or 'Restart Steam') button.",
             |ui| {
-                if primary_button(ui, "Open Library ›").clicked() {
+                if primary_button(ui, "Open My Games ›").clicked() {
                     nav_target = Some((ActiveView::Library, None));
                 }
-                if ghost_button(ui, "General & Steam ›").clicked() {
+                if ghost_button(ui, "Settings › General").clicked() {
                     nav_target = Some((ActiveView::Settings, Some(SettingsSubTab::General)));
                 }
             },
@@ -361,8 +360,8 @@ impl LuaToolsApp {
         self.render_guide_screenshot_card(
             ui,
             "01_home_overview",
-            "Home Workspace & Top-Right Steam Launch Pill",
-            "Drop .lua/.manifest/.zip packages onto the main sheet, monitor Steam libraries, SLSsteam, and live inotify Hot-Reload status, and launch or restart Steam with the bridge from the top-right pill.",
+            "Home Workspace & Recently Added Games",
+            "Drop .lua/.manifest/.zip packages onto the main sheet, click 'Open' on any recently added game to launch Integration & Process Controls, or click 'Depots & DLC' to manage files.",
         );
 
         ui.add_space(14.0);
@@ -379,24 +378,28 @@ impl LuaToolsApp {
 
             let tasks = [
                 (
-                    "Install bridge without root",
-                    "Settings › Steam Integration › Install Integration (No Root)",
+                    "1-click SLSsteam setup",
+                    "Settings › Steam Setup › Install Steam Unlocker (SLSsteam)",
                 ),
                 (
-                    "Start / restart Steam with bridge",
-                    "Top-right pill: Launch Steam w/ Bridge (or Restart Steam w/ Bridge)",
+                    "Open per-game Integration window",
+                    "Home › Open (or My Games › Integrate / Add Games › Open Setup / Integration)",
                 ),
                 (
-                    "Force-close all Steam processes",
-                    "Top-right 'Kill Steam' button (or Settings › General & Steam › Kill Steam)",
+                    "Apply 1-click recommended fixes",
+                    "Integration window › Apply Recommended Fixes Now",
                 ),
                 (
-                    "One-click setup for a game",
-                    "Library › More › Integration Actions… › Apply Recommended Fixes Now",
+                    "Start / restart / stop Steam",
+                    "Top-right bar: Launch Steam / Restart Steam / Stop Steam",
+                ),
+                (
+                    "Edit a game's .lua & FakeAppId",
+                    "My Games › Edit .lua (or Integration window › Edit .lua)",
                 ),
                 (
                     "Make unowned game appear in Steam",
-                    "Close Steam, then Discover › + Add to Steam Library (writes appmanifest_<id>.acf)",
+                    "Close Steam, then Add Games › + Add to Steam Library (or My Games › More › Add Steam Library Entry)",
                 ),
                 (
                     "Lock or switch a game patch/build",
@@ -407,12 +410,12 @@ impl LuaToolsApp {
                     "Depots & Vault › Download Depots (supports QR sign-in & -depotkeys)",
                 ),
                 (
-                    "Install Goldberg / SteamAutoPatch",
-                    "Settings › Updates & Toolchain › Goldberg Emulator › Install / Update",
+                    "Install Goldberg / Steamless",
+                    "Settings › Updates & Tools › Install / Update",
                 ),
                 (
                     "Sync saves with Cloud Redirect",
-                    "Settings › SLSsteam & Store Bridge › Sync to CloudRedirect",
+                    "Settings › Steam Setup › Cloud Save Redirect › Sync to CloudRedirect",
                 ),
             ];
 
@@ -513,8 +516,8 @@ impl LuaToolsApp {
         self.render_guide_screenshot_card(
             ui,
             "02_discover_store",
-            "Discover Catalog — Cloud Providers & Library Registration",
-            "Browse Top Sellers, New Releases, or search any Steam title to check live manifest providers (Morrenus, Hubcap), install manifests, generate DLC .lua files, or add games directly to your Steam Library.",
+            "Add Games — Cloud Providers, Setup Shortcuts & Library Registration",
+            "Browse Top Sellers, New Releases, or search any Steam title to check live manifest providers (Morrenus, Hubcap), click 'Install Game', generate DLC .lua files, or jump straight to 'Open Setup / Integration', 'Files & DLC', 'Game Fixes', and 'Launch Options'.",
         );
 
         ui.add_space(14.0);
@@ -531,27 +534,27 @@ impl LuaToolsApp {
             guide_bullet(
                 ui,
                 "1. Drag & Drop / File Picker (Offline Packages)",
-                "Drop <appid>.zip, <appid>.lua, <appid>_<buildid>.lua, or <depot>_<gid>.manifest anywhere on LuaTools. \
+                "Drop <appid>.zip, <appid>.lua, <appid>_<buildid>.lua, or <depot>_<gid>.manifest anywhere on LuaTools (or click 'Browse Files…' on Home). \
                  Archives are verified against ZipSlip path traversal: .lua files install to stplug-in/, .manifest files copy \
                  to depotcache/, a SHA-256 snapshot is stored in LuaVault, and SLSsteam config.yaml updates automatically.",
             );
             guide_bullet(
                 ui,
-                "2. Cloud Manifest Providers (Discover)",
-                "Sign in with Discord under Settings › Account & Providers (browser OAuth or 6-character /login bot code), \
-                 or paste a Hubcap API key (smm_ + 96 hex characters). Select any game in Discover and click 'Install Manifest' \
+                "2. Cloud Manifest Providers (Add Games)",
+                "Sign in with Discord under Settings › Account (browser OAuth or 6-character /login bot code), \
+                 or paste a Hubcap API key (smm_ + 96 hex characters). Select any game in Add Games and click 'Install Game' \
                  (with 'FastFetch' auto-selecting the first available provider).",
             );
             guide_bullet(
                 ui,
-                "3. 1-Click Steam Library ACF Registration",
-                "Click '+ Add to Steam Library' in Discover or 'Library › More › Register in Steam Library (ACF)'. LuaTools writes \
+                "3. 1-Click Steam Library Entry (ACF)",
+                "Click '+ Add to Steam Library' in Add Games or 'My Games › More › Add Steam Library Entry'. LuaTools writes \
                  a valid Valve \"AppState\" appmanifest_<appid>.acf, creates <steamapps>/common/<installdir>, updates libraryfolders.vdf, \
                  and sets FakeAppId 480 in SLSsteam. Close Steam before writing .acf files so Steam does not overwrite them on exit.",
             );
             guide_bullet(
                 ui,
-                "4. Global Quick Command Bar (Ctrl+K / Ctrl+L)",
+                "4. Global Quick Search & Command Bar (Ctrl+K / Ctrl+L)",
                 "Press Ctrl+K from any tab and paste a numeric AppID (e.g. 1245620), a Steam Store URL, a SteamDB URL, \
                  a steam:// link, a luatools://install/<appid> URI, a local file path, or a game title to search.",
             );
@@ -559,16 +562,16 @@ impl LuaToolsApp {
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
-                if primary_button(ui, "Open Discover").clicked() {
+                if primary_button(ui, "Open Add Games").clicked() {
                     nav_discover = true;
                 }
-                if secondary_button(ui, "Open Library").clicked() {
+                if secondary_button(ui, "Open My Games").clicked() {
                     nav_library = true;
                 }
                 if secondary_button(ui, "Account & Hubcap Sign-In").clicked() {
                     nav_account = true;
                 }
-                if ghost_button(ui, "Focus Command Bar (Ctrl+K)").clicked() {
+                if ghost_button(ui, "Focus Search Bar (Ctrl+K)").clicked() {
                     focus_omnibox = true;
                 }
             });
@@ -745,7 +748,7 @@ impl LuaToolsApp {
             ui,
             "04_library_integration_modal",
             "One-Click Game Setup — Integration & Process Controls Modal",
-            "Open Library › More › Integration Actions… and click 'Apply Recommended Fixes Now' to enable Play-Unowned (Steam Inlibrary Fix), set the 480 AppID redirect, and apply native Goldberg SteamAutoPatch in a single click.",
+            "Click 'Open' on any added game on Home (or 'Integrate' in My Games) and click 'Apply Recommended Fixes Now' to enable Play-Unowned, set the 480 AppID redirect, and apply native Goldberg in one click — plus jump straight to Files & DLC, Edit .lua, Launch Options, or Game Fixes from the top Game Tools bar.",
         );
 
         ui.add_space(14.0);
@@ -753,13 +756,14 @@ impl LuaToolsApp {
         guide_step_card(
             ui,
             "QUICK SETUP",
-            "One-Click Recommended Fixes & Per-Game Integration Modal",
-            "In Library (Ctrl+3), open 'More › Integration Actions…' on any title:\n\
-             - Apply Recommended Fixes Now: Automatically adds the title to the Play-Unowned redirect set, sets AppID redirect to 480 (online compatibility), and applies native Goldberg SteamAutoPatch when installed.\n\
-             - Legacy CD Key & DepotKeyIntegration: Push retail CD keys or 64-character hex AES-256 depot keys into the live Steam bridge and SLSsteam.\n\
-             - Steam Stats & Per-App LD_PRELOAD: Override stat values or launch the game executable directly with a custom .so library via 'Launch with Integration'.",
+            "How to Open Integration & Process Controls",
+            "Open the Integration & Process Controls window in 1 click from anywhere:\n\
+             - Home: Click 'Open' (or click the cover image) on any card under Recently Added Games.\n\
+             - My Games (Ctrl+3): Click 'Integrate' right on any game row (or click the game's title).\n\
+             - Add Games / Depots & Vault / Game Fixes: Click 'Open Setup / Integration' or 'Integrate / Setup'.\n\
+             Inside, click 'Apply Recommended Fixes Now', configure CD/depot keys or Steam stats, or use the top 'Game Tools' bar to switch straight to Files & DLC, Edit .lua, Launch Options, or Game Fixes.",
             |ui| {
-                if primary_button(ui, "Open Library ›").clicked() {
+                if primary_button(ui, "Open My Games ›").clicked() {
                     go_library = true;
                 }
             },
@@ -769,16 +773,15 @@ impl LuaToolsApp {
 
         guide_step_card(
             ui,
-            "LIBRARY & VDF",
-            "ACF Registration, PlayUnowned & Binary appinfo.vdf Launch Options",
-            "Each row in Library also includes:\n\
-             - Configure: Edit SLSsteam FakeAppId (480), AppToken, or live stplug-in .lua.\n\
-             - More › Register / Unregister in Steam Library (ACF): Generates or removes appmanifest_<appid>.acf and updates libraryfolders.vdf.\n\
-             - More › Enable Play Unowned / Run SteamAutoPatch: Updates multi-app play_unowned_games.lua or runs native Goldberg deployment.\n\
-             - More › Launch Options…: Edits binary Steam appcache/appinfo.vdf (v27–v29 with SHA-1 re-hashing and backup).\n\
-             IMPORTANT: Always close Steam completely ('steam -shutdown') before writing appinfo.vdf or appmanifest_<appid>.acf files.",
+            "MY GAMES & VDF",
+            "Direct Row Actions & Flattened More Menu",
+            "Each row in My Games gives direct 1-click buttons plus a flat, clearly labeled More menu:\n\
+             - Integrate: Opens Integration & Process Controls (Recommended Fixes, AppID 480 redirect, keys, LD_PRELOAD).\n\
+             - Files & DLC: Opens Depots & Vault to toggle DLCs, switch saved .lua builds, pin manifests, or download depots.\n\
+             - Edit .lua: Edits SLSsteam FakeAppId (480), AppToken, and live stplug-in/<appid>.lua.\n\
+             - More: Flat menu with Game Fixes…, Launch Options…, Launch Game with Bridge, Add / Remove Steam Library Entry, Enable / Disable Play Unowned, Offline Patch (Goldberg), Remove SteamStub DRM (Steamless), Clean Old Unlockers, Open Game Folder, and Remove from LuaTools.",
             |ui| {
-                if secondary_button(ui, "Browse Library ›").clicked() {
+                if secondary_button(ui, "Browse My Games ›").clicked() {
                     go_library = true;
                 }
             },
@@ -790,7 +793,7 @@ impl LuaToolsApp {
             ui,
             "GAME FIXES",
             "Verified Game Fixes with SHA-256 Backup & Clean Revert",
-            "In Game Fixes (Ctrl+5), filter by tag or 'Configured only':\n\
+            "In Game Fixes (Ctrl+5), filter by tag or 'My Games only':\n\
              - Install Manifest: Installs the exact build-pinned manifest required by the fix.\n\
              - Apply Fix: Hashes existing game files with SHA-256 and backs them up into <GameDir>/.luatools-fix/backups/<fix_id>/ before extracting.\n\
              - Revert: Verifies post-apply SHA-256 hashes, removes newly added fix files, and restores every original binary byte-for-byte.",
@@ -807,12 +810,12 @@ impl LuaToolsApp {
             ui,
             "TOOLCHAIN",
             "Native Goldberg Emulator, SteamAutoPatch, StubRemover & Git Self-Updater",
-            "Under Settings › Updates & Toolchain:\n\
-             - Goldberg Emulator (Native Linux): Installs Detanup01/gbe_fork Linux/Proton binaries (libsteam_api.so / steam_api64.dll) into ~/.local/share/luatools/goldberg/ so native Rust SteamAutoPatch works without Wine or .NET, automatically generating steam_interfaces.txt from binary ELF/PE files.\n\
-             - DepotDownloaderMod / SteamAutoPatch CLI / StubRemover (Steamless): One-click GitHub release installers.\n\
-             - Git Self-Updater: Rebuilds the full workspace (luatools + libsteam_integration.so) and atomically swaps the executable.",
+            "Under Settings › Updates & Tools:\n\
+             - Goldberg Emulator (Native Linux): Installs Detanup01/gbe_fork Linux/Proton binaries (libsteam_api.so / steam_api64.dll) into ~/.local/share/luatools/goldberg/ so native SteamAutoPatch works offline.\n\
+             - DepotDownloaderMod / SteamAutoPatch / StubRemover (Steamless): One-click GitHub release installers with plain-English explanations.\n\
+             - Git Self-Updater: Rebuilds LuaTools and atomically swaps the executable.",
             |ui| {
-                if secondary_button(ui, "Open Updates & Toolchain ›").clicked() {
+                if secondary_button(ui, "Open Updates & Tools ›").clicked() {
                     go_tools = true;
                 }
             },
@@ -836,7 +839,7 @@ impl LuaToolsApp {
         self.render_guide_screenshot_card(
             ui,
             "05_settings_steam_integration",
-            "Settings › Steam Integration — Rootless LD_PRELOAD, ELF64 Patterns & Hot-Reload",
+            "Settings › Advanced Bridge — Rootless LD_PRELOAD, ELF64 Patterns & Hot-Reload",
             "Install the rootless launcher (~/.local/bin/luatools-steam-launcher), inspect SHA-256 pattern matches on steamclient.so and steamui.so, and monitor real-time inotify events in stplug-in/.",
         );
 
@@ -844,14 +847,14 @@ impl LuaToolsApp {
 
         guide_step_card(
             ui,
-            "STEAM BRIDGE",
+            "ADVANCED BRIDGE",
             "Steam Inlibrary Fix (libsteam_integration.so) & Live Hot-Reload",
-            "Settings › Steam Integration controls the native Rust Steam Client Interop layer:\n\
-             - Install Integration (No Root): Stages libsteam_integration.so and creates ~/.local/bin/luatools-steam-launcher (system-wide /etc/ld.so.preload is optional and fails gracefully without root).\n\
-             - Steam Inlibrary Fix Hooks: Uses 14-byte 64-bit ASLR-safe trampolines for BIsSubscribedApp, GetAppId (480 spoof), GetAppOwnershipTicket, RequestEncryptedAppTicket / GetEncryptedAppTicket, GetSteamID, and DepotKeyIntegration.\n\
+            "Settings › Advanced Bridge controls the optional rootless Steam Client Interop layer:\n\
+             - Install Integration (No Root): Stages libsteam_integration.so and creates ~/.local/bin/luatools-steam-launcher (system-wide /etc/ld.so.preload is optional and not needed).\n\
+             - Steam Inlibrary Fix Hooks: Hooks BIsSubscribedApp, GetAppId (480 spoof), GetAppOwnershipTicket, RequestEncryptedAppTicket / GetEncryptedAppTicket, GetSteamID, and DepotKeyIntegration.\n\
              - Automatic Startup Sync: On Steam startup, libsteam_integration.so automatically loads stplug-in/*.lua, bridge_overrides.json, manifest_pins.json, and localconfig.vdf tickets — plus reloads automatically whenever the inotify Hot-Reload Watcher detects .lua edits.",
             |ui| {
-                if primary_button(ui, "Open Steam Integration ›").clicked() {
+                if primary_button(ui, "Open Advanced Bridge ›").clicked() {
                     go_settings = Some(SettingsSubTab::SteamIntegration);
                 }
             },
@@ -861,14 +864,14 @@ impl LuaToolsApp {
 
         guide_step_card(
             ui,
-            "WIRED & CLOUD",
-            "Wired Suite (ACCELA + SLSsteam), Cloud Redirect & Store Bridge",
-            "In Settings › SLSsteam & Store Bridge:\n\
-             - Wired Suite: Installs ACCELA (~/.local/share/ACCELA) and SLSsteam (~/.local/share/SLSsteam + ~/.local/bin/steam-sls LD_AUDIT launcher) natively in Rust (.7z, .tar.zst, .tar.gz, .zip) without executing remote shell scripts.\n\
-             - Cloud Redirect: Restores per-game save cloud sync — tick games or enter an AppID and click 'Sync to CloudRedirect'.\n\
-             - Store Bridge: Probe Millennium (:38495), enable Steam CEF Debugging (:8080 › :6767) to configure Linux Steam Store CSP access, and register the luatools:// desktop URI handler.",
+            "STEAM SETUP & CLOUD",
+            "1-Click SLSsteam, Cloud Save Redirect & Store Page Plugin",
+            "In Settings › Steam Setup, every integration sits on its own open card:\n\
+             - 1-Click Steam Unlocker (SLSsteam): Installs SLSsteam (and optional ACCELA) natively in one click without root.\n\
+             - Cloud Save Redirect: Restores per-game save cloud sync — tick games or enter an AppID and click 'Sync to CloudRedirect'.\n\
+             - Steam Store Page Plugin & URI Links: Click 'Install Store Page Plugin', 'Register luatools:// Links', 'Enable Steam CEF Debugging', or 'Check Millennium Status'.",
             |ui| {
-                if secondary_button(ui, "Open SLSsteam & Store Bridge ›").clicked() {
+                if secondary_button(ui, "Open Steam Setup ›").clicked() {
                     go_settings = Some(SettingsSubTab::Integrations);
                 }
             },
@@ -879,8 +882,8 @@ impl LuaToolsApp {
         self.render_guide_screenshot_card(
             ui,
             "06_settings_wired_cloud",
-            "Settings › SLSsteam, Wired Suite & Cloud Redirect",
-            "Toggle PlayNotOwnedGames, install ACCELA and SLSsteam in one click via Wired Suite, and select configured Library games for Cloud Redirect save routing.",
+            "Settings › Steam Setup — SLSsteam, Cloud Save Redirect & Store Plugin",
+            "Install SLSsteam in one click, toggle PlayNotOwnedGames, configure Cloud Save Redirect, and install the Steam Store Page Plugin.",
         );
 
         if let Some(sub) = go_settings {
@@ -902,38 +905,38 @@ impl LuaToolsApp {
             guide_bullet(
                 ui,
                 "Game does not appear in Steam after installing a .lua file",
-                "1) In Library, click 'More › Integration Actions… › Apply Recommended Fixes Now'. \
-                 2) For Lua-only titles without local files yet, close Steam ('steam -shutdown') and click 'More › Register in Steam Library (ACF)'. \
-                 3) Click 'Launch Steam w/ Bridge' in the top-right bar (or run ~/.local/bin/steam-sls).",
+                "1) Click 'Open' on the game card on Home (or 'Integrate' in My Games) and click 'Apply Recommended Fixes Now'. \
+                 2) For Lua-only titles without local files yet, close Steam ('Stop Steam') and click 'My Games › More › Add Steam Library Entry'. \
+                 3) Click 'Launch Steam' (or 'Restart Steam') in the top-right bar.",
             );
             guide_bullet(
                 ui,
                 "Manifest Binding pin shows 'Pending (Saved)' instead of 'Active (Bound)'",
                 "'Pending (Saved)' means the pin is stored in manifest_pins.json, waiting for Steam to run with libsteam_integration.so. \
-                 Click 'Restart Steam w/ Bridge' in the top-right bar, then click 'Re-Sync Pins to Bridge' in Depots & Vault › Manifest Binding.",
+                 Click 'Restart Steam' in the top-right bar, then click 'Re-Sync Pins to Bridge' in Depots & Vault › Manifest Binding.",
             );
             guide_bullet(
                 ui,
                 "SteamAutoPatch says Goldberg Emulator is not installed",
-                "Open Settings › Updates & Toolchain and click 'Install / Update' on 'Goldberg Emulator (Native Linux)' to stage libsteam_api.so and steam_api64.dll into ~/.local/share/luatools/goldberg/.",
+                "Open Settings › Updates & Tools and click 'Install / Update' on 'Goldberg Emulator (Native Linux)' to stage libsteam_api.so and steam_api64.dll into ~/.local/share/luatools/goldberg/.",
             );
             guide_bullet(
                 ui,
                 "Steam Store 'LuaTools' button is blocked by Linux Steam CSP",
-                "Linux Steam's Content Security Policy blocks standard theme JS injection. Either use the native Discover tab directly, \
-                 or enable 'Enable Steam CEF Debugging' + 'Enable CEF DevTools Store Bridge' in Settings › SLSsteam & Store Bridge and restart Steam.",
+                "Linux Steam's Content Security Policy blocks standard theme JS injection. Either use the native Add Games tab directly, \
+                 or click 'Install Store Page Plugin' + 'Enable Steam CEF Debugging' and tick 'Enable Steam Store CEF Bridge' in Settings › Steam Setup, then restart Steam.",
             );
             guide_bullet(
                 ui,
                 "DepotDownloader reports 'Access Denied' or 'No Subscription'",
                 "Official SteamRE/DepotDownloader requires an authenticated Steam session for non-free depots — click 'Sign In (QR)' \
-                 in Download Depots to cache your session, or install DepotDownloaderMod in Settings › Updates & Toolchain to use local .manifest files.",
+                 in Download Depots to cache your session, or install DepotDownloaderMod in Settings › Updates & Tools to use local .manifest files.",
             );
             guide_bullet(
                 ui,
-                "appinfo.vdf Launch Options or appmanifest_<appid>.acf changes disappeared after quitting Steam",
-                "Steam flushes its in-memory cache to disk on exit. Run 'steam -shutdown' first, write Launch Options or ACF registration \
-                 in LuaTools, and then start Steam. Use 'Restore Backup' anytime to revert to appinfo.vdf.luatools.bak.",
+                "Launch Options or Steam Library Entry changes disappeared after quitting Steam",
+                "Launch Options automatically coordinates shutting down and restarting Steam when saving. For Add / Remove Steam Library Entry (.acf), \
+                 click 'Stop Steam' first, apply the change, and then click 'Launch Steam'.",
             );
         });
 
@@ -952,13 +955,13 @@ impl LuaToolsApp {
             let shortcuts = [
                 (
                     "Ctrl + K  /  Ctrl + L",
-                    "Focus Global Quick Command & Search Bar",
+                    "Focus Global Search & Link Bar",
                 ),
                 (
                     "Ctrl + 1 … Ctrl + 5",
-                    "Switch to Home, Discover, Library, Depots & Vault, or Game Fixes",
+                    "Switch to Home, Add Games, My Games, Depots & Vault, or Game Fixes",
                 ),
-                ("Ctrl + 6  /  F1", "Open this How to Use manual"),
+                ("Ctrl + 6  /  F1", "Open this Help manual"),
                 ("Ctrl + 7  /  Ctrl + ,", "Open Preferences & Settings"),
                 ("Esc", "Close active modal or screenshot preview"),
                 ("Ctrl + Q", "Quit LuaTools Linux"),

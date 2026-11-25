@@ -442,8 +442,9 @@ impl LuaToolsApp {
             settings_show_hubcap: false,
             settings_hubcap_status: String::new(),
             settings_usage_text: String::new(),
-            settings_millennium_status: "Click Probe Bridge to check Millennium RPC (:38495)"
-                .into(),
+            settings_millennium_status:
+                "Optional: Click 'Check Millennium Status' if you use Millennium Steam themes"
+                    .into(),
             settings_update_status: "Checked automatically once on startup".into(),
             settings_telemetry_status: String::new(),
             wired_busy: false,
@@ -701,7 +702,9 @@ impl LuaToolsApp {
             settings_show_hubcap: false,
             settings_hubcap_status: String::new(),
             settings_usage_text: String::new(),
-            settings_millennium_status: "Click Probe Millennium to check local RPC (:38495)".into(),
+            settings_millennium_status:
+                "Optional: Click 'Check Millennium Status' if you use Millennium Steam themes"
+                    .into(),
             settings_update_status: format!("Up to date (v{}) · Checked once on startup", VERSION),
             settings_telemetry_status: String::new(),
             wired_busy: false,
@@ -3849,6 +3852,9 @@ impl LuaToolsApp {
                             self.active_view == ActiveView::Settings,
                             204.0,
                         )
+                        .on_hover_text(
+                            "Steam folder path, 1-click SLSsteam setup, Discord/Hubcap account, Cloud Save Redirect, and tools (Ctrl+7)",
+                        )
                         .clicked()
                         {
                             self.settings_service.sync_autostart_from_disk();
@@ -3903,13 +3909,36 @@ impl LuaToolsApp {
                     .count()
                     .max(self.recent_installed.len());
                 let primary_items = [
-                    ("Home", None, ActiveView::Overview),
-                    ("Add Games", None, ActiveView::Acquire),
-                    ("My Games", Some(lua_n), ActiveView::Library),
-                    ("Game Fixes", None, ActiveView::Fixes),
+                    (
+                        "Home",
+                        None,
+                        ActiveView::Overview,
+                        "Drop .lua/.zip/.manifest files, view setup status, and open recently added games (Ctrl+1)",
+                    ),
+                    (
+                        "Add Games",
+                        None,
+                        ActiveView::Acquire,
+                        "Search Steam games, install .lua manifests from cloud providers, and generate DLCs (Ctrl+2)",
+                    ),
+                    (
+                        "My Games",
+                        Some(lua_n),
+                        ActiveView::Library,
+                        "Manage all added and installed games: Integrate, Files & DLC, Edit .lua, Launch Options, and Fixes (Ctrl+3)",
+                    ),
+                    (
+                        "Game Fixes",
+                        None,
+                        ActiveView::Fixes,
+                        "Apply or revert verified DRM and online patches with SHA-256 backup (Ctrl+5)",
+                    ),
                 ];
-                for (lbl, count, view) in primary_items {
-                    if nav_rail_button(ui, lbl, count, self.active_view == view, 204.0).clicked() {
+                for (lbl, count, view, tip) in primary_items {
+                    if nav_rail_button(ui, lbl, count, self.active_view == view, 204.0)
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
                         self.active_view = view;
                     }
                 }
@@ -3926,11 +3955,24 @@ impl LuaToolsApp {
                 ui.add_space(6.0);
 
                 let secondary_items = [
-                    ("Depots & Vault", None, ActiveView::Depots),
-                    ("Help", None, ActiveView::Guide),
+                    (
+                        "Depots & Vault",
+                        None,
+                        ActiveView::Depots,
+                        "Toggle DLCs, switch saved .lua builds in LuaVault, pin manifest versions, and download depots (Ctrl+4)",
+                    ),
+                    (
+                        "Help",
+                        None,
+                        ActiveView::Guide,
+                        "Illustrated user guide, common tasks reference, and troubleshooting tips (Ctrl+6 / F1)",
+                    ),
                 ];
-                for (lbl, count, view) in secondary_items {
-                    if nav_rail_button(ui, lbl, count, self.active_view == view, 204.0).clicked() {
+                for (lbl, count, view, tip) in secondary_items {
+                    if nav_rail_button(ui, lbl, count, self.active_view == view, 204.0)
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
                         self.active_view = view;
                     }
                 }

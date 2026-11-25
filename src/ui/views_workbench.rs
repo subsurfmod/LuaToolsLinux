@@ -36,17 +36,36 @@ impl LuaToolsApp {
 
     pub fn render_depots(&mut self, ui: &mut egui::Ui) {
         let mut do_refresh = false;
+        let mut do_open_integration = false;
         section_header(
             ui,
             "WORKBENCH",
             "Depots & LuaVault",
-            "Switch stored manifest builds, edit live stplug-in .lua files, and download Steam depots",
+            "Toggle DLCs, switch saved .lua builds, edit live scripts, pin manifest versions, and download Steam depots",
             |ui| {
-                if self.depots_app_id.is_some() && ghost_button(ui, "Reload").clicked() {
-                    do_refresh = true;
+                if self.depots_app_id.is_some() {
+                    if secondary_button(ui, "Integrate / Setup")
+                        .on_hover_text(
+                            "Open Integration & Process Controls for the active game (1-click Recommended Fixes, Play Unowned, AppID 480, Goldberg)",
+                        )
+                        .clicked()
+                    {
+                        do_open_integration = true;
+                    }
+                    if ghost_button(ui, "Reload")
+                        .on_hover_text("Reload local .lua and Steam depot metadata for this game")
+                        .clicked()
+                    {
+                        do_refresh = true;
+                    }
                 }
             },
         );
+        if do_open_integration {
+            if let Some(aid) = self.depots_app_id {
+                self.open_integration_for_app(aid);
+            }
+        }
         if do_refresh {
             if let Some(aid) = self.depots_app_id {
                 self.open_game_in_depots(aid, ui.ctx());
@@ -127,6 +146,9 @@ impl LuaToolsApp {
                         "Manifest Binding",
                         cur_subtab == DepotsSubTab::ManifestBinding,
                     )
+                    .on_hover_text(
+                        "Lock specific depot manifest versions in the live Steam bridge so Steam won't auto-update over modded files",
+                    )
                     .clicked()
                     {
                         new_subtab = Some(DepotsSubTab::ManifestBinding);
@@ -136,11 +158,17 @@ impl LuaToolsApp {
                         "Download Depots",
                         cur_subtab == DepotsSubTab::DownloadPicker,
                     )
+                    .on_hover_text(
+                        "Download game depot files directly from Steam CDN using DepotDownloader",
+                    )
                     .clicked()
                     {
                         new_subtab = Some(DepotsSubTab::DownloadPicker);
                     }
                     if chip_button(ui, "Lua Editor", cur_subtab == DepotsSubTab::LiveEditor)
+                        .on_hover_text(
+                            "View and edit the raw stplug-in/<appid>.lua script with live syntax validation",
+                        )
                         .clicked()
                     {
                         new_subtab = Some(DepotsSubTab::LiveEditor);
@@ -149,6 +177,9 @@ impl LuaToolsApp {
                         ui,
                         "Manifests & Vault",
                         cur_subtab == DepotsSubTab::Declarations,
+                    )
+                    .on_hover_text(
+                        "Enable or disable DLCs, pin/unpin game builds, and switch saved .lua presets in LuaVault",
                     )
                     .clicked()
                     {
@@ -228,6 +259,13 @@ impl LuaToolsApp {
                                 .color(Palette::TEXT_PRIMARY),
                         );
                         ui.label(
+                            RichText::new(
+                                "Locks depots to exact 19-digit Manifest GIDs in the Steam bridge so Steam cannot auto-update over modded builds.",
+                            )
+                            .size(12.0)
+                            .color(Palette::TEXT_SECONDARY),
+                        );
+                        ui.label(
                             RichText::new(format!(
                                 "{} pinned depot(s) for AppID {}  ·  {} active in Steam bridge, {} pending Steam launch",
                                 pins.len(),
@@ -235,13 +273,16 @@ impl LuaToolsApp {
                                 active_n,
                                 pins.len().saturating_sub(active_n)
                             ))
-                            .size(12.5)
+                            .size(12.0)
                             .color(Palette::TEXT_MUTED),
                         );
                     });
                 },
                 |ui| {
-                    if secondary_button(ui, "Re-Sync Pins to Bridge").clicked() {
+                    if secondary_button(ui, "Re-Sync Pins to Bridge")
+                        .on_hover_text("Push all saved manifest pins to the live Steam IPC bridge now")
+                        .clicked()
+                    {
                         do_resync = true;
                     }
                 },
@@ -551,9 +592,35 @@ impl LuaToolsApp {
                         ui.add_space(10.0);
                         if let Some(ref sel_h) = self.depots_selected_variant_hash.clone() {
                             let is_already_live = active_hash.as_deref() == Some(sel_h.as_str());
-                            ui.add_enabled_ui(!is_already_live, |ui| {
-                                if primary_button(ui, "Apply Selected Variant").clicked() {
-                                    apply_hash = Some(sel_h.clone());
+                            let cur_label = variants
+                                .iter()
+                                .find(|v| &v.hash == sel_h)
+                                .and_then(|v| v.label.clone())
+                                .unwrap_or_default();
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                                ui.add_enabled_ui(!is_already_live, |ui| {
+                                    if table_button(ui, "Apply Selected", true)
+                                        .on_hover_text(
+                                            "Make this saved LuaVault build active in Steam stplug-in/",
+                                        )
+                                        .clicked()
+                                    {
+                                        apply_hash = Some(sel_h.clone());
+                                    }
+                                });
+                                if table_button(ui, "Rename", false)
+                                    .on_hover_text("Give this saved LuaVault snapshot a friendly name")
+                                    .clicked()
+                                {
+                                    rename_hash = Some((sel_h.clone(), cur_label));
+                                }
+                                if !is_already_live
+                                    && table_button(ui, "Delete", false)
+                                        .on_hover_text("Delete this non-active snapshot from LuaVault")
+                                        .clicked()
+                                {
+                                    delete_hash = Some(sel_h.clone());
                                 }
                             });
                         }
@@ -608,14 +675,27 @@ impl LuaToolsApp {
                         egui::Sides::new().show(
                             ui,
                             |ui| {
-                                ui.label(
-                                    RichText::new("Depot & DLC Declarations")
-                                        .font(display_font(16.5))
-                                        .color(Palette::TEXT_PRIMARY),
-                                );
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 2.0;
+                                    ui.label(
+                                        RichText::new("Depot & DLC Declarations")
+                                            .font(display_font(16.5))
+                                            .color(Palette::TEXT_PRIMARY),
+                                    );
+                                    ui.label(
+                                        RichText::new(
+                                            "Tick checkboxes to enable/disable DLCs, or click Pin / Unpin to lock a patch build vs allow Steam updates.",
+                                        )
+                                        .size(12.0)
+                                        .color(Palette::TEXT_MUTED),
+                                    );
+                                });
                             },
                             |ui| {
-                                if ghost_button(ui, "Open Lua Editor ›").clicked() {
+                                if ghost_button(ui, "Open Lua Editor ›")
+                                    .on_hover_text("Edit raw stplug-in/<appid>.lua text directly")
+                                    .clicked()
+                                {
                                     self.depots_subtab = DepotsSubTab::LiveEditor;
                                 }
                             },
@@ -1052,6 +1132,15 @@ impl LuaToolsApp {
             let mut click_qr_login = false;
             let mut click_refresh_info = false;
 
+            ui.label(
+                RichText::new(
+                    "Select content depots below to download directly from Steam CDN. Use 'Sign In (QR)' once if Steam requires account login.",
+                )
+                .size(12.0)
+                .color(Palette::TEXT_MUTED),
+            );
+            ui.add_space(6.0);
+
             // Output folder + Steam Login / Selection controls
             egui::Sides::new().show(
                 ui,
@@ -1267,7 +1356,7 @@ impl LuaToolsApp {
             ui.add_space(8.0);
             egui::CollapsingHeader::new(
                 RichText::new(format!(
-                    "Download Queue & History (100-item ring · {})",
+                    "Recent Downloads ({})",
                     self.download_history.len()
                 ))
                 .font(semibold_font(12.5))
@@ -1421,7 +1510,8 @@ impl LuaToolsApp {
                         .margin(Margin::symmetric(10, 6))
                         .hint_text("Filter fixes…"),
                 );
-                ui.checkbox(&mut self.fixes_my_games_only, "Configured only");
+                ui.checkbox(&mut self.fixes_my_games_only, "My Games only")
+                    .on_hover_text("Only show fixes for games you have added in LuaTools");
             },
         );
 
@@ -1506,11 +1596,30 @@ impl LuaToolsApp {
                         ui.set_height(body_h - 36.0);
                         if let Some(aid) = self.fixes_current_app {
                             let install_dir = self.steam_service.find_install_dir(aid);
-                            ui.label(
-                                RichText::new(self.resolve_game_title(aid))
-                                    .font(display_font(20.0))
-                                    .color(Palette::TEXT_PRIMARY),
+                            let mut open_fix_integration = false;
+                            egui::Sides::new().show(
+                                ui,
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(self.resolve_game_title(aid))
+                                            .font(display_font(20.0))
+                                            .color(Palette::TEXT_PRIMARY),
+                                    );
+                                },
+                                |ui| {
+                                    if secondary_button(ui, "Integrate / Setup")
+                                        .on_hover_text(
+                                            "Open Integration & Process Controls for this game (1-click Recommended Fixes, Play Unowned, AppID 480, Goldberg)",
+                                        )
+                                        .clicked()
+                                    {
+                                        open_fix_integration = true;
+                                    }
+                                },
                             );
+                            if open_fix_integration {
+                                self.open_integration_for_app(aid);
+                            }
                             ui.label(
                                 RichText::new(match &install_dir {
                                     Some(p) => format!("AppID {}  ·  {}", aid, p.display()),
@@ -1777,14 +1886,22 @@ impl LuaToolsApp {
             }
         }
 
-        // Clean Sub-Tab Strip (plain-English labels)
+        // Clean Sub-Tab Strip (plain-English labels + clear hover descriptions)
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            if chip_button(ui, "General", self.settings_subtab == SettingsSubTab::General).clicked()
+            if chip_button(ui, "General", self.settings_subtab == SettingsSubTab::General)
+                .on_hover_text(
+                    "Steam root folder, auto-update behavior, OS login autostart, and system tray preferences",
+                )
+                .clicked()
             {
                 self.settings_subtab = SettingsSubTab::General;
             }
-            if chip_button(ui, "Account", self.settings_subtab == SettingsSubTab::Account).clicked()
+            if chip_button(ui, "Account", self.settings_subtab == SettingsSubTab::Account)
+                .on_hover_text(
+                    "Discord OAuth sign-in, Hubcap manifest API key, and Steam DepotDownloader QR login",
+                )
+                .clicked()
             {
                 self.settings_subtab = SettingsSubTab::Account;
             }
@@ -1792,6 +1909,9 @@ impl LuaToolsApp {
                 ui,
                 "Steam Setup",
                 self.settings_subtab == SettingsSubTab::Integrations,
+            )
+            .on_hover_text(
+                "1-click SLSsteam unlocker installer, Play Unowned toggle, Cloud Save Redirect, and Steam Store Page Plugin",
             )
             .clicked()
             {
@@ -1802,6 +1922,9 @@ impl LuaToolsApp {
                 "Advanced Bridge",
                 self.settings_subtab == SettingsSubTab::SteamIntegration,
             )
+            .on_hover_text(
+                "Rootless libsteam_integration.so launcher, ELF64 binary pattern scanner, and live stplug-in file watcher",
+            )
             .clicked()
             {
                 self.settings_subtab = SettingsSubTab::SteamIntegration;
@@ -1811,6 +1934,9 @@ impl LuaToolsApp {
                 "Updates & Tools",
                 self.settings_subtab == SettingsSubTab::UpdatesAndTools,
             )
+            .on_hover_text(
+                "Update LuaTools via Git and install Goldberg Emulator, DepotDownloaderMod, SteamAutoPatch, or Steamless",
+            )
             .clicked()
             {
                 self.settings_subtab = SettingsSubTab::UpdatesAndTools;
@@ -1819,6 +1945,9 @@ impl LuaToolsApp {
                 ui,
                 "Diagnostics",
                 self.settings_subtab == SettingsSubTab::Telemetry,
+            )
+            .on_hover_text(
+                "Privacy-scrubbed error logs, crash diagnostics, and 1-click GitHub bug report helper",
             )
             .clicked()
             {
@@ -2478,182 +2607,213 @@ impl LuaToolsApp {
 
         ui.add_space(16.0);
 
-        // 3. Advanced Optional Bridges (collapsed by default so primary users aren't overwhelmed)
+        // 3. Cloud Save Redirect & Steam Store Page Plugin (visible cards, never hidden in a closed drawer)
         let mut sync_cloud = false;
         let mut add_cloud_app: Option<u32> = None;
         let mut add_cloud_invalid = false;
         let mut toggle_cloud: Option<(u32, bool)> = None;
         let mut cef_toggled = false;
 
-        egui::CollapsingHeader::new(
-            RichText::new("Advanced: Steam Cloud Redirect & Store Page Plugins")
-                .font(semibold_font(13.5))
-                .color(Palette::TEXT_SECONDARY),
-        )
-        .default_open(false)
-        .show(ui, |ui| {
-            ui.add_space(8.0);
-            let cr_status = self.cloud_redirect_service.status();
-            let cloud_apps = self.cloud_redirect_service.list_cloud_apps();
+        let cr_status = self.cloud_redirect_service.status();
+        let cloud_apps = self.cloud_redirect_service.list_cloud_apps();
 
-            paper_card(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.spacing_mut().item_spacing.y = 10.0;
-                egui::Sides::new().show(
-                    ui,
-                    |ui| {
-                        ui.label(
-                            RichText::new("Cloud Redirect (Steam Cloud Revival)")
-                                .font(display_font(16.5))
-                                .color(Palette::TEXT_PRIMARY),
-                        );
-                    },
-                    |ui| match &cr_status {
-                        CloudRedirectStatus::Active => {
-                            status_badge(ui, "CloudRedirect Active", BadgeTone::Ready);
-                        }
-                        CloudRedirectStatus::Installed => {
-                            status_badge(ui, "Installed", BadgeTone::Blue);
-                        }
-                        CloudRedirectStatus::NotInstalled => {
-                            status_badge(ui, "Not Installed", BadgeTone::Muted);
-                        }
-                        CloudRedirectStatus::Error(_) => {
-                            status_badge(ui, "Error", BadgeTone::Warn);
-                        }
-                    },
-                );
-                ui.label(
-                    RichText::new(format!(
-                        "Config path: {}  ·  {} cloud-synced app(s)",
-                        self.cloud_redirect_service.redirect_path().display(),
-                        cloud_apps.len()
-                    ))
-                    .size(12.0)
-                    .color(Palette::TEXT_MUTED),
-                );
-                ui.horizontal(|ui| {
-                    let cloud_edit = ui.add_sized(
-                        [150.0, 28.0],
-                        TextEdit::singleline(&mut self.cloud_app_input)
-                            .margin(Margin::symmetric(8, 5))
-                            .hint_text("AppID (e.g. 1245620)"),
+        paper_card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 10.0;
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    ui.label(
+                        RichText::new("Cloud Save Redirect (Steam Cloud Revival)")
+                            .font(display_font(17.5))
+                            .color(Palette::TEXT_PRIMARY),
                     );
-                    let submit_cloud = (cloud_edit.lost_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                        || secondary_button(ui, "+ Enable Cloud App").clicked();
-                    if submit_cloud {
-                        match self.cloud_app_input.trim().parse::<u32>() {
-                            Ok(aid) if aid > 0 => add_cloud_app = Some(aid),
-                            _ => add_cloud_invalid = true,
-                        }
+                },
+                |ui| match &cr_status {
+                    CloudRedirectStatus::Active => {
+                        status_badge(ui, "CloudRedirect Active", BadgeTone::Ready);
                     }
-                    if primary_button(ui, "Sync to CloudRedirect").clicked() {
-                        sync_cloud = true;
+                    CloudRedirectStatus::Installed => {
+                        status_badge(ui, "Installed", BadgeTone::Blue);
                     }
-                });
-
-                let mut candidate_ids: Vec<(u32, String)> = self
-                    .library_rows
-                    .iter()
-                    .map(|r| (r.app_id, r.name.clone()))
-                    .collect();
-                for &cid in &cloud_apps {
-                    if !candidate_ids.iter().any(|(id, _)| *id == cid) {
-                        candidate_ids.push((cid, self.resolve_game_title(cid)));
+                    CloudRedirectStatus::NotInstalled => {
+                        status_badge(ui, "Not Installed", BadgeTone::Muted);
+                    }
+                    CloudRedirectStatus::Error(_) => {
+                        status_badge(ui, "Error", BadgeTone::Warn);
+                    }
+                },
+            );
+            ui.label(
+                RichText::new(
+                    "Restores save-game cloud sync for added games via CloudRedirect. Tick games below or enter an AppID, then click Sync to CloudRedirect.",
+                )
+                .size(12.5)
+                .color(Palette::TEXT_MUTED),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "Config path: {}  ·  {} cloud-synced app(s)",
+                    self.cloud_redirect_service.redirect_path().display(),
+                    cloud_apps.len()
+                ))
+                .size(12.0)
+                .color(Palette::TEXT_SECONDARY),
+            );
+            ui.horizontal(|ui| {
+                let cloud_edit = ui.add_sized(
+                    [150.0, 28.0],
+                    TextEdit::singleline(&mut self.cloud_app_input)
+                        .margin(Margin::symmetric(8, 5))
+                        .hint_text("AppID (e.g. 1245620)"),
+                );
+                let submit_cloud = (cloud_edit.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    || secondary_button(ui, "+ Enable Cloud App")
+                        .on_hover_text("Add this AppID to your Cloud Save Redirect list")
+                        .clicked();
+                if submit_cloud {
+                    match self.cloud_app_input.trim().parse::<u32>() {
+                        Ok(aid) if aid > 0 => add_cloud_app = Some(aid),
+                        _ => add_cloud_invalid = true,
                     }
                 }
-                if !candidate_ids.is_empty() {
-                    inset_paper_sheet(ui, Margin::symmetric(10, 8), |ui| {
-                        ui.set_width(ui.available_width());
-                        ScrollArea::vertical()
-                            .id_salt("cloud_redirect_apps_scroll")
-                            .max_height(140.0)
-                            .show(ui, |ui| {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.spacing_mut().item_spacing = egui::vec2(14.0, 6.0);
-                                    for (aid, name) in &candidate_ids {
-                                        let mut enabled =
-                                            self.cloud_redirect_service.is_cloud_enabled(*aid);
-                                        let lbl = format!("{} (#{})", name, aid);
-                                        if ui.checkbox(&mut enabled, lbl).changed() {
-                                            toggle_cloud = Some((*aid, enabled));
-                                        }
-                                    }
-                                });
-                            });
-                    });
+                if primary_button(ui, "Sync to CloudRedirect")
+                    .on_hover_text("Write selected cloud-enabled AppIDs to your CloudRedirect config")
+                    .clicked()
+                {
+                    sync_cloud = true;
                 }
             });
 
-            ui.add_space(12.0);
-
-            paper_card(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.spacing_mut().item_spacing.y = 10.0;
-                ui.label(
-                    RichText::new("Steam Store Bridge (Millennium, CEF & URI Handler)")
-                        .font(display_font(16.5))
-                        .color(Palette::TEXT_PRIMARY),
-                );
-                ui.label(
-                    RichText::new(&self.settings_millennium_status)
-                        .size(12.5)
-                        .color(if self.millennium_connected {
-                            Palette::GO_TEXT
-                        } else {
-                            Palette::TEXT_MUTED
-                        }),
-                );
-                if ui
-                    .checkbox(
-                        &mut self.settings_service.settings.cef_bridge_enabled,
-                        "Enable CEF DevTools Store Bridge (127.0.0.1:8080 › local RPC :6767)",
-                    )
-                    .changed()
-                {
-                    cef_toggled = true;
+            let mut candidate_ids: Vec<(u32, String)> = self
+                .library_rows
+                .iter()
+                .map(|r| (r.app_id, r.name.clone()))
+                .collect();
+            for &cid in &cloud_apps {
+                if !candidate_ids.iter().any(|(id, _)| *id == cid) {
+                    candidate_ids.push((cid, self.resolve_game_title(cid)));
                 }
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 10.0;
-                    if secondary_button(ui, "Probe Millennium").clicked() {
-                        self.probe_bridge_async(ui.ctx());
-                    }
-                    if secondary_button(ui, "Enable Steam CEF Debugging").clicked() {
-                        if let Some(inst) = &self.steam_service.installation {
-                            match CefBridgeService::ensure_cef_debugging_enabled(&inst.root) {
-                                Ok(m) => self.notify(m, ToastKind::Success),
-                                Err(m) => self.notify(m, ToastKind::Warning),
-                            }
-                        } else {
-                            self.notify("Steam installation not detected.", ToastKind::Warning);
+            }
+            if !candidate_ids.is_empty() {
+                inset_paper_sheet(ui, Margin::symmetric(10, 8), |ui| {
+                    ui.set_width(ui.available_width());
+                    ScrollArea::vertical()
+                        .id_salt("cloud_redirect_apps_scroll")
+                        .max_height(140.0)
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(14.0, 6.0);
+                                for (aid, name) in &candidate_ids {
+                                    let mut enabled =
+                                        self.cloud_redirect_service.is_cloud_enabled(*aid);
+                                    let lbl = format!("{} (#{})", name, aid);
+                                    if ui.checkbox(&mut enabled, lbl).changed() {
+                                        toggle_cloud = Some((*aid, enabled));
+                                    }
+                                }
+                            });
+                        });
+                });
+            }
+        });
+
+        ui.add_space(16.0);
+
+        paper_card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 10.0;
+            ui.label(
+                RichText::new("Steam Store Page Plugin & URI Links")
+                    .font(display_font(17.5))
+                    .color(Palette::TEXT_PRIMARY),
+            );
+            ui.label(
+                RichText::new(
+                    "Adds LuaTools install buttons inside the Steam Store and registers luatools:// browser links on your desktop.",
+                )
+                .size(12.5)
+                .color(Palette::TEXT_MUTED),
+            );
+            ui.label(
+                RichText::new(&self.settings_millennium_status)
+                    .size(12.0)
+                    .color(if self.millennium_connected {
+                        Palette::GO_TEXT
+                    } else {
+                        Palette::TEXT_SECONDARY
+                    }),
+            );
+            if ui
+                .checkbox(
+                    &mut self.settings_service.settings.cef_bridge_enabled,
+                    "Enable Steam Store CEF Bridge (needed on Linux so Steam Store pages allow the LuaTools button)",
+                )
+                .on_hover_text("Connects Steam's local CEF DevTools (:8080) to LuaTools local RPC (:6767)")
+                .changed()
+            {
+                cef_toggled = true;
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                if primary_button(ui, "Install Store Page Plugin")
+                    .on_hover_text(
+                        "Stage the LuaTools JavaScript plugin into Steam so store pages show LuaTools buttons",
+                    )
+                    .clicked()
+                {
+                    if let Some(inst) = &self.steam_service.installation {
+                        let plugin_svc =
+                            crate::services::plugin_installer_service::PluginInstallerService::new(
+                                None,
+                            );
+                        match plugin_svc.ensure_luatools_js_installed(Some(&inst.root)) {
+                            Ok(path) => self.notify(
+                                format!("Installed Steam Store Plugin to {}", path.display()),
+                                ToastKind::Success,
+                            ),
+                            Err(e) => self.notify(
+                                format!("Failed to install Store Plugin: {}", e),
+                                ToastKind::Warning,
+                            ),
                         }
+                    } else {
+                        self.notify("Steam installation not detected.", ToastKind::Warning);
                     }
-                    if secondary_button(ui, "Register luatools:// Handler").clicked() {
-                        match ProtocolService::register_desktop_handler() {
+                }
+                if secondary_button(ui, "Register luatools:// Links")
+                    .on_hover_text(
+                        "Register luatools:// links with your Linux desktop so browser links open directly in LuaTools",
+                    )
+                    .clicked()
+                {
+                    match ProtocolService::register_desktop_handler() {
+                        Ok(m) => self.notify(m, ToastKind::Success),
+                        Err(m) => self.notify(m, ToastKind::Warning),
+                    }
+                }
+                if secondary_button(ui, "Enable Steam CEF Debugging")
+                    .on_hover_text(
+                        "Create Steam's .cef-enable-remote-debugging file (restart Steam afterward)",
+                    )
+                    .clicked()
+                {
+                    if let Some(inst) = &self.steam_service.installation {
+                        match CefBridgeService::ensure_cef_debugging_enabled(&inst.root) {
                             Ok(m) => self.notify(m, ToastKind::Success),
                             Err(m) => self.notify(m, ToastKind::Warning),
                         }
+                    } else {
+                        self.notify("Steam installation not detected.", ToastKind::Warning);
                     }
-                    if secondary_button(ui, "Install Store Page Plugin (LTSP)").clicked() {
-                        if let Some(inst) = &self.steam_service.installation {
-                            let plugin_svc =
-                                crate::services::plugin_installer_service::PluginInstallerService::new(None);
-                            match plugin_svc.ensure_luatools_js_installed(Some(&inst.root)) {
-                                Ok(path) => self.notify(
-                                    format!("Installed Steam Store Plugin to {}", path.display()),
-                                    ToastKind::Success,
-                                ),
-                                Err(e) => self.notify(
-                                    format!("Failed to install Store Plugin: {}", e),
-                                    ToastKind::Warning,
-                                ),
-                            }
-                        } else {
-                            self.notify("Steam installation not detected.", ToastKind::Warning);
-                        }
-                    }
-                });
+                }
+                if ghost_button(ui, "Check Millennium Status")
+                    .on_hover_text("Check if Millennium RPC is running on 127.0.0.1:38495")
+                    .clicked()
+                {
+                    self.probe_bridge_async(ui.ctx());
+                }
             });
         });
 
@@ -2788,14 +2948,27 @@ impl LuaToolsApp {
         egui::Sides::new().show(
             ui,
             |ui| {
-                ui.label(
-                    RichText::new("External Toolchain")
-                        .font(display_font(17.5))
-                        .color(Palette::TEXT_PRIMARY),
-                );
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(
+                        RichText::new("External Toolchain")
+                            .font(display_font(17.5))
+                            .color(Palette::TEXT_PRIMARY),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Optional helper tools for offline Steam emulation, depot downloading, and unpacking SteamStub executables:",
+                        )
+                        .size(12.5)
+                        .color(Palette::TEXT_MUTED),
+                    );
+                });
             },
             |ui| {
-                if ghost_button(ui, "Refresh Status").clicked() {
+                if ghost_button(ui, "Refresh Status")
+                    .on_hover_text("Re-check installed versions of all external helper tools")
+                    .clicked()
+                {
                     self.cached_tool_statuses.clear();
                 }
             },
@@ -2817,6 +2990,21 @@ impl LuaToolsApp {
                 .unwrap_or_else(|| self.tools_manager.inspect_tool(spec.key));
             let is_busy = self.tool_busy.get(spec.key).copied().unwrap_or(false);
             let pct = self.tool_progress.get(spec.key).copied().unwrap_or(0.0);
+            let when_to_use = match spec.key {
+                "depotdownloader" => {
+                    "When to use: Install this to download game depots directly in Depots & Vault › Download Depots using local .manifest files and decryption keys."
+                }
+                "goldberg" => {
+                    "When to use: Recommended — provides native Linux/Proton Steamworks libraries so 'Apply Recommended Fixes Now' and 'Offline Patch (Goldberg)' work offline."
+                }
+                "steamautopatch" => {
+                    "When to use: Automated folder patcher that applies Goldberg Steam emulation and generates steam_interfaces.txt for any game directory."
+                }
+                "stub_remover" => {
+                    "When to use: Unpacks SteamStub DRM on older Windows game .exe files (via Wine) when a game refuses to start with an emulator."
+                }
+                _ => "",
+            };
 
             paper_card_padded(ui, Margin::same(16), |ui| {
                 ui.set_width(ui.available_width());
@@ -2855,6 +3043,13 @@ impl LuaToolsApp {
                         .size(12.5)
                         .color(Palette::TEXT_SECONDARY),
                 );
+                if !when_to_use.is_empty() {
+                    ui.label(
+                        RichText::new(when_to_use)
+                            .size(12.0)
+                            .color(Palette::TEXT_MUTED),
+                    );
+                }
 
                 ui.add_space(4.0);
                 ui.horizontal_wrapped(|ui| {
@@ -3317,13 +3512,20 @@ impl LuaToolsApp {
                 .map(|p| format!("Running (PID {})", p))
                 .unwrap_or_else(|| "Not running".into());
             ui.label(
+                RichText::new(
+                    "Optional rootless LD_PRELOAD bridge that hooks Steam ownership checks, AppID 480 redirects, depot keys, and manifest pins.",
+                )
+                .size(12.5)
+                .color(Palette::TEXT_SECONDARY),
+            );
+            ui.label(
                 RichText::new(format!(
                     "Steam root: {}  ·  Process: {}  ·  Ticketed apps: {}",
                     root_txt,
                     pid_txt,
                     st.apps_with_tickets.len()
                 ))
-                .size(12.5)
+                .size(12.0)
                 .color(Palette::TEXT_MUTED),
             );
 

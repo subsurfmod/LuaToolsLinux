@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.1.0] - 2026-11-25
+
+### SLSsteam Configuration & Schema Compatibility
+- **Complete 32-Key `AceSLS/SLSsteam` `config.yaml` Schema (`src/models/config.rs`, `src/services/slssteam_service.rs`)**:
+  - Added and emitted all 32 upstream `AceSLS/SLSsteam` keys (`LogLevels: 0xff`, `API`, `DisableFamilyShareLock`, `UseWhitelist`, `MaxSchemaTries`, `SmartTickets: 0x1`, `SafeMode`, `WarnHashMissmatch`, `NotifyInit`, quoted `FakeName: ""` / `FakeEmail: ""`, `FakeWalletBalance`, `Plugins`, `DisableCloud`, `DisableUpdates`, `DumpClientInterfaces`, `ExtendedLogging`, explicit `[]` sequence defaults for `AppIds` / `FakeOffline` / `DepotBlacklist` / `AdditionalApps`, explicit `{}` map defaults for `FakeAppIds` / `ManifestIds` / `AppTokens` / `CDKeys` / `GameTitles` / `SubscriptionTimestamps` / `SteamIdOverride` / `LaunchOptions` / `DlcData` / `DenuvoGames`, and `IdleStatus`) so `SLSsteam.so` (`yaml-cpp`) starts with zero missing-key or null-type warnings.
+  - Fixed `ManifestIds` parsing & serialization: validates unquoted `u64` manifest GIDs, rejects non-numeric strings, strips octal-trap leading zeros, preserves non-numeric app tokens via `AppTokenStrings`, and automatically heals legacy/incomplete `config.yaml` files (including quoted/nested `ManifestIds` and scalar `SteamIdOverride`) on startup while preserving custom `extra_fields` without duplicate keys.
+
+### UI Discoverability & Per-Game Integration Wiring
+- **Direct Access to `Integration & Process Controls` & Surfaced Actions (`src/ui/app.rs`, `src/ui/dialogs.rs`, `src/ui/views_primary.rs`, `src/ui/views_workbench.rs`, `src/ui/views_guide.rs`)**:
+  - Wired the **Home** screen `Open` button (and game cover click) on Recently Added Games directly to **Integration & Process Controls** (`04_library_integration_modal.png`), with a companion `Depots & DLC` shortcut beside it, plus a new 1-click **Game Tools** bar inside the Integration modal (`Files & DLC`, `Edit .lua`, `Game Fixes`, `Launch Options`, `Open Folder`).
+  - Surfaced visible 1-click `Integrate`, `Files & DLC`, and `Edit .lua` buttons with a flattened `More` menu in **My Games**; added post-install action buttons (`Open Setup / Integration`, `Files & DLC`, `Game Fixes`, `Launch Options`) directly in **Add Games**; added `Integrate / Setup` and visible `LuaVault` action buttons (`Apply Selected`, `Rename`, `Delete`) in **Depots & Vault** and **Game Fixes**; and un-hid **Cloud Save Redirect** and **Steam Store Page Plugin & URI Links** into open cards in **Settings › Steam Setup**.
+
+### Documentation
+- **Plain-English `README.md` Rewrite (`README.md`)**:
+  - Rewrote `README.md` into a concise, plain-English quick-start and feature guide aligned 100% with the updated tab and button labels across all screens and guide screenshots.
+
+---
+
 ## [3.0.1] - 2026-11-25
 
 > **Major Stable Release (`v2.6.1` -> `v3.0.1`)**: Consolidates every milestone from `v2.7.1`, `v2.7.3-beta`, `v2.8.2-beta`, `v2.8.4-beta`, `v2.9.0-beta`, `v2.9.1-beta`, `v2.9.2-beta`, `v2.9.3-beta`, and `v2.9.4-beta` onto `main`, delivering 100% forensic feature parity, dramatic memory optimization (**220.7 MB -> 87.5 MB VmRSS**), a simplified primary-user interface, and complete test-verified reliability (**413 passing workspace tests, 0 warnings**).

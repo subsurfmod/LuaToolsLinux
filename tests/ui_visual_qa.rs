@@ -364,6 +364,20 @@ fn headless_papercut_views_render_cleanly_at_wide_and_narrow_resolutions() {
             d_sub: None,
             s_sub: Some(SettingsSubTab::General),
         },
+        QaViewCase {
+            fname: "21_library_narrow_1060x660.png",
+            size: [1060, 660],
+            view: ActiveView::Library,
+            d_sub: None,
+            s_sub: None,
+        },
+        QaViewCase {
+            fname: "22_integration_modal_narrow.png",
+            size: [1060, 660],
+            view: ActiveView::Overview,
+            d_sub: None,
+            s_sub: None,
+        },
     ];
 
     let guide_out_opt = std::env::var("LUATOOLS_GUIDE_OUT").ok().map(PathBuf::from);
@@ -383,8 +397,10 @@ fn headless_papercut_views_render_cleanly_at_wide_and_narrow_resolutions() {
         } else {
             GuideTopic::QuickStart
         };
-        if fname == "18_library_integration_modal.png" {
-            app.open_integration_modal(1245620, "ELDEN RING".into(), None);
+        if fname == "18_library_integration_modal.png"
+            || fname == "22_integration_modal_narrow.png"
+        {
+            app.open_integration_for_app(1245620);
         } else {
             app.integration_modal.open = false;
         }
@@ -521,6 +537,22 @@ fn modals_render_cleanly_and_dismiss_with_escape() {
     run_frame(&ctx, &mut app, true);
     assert!(!app.game_detail_modal.open);
 
+    // 3b. Integration modal opens via open_integration_for_app, resolves title + install_path, and closes on Escape
+    let fake_install = tmp.path().join("Steam/steamapps/common/ELDEN RING");
+    std::fs::create_dir_all(&fake_install).unwrap();
+    if let Some(row) = app.library_rows.iter_mut().find(|r| r.app_id == 1245620) {
+        row.install_path = Some(fake_install.clone());
+    }
+    app.open_integration_for_app(1245620);
+    assert!(app.integration_modal.open);
+    assert_eq!(app.integration_modal.app_id, 1245620);
+    assert_eq!(app.integration_modal.game_name, "ELDEN RING");
+    assert_eq!(app.integration_modal.install_path, Some(fake_install));
+    run_frame(&ctx, &mut app, false);
+    assert!(app.integration_modal.open);
+    run_frame(&ctx, &mut app, true);
+    assert!(!app.integration_modal.open);
+
     // 4. LaunchOptions modal renders and closes on Escape
     app.open_launch_options_modal(1245620, "ELDEN RING".into());
     run_frame(&ctx, &mut app, false);
@@ -601,7 +633,7 @@ fn cover_cooldown_prevents_retry_storms_and_protects_high_res_urls() {
 
 #[test]
 fn lua_editor_widget_renders_with_validation_and_version_matches_release() {
-    assert_eq!(luatools_linux::VERSION, "3.0.1");
+    assert_eq!(luatools_linux::VERSION, "3.1.0");
 
     let ctx = egui::Context::default();
     let mut editor = luatools_linux::ui::lua_editor::LuaEditor::new();

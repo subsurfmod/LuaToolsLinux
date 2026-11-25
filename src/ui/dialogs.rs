@@ -508,18 +508,27 @@ impl LuaToolsApp {
         let mut close = false;
         let mut do_save = false;
         let mut do_delete = false;
+        let mut do_open_integration = false;
         let app_id = self.game_detail_modal.app_id;
 
         egui::Window::new(format!(
-            "Configure {} (#{})",
+            "Edit .lua & Overrides — {} (#{})",
             self.game_detail_modal.game_name, app_id
         ))
         .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(true)
-        .default_size([620.0, 470.0])
+        .default_size([630.0, 490.0])
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
+            ui.label(
+                RichText::new(
+                    "Edit this game's stplug-in .lua script, FakeAppId override, and optional AppToken.",
+                )
+                .size(12.0)
+                .color(Palette::TEXT_MUTED),
+            );
+            ui.add_space(6.0);
             egui::Grid::new("game_detail_overrides_grid")
                 .num_columns(2)
                 .spacing([14.0, 10.0])
@@ -531,7 +540,10 @@ impl LuaToolsApp {
                             TextEdit::singleline(&mut self.game_detail_modal.fake_id_input)
                                 .hint_text("e.g. 480"),
                         );
-                        if ghost_button(ui, "Set 480 (Spacewar)").clicked() {
+                        if ghost_button(ui, "Set 480 (Spacewar)")
+                            .on_hover_text("Use AppID 480 (Spacewar) for online multiplayer compatibility")
+                            .clicked()
+                        {
                             self.game_detail_modal.fake_id_input = "480".into();
                         }
                         if !self.game_detail_modal.fake_id_input.trim().is_empty()
@@ -627,20 +639,39 @@ impl LuaToolsApp {
             egui::Sides::new().show(
                 ui,
                 |ui| {
-                    if danger_button(ui, "Remove .lua").clicked() {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if danger_button(ui, "Remove .lua")
+                        .on_hover_text("Delete stplug-in/<appid>.lua and clear unlocker overrides for this game")
+                        .clicked()
+                    {
                         do_delete = true;
+                    }
+                    if secondary_button(ui, "Integration & Quick Setup…")
+                        .on_hover_text("Switch to Integration & Process Controls (1-click Recommended Fixes, Play Unowned, Goldberg, LD_PRELOAD)")
+                        .clicked()
+                    {
+                        do_open_integration = true;
                     }
                 },
                 |ui| {
                     if ghost_button(ui, "Cancel").clicked() {
                         close = true;
                     }
-                    if primary_button(ui, "Save Configuration").clicked() {
+                    if primary_button(ui, "Save .lua & Overrides")
+                        .on_hover_text("Write changes to stplug-in/<appid>.lua and sync SLSsteam config.yaml")
+                        .clicked()
+                    {
                         do_save = true;
                     }
                 },
             );
         });
+
+        if do_open_integration {
+            self.game_detail_modal.open = false;
+            self.open_integration_for_app(app_id);
+            return;
+        }
 
         if do_save {
             let fid_trim = self.game_detail_modal.fake_id_input.trim();
@@ -1245,12 +1276,31 @@ impl LuaToolsApp {
         }
     }
 
+    pub fn open_integration_for_app(&mut self, app_id: u32) {
+        let game_name = self.resolve_game_title(app_id);
+        let install_path = self
+            .library_rows
+            .iter()
+            .find(|r| r.app_id == app_id)
+            .and_then(|r| r.install_path.clone())
+            .or_else(|| self.steam_service.find_install_dir(app_id));
+        self.open_integration_modal(app_id, game_name, install_path);
+    }
+
     pub fn open_integration_modal(
         &mut self,
         app_id: u32,
         game_name: String,
         install_path: Option<std::path::PathBuf>,
     ) {
+        let resolved_install_path = install_path
+            .or_else(|| {
+                self.library_rows
+                    .iter()
+                    .find(|r| r.app_id == app_id)
+                    .and_then(|r| r.install_path.clone())
+            })
+            .or_else(|| self.steam_service.find_install_dir(app_id));
         let spoof = self
             .steam_bridge_service
             .get_app_id_spoof(app_id)
@@ -1282,7 +1332,7 @@ impl LuaToolsApp {
         self.integration_modal.open = true;
         self.integration_modal.app_id = app_id;
         self.integration_modal.game_name = game_name;
-        self.integration_modal.install_path = install_path;
+        self.integration_modal.install_path = resolved_install_path;
         self.integration_modal.spoof_id_input = spoof;
         self.integration_modal.cd_key_input = cd_key;
         self.integration_modal.depot_id_input = app_id.saturating_add(1).to_string();
@@ -1318,6 +1368,10 @@ impl LuaToolsApp {
         let cur_stats = self.steam_bridge_service.get_stats(app_id);
 
         let mut close = false;
+        let mut jump_depots = false;
+        let mut jump_edit_lua = false;
+        let mut jump_launch_opts = false;
+        let mut jump_fixes = false;
         let mut apply_quick_setup = false;
         let mut toggle_redirect: Option<bool> = None;
         let mut set_spoof = false;
@@ -1333,6 +1387,10 @@ impl LuaToolsApp {
         let mut run_steamless = false;
         let mut clean_legacy = false;
 
+        let screen_h = ctx.screen_rect().height();
+        let modal_h = (screen_h - 104.0).clamp(400.0, 585.0);
+        let scroll_max_h = (modal_h - 155.0).max(245.0);
+
         egui::Window::new(format!(
             "Integration & Process Controls — {} (#{})",
             game_name, app_id
@@ -1340,12 +1398,68 @@ impl LuaToolsApp {
         .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(true)
-        .default_size([650.0, 560.0])
+        .default_size([660.0, modal_h])
+        .max_height(modal_h)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
+            // Top 1-Click Game Tool Switcher so users never hunt through hidden menus
+            inset_paper_sheet(ui, Margin::symmetric(12, 8), |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                    ui.label(
+                        RichText::new("Game Tools:")
+                            .font(semibold_font(12.0))
+                            .color(Palette::TEXT_MUTED),
+                    );
+                    if crate::ui::theme::table_button(ui, "Files & DLC", false)
+                        .on_hover_text(
+                            "Open Depots & Vault to toggle DLCs, switch saved .lua builds, pin manifests, or download depots",
+                        )
+                        .clicked()
+                    {
+                        jump_depots = true;
+                    }
+                    if crate::ui::theme::table_button(ui, "Edit .lua", false)
+                        .on_hover_text(
+                            "Edit stplug-in/<appid>.lua script, FakeAppId override, and AppToken",
+                        )
+                        .clicked()
+                    {
+                        jump_edit_lua = true;
+                    }
+                    if crate::ui::theme::table_button(ui, "Launch Options", false)
+                        .on_hover_text(
+                            "View or edit Steam appinfo.vdf launch executables and arguments",
+                        )
+                        .clicked()
+                    {
+                        jump_launch_opts = true;
+                    }
+                    if crate::ui::theme::table_button(ui, "Game Fixes", false)
+                        .on_hover_text(
+                            "Browse and apply verified DRM / online fixes with SHA-256 backup",
+                        )
+                        .clicked()
+                    {
+                        jump_fixes = true;
+                    }
+                    if let Some(ref p) = install_path {
+                        if crate::ui::theme::table_button(ui, "Open Folder", false)
+                            .on_hover_text("Open the local game installation folder in your file manager")
+                            .clicked()
+                        {
+                            let _ = std::process::Command::new("xdg-open").arg(p).spawn();
+                        }
+                    }
+                });
+            });
+
+            ui.add_space(6.0);
+
             ScrollArea::vertical()
                 .id_salt("integration_modal_scroll")
-                .max_height(485.0)
+                .max_height(scroll_max_h)
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 10.0;
 
@@ -1387,15 +1501,30 @@ impl LuaToolsApp {
                         );
                         ui.add_space(8.0);
                         ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing.x = 8.0;
-                            if primary_button(ui, "Apply Recommended Fixes Now").clicked() {
+                            ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+                            if primary_button(ui, "Apply Recommended Fixes Now")
+                                .on_hover_text(
+                                    "Enables Play-Unowned, sets AppID 480 redirect, and applies Goldberg if installed locally",
+                                )
+                                .clicked()
+                            {
                                 apply_quick_setup = true;
                             }
                             if install_path.is_some() {
-                                if secondary_button(ui, "Unpack SteamStub (Steamless)").clicked() {
+                                if secondary_button(ui, "Remove SteamStub DRM (Steamless)")
+                                    .on_hover_text(
+                                        "Unpack SteamStub-wrapped game .exe files using Steamless",
+                                    )
+                                    .clicked()
+                                {
                                     run_steamless = true;
                                 }
-                                if secondary_button(ui, "Clean Legacy Unlockers").clicked() {
+                                if secondary_button(ui, "Clean Old Unlockers")
+                                    .on_hover_text(
+                                        "Remove leftover SmokeAPI/GreenLuma/Koalageddon files and restore original DLLs",
+                                    )
+                                    .clicked()
+                                {
                                     clean_legacy = true;
                                 }
                             }
@@ -1864,6 +1993,26 @@ impl LuaToolsApp {
                 },
             );
             self.refresh_all_local_state();
+        }
+        if jump_depots {
+            self.integration_modal.open = false;
+            self.open_game_in_depots(app_id, ctx);
+            return;
+        }
+        if jump_edit_lua {
+            self.integration_modal.open = false;
+            self.open_game_detail_modal(app_id, game_name);
+            return;
+        }
+        if jump_launch_opts {
+            self.integration_modal.open = false;
+            self.open_launch_options_modal(app_id, game_name);
+            return;
+        }
+        if jump_fixes {
+            self.integration_modal.open = false;
+            self.open_app_in_fixes(app_id, ctx);
+            return;
         }
         if close {
             self.integration_modal.open = false;
