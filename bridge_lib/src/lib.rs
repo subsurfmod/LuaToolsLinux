@@ -60,7 +60,7 @@ use luatools_linux::steam_bridge::{
     },
     memory_patch::{self, MemoryPatch, JMP_ABS64_LEN},
     netpacket::{
-        install_cloud_hooks, install_eticket_hooks, install_manifestprobe_hooks,
+        install_cloud_hooks, install_eticket_hooks, install_licenses_hooks, install_manifestprobe_hooks,
         install_netpacket_core, install_ownershipticket_hooks, install_userstats_hooks,
         netpacket_eticket::parse_eticket_steam_id,
         netpacket_manifestprobe::expire_manifest_probe_stale,
@@ -1000,6 +1000,7 @@ fn try_install_steamclient_patches(steam_root: &Path) {
         );
     }
     let _ = install_eticket_hooks();
+    let _ = install_licenses_hooks();
     let _ = install_manifestprobe_hooks();
     let _ = install_ownershipticket_hooks();
     let _ = install_userstats_hooks();
@@ -1636,6 +1637,34 @@ pub fn get_legacy_cd_key(app_id: u32) -> Option<String> {
         return Some(resolved);
     }
     Some(legacycdkey::synthesize(app_id, account_id))
+}
+
+/// Reader function for depot decryption keys
+pub fn get_depot_key(depot_id: u32) -> Option<String> {
+    read_lock(depot_keys()).get(&depot_id).cloned()
+}
+
+/// Exported C reader for depot decryption keys
+/// Returns a pointer to a C string (caller does not need to free - memory is leaked)
+#[no_mangle]
+pub extern "C" fn get_depot_key_c(depot_id: u32) -> *const libc::c_char {
+    if let Some(key) = get_depot_key(depot_id) {
+        let c_str = std::ffi::CString::new(key).unwrap_or_default();
+        c_str.into_raw()
+    } else {
+        std::ptr::null()
+    }
+}
+
+/// Reader function for additional apps (Lua-unlocked via addappid)
+pub fn is_additional_app(app_id: u32) -> bool {
+    read_lock(spoofed_apps()).contains(&app_id)
+}
+
+/// Exported C reader for additional apps check
+#[no_mangle]
+pub extern "C" fn is_additional_app_c(app_id: u32) -> bool {
+    is_additional_app(app_id)
 }
 
 /// Exported C reader for legacy CD keys

@@ -10,14 +10,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::steam_bridge::credentials::appticket::AppTicketSource;
 use crate::steam_bridge::credentials::eticketclient::EticketClient;
 use crate::steam_bridge::interop::interop_ipc::register_handler;
-use crate::steam_bridge::interop::interop_misc::{is_online_fix_active, resolve_app_id};
+use crate::steam_bridge::interop::interop_misc::{is_online_fix_active, ONLINE_FIX_APP_ID, resolve_app_id};
 use crate::steam_bridge::interop::ipc::fnv1a_hash;
 use crate::steam_bridge::ticket_store::TicketStore;
 
 static FRESH_ETICKET: OnceLock<Mutex<HashMap<u32, Vec<u8>>>> = OnceLock::new();
-
-/// Online fix app ID (Spacewar).
-pub const ONLINE_FIX_APP_ID: u32 = 480;
 
 const DEFAULT_FORGED_STEAM_ID: u64 = 76_561_197_960_287_930;
 

@@ -186,11 +186,12 @@ pub fn read_config_store_local_binary(key_name: &str) -> Vec<u8> {
     value
 }
 
-/// Get decryption key for a depot (integrates with LuaConfig).
-fn get_decryption_key(_depot_id: u32) -> Option<Vec<u8>> {
-    // This would be populated by the Lua config system
-    // For now return None - will be wired up when LuaConfig is fully implemented
-    None
+/// Get decryption key for a depot (integrates with LuaConfig / bridge_lib depot_keys).
+fn get_decryption_key(depot_id: u32) -> Option<Vec<u8>> {
+    // Try to get from bridge_lib's depot_keys store
+    crate::steam_bridge::interop::bridge_lib::read_depot_key(depot_id)
+        .and_then(|hex| hex::decode(hex.trim()).ok())
+        .filter(|b| b.len() == 32)
 }
 
 /// Get cached app ownership ticket.

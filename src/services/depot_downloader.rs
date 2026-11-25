@@ -342,8 +342,11 @@ impl DepotDownloaderService {
         if !clean_user.is_empty() && !clean_user.eq_ignore_ascii_case("anonymous") {
             args.push("-username".to_string());
             args.push(clean_user.to_string());
+            args.push("-remember-password".to_string());
+        } else {
+            args.push("-qr".to_string());
+            args.push("-remember-password".to_string());
         }
-        args.push("-remember-password".to_string());
         args
     }
 

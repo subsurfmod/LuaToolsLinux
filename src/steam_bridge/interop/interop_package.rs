@@ -277,6 +277,12 @@ pub fn has_depot(depot_id: u32) -> bool {
     depots.contains(&depot_id)
 }
 
+/// Check if an AppID is in additional_apps (Lua-unlocked, configured via addappid).
+/// This checks the bridge_lib's additional apps store.
+pub fn is_additional_app(app_id: u32) -> bool {
+    crate::steam_bridge::interop::bridge_lib::is_additional_app(app_id)
+}
+
 /// Detour for CUtlMemoryGrow.
 unsafe extern "C" fn cutl_memory_grow_detour(buffer: usize, grow_size: i32) -> usize {
     panic::catch_unwind(AssertUnwindSafe(|| {

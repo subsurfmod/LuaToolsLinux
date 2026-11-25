@@ -3,6 +3,7 @@
 //! This module replaces Windows-specific hooking and IPC interception
 //! with Linux equivalents using memory_patch.rs and pattern_db.rs.
 
+pub mod bridge_lib;
 pub mod interop_callbacks;
 pub mod interop_decryption;
 pub mod interop_ipc;
@@ -22,7 +23,7 @@ pub use interop_ipc::{
 pub use interop_ipc_isteamuser::{
     handler_post_get_app_ownership_ticket, handler_post_get_encrypted_app_ticket,
     handler_post_get_steam_id, handler_post_request_encrypted_app_ticket,
-    install_iclientuser_handlers, ONLINE_FIX_APP_ID,
+    install_iclientuser_handlers,
 };
 
 pub use interop_ipc_isteamutils::{
@@ -33,7 +34,7 @@ pub use interop_misc::{
     ensure_buffer_capacity, get_app_id_for_current_pipe, get_game_name_by_app_id,
     install as interop_misc_install, is_online_fix_active, is_lua_unlocked, notify_networking_sockets_used,
     register_ipc_handlers, resolve_app_id, set_suppress_app_id_flip,
-    should_report_online_fix_app_id,
+    should_report_online_fix_app_id, ONLINE_FIX_APP_ID,
     FriendEntry, ClanData, OtherGameData, PersonaStateMsg,
 };
 

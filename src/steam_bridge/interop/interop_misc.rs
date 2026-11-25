@@ -364,8 +364,16 @@ pub fn get_game_name_by_app_id(app_id: u32) -> String {
 
 /// Check if an AppID is Lua-unlocked (in additional_apps, i.e., configured via addappid).
 /// This mirrors LuaConfig::HasDepot(appId) from Windows.
+/// Returns true if the app is either:
+/// 1. Actually owned (has_depot returns true)
+/// 2. In additional_apps (configured via addappid to be playable without ownership)
 pub fn is_lua_unlocked(app_id: u32) -> bool {
-    crate::steam_bridge::interop::interop_package::has_depot(app_id)
+    // First check if actually owned
+    if crate::steam_bridge::interop::interop_package::has_depot(app_id) {
+        return true;
+    }
+    // Then check if in additional_apps (Lua-unlocked)
+    crate::steam_bridge::interop::interop_package::is_additional_app(app_id)
 }
 
 /// Friend entry in CMsgClientPersonaState.

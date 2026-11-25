@@ -662,7 +662,9 @@ pub fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
         if list_out.status.success() {
             let listing = String::from_utf8_lossy(&list_out.stdout);
             for line in listing.lines() {
-                if line.contains("..") || line.contains("/../") || line.contains("\\..\\") {
+                // Check for actual path traversal patterns (../ or ..\ as path components)
+                // Not just ".." anywhere in the filename (e.g., "docs/LICENSE" contains ".." in "LICENSE")
+                if line.contains("/../") || line.contains("\\..\\") || line.contains("../") || line.contains("..\\") {
                     return Err(format!("Rejected unsafe path-traversal entry in 7z: {}", line.trim()));
                 }
             }
