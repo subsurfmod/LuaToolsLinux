@@ -2,8 +2,8 @@
 //!
 //! Implements XOR decryption, XTEA decryption, and AES decryption used by SteamStub variants.
 
-use aes::cipher::{KeyIvInit, block_padding::NoPadding, BlockDecryptMut};
-use cbc::Decryptor;
+use aes::cipher::{KeyIvInit, block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, BlockSizeUser};
+use cbc::{Decryptor, Encryptor};
 
 type Aes256CbcDec = Decryptor<aes::Aes256>;
 
