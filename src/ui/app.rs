@@ -1911,7 +1911,7 @@ impl LuaToolsApp {
     ) {
         self.tool_busy.insert("stub_remover".to_string(), true);
         self.status_text = format!(
-            "Running Steamless on AppID {} ({})…",
+            "Running Steamless (native) on AppID {} ({})…",
             app_id,
             install_dir.display()
         );
@@ -1921,7 +1921,19 @@ impl LuaToolsApp {
         let ctx_c = ctx.clone();
 
         thread::spawn(move || {
-            let res = steamless_service.patch_game(app_id, &install_dir);
+            // Try native steamflatline first
+            let res = steamless_service.patch_game_native(app_id, &install_dir);
+            let mut total_unpacked = res.patched as usize;
+            let mut native_success = res.error.is_none() && res.patched > 0;
+
+            // If native didn't patch anything, fall back to CLI tool
+            if !native_success {
+                let cli_res = steamless_service.patch_game(app_id, &install_dir);
+                total_unpacked += cli_res.patched as usize;
+                native_success = cli_res.error.is_none() && cli_res.patched > 0;
+            }
+
+            // Also scan for any .unpacked.exe files that might have been created
             let mut unpacked_count = 0usize;
             if let Ok(entries) = walkdir::WalkDir::new(&install_dir)
                 .max_depth(4)
@@ -1955,10 +1967,9 @@ impl LuaToolsApp {
                     }
                 }
             }
-            let total_unpacked = res.patched as usize + unpacked_count;
-            let (ok, msg) = if let Some(err) = res.error {
-                (false, err)
-            } else if total_unpacked > 0 {
+
+            total_unpacked += unpacked_count;
+            let (ok, msg) = if total_unpacked > 0 {
                 (
                     true,
                     format!(

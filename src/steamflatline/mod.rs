@@ -12,8 +12,8 @@ pub mod variants;
 pub mod error;
 
 use std::path::Path;
-use crate::steamflatline::error::SteamFlatlineError;
-use crate::steamflatline::variants::{Unpacker, all};
+pub use crate::steamflatline::error::SteamFlatlineError;
+pub use crate::steamflatline::variants::{Unpacker, all};
 
 /// Main entry point for steamflatline unpacking.
 ///

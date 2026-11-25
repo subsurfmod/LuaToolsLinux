@@ -187,6 +187,79 @@ impl SteamlessService {
             error: None,
         }
     }
+
+    /// Process game executables using native Rust steamflatline (Steamless port).
+    /// Returns the number of patched executables, unchanged executables, and total count.
+    pub fn patch_game_native(&self, _app_id: u32, install_path: &Path) -> SteamlessResult {
+        let exes = match find_exes(install_path) {
+            Ok(e) => e,
+            Err(e) => {
+                return SteamlessResult {
+                    patched: 0,
+                    unchanged: 0,
+                    total: 0,
+                    error: Some(format!("Failed to scan game directory: {}", e)),
+                };
+            }
+        };
+
+        if exes.is_empty() {
+            return SteamlessResult {
+                patched: 0,
+                unchanged: 0,
+                total: 0,
+                error: Some("No executable files found".to_string()),
+            };
+        }
+
+        let mut patched = 0u32;
+        let mut unchanged = 0u32;
+
+        for exe in exes {
+            if let Err(reason) = inspect_pe_executable(&exe) {
+                log::debug!("Skipping non-PE file {}: {}", exe.display(), reason);
+                unchanged += 1;
+                continue;
+            }
+
+            // Try native steamflatline unpack
+            match crate::steamflatline::unpack(&exe) {
+                Ok(unpacked_path) => {
+                    // Success - replace original with unpacked
+                    let backup = backup_output_path(&exe);
+                    if !backup.exists() {
+                        if let Err(e) = std::fs::copy(&exe, &backup) {
+                            log::warn!("Failed to backup {}: {}", exe.display(), e);
+                            unchanged += 1;
+                            continue;
+                        }
+                    }
+                    if let Err(e) = std::fs::rename(&unpacked_path, &exe) {
+                        log::warn!("Failed to replace {} with unpacked: {}", exe.display(), e);
+                        unchanged += 1;
+                        continue;
+                    }
+                    log::info!("Native steamflatline unpacked {}", exe.display());
+                    patched += 1;
+                }
+                Err(crate::steamflatline::SteamFlatlineError::UnsupportedFormat) => {
+                    log::debug!("No native steamflatline unpacker matched {}", exe.display());
+                    unchanged += 1;
+                }
+                Err(e) => {
+                    log::warn!("Native steamflatline failed on {}: {}", exe.display(), e);
+                    unchanged += 1;
+                }
+            }
+        }
+
+        SteamlessResult {
+            patched,
+            unchanged,
+            total: patched + unchanged,
+            error: None,
+        }
+    }
 }
 
 const SKIP_PATTERNS: &[&str] = &[

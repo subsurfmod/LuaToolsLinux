@@ -7,6 +7,15 @@ use std::path::{Path, PathBuf};
 use crate::models::config::default_luatools_data_dir;
 use crate::services::steam_service::SteamService;
 
+// Custom deserializer for Option<PathBuf> that gracefully handles missing, null, or invalid values
+fn deserialize_option_path_buf<'de, D>(deserializer: D) -> Result<Option<PathBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(opt.map(PathBuf::from))
+}
+
 const APPLIED_FIXES_FILENAME: &str = "applied_fixes.json";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -15,7 +24,7 @@ pub struct AppliedFixRecord {
     pub app_id: u32,
     pub fix_id: String,
     pub applied_at: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_option_path_buf")]
     pub game_dir: Option<PathBuf>,
     pub files: Vec<AppliedFixFileEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

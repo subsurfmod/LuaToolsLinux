@@ -170,6 +170,22 @@ impl DownloadQueue {
         let start = Instant::now();
         let mut bytes_downloaded = 0u64;
 
+        // Handle manifest:// custom protocol - these should be downloaded via
+        // dedicated functions (HubcapService::download_manifest or
+        // LuaToolsApiClient::download_manifest) rather than the generic HTTP queue.
+        if task.url.starts_with("manifest://") {
+            self.record_history(
+                task.app_id,
+                &task.label,
+                &task.source,
+                "failed",
+                start.elapsed(),
+                None,
+                Some("manifest:// URLs must be handled by dedicated manifest download functions, not the generic download queue".into()),
+            );
+            return;
+        }
+
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(10))
             .timeout(Duration::from_secs(300))

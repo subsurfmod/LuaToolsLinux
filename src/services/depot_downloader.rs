@@ -1020,7 +1020,8 @@ mod tests {
             .windows(2)
             .any(|w| w == ["-manifestfile", "/tmp/3321461_1669007755731719796.manifest"]));
         assert!(!args.iter().any(|a| a == "-username"));
-        assert!(args.iter().any(|a| a == "-remember-password"));
+        assert!(args.iter().any(|a| a == "-remember-password"), "-remember-password should be used with -qr login");
+        assert!(args.iter().any(|a| a == "-qr"), "-qr should be present for anonymous login");
         assert!(args.windows(2).any(|w| w == ["-max-downloads", "8"]));
         assert!(args
             .windows(2)
