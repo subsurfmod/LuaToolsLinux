@@ -13,6 +13,22 @@ use crate::services::api_client::{DRMFixFixItem, LuaToolsApiClient};
 use crate::services::lua_installer::LuaInstaller;
 use crate::services::settings_service::SettingsService;
 use crate::services::slssteam_service::SlssteamService;
+use crate::steam_bridge::ost_platform::encoding::wide_to_utf8_lossy;
+
+fn read_wine_registry_text(path: &Path) -> io::Result<String> {
+    let bytes = fs::read(path)?;
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        let wide: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        return Ok(wide_to_utf8_lossy(&wide));
+    }
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return Ok(String::from_utf8_lossy(&bytes[3..]).into_owned());
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
 
 pub const FIX_DIR_NAME: &str = ".luatools-fix";
 
@@ -576,7 +592,7 @@ impl FixesService {
                 let initial = format!("WINE REGISTRY Version 2\n;; All keys relative to \\User\\...\n\n[Software\\\\Wine\\\\DllOverrides]\n\n");
                 let _ = fs::write(&reg_path, initial);
             }
-            if let Ok(content) = fs::read_to_string(&reg_path) {
+            if let Ok(content) = read_wine_registry_text(&reg_path) {
                 let mut new_content = content.clone();
                 let section_prefix = "[Software\\Wine\\DllOverrides]";
                 if !new_content.contains(section_prefix) {
@@ -603,7 +619,7 @@ impl FixesService {
             .map(|p| p.join("compatdata").join(app_id.to_string()).join("pfx/user.reg"));
         if let Some(reg_path) = pfx_reg {
             if reg_path.is_file() {
-                if let Ok(content) = fs::read_to_string(&reg_path) {
+                if let Ok(content) = read_wine_registry_text(&reg_path) {
                     let mut lines = content.lines().map(String::from).collect::<Vec<_>>();
                     for part in overrides_str.split(';') {
                         let dll_stem = part.split('=').next().unwrap_or("").trim();
@@ -768,6 +784,36 @@ mod tests {
         assert!(!env_file.exists());
         assert!(!game_dir.join("winmm.dll").exists());
         assert!(!FixesService::is_fix_applied(&game_dir, online_fix_id));
+    }
+
+    #[test]
+    fn wine_registry_reads_utf16le_bom_user_reg() {
+        let dir = tempfile::tempdir().unwrap();
+        let steamapps = dir.path().join("steamapps");
+        let game_dir = steamapps.join("common/MyGame");
+        let pfx_dir = steamapps.join("compatdata/1245620/pfx");
+        fs::create_dir_all(&game_dir).unwrap();
+        fs::create_dir_all(&pfx_dir).unwrap();
+
+        let reg_text = "WINE REGISTRY Version 2\n[Software\\Wine\\DllOverrides]\n";
+        let mut utf16_bytes = vec![0xFFu8, 0xFEu8];
+        for unit in reg_text.encode_utf16() {
+            utf16_bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let user_reg = pfx_dir.join("user.reg");
+        fs::write(&user_reg, utf16_bytes).unwrap();
+
+        FixesService::configure_wine_registry_overrides(
+            &game_dir,
+            1245620,
+            &["winmm".to_string()],
+        );
+        let updated = fs::read_to_string(&user_reg).unwrap();
+        assert!(updated.contains("\"winmm\"= \"native,builtin\""));
+
+        FixesService::remove_wine_registry_overrides(&game_dir, 1245620, "winmm=n,b");
+        let cleaned = fs::read_to_string(&user_reg).unwrap();
+        assert!(!cleaned.contains("\"winmm\"="));
     }
 }
 

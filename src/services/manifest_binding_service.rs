@@ -15,6 +15,19 @@ use crate::models::config::default_luatools_data_dir;
 use crate::parsers::lua_parser::LuaContents;
 use crate::services::slssteam_service::SlssteamService;
 use crate::steam_bridge::ipc::{IpcClient, IpcMessage};
+use crate::steam_bridge::manifest_hooks::{
+    remove_manifest_override, set_manifest_override, ManifestOverride,
+};
+
+fn sync_hook_override(app_id: u32, depot_id: u32, manifest_id: &str, size: u64) {
+    if let Ok(gid) = manifest_id.trim().parse::<u64>() {
+        set_manifest_override(
+            app_id,
+            depot_id,
+            ManifestOverride::new(gid, (size > 0).then_some(size)),
+        );
+    }
+}
 
 /// Represents a manifest pin for a specific app+depot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +65,7 @@ impl ManifestBindingService {
                 if let Ok(list) = serde_json::from_str::<Vec<ManifestPin>>(&raw) {
                     for mut p in list {
                         p.active_in_bridge = false;
+                        sync_hook_override(p.app_id, p.depot_id, &p.manifest_id, p.size);
                         map.insert((p.app_id, p.depot_id), p);
                     }
                 }
@@ -78,6 +92,7 @@ impl ManifestBindingService {
 
     /// Registers a manifest pin for `app_id` + `depot_id` and pushes it over IPC to `bridge_lib`.
     pub fn set_pin(&self, app_id: u32, depot_id: u32, manifest_id: String, size: u64) -> bool {
+        sync_hook_override(app_id, depot_id, &manifest_id, size);
         let bound = self
             .notify_set_pin(app_id, depot_id, &manifest_id, size)
             .unwrap_or(false);
@@ -102,6 +117,7 @@ impl ManifestBindingService {
 
     /// Removes a manifest pin and notifies `bridge_lib`.
     pub fn remove_pin(&self, app_id: u32, depot_id: u32) {
+        remove_manifest_override(app_id, depot_id);
         let mut guard = self.pins.lock().unwrap();
         guard.remove(&(app_id, depot_id));
         self.persist(&guard);
@@ -125,6 +141,7 @@ impl ManifestBindingService {
             if let Some(ref gid) = entry.manifest_id {
                 let key = (app_id, entry.id);
                 let sz = entry.size_on_disk.unwrap_or(0);
+                sync_hook_override(app_id, entry.id, gid, sz);
                 let needs_update = guard
                     .get(&key)
                     .map(|p| p.manifest_id != *gid)
@@ -162,6 +179,7 @@ impl ManifestBindingService {
         let mut guard = self.pins.lock().unwrap();
         let mut active_n = 0usize;
         for pin in guard.values_mut() {
+            sync_hook_override(pin.app_id, pin.depot_id, &pin.manifest_id, pin.size);
             let bound = self
                 .notify_set_pin(pin.app_id, pin.depot_id, &pin.manifest_id, pin.size)
                 .unwrap_or(false);
@@ -218,6 +236,7 @@ impl ManifestBindingService {
         for (&depot_id, gid) in &sls.config.manifest_overrides {
             let existing_key = guard.keys().find(|(_, d)| *d == depot_id).copied();
             if let Some(key) = existing_key {
+                sync_hook_override(key.0, depot_id, gid, 0);
                 if let Some(p) = guard.get_mut(&key) {
                     if p.manifest_id != *gid {
                         p.manifest_id = gid.clone();
@@ -225,6 +244,7 @@ impl ManifestBindingService {
                     }
                 }
             } else {
+                sync_hook_override(0, depot_id, gid, 0);
                 guard.insert(
                     (0, depot_id),
                     ManifestPin {
@@ -247,6 +267,7 @@ impl ManifestBindingService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::steam_bridge::manifest_hooks::get_manifest_overrides;
 
     #[test]
     fn set_get_persist_and_remove_pins() {
@@ -256,14 +277,21 @@ mod tests {
         svc.set_pin(1245620, 1245621, "abc123def456".into(), 1024000);
         svc.set_pin(1245620, 1245622, "pin2".into(), 200);
         svc.set_pin(999999, 1245621, "pin3".into(), 300);
+        svc.set_pin(1245620, 1245629, "8888777766665555444".into(), 4096);
+        assert_eq!(
+            get_manifest_overrides().get(&(1245620, 1245629)).map(|o| o.gid),
+            Some(8888777766665555444)
+        );
 
         let reloaded = ManifestBindingService::with_storage(Some(path));
         let pin = reloaded.get_pin(1245620, 1245621).unwrap();
         assert_eq!(pin.manifest_id, "abc123def456");
         assert_eq!(pin.size, 1024000);
-        assert_eq!(reloaded.get_pins_for_app(1245620).len(), 2);
+        assert_eq!(reloaded.get_pins_for_app(1245620).len(), 3);
 
         reloaded.remove_pin(1245620, 1245621);
+        reloaded.remove_pin(1245620, 1245629);
         assert!(reloaded.get_pin(1245620, 1245621).is_none());
+        assert!(!get_manifest_overrides().contains_key(&(1245620, 1245629)));
     }
 }

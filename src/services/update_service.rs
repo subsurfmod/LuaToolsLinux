@@ -5,7 +5,6 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -454,21 +453,15 @@ impl UpdateService {
         let owner = parts.next()?;
         let repo = parts.next()?;
 
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(6))
-            .build();
+        let downloader = crate::services::proxied_file_downloader::ProxiedFileDownloader::new();
 
-        // Check latest release first
+        // Check latest release first (with GitHub proxy mirror fallback)
         let rel_url = format!(
             "https://api.github.com/repos/{}/{}/releases/latest",
             owner, repo
         );
-        if let Ok(resp) = agent
-            .get(&rel_url)
-            .set("User-Agent", "LuaToolsLinux/2.0")
-            .call()
-        {
-            if let Ok(val) = resp.into_json::<Value>() {
+        if let Ok(txt) = downloader.download_string_sync(&rel_url) {
+            if let Ok(val) = serde_json::from_str::<Value>(&txt) {
                 if let Some(tag) = val.get("tag_name").and_then(|v| v.as_str()) {
                     let clean = tag.trim_start_matches('v').to_string();
                     let name = val
@@ -487,11 +480,9 @@ impl UpdateService {
                     "https://raw.githubusercontent.com/{}/{}/{}/{}",
                     owner, repo, branch, rel_path
                 );
-                if let Ok(resp) = agent.get(&raw_url).call() {
-                    if let Ok(txt) = resp.into_string() {
-                        if let Some(ver) = Self::parse_cargo_version(&txt) {
-                            return Some((ver, Some(format!("{}/{} ({})", owner, repo, branch))));
-                        }
+                if let Ok(txt) = downloader.download_string_sync(&raw_url) {
+                    if let Some(ver) = Self::parse_cargo_version(&txt) {
+                        return Some((ver, Some(format!("{}/{} ({})", owner, repo, branch))));
                     }
                 }
             }

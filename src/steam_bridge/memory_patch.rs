@@ -14,6 +14,8 @@ use std::arch::x86_64::_mm_mfence;
 use std::io;
 use std::ptr;
 
+use crate::steam_bridge::ost_platform::memory::{get_module_image, is_readable};
+
 pub const JMP_ABS64_LEN: usize = 14;
 const TRAMPOLINE_SIZE: usize = 64;
 const MIN_VALID_USER_ADDR: usize = 0x10000;
@@ -70,6 +72,42 @@ pub fn is_executable_mapped_range(addr: usize, len: usize) -> bool {
         return false;
     };
     parse_maps_contains_exec_range(&maps, addr, len)
+}
+
+/// Validates that `[addr, addr + len)` is readable via `ost_platform::memory::is_readable`
+/// and mapped readable + executable in `/proc/self/maps`.
+fn validate_patch_target_range(addr: usize, len: usize) -> Result<(), String> {
+    let ptr = addr as *const std::ffi::c_void;
+    if !is_readable(ptr, len) || !is_executable_mapped_range(addr, len) {
+        return Err(format!(
+            "refusing to patch 0x{:x} ({} bytes): not inside a mapped readable+executable page",
+            addr, len
+        ));
+    }
+    Ok(())
+}
+
+/// Validates that `[addr, addr + len)` is readable+executable and lies within the loaded
+/// module image identified by a `dlopen` `module_handle`.
+pub fn is_range_in_module_image(
+    module_handle: *mut std::ffi::c_void,
+    addr: usize,
+    len: usize,
+) -> bool {
+    if module_handle.is_null() || validate_patch_target_range(addr, len).is_err() {
+        return false;
+    }
+    let Some(img) = get_module_image(module_handle) else {
+        return false;
+    };
+    let img_start = img.base as usize;
+    let Some(img_end) = img_start.checked_add(img.size) else {
+        return false;
+    };
+    let Some(target_end) = addr.checked_add(len) else {
+        return false;
+    };
+    addr >= img_start && target_end <= img_end
 }
 
 fn page_bounds(addr: usize, len: usize, page_size: usize) -> Result<(usize, usize), String> {
@@ -148,12 +186,7 @@ impl MemoryPatch {
             return Err("overwrite_len exceeds trampoline capacity".into());
         }
 
-        if !is_executable_mapped_range(self.target as usize, overwrite_len) {
-            return Err(format!(
-                "refusing to patch {:p} ({} bytes): not inside a mapped r-x executable page",
-                self.target, overwrite_len
-            ));
-        }
+        validate_patch_target_range(self.target as usize, overwrite_len)?;
 
         let orig_slice = std::slice::from_raw_parts(self.target, overwrite_len);
         self.original_bytes = orig_slice.to_vec();
@@ -256,7 +289,8 @@ impl MemoryPatch {
         if !self.active {
             return Err("patch not installed".into());
         }
-        if self.target.is_null() || !is_executable_mapped_range(self.target as usize, self.orig_len)
+        if self.target.is_null()
+            || validate_patch_target_range(self.target as usize, self.orig_len).is_err()
         {
             self.active = false;
             return Err(format!(
@@ -474,5 +508,19 @@ mod tests {
 
             libc::munmap(code_page, page_size);
         }
+    }
+
+    #[test]
+    fn validates_module_handle_image_bounds_without_crashing_on_anon_pages() {
+        assert!(!is_range_in_module_image(std::ptr::null_mut(), 0x1000, 4));
+        let handle = crate::steam_bridge::ost_platform::dynamic_library::load(
+            std::path::Path::new("libc.so.6"),
+        );
+        assert!(!handle.is_null());
+        let sym = unsafe { libc::dlsym(handle, b"getpid\0".as_ptr().cast()) };
+        if !sym.is_null() {
+            assert!(is_range_in_module_image(handle, sym as usize, 4));
+        }
+        assert!(!is_range_in_module_image(handle, 0x1000, 4));
     }
 }

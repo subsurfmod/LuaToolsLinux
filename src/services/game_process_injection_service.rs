@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::models::config::default_luatools_data_dir;
 use crate::steam_bridge::ipc::{IpcClient, IpcMessage};
+use crate::steam_bridge::ost_platform::pe::Image;
+use crate::steam_bridge::ost_platform::process::enumerate_modules;
+use crate::steam_bridge::ost_platform::remote_process::{
+    get_architecture, inject_library, Architecture, InjectStatus,
+};
 use crate::steam_bridge::preload_loader::default_integration_lib_path;
 
 /// Status of an injection target.
@@ -181,6 +186,9 @@ impl GameProcessInjectionService {
             .unwrap_or(false);
 
         if is_windows_binary {
+            if game_exe.is_file() {
+                Self::validate_pe_executable(game_exe)?;
+            }
             let existing_overrides = std::env::var("WINEDLLOVERRIDES").unwrap_or_default();
             let new_overrides = if existing_overrides.is_empty() {
                 "steam_api=n,b;steam_api64=n,b;version=n,b".to_string()
@@ -281,12 +289,17 @@ impl GameProcessInjectionService {
                         pid,
                         app_id
                     );
-                    let _ = this.inject_into_running(pid, &this.default_library);
-                    this.statuses
-                        .lock()
-                        .unwrap()
-                        .insert(app_id, InjectionStatus::Injected);
-                    let _ = this.notify_bridge(app_id, true);
+                    let status = match this.inject_into_running(pid, &this.default_library) {
+                        Ok(()) => {
+                            let _ = this.notify_bridge(app_id, true);
+                            InjectionStatus::Injected
+                        }
+                        Err(e) => {
+                            let _ = this.notify_bridge(app_id, false);
+                            InjectionStatus::Failed(e)
+                        }
+                    };
+                    this.statuses.lock().unwrap().insert(app_id, status);
                     break;
                 }
             }
@@ -366,20 +379,84 @@ impl GameProcessInjectionService {
         ))
     }
 
+    /// Validates that `path` is a valid PE executable via `ost_platform::pe::Image`.
+    pub fn validate_pe_executable(path: &Path) -> Result<Image, String> {
+        let img = Image::new(&path.to_string_lossy())
+            .map_err(|e| format!("Invalid PE executable {}: {}", path.display(), e))?;
+        if !img.is_valid() {
+            return Err(format!("Invalid PE image: {}", path.display()));
+        }
+        Ok(img)
+    }
+
     pub fn inject_into_running(&self, pid: u32, library_path: &Path) -> Result<(), String> {
-        let mem_path = format!("/proc/{}/mem", pid);
-        if fs::File::open(&mem_path).is_err() {
+        if pid == 0 {
+            return Err("Invalid target PID 0".to_string());
+        }
+
+        let arch = get_architecture(pid);
+        if arch == Architecture::Unknown {
             return Err(format!(
-                "Cannot access process {} memory (requires CAP_SYS_PTRACE / Yama scope)",
+                "Cannot determine target architecture for PID {} (process exited or inaccessible)",
                 pid
             ));
         }
-        eprintln!(
-            "[game_injection] Would inject {} into pid {} (ptrace prototype)",
-            library_path.display(),
-            pid
-        );
-        Ok(())
+
+        let modules = enumerate_modules(pid);
+        if modules.is_empty() {
+            return Err(format!(
+                "No mapped modules found for PID {} (cannot inspect /proc/{}/maps)",
+                pid, pid
+            ));
+        }
+
+        for m in &modules {
+            if m.native_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+                && m.native_path.is_file()
+            {
+                Self::validate_pe_executable(&m.native_path)?;
+            }
+        }
+
+        let lib_name = library_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if !lib_name.is_empty()
+            && modules.iter().any(|m| {
+                m.native_path == library_path
+                    || m.native_path.file_name().and_then(|n| n.to_str()) == Some(lib_name)
+            })
+        {
+            log::info!(
+                "[game_injection] Library {} already loaded in PID {} ({})",
+                library_path.display(),
+                pid,
+                arch.as_str()
+            );
+            return Ok(());
+        }
+
+        match inject_library(pid, library_path) {
+            InjectStatus::Ok => Ok(()),
+            InjectStatus::ResolveLoadLibraryFailed => Err(format!(
+                "PID {} ({}, {} modules inspected) attached cleanly via ptrace, but live dlopen shellcode injection is unsupported on Linux; launch via LD_PRELOAD instead ({})",
+                pid,
+                arch.as_str(),
+                modules.len(),
+                InjectStatus::ResolveLoadLibraryFailed.as_str()
+            )),
+            other => Err(format!(
+                "Failed to inject {} into PID {} ({}): {}",
+                library_path.display(),
+                pid,
+                arch.as_str(),
+                other.as_str()
+            )),
+        }
     }
 
     pub fn notify_bridge(&self, app_id: u32, injected: bool) -> Result<(), String> {
@@ -432,5 +509,43 @@ mod tests {
             *k == "WINEDLLOVERRIDES" && v.map(|s| s.to_string_lossy().contains("steam_api=n,b")).unwrap_or(false)
         });
         assert!(has_wine_override);
+    }
+
+    #[test]
+    fn validates_pe_executables_and_rejects_invalid_live_injection_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad_exe = tmp.path().join("bad.exe");
+        fs::write(&bad_exe, b"not a valid PE file").unwrap();
+        assert!(GameProcessInjectionService::validate_pe_executable(&bad_exe).is_err());
+
+        // Build minimal valid PE32+ header
+        let mut pe = vec![0u8; 0x200];
+        pe[0..2].copy_from_slice(&0x5A4Du16.to_le_bytes()); // MZ
+        pe[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        pe[0x80..0x84].copy_from_slice(&0x0000_4550u32.to_le_bytes()); // PE\0\0
+        pe[0x84 + 16..0x84 + 18].copy_from_slice(&240u16.to_le_bytes());
+        pe[0x84 + 20..0x84 + 22].copy_from_slice(&0x20Bu16.to_le_bytes());
+        let good_exe = tmp.path().join("good.exe");
+        fs::write(&good_exe, &pe).unwrap();
+        assert!(GameProcessInjectionService::validate_pe_executable(&good_exe).is_ok());
+
+        let svc = GameProcessInjectionService::new();
+        svc.configure(
+            1245620,
+            InjectionConfig {
+                app_id: 1245620,
+                library_path: PathBuf::from("/tmp/libtest.so"),
+                ..Default::default()
+            },
+        );
+        assert!(svc.build_launch_command(1245620, &bad_exe, &[]).is_err());
+        assert!(svc.build_launch_command(1245620, &good_exe, &[]).is_ok());
+
+        assert!(svc
+            .inject_into_running(0, Path::new("/nonexistent.so"))
+            .is_err());
+        assert!(svc
+            .inject_into_running(std::process::id(), Path::new("/nonexistent.so"))
+            .is_err());
     }
 }

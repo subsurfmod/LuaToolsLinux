@@ -18,10 +18,12 @@ use egui_extras::{Size, StripBuilder};
 use crate::models::lua_vault::{LuaVariant, LuaVault};
 use crate::parsers::lua_parser::{LuaContents, LuaFileParser};
 use crate::parsers::steam_link::SteamLinkParser;
+use crate::services::analytics_service::AnalyticsService;
 use crate::services::api_client::{
     DRMFixFixItem, DRMFixGameListing, DRMFixTag, DlcInfo, HubcapService, LuaToolsApiClient,
     SteamFeaturedItem, SteamSearchItem,
 };
+use crate::services::asset_hash::AssetHashService;
 use crate::services::auth_service::AuthService;
 use crate::services::caches::{
     CoverCache, GameDetails, HardwareAppIdService, SteamAppInfoCache, SteamAppListCache,
@@ -47,7 +49,9 @@ use crate::services::steam_auto_crack_service::SteamAutoCrackService;
 use crate::services::steam_bridge_service::SteamBridgeService;
 use crate::services::steam_library_service::SteamLibraryService;
 use crate::services::steam_service::SteamService;
+use crate::services::applied_fix_index::AppliedFixIndexService;
 use crate::services::telemetry_service::TelemetryService;
+// use crate::services::tray_service::TrayService;  -- temporarily disabled
 use crate::services::update_service::UpdateService;
 use crate::services::wired_service::WiredService;
 use crate::ui::state::{
@@ -114,6 +118,9 @@ pub struct LuaToolsApp {
     pub http_server: Option<HttpServerService>,
     pub tools_manager: ExternalToolsManager,
     pub telemetry_service: TelemetryService,
+    pub asset_hash_service: AssetHashService,
+    pub applied_fix_index: AppliedFixIndexService,
+    // pub tray_service: TrayService,  -- temporarily disabled
 
     // Async Channels
     pub egui_ctx: Option<egui::Context>,
@@ -274,6 +281,7 @@ impl LuaToolsApp {
         let lua_vault = LuaVault::new(None, None);
         let cef_bridge = CefBridgeService::new(None, settings_service.settings.http_server_port);
         let tools_manager = ExternalToolsManager::default();
+        let asset_hash_service = AssetHashService::new();
 
         let (msg_tx, msg_rx) = mpsc::channel();
         let (rpc_tx, rpc_rx) = mpsc::channel();
@@ -331,6 +339,9 @@ impl LuaToolsApp {
             http_server: None,
             tools_manager,
             telemetry_service,
+            asset_hash_service,
+            applied_fix_index: AppliedFixIndexService::default(),
+            // tray_service: TrayService::default(),  -- temporarily disabled
             egui_ctx: Some(cc.egui_ctx.clone()),
             msg_tx,
             msg_rx,
@@ -443,9 +454,25 @@ impl LuaToolsApp {
                 "app_start",
                 "LuaTools Linux desktop session initialized",
             );
+            {
+                let consent_seen = app.settings_service.settings.telemetry_consent_seen;
+                let telemetry_on = app.settings_service.settings.telemetry_enabled;
+                if consent_seen && telemetry_on {
+                    thread::spawn(move || {
+                        let _ = AnalyticsService::new()
+                            .track_app_launch_gated(consent_seen, telemetry_on);
+                    });
+                }
+            }
             if app.steam_service.is_available() {
                 let _ = app.hot_reload_service.start();
+                // Run depot cache migration (LT-34)
+                crate::services::depot_cache_migration::run_depot_cache_migration(&app.steam_service);
             }
+            // Initialize system tray (temporarily disabled due to system deps)
+            // let _ = app.tray_service.initialize();
+            // app.tray_service.set_app_message_sender(app.msg_tx.clone());
+
             app.probe_bridge_async(&cc.egui_ctx);
             app.fetch_featured_async(&cc.egui_ctx);
             app.fetch_fix_listings_async(&cc.egui_ctx);
@@ -506,6 +533,7 @@ impl LuaToolsApp {
             String::new(),
             "0102030405060708".into(),
         );
+        // let tray_service = TrayService::default();  -- temporarily disabled
         let (msg_tx, msg_rx) = mpsc::channel();
         let (rpc_tx, rpc_rx) = mpsc::channel();
 
@@ -547,6 +575,9 @@ impl LuaToolsApp {
             http_server: None,
             tools_manager,
             telemetry_service,
+            asset_hash_service: AssetHashService::new(),
+            applied_fix_index: AppliedFixIndexService::default(),
+            // tray_service,  -- temporarily disabled
             egui_ctx: Some(ctx.clone()),
             msg_tx,
             msg_rx,
@@ -1481,6 +1512,22 @@ impl LuaToolsApp {
         });
     }
 
+    pub fn refresh_depot_info_async(&mut self, app_id: u32, ctx: &egui::Context) {
+        self.depot_info_service.invalidate(app_id);
+        let di = self.depot_info_service.clone();
+        let tx = self.msg_tx.clone();
+        let ctx_c = ctx.clone();
+        thread::spawn(move || {
+            let info = di.get(app_id);
+            let _ = tx.send(AppMessage::DepotInfoLoaded { app_id, info });
+            ctx_c.request_repaint();
+        });
+        self.notify(
+            format!("Refreshing depot metadata for AppID {}…", app_id),
+            ToastKind::Info,
+        );
+    }
+
     pub fn reload_depots_local(&mut self, app_id: u32) {
         let live_text = self.lua_vault.read_live_text(app_id);
         self.depots_lua =
@@ -1660,6 +1707,7 @@ impl LuaToolsApp {
         self.fixes_busy = true;
         self.fixes_progress = 0.0;
         let api = self.api_client.clone();
+        let ahs = self.asset_hash_service.clone();
         let tx = self.msg_tx.clone();
         let ctx_c = ctx.clone();
         thread::spawn(move || {
@@ -1670,6 +1718,14 @@ impl LuaToolsApp {
                     let _ = tx_p.send(AppMessage::FixProgress { pct: p, msg: m });
                     ctx_p.request_repaint();
                 });
+            if res.ok {
+                for rel in &res.applied_files {
+                    let p = install_dir.join(rel);
+                    if p.is_file() {
+                        let _ = ahs.hash_file(app_id, &p, rel);
+                    }
+                }
+            }
             let _ = tx.send(AppMessage::FixActionFinished {
                 app_id,
                 ok: res.ok,
@@ -1737,6 +1793,7 @@ impl LuaToolsApp {
             install_dir.display()
         );
         let mgr = self.tools_manager.clone();
+        let ahs = self.asset_hash_service.clone();
         let tx = self.msg_tx.clone();
         let ctx_c = ctx.clone();
 
@@ -1782,7 +1839,11 @@ impl LuaToolsApp {
                 let mut last_err = None;
                 for exe in &exes {
                     match mgr.launch_stub_remover(exe) {
-                        Ok(_) => unpacked += 1,
+                        Ok(_) => {
+                            let fname = exe.file_name().and_then(|s| s.to_str()).unwrap_or("game.exe");
+                            let _ = ahs.hash_file(app_id, exe, fname);
+                            unpacked += 1;
+                        }
                         Err(e) => last_err = Some(e),
                     }
                 }
@@ -1811,6 +1872,97 @@ impl LuaToolsApp {
             };
             let _ = tx.send(AppMessage::ToolFinished {
                 tool_key: "stub_remover".to_string(),
+                ok,
+                msg,
+            });
+            ctx_c.request_repaint();
+        });
+    }
+
+    pub fn verify_game_integrity_async(
+        &mut self,
+        app_id: u32,
+        install_dir: PathBuf,
+        ctx: &egui::Context,
+    ) {
+        let ahs = self.asset_hash_service.clone();
+        let tx = self.msg_tx.clone();
+        let ctx_c = ctx.clone();
+        thread::spawn(move || {
+            let existing = ahs.get_hashes(app_id);
+            let mut recorded_paths: HashSet<String> = HashSet::with_capacity(existing.len());
+            let mut verified = 0usize;
+            let mut baselined = 0usize;
+            let mut failed = 0usize;
+
+            for h in &existing {
+                recorded_paths.insert(h.file_path.clone());
+                let p = PathBuf::from(&h.file_path);
+                if ahs.verify_file(app_id, &p) {
+                    verified += 1;
+                } else {
+                    failed += 1;
+                }
+            }
+
+            let mut scanned_binaries = 0usize;
+            for entry in walkdir::WalkDir::new(&install_dir)
+                .max_depth(3)
+                .into_iter()
+                .flatten()
+            {
+                if entry.file_type().is_file() {
+                    let p = entry.path();
+                    let name = p
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    if name.ends_with(".exe")
+                        || name.ends_with(".dll")
+                        || name.ends_with(".so")
+                    {
+                        scanned_binaries += 1;
+                        let key_path = p.to_string_lossy().to_string();
+                        if !recorded_paths.contains(&key_path) {
+                            let h = ahs.hash_file(app_id, p, &name);
+                            if !h.sha256.is_empty() {
+                                baselined += 1;
+                            } else {
+                                failed += 1;
+                            }
+                            recorded_paths.insert(key_path);
+                        }
+                        if scanned_binaries >= 40 {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let total = verified + baselined + failed;
+            let ok = failed == 0 && total > 0;
+            let msg = if total == 0 {
+                format!("No binaries found under {} to hash.", install_dir.display())
+            } else if verified == 0 && failed == 0 {
+                format!(
+                    "Baseline recorded for {} file(s) (AppID {}).",
+                    baselined, app_id
+                )
+            } else if baselined == 0 {
+                format!(
+                    "Verified {} file(s) ({} changed/missing) (AppID {}).",
+                    verified, failed, app_id
+                )
+            } else {
+                format!(
+                    "Verified {} file(s) ({} changed/missing), baseline recorded for {} new file(s) (AppID {}).",
+                    verified, failed, baselined, app_id
+                )
+            };
+            let _ = tx.send(AppMessage::GameIntegrityChecked {
+                app_id,
+                checked: total,
                 ok,
                 msg,
             });
@@ -2591,6 +2743,21 @@ impl LuaToolsApp {
                                 self.acquire_status = msg.clone();
                                 self.notify(msg, ToastKind::Success);
                                 self.refresh_all_local_state();
+                                {
+                                    let consent_seen = self.settings_service.settings.telemetry_consent_seen;
+                                    let telemetry_on = self.settings_service.settings.telemetry_enabled;
+                                    let src_copy = source.clone();
+                                    if consent_seen && telemetry_on {
+                                        thread::spawn(move || {
+                                            let _ = AnalyticsService::new().track_event_gated(
+                                                "acquire_install",
+                                                Some(serde_json::json!({ "source": src_copy })),
+                                                consent_seen,
+                                                telemetry_on,
+                                            );
+                                        });
+                                    }
+                                }
                             } else {
                                 let err = res.error.unwrap_or_else(|| "Install failed".into());
                                 self.record_download_history(
@@ -2673,6 +2840,20 @@ impl LuaToolsApp {
                             format!("Completed · {} of {} depot(s) downloaded", ok, total);
                         self.depots_dl_status = summary.clone();
                         self.notify(summary, ToastKind::Success);
+                        {
+                            let consent_seen = self.settings_service.settings.telemetry_consent_seen;
+                            let telemetry_on = self.settings_service.settings.telemetry_enabled;
+                            if consent_seen && telemetry_on {
+                                thread::spawn(move || {
+                                    let _ = AnalyticsService::new().track_event_gated(
+                                        "depot_download",
+                                        Some(serde_json::json!({ "count": ok })),
+                                        consent_seen,
+                                        telemetry_on,
+                                    );
+                                });
+                            }
+                        }
                     }
                     self.rebuild_depot_picks();
                 }
@@ -2973,8 +3154,46 @@ impl LuaToolsApp {
                         },
                     );
                 }
+                AppMessage::GameIntegrityChecked {
+                    app_id: _,
+                    checked: _,
+                    ok,
+                    msg,
+                } => {
+                    self.notify(
+                        msg,
+                        if ok {
+                            ToastKind::Success
+                        } else {
+                            ToastKind::Warning
+                        },
+                    );
+                }
                 AppMessage::FilePickedForGameInjectionSo(path) => {
                     self.integration_modal.proc_lib_input = path.to_string_lossy().to_string();
+                }
+                AppMessage::ShowWindow => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    // self.tray_service.set_visibility(true);  -- temporarily disabled
+                }
+                AppMessage::HideWindow => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    // self.tray_service.set_visibility(false);  -- temporarily disabled
+                }
+                AppMessage::OpenSettings => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.active_view = ActiveView::Settings;
+                    // self.tray_service.set_visibility(true);  -- temporarily disabled
+                }
+                AppMessage::RestartSteamRequested => {
+                    self.trigger_restart_steam(ctx);
+                }
+                AppMessage::QuitRequested => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
         }

@@ -13,48 +13,70 @@ use ureq::Agent;
 use crate::services::github_proxy::GithubProxy;
 
 const MAX_IN_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct ProxiedFileDownloader {
     proxy: GithubProxy,
     http: Agent,
+    timeout_override: Option<Duration>,
 }
 
 impl Default for ProxiedFileDownloader {
     fn default() -> Self {
-        let http = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build();
         Self {
             proxy: GithubProxy::new(),
-            http,
+            http: Self::build_agent(DEFAULT_TIMEOUT),
+            timeout_override: None,
         }
     }
 }
 
 impl ProxiedFileDownloader {
+    fn build_agent(timeout: Duration) -> Agent {
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_read(timeout)
+            .timeout(timeout)
+            .build()
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
 
     pub fn with_proxy(mut self, proxy: GithubProxy) -> Self {
-        self.proxy = proxy;
+        if let Some(t) = self.timeout_override {
+            self.proxy = proxy.with_timeout(t);
+        } else {
+            self.http = Self::build_agent(proxy.timeout());
+            self.proxy = proxy;
+        }
         self
     }
 
-    /// Download a file to disk with progress reporting.
-    /// Tries direct URL first, then mirror fallbacks.
-    pub async fn download_file(
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout_override = Some(timeout);
+        self.http = Self::build_agent(timeout);
+        self.proxy = self.proxy.with_timeout(timeout);
+        self
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.proxy.timeout()
+    }
+
+    /// Download a file to disk synchronously with progress reporting and mirror fallback.
+    pub fn download_file_sync(
         &self,
         url: &str,
         target_file: &Path,
         progress: Option<&mut dyn FnMut(f64)>,
     ) -> Result<(), Box<ureq::Error>> {
-        self.proxy.download_async(url, target_file, progress).await
+        self.proxy.download_sync(url, target_file, progress)
     }
 
-    /// Download raw bytes into memory with mirror fallback (binary-safe, capped at 64 MiB).
-    pub async fn download_bytes(&self, url: &str) -> Result<Vec<u8>, Box<ureq::Error>> {
+    /// Download raw bytes into memory synchronously with mirror fallback (binary-safe, capped at 64 MiB).
+    pub fn download_bytes_sync(&self, url: &str) -> Result<Vec<u8>, Box<ureq::Error>> {
         let mut last: Option<ureq::Error> = None;
 
         for candidate in self.proxy.candidates(url) {
@@ -91,8 +113,8 @@ impl ProxiedFileDownloader {
         })))
     }
 
-    /// Download a string (text content) with mirror fallback.
-    pub async fn download_string(&self, url: &str) -> Result<String, Box<ureq::Error>> {
+    /// Download a string (text content) synchronously with mirror fallback.
+    pub fn download_string_sync(&self, url: &str) -> Result<String, Box<ureq::Error>> {
         let mut last: Option<ureq::Error> = None;
 
         for candidate in self.proxy.candidates(url) {
@@ -114,6 +136,27 @@ impl ProxiedFileDownloader {
         Err(Box::new(last.unwrap_or_else(|| {
             ureq::Error::from(io::Error::other("All download mirrors failed"))
         })))
+    }
+
+    /// Download a file to disk with progress reporting.
+    /// Tries direct URL first, then mirror fallbacks.
+    pub async fn download_file(
+        &self,
+        url: &str,
+        target_file: &Path,
+        progress: Option<&mut dyn FnMut(f64)>,
+    ) -> Result<(), Box<ureq::Error>> {
+        self.download_file_sync(url, target_file, progress)
+    }
+
+    /// Download raw bytes into memory with mirror fallback (binary-safe, capped at 64 MiB).
+    pub async fn download_bytes(&self, url: &str) -> Result<Vec<u8>, Box<ureq::Error>> {
+        self.download_bytes_sync(url)
+    }
+
+    /// Download a string (text content) with mirror fallback.
+    pub async fn download_string(&self, url: &str) -> Result<String, Box<ureq::Error>> {
+        self.download_string_sync(url)
     }
 }
 
@@ -141,6 +184,10 @@ mod tests {
     fn test_downloader_creation() {
         let downloader = ProxiedFileDownloader::new();
         assert_eq!(downloader.proxy.download_mirrors().len(), 2);
+        assert_eq!(downloader.timeout(), Duration::from_secs(30));
+
+        let long_dl = ProxiedFileDownloader::new().with_timeout(Duration::from_secs(90));
+        assert_eq!(long_dl.timeout(), Duration::from_secs(90));
     }
 
     #[test]

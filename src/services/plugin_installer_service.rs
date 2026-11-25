@@ -270,22 +270,8 @@ impl PluginInstallerService {
         steam_root: Option<&Path>,
     ) -> Result<PathBuf, String> {
         let zip_url = "https://github.com/madoiscool/LTSP/releases/latest/download/plugin.zip";
-        let proxy = crate::services::github_proxy::GithubProxy::default();
-        let mut zip_bytes = Vec::new();
-
-        for candidate in proxy.candidates(zip_url) {
-            let agent = ureq::AgentBuilder::new()
-                .timeout_connect(std::time::Duration::from_secs(5))
-                .timeout(std::time::Duration::from_secs(15))
-                .build();
-            if let Ok(resp) = agent.get(&candidate).call() {
-                let mut buf = Vec::new();
-                if resp.into_reader().take(16 * 1024 * 1024).read_to_end(&mut buf).is_ok() && !buf.is_empty() {
-                    zip_bytes = buf;
-                    break;
-                }
-            }
-        }
+        let downloader = crate::services::proxied_file_downloader::ProxiedFileDownloader::new();
+        let zip_bytes = downloader.download_bytes_sync(zip_url).unwrap_or_default();
 
         if !zip_bytes.is_empty() {
             if let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)) {

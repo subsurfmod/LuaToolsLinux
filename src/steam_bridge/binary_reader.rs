@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use crate::steam_bridge::ost_platform::{byte_search, hash};
+
 const ELF64_HEADER_LEN: usize = 64;
 const ELF64_PHDR_MIN_LEN: usize = 56;
 const ELF64_SHDR_MIN_LEN: usize = 64;
@@ -172,7 +174,8 @@ impl BinaryFile {
     }
 
     pub fn from_bytes(path: PathBuf, raw: Vec<u8>) -> Result<Self, BinaryError> {
-        let sha256 = format!("{:x}", Sha256::digest(&raw));
+        let sha256 = hash::sha256_of_buffer(&raw)
+            .unwrap_or_else(|_| format!("{:x}", Sha256::digest(&raw)));
 
         if raw.len() < 16 || &raw[0..4] != b"\x7fELF" {
             return Err(BinaryError::NotElf);
@@ -536,31 +539,10 @@ impl BinaryFile {
         pattern: &[u8],
         mask: Option<&[u8]>,
     ) -> Option<usize> {
-        if pattern.is_empty() || haystack.len() < pattern.len() {
-            return None;
+        match mask {
+            Some(m) => byte_search::find_with_mask(haystack, pattern, m),
+            None => byte_search::find(haystack, pattern),
         }
-        if let Some(m) = mask {
-            if m.len() < pattern.len() {
-                return None;
-            }
-            for i in 0..=haystack.len() - pattern.len() {
-                let mut matched = true;
-                for j in 0..pattern.len() {
-                    if (haystack[i + j] & m[j]) != (pattern[j] & m[j]) {
-                        matched = false;
-                        break;
-                    }
-                }
-                if matched {
-                    return Some(i);
-                }
-            }
-            return None;
-        }
-
-        haystack
-            .windows(pattern.len())
-            .position(|window| window == pattern)
     }
 
     pub fn file_offset_to_vaddr(&self, file_offset: usize) -> Option<u64> {

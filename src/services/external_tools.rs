@@ -11,9 +11,8 @@ use serde_json::{json, Value};
 use walkdir_lite::collect_files_recursive;
 
 use crate::models::config::default_luatools_data_dir;
-use crate::services::api_client::stream_response_to_file;
 use crate::services::depot_downloader::{which_in_path, DepotDownloaderService};
-use crate::services::github_proxy::GithubProxy;
+use crate::services::proxied_file_downloader::ProxiedFileDownloader;
 use crate::services::wired_service::extract_archive;
 
 #[derive(Debug, Clone)]
@@ -212,24 +211,20 @@ impl ExternalToolsManager {
             repos.push(fb);
         }
 
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(10))
-            .timeout(Duration::from_secs(90))
-            .build();
-        let ua = format!("LuaToolsLinux/{}", crate::VERSION);
+        let downloader = ProxiedFileDownloader::new().with_timeout(Duration::from_secs(90));
         let mut last_err: Option<String> = None;
 
         for repo in repos {
             progress_cb(0.05, format!("Querying GitHub releases ({})...", repo));
             let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
-            let resp = match agent.get(&url).set("User-Agent", &ua).call() {
-                Ok(r) => r,
+            let rel_txt = match downloader.download_string_sync(&url) {
+                Ok(t) => t,
                 Err(e) => {
                     last_err = Some(format!("GitHub API error ({}): {}", repo, e));
                     continue;
                 }
             };
-            let rel = match resp.into_json::<Value>() {
+            let rel = match serde_json::from_str::<Value>(&rel_txt) {
                 Ok(v) => v,
                 Err(e) => {
                     last_err = Some(format!("Invalid release JSON ({}): {}", repo, e));
@@ -345,33 +340,15 @@ impl ExternalToolsManager {
                 let archive_path = tool_dir.join(safe_aname);
 
                 let base_pct = 0.1 + (idx as f32) * 0.4;
-                progress_cb(base_pct, format!("Downloading {} {} ({})", spec.name, tag, safe_aname));
-                let mut dl_resp_opt = None;
-                if GithubProxy::is_github(dl_url) {
-                    let proxy = GithubProxy::default();
-                    for candidate in proxy.candidates(dl_url) {
-                        if let Ok(r) = agent.get(&candidate).set("User-Agent", &ua).call() {
-                            dl_resp_opt = Some(r);
-                            break;
-                        }
-                    }
-                } else if let Ok(r) = agent.get(dl_url).set("User-Agent", &ua).call() {
-                    dl_resp_opt = Some(r);
-                }
-
-                let dl_resp = match dl_resp_opt {
-                    Some(r) => r,
-                    None => {
-                        last_err = Some(format!("Download failed ({}): {}", repo, dl_url));
-                        dl_failed = true;
-                        break;
-                    }
+                let base_msg = format!("Downloading {} {} ({})", spec.name, tag, safe_aname);
+                progress_cb(base_pct, base_msg.clone());
+                let mut dl_progress = |frac: f64| {
+                    let mapped = (base_pct + (frac as f32).clamp(0.0, 1.0) * 0.35).clamp(0.1, 0.88);
+                    progress_cb(mapped, base_msg.clone());
                 };
-                if let Err(e) = stream_response_to_file(dl_resp, &archive_path, &mut |frac, msg| {
-                    progress_cb((base_pct + frac.clamp(0.0, 1.0) * 0.35).clamp(0.1, 0.88), msg);
-                }) {
+                if let Err(e) = downloader.download_file_sync(dl_url, &archive_path, Some(&mut dl_progress)) {
                     let _ = fs::remove_file(&archive_path);
-                    last_err = Some(format!("Download stream failed ({}): {}", repo, e));
+                    last_err = Some(format!("Download failed ({}): {}", repo, e));
                     dl_failed = true;
                     break;
                 }

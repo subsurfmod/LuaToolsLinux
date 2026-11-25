@@ -10,6 +10,7 @@ use std::process::{Command, Stdio};
 use crate::services::external_tools::ExternalToolsManager;
 
 use crate::services::depot_downloader::DepotDownloaderService;
+use crate::steam_bridge::ost_platform::pe::Image;
 
 #[derive(Debug, Clone)]
 pub struct SteamlessResult {
@@ -168,6 +169,11 @@ impl SteamlessService {
         let mut unchanged = 0u32;
 
         for exe in exes {
+            if let Err(reason) = inspect_pe_executable(&exe) {
+                log::debug!("Skipping non-PE file {}: {}", exe.display(), reason);
+                unchanged += 1;
+                continue;
+            }
             match run_steamless(&cli, &exe) {
                 Ok(true) => patched += 1,
                 Ok(false) | Err(_) => unchanged += 1,
@@ -271,9 +277,28 @@ fn find_exes(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
     Ok(exes)
 }
 
+/// Validate that `exe` is a genuine PE executable and inspect its sections before invoking Steamless CLI.
+pub fn inspect_pe_executable(exe: &Path) -> Result<usize, String> {
+    let path_str = exe
+        .to_str()
+        .ok_or_else(|| "Non-UTF8 executable path".to_string())?;
+    let image = Image::new(path_str).map_err(|e| format!("Not a valid PE executable: {}", e))?;
+    if !image.is_valid() {
+        return Err("PE header validation failed".to_string());
+    }
+    let sections = image.sections();
+    if sections.is_empty() {
+        return Err("PE executable contains no sections".to_string());
+    }
+    Ok(sections.len())
+}
+
 /// Run Steamless CLI on a single executable using the appropriate Linux runtime wrapper
 /// (`wine` for `.exe`, `dotnet` for `.dll`, or direct execution for native binaries).
 fn run_steamless(cli: &Path, exe: &Path) -> Result<bool, Box<dyn std::error::Error>> {
+    inspect_pe_executable(exe)
+        .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidData, msg))?;
+
     let prefix = DepotDownloaderService::build_invocation(cli).map_err(std::io::Error::other)?;
     let first = prefix
         .first()
@@ -387,5 +412,49 @@ mod tests {
         assert!(!res.is_success());
         assert_eq!(res.patched, 0);
         assert!(res.error.is_some());
+    }
+
+    #[test]
+    fn test_inspect_pe_executable_guards_non_pe_and_accepts_valid_pe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad_exe = tmp.path().join("not_a_pe.exe");
+        fs::write(&bad_exe, b"plain text not a PE").unwrap();
+        assert!(inspect_pe_executable(&bad_exe).is_err());
+
+        // Build minimal synthetic PE64 with one .text section
+        let mut pe = vec![0u8; 0x400];
+        pe[0..2].copy_from_slice(&0x5A4Du16.to_le_bytes()); // MZ
+        pe[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        pe[0x80..0x84].copy_from_slice(&0x0000_4550u32.to_le_bytes()); // PE\0\0
+        let fh = 0x84;
+        pe[fh + 2..fh + 4].copy_from_slice(&1u16.to_le_bytes()); // NumberOfSections = 1
+        pe[fh + 16..fh + 18].copy_from_slice(&240u16.to_le_bytes()); // SizeOfOptionalHeader
+        let opt = fh + 20;
+        pe[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes()); // PE32+
+        let sec = opt + 240;
+        pe[sec..sec + 5].copy_from_slice(b".text");
+        pe[sec + 8..sec + 12].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        pe[sec + 36..sec + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes());
+
+        let good_exe = tmp.path().join("valid.exe");
+        fs::write(&good_exe, &pe).unwrap();
+        assert_eq!(inspect_pe_executable(&good_exe).unwrap(), 1);
+
+        // patch_game with a dummy CLI and only non-PE exes skips them cleanly as unchanged
+        let dd = DepotDownloaderService::new(Some(tmp.path().join("dd")));
+        let tools_dir = tmp.path().join("steamless");
+        fs::create_dir_all(&tools_dir).unwrap();
+        fs::write(tools_dir.join("Steamless.CLI.exe"), b"dummy cli").unwrap();
+        let game_dir = tmp.path().join("game");
+        fs::create_dir_all(&game_dir).unwrap();
+        fs::write(game_dir.join("broken.exe"), b"not pe").unwrap();
+
+        let svc = SteamlessService::with_tools_dir(dd, tools_dir);
+        let summary = svc.patch_game(1245620, &game_dir);
+        assert!(summary.error.is_none());
+        assert_eq!(summary.patched, 0);
+        assert_eq!(summary.unchanged, 1);
+        assert_eq!(summary.total, 1);
     }
 }

@@ -3,6 +3,7 @@
 //! Uses `memory_patch.rs` for 64-bit indirect jump hooks and `pattern_db.rs` for
 //! pattern-based symbol resolution in `steamclient.so`.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
@@ -13,10 +14,11 @@ use crate::steam_bridge::binary_reader::{find_loaded_module_mapping, BinaryFile}
 use crate::steam_bridge::interop::interop_ipc_isteamuser::install_iclientuser_handlers;
 use crate::steam_bridge::interop::interop_ipc_isteamutils::install_iclientutils_handlers;
 use crate::steam_bridge::interop::interop_misc;
-use crate::steam_bridge::interop::ipc::fnv1a_hash;
+use crate::steam_bridge::interop::ipc::{self, fnv1a_hash};
 use crate::steam_bridge::ipc::{IpcMessage, IpcServer};
 use crate::steam_bridge::manifest_hooks::{self, parse_pattern_and_mask, ManifestOverride};
 use crate::steam_bridge::memory_patch::{MemoryPatch, JMP_ABS64_LEN};
+use crate::steam_bridge::ost_platform::memory;
 use crate::steam_bridge::pattern_db::{BinaryComponent, PatternChannel, PatternDb};
 use crate::steam_bridge::ticket_store::TicketStore;
 
@@ -129,6 +131,7 @@ static IPC_PATCHES: OnceLock<Mutex<Vec<MemoryPatch>>> = OnceLock::new();
 pub(crate) static STEAM_CLIENT_BASE: OnceLock<u64> = OnceLock::new();
 static STEAM_UI_BASE: OnceLock<u64> = OnceLock::new();
 static IPC_SERVER: OnceLock<Mutex<Option<IpcServer>>> = OnceLock::new();
+static ACTIVE_PIPES: OnceLock<Mutex<HashMap<u32, usize>>> = OnceLock::new();
 
 /// Function pointer type for the original `IPCProcessMessage`.
 pub type IPCProcessMessageFn = unsafe extern "C" fn(
@@ -154,6 +157,10 @@ pub(crate) fn ipc_patches() -> &'static Mutex<Vec<MemoryPatch>> {
 
 fn ipc_server() -> &'static Mutex<Option<IpcServer>> {
     IPC_SERVER.get_or_init(|| Mutex::new(None))
+}
+
+fn active_pipes() -> &'static Mutex<HashMap<u32, usize>> {
+    ACTIVE_PIPES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn original_ipc_process_message() -> &'static Mutex<Option<IPCProcessMessageFn>> {
@@ -324,9 +331,58 @@ pub fn register_handler(
     Ok(())
 }
 
+fn map_ipc_interface(iface: EIPCInterface) -> ipc::IpcInterface {
+    match iface {
+        EIPCInterface::IClientUser => ipc::IpcInterface::IClientUser,
+        EIPCInterface::IClientUtils => ipc::IpcInterface::IClientUtils,
+        EIPCInterface::IClientNetworkingSocketsSerialized => {
+            ipc::IpcInterface::IClientNetworkingSocketsSerialized
+        }
+    }
+}
+
+fn wrap_handler_fn(f: IpcHandlerFn) -> ipc::HandlerFn {
+    Arc::new(move |ctx: &mut ipc::IpcContext| {
+        let _ = f(ctx.pipe, &mut ctx.read_buffer, &mut ctx.write_buffer);
+        Ok(())
+    })
+}
+
 fn register_default_handlers() {
     let _ = install_iclientuser_handlers();
     let _ = install_iclientutils_handlers();
+
+    let mirrored: Vec<ipc::ResolvedHandler> = handlers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|h| {
+            ipc::make_handler(
+                map_ipc_interface(h.interface_id),
+                h.func_hash,
+                &h.name,
+                h.fencepost,
+                h.argc,
+                h.pre_handler.clone().map(wrap_handler_fn),
+                h.post_handler.clone().map(wrap_handler_fn),
+            )
+        })
+        .collect();
+    ipc::register_handlers(mirrored);
+}
+
+fn dispatch_via_shared_ipc(
+    read_slice: &[u8],
+    write_slice: &mut [u8],
+    pipe: *mut c_void,
+) -> bool {
+    let mut out = write_slice.to_vec();
+    if !ipc::dispatch_ipc_message(read_slice, &mut out, pipe) {
+        return false;
+    }
+    let n = write_slice.len().min(out.len());
+    write_slice[..n].copy_from_slice(&out[..n]);
+    true
 }
 
 unsafe extern "C" fn hook_ipc_process_message(
@@ -349,6 +405,15 @@ unsafe extern "C" fn hook_ipc_process_message(
 
         let dispatch = resolve_dispatch(p_server, h_steam_pipe, &read_buffer);
         if !dispatch.enabled() {
+            if !dispatch.pipe.is_null()
+                && dispatch_via_shared_ipc(
+                    read_buffer.as_slice(),
+                    write_buffer.as_mut_slice(),
+                    dispatch.pipe,
+                )
+            {
+                return true;
+            }
             return call_original(p_server, h_steam_pipe, p_read, p_write);
         }
 
@@ -637,8 +702,18 @@ impl IPCInterfaceCall {
     }
 }
 
-fn get_pipe_client(_p_server: *mut c_void, _h_steam_pipe: u32) -> *mut c_void {
-    std::ptr::null_mut()
+fn get_pipe_client(p_server: *mut c_void, h_steam_pipe: u32) -> *mut c_void {
+    if p_server.is_null() || h_steam_pipe == 0 {
+        return std::ptr::null_mut();
+    }
+    if memory::is_readable(p_server, std::mem::size_of::<usize>()) {
+        if let Ok(mut pipes) = active_pipes().lock() {
+            pipes.insert(h_steam_pipe, p_server as usize);
+        }
+        p_server
+    } else {
+        std::ptr::null_mut()
+    }
 }
 
 fn start_ipc_server() -> Result<(), String> {
@@ -840,5 +915,41 @@ mod tests {
             depot_id: 55502,
         });
         assert!(!manifest_hooks::get_manifest_overrides().contains_key(&(55501, 55502)));
+    }
+
+    #[test]
+    fn test_get_pipe_client_validates_readability_and_registers_default_ipc_handlers() {
+        assert!(get_pipe_client(std::ptr::null_mut(), 1).is_null());
+        let mut pipe_obj: usize = 0xDEAD_BEEF;
+        let pipe_ptr = (&mut pipe_obj as *mut usize).cast::<c_void>();
+        assert!(get_pipe_client(pipe_ptr, 0).is_null());
+        assert!(get_pipe_client(0x1000 as *mut c_void, 1).is_null());
+
+        let resolved = get_pipe_client(pipe_ptr, 42);
+        assert_eq!(resolved, pipe_ptr);
+        assert_eq!(
+            active_pipes()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&42)
+                .copied(),
+            Some(pipe_ptr as usize)
+        );
+
+        register_default_handlers();
+        assert!(ipc::find_handler(
+            ipc::IpcInterface::IClientUser,
+            compute_func_hash("IClientUser", "GetSteamID")
+        )
+        .is_some());
+        assert!(ipc::find_handler(
+            ipc::IpcInterface::IClientUtils,
+            compute_func_hash("IClientUtils", "GetAppID")
+        )
+        .is_some());
+
+        // Exercise dispatch_via_shared_ipc cleanly with an empty/non-matching message
+        let mut write_buf = vec![0u8; 16];
+        assert!(!dispatch_via_shared_ipc(&[0u8; 4], &mut write_buf, pipe_ptr));
     }
 }

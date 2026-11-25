@@ -53,7 +53,7 @@ fn depots_seen() -> &'static Mutex<HashMap<(u32, u32), u64>> {
 
 /// Parse a hex byte pattern with optional `?`/`??` wildcards and optional explicit mask
 /// (`xx?x` or whitespace-separated hex bitmask bytes). Returns `None` on malformed tokens.
-pub(crate) fn parse_pattern_and_mask(
+pub fn parse_pattern_and_mask(
     pattern_hex: &str,
     explicit_mask: Option<&str>,
 ) -> Option<(Vec<u8>, Option<Vec<u8>>)> {

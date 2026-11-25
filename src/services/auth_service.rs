@@ -1,5 +1,5 @@
 //! Authentication service — Discord PKCE OAuth (`:53789`) & 6-character Discord bot code sign-in.
-//! Compatible with `~/.local/share/luatools/auth.json`.
+//! Compatible with `~/.local/share/luatools/auth.json` (encrypted as auth.json.enc).
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -18,6 +18,7 @@ use tiny_http::{Header, Response, Server};
 use url::Url;
 
 use crate::models::config::default_luatools_data_dir;
+use crate::services::credential_encryption::{EncryptionService, migrate_auth_to_encrypted};
 
 pub const SUPABASE_URL: &str = "https://db.lua.tools";
 pub const SUPABASE_ANON_KEY: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.\
@@ -72,7 +73,14 @@ impl AuthService {
         }
     }
 
+    /// Ensures encryption service is initialized and attempts to migrate plaintext auth.json
+    fn ensure_encryption(&self) {
+        let _ = EncryptionService::init_global();
+        let _ = migrate_auth_to_encrypted();
+    }
+
     pub fn initialize(&self) -> bool {
+        self.ensure_encryption();
         let Some(stored) = self.load_stored() else {
             return false;
         };
@@ -356,11 +364,55 @@ impl AuthService {
     }
 
     fn load_stored(&self) -> Option<AuthSession> {
+        // Try encrypted file first
+        let encrypted_path = self.auth_file.with_extension("enc");
+        if encrypted_path.exists() {
+            let global = EncryptionService::global();
+            let guard = global.lock().unwrap();
+            if let Some(service) = guard.as_ref() {
+                if let Ok(payload_str) = fs::read_to_string(&encrypted_path) {
+                    if let Ok(payload) = serde_json::from_str::<crate::services::credential_encryption::EncryptedPayload>(&payload_str) {
+                        if let Ok(session) = service.decrypt(&payload) {
+                            return Some(session);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback to plaintext (for migration)
         let raw = fs::read_to_string(&self.auth_file).ok()?;
         serde_json::from_str::<AuthSession>(&raw).ok()
     }
 
     fn save_stored(&self, session: &AuthSession) {
+        // Try to use encryption
+        let global = EncryptionService::global();
+        let guard = global.lock().unwrap();
+        if let Some(service) = guard.as_ref() {
+            if let Ok(payload) = service.encrypt(session) {
+                let encrypted_path = self.auth_file.with_extension("enc");
+                if let Some(parent) = encrypted_path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                if let Ok(json) = serde_json::to_string_pretty(&payload) {
+                    let tmp = encrypted_path.with_extension("tmp");
+                    if fs::write(&tmp, json).is_ok() {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+                        }
+                        let _ = fs::rename(&tmp, &encrypted_path);
+                        // Remove plaintext if it exists
+                        let _ = fs::remove_file(&self.auth_file);
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Fallback to plaintext (should not happen if encryption is initialized)
         if let Some(parent) = self.auth_file.parent() {
             let _ = fs::create_dir_all(parent);
         }

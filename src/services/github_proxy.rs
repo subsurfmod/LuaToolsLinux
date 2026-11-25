@@ -16,20 +16,20 @@ use ureq::Agent;
 
 static PROXY_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct GithubProxy {
     http: Agent,
+    timeout: Duration,
     pub(crate) api_mirrors: Vec<String>,
     pub(crate) download_mirrors: Vec<String>,
 }
 
 impl Default for GithubProxy {
     fn default() -> Self {
-        let http = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build();
         Self {
-            http,
+            http: Self::build_agent(DEFAULT_TIMEOUT),
+            timeout: DEFAULT_TIMEOUT,
             api_mirrors: vec![
                 "https://ghfast.top/https://api.github.com".into(),
                 "https://gh-proxy.com/https://api.github.com".into(),
@@ -43,8 +43,26 @@ impl Default for GithubProxy {
 }
 
 impl GithubProxy {
+    fn build_agent(timeout: Duration) -> Agent {
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_read(timeout)
+            .timeout(timeout)
+            .build()
+    }
+
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self.http = Self::build_agent(timeout);
+        self
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 
     pub fn with_mirrors(mut self, api_mirrors: Vec<String>, download_mirrors: Vec<String>) -> Self {
@@ -136,8 +154,8 @@ impl GithubProxy {
         })))
     }
 
-    /// Download a file, trying direct then mirrors. Streams atomically to disk with progress.
-    pub async fn download_async(
+    /// Download a file synchronously, trying direct then mirrors. Streams atomically to disk with progress.
+    pub fn download_sync(
         &self,
         url: &str,
         dest_path: &std::path::Path,
@@ -238,6 +256,16 @@ impl GithubProxy {
             ureq::Error::from(io::Error::other("All GitHub mirrors failed"))
         })))
     }
+
+    /// Download a file, trying direct then mirrors. Streams atomically to disk with progress.
+    pub async fn download_async(
+        &self,
+        url: &str,
+        dest_path: &std::path::Path,
+        progress: Option<&mut dyn FnMut(f64)>,
+    ) -> Result<(), Box<ureq::Error>> {
+        self.download_sync(url, dest_path, progress)
+    }
 }
 
 #[cfg(test)]
@@ -299,5 +327,14 @@ mod tests {
         let p = GithubProxy::new();
         let cands = p.candidates("https://example.com/file");
         assert_eq!(cands, vec!["https://example.com/file"]);
+    }
+
+    #[test]
+    fn test_with_timeout_updates_configured_timeout() {
+        let default_proxy = GithubProxy::new();
+        assert_eq!(default_proxy.timeout(), Duration::from_secs(30));
+
+        let custom_proxy = GithubProxy::new().with_timeout(Duration::from_secs(90));
+        assert_eq!(custom_proxy.timeout(), Duration::from_secs(90));
     }
 }

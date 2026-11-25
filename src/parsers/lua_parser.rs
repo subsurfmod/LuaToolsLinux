@@ -7,6 +7,8 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
+use crate::steam_bridge::ost_platform::numbers::{parse_uint32, parse_uint64};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LuaEntry {
     pub id: u32,
@@ -615,6 +617,14 @@ pub fn expand_procedural_lua(text: &str) -> String {
 pub struct LuaFileParser;
 
 impl LuaFileParser {
+    pub fn parse_app_or_depot_id(raw: &str) -> Option<u32> {
+        parse_uint32(raw.trim()).ok()
+    }
+
+    pub fn parse_manifest_id(raw: &str) -> Option<u64> {
+        parse_uint64(raw.trim()).ok()
+    }
+
     fn clean_comment(raw: Option<&str>) -> Option<String> {
         let s = raw?.trim();
         if s.is_empty() {
@@ -678,7 +688,7 @@ impl LuaFileParser {
             if !commented {
                 if let Some(cap) = add_token_re().captures(line_to_match) {
                     if let (Some(id_m), Some(tok_m)) = (cap.get(1), cap.get(2)) {
-                        if let Ok(aid) = id_m.as_str().parse::<u32>() {
+                        if let Some(aid) = Self::parse_app_or_depot_id(id_m.as_str()) {
                             tokens.insert(aid, tok_m.as_str().to_string());
                         }
                     }
@@ -686,7 +696,7 @@ impl LuaFileParser {
 
                 if let Some(cap) = add_process_re().captures(line_to_match) {
                     if let (Some(id_m), Some(exe_m)) = (cap.get(1), cap.get(2)) {
-                        if let Ok(aid) = id_m.as_str().parse::<u32>() {
+                        if let Some(aid) = Self::parse_app_or_depot_id(id_m.as_str()) {
                             process_map.insert(aid, exe_m.as_str().to_string());
                         }
                     }
@@ -694,7 +704,7 @@ impl LuaFileParser {
 
                 if let Some(cap) = force_denuvo_re().captures(line_to_match) {
                     if let Some(id_m) = cap.get(1) {
-                        if let Ok(aid) = id_m.as_str().parse::<u32>() {
+                        if let Some(aid) = Self::parse_app_or_depot_id(id_m.as_str()) {
                             force_denuvo.insert(aid);
                         }
                     }
@@ -702,7 +712,7 @@ impl LuaFileParser {
 
                 if let Some(cap) = pin_app_re().captures(line_to_match) {
                     if let Some(id_m) = cap.get(1) {
-                        if let Ok(aid) = id_m.as_str().parse::<u32>() {
+                        if let Some(aid) = Self::parse_app_or_depot_id(id_m.as_str()) {
                             pinned_apps.insert(aid);
                         }
                     }
@@ -710,7 +720,7 @@ impl LuaFileParser {
 
                 if let Some(cap) = set_legacy_cdkey_re().captures(line_to_match) {
                     if let (Some(id_m), Some(k_m)) = (cap.get(1), cap.get(2)) {
-                        if let Ok(aid) = id_m.as_str().parse::<u32>() {
+                        if let Some(aid) = Self::parse_app_or_depot_id(id_m.as_str()) {
                             legacy_cd_keys.insert(aid, k_m.as_str().to_string());
                         }
                     }
@@ -718,7 +728,7 @@ impl LuaFileParser {
 
                 if let Some(cap) = set_app_ticket_re().captures(line_to_match) {
                     if let (Some(id_m), Some(t_m)) = (cap.get(1), cap.get(2)) {
-                        if let Ok(aid) = id_m.as_str().parse::<u32>() {
+                        if let Some(aid) = Self::parse_app_or_depot_id(id_m.as_str()) {
                             app_tickets.insert(aid, t_m.as_str().to_string());
                         }
                     }
@@ -726,7 +736,7 @@ impl LuaFileParser {
 
                 if let Some(cap) = set_e_ticket_re().captures(line_to_match) {
                     if let (Some(id_m), Some(t_m)) = (cap.get(1), cap.get(2)) {
-                        if let Ok(aid) = id_m.as_str().parse::<u32>() {
+                        if let Some(aid) = Self::parse_app_or_depot_id(id_m.as_str()) {
                             e_tickets.insert(aid, t_m.as_str().to_string());
                         }
                     }
@@ -740,7 +750,7 @@ impl LuaFileParser {
 
                 if let Some(cap) = set_stat_re().captures(line_to_match) {
                     if let (Some(id_m), Some(s_m)) = (cap.get(1), cap.get(2)) {
-                        if let Ok(aid) = id_m.as_str().parse::<u32>() {
+                        if let Some(aid) = Self::parse_app_or_depot_id(id_m.as_str()) {
                             stats.insert(aid, s_m.as_str().to_string());
                         }
                     }
@@ -749,7 +759,10 @@ impl LuaFileParser {
 
             if let Some(pin) = set_manifest_re().captures(line_to_match) {
                 if let (Some(d_m), Some(gid_m)) = (pin.get(1), pin.get(2)) {
-                    if let Ok(depot) = d_m.as_str().parse::<u32>() {
+                    if let (Some(depot), Some(_gid)) = (
+                        Self::parse_app_or_depot_id(d_m.as_str()),
+                        Self::parse_manifest_id(gid_m.as_str()),
+                    ) {
                         let gid = gid_m.as_str().to_string();
                         if commented {
                             commented_manifests.insert(depot, gid);
@@ -757,7 +770,7 @@ impl LuaFileParser {
                             manifests.insert(depot, gid);
                         }
                         if let Some(sz_m) = pin.get(3) {
-                            if let Ok(sz) = sz_m.as_str().parse::<u64>() {
+                            if let Ok(sz) = parse_uint64(sz_m.as_str()) {
                                 if sz > 0 {
                                     sizes.insert(depot, sz);
                                 }
@@ -773,7 +786,7 @@ impl LuaFileParser {
             let Some(id_m) = m.get(1) else {
                 continue;
             };
-            let Ok(entry_id) = id_m.as_str().parse::<u32>() else {
+            let Some(entry_id) = Self::parse_app_or_depot_id(id_m.as_str()) else {
                 continue;
             };
 
@@ -914,7 +927,7 @@ impl LuaFileParser {
         if !changed {
             if let Some(gid) = fallback_manifest_id
                 .map(str::trim)
-                .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+                .filter(|s| Self::parse_manifest_id(s).is_some())
             {
                 new_lines.push(format!("setManifestid({}, \"{}\")", depot_id, gid));
                 changed = true;
@@ -995,7 +1008,7 @@ impl LuaFileParser {
                 continue;
             }
             if let Some(cap) = re.captures(trimmed) {
-                if let Ok(aid) = cap.get(1)?.as_str().parse::<u32>() {
+                if let Some(aid) = Self::parse_app_or_depot_id(cap.get(1)?.as_str()) {
                     if aid > 0 && aid < 2_000_000_000 {
                         return Some(aid);
                     }

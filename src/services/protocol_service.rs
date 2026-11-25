@@ -8,6 +8,23 @@ use std::sync::{Mutex, OnceLock};
 
 use url::Url;
 
+use crate::steam_bridge::token_bridge::{BstUri, TokenBridge};
+
+fn shared_token_bridge() -> &'static TokenBridge {
+    static BRIDGE: OnceLock<TokenBridge> = OnceLock::new();
+    BRIDGE.get_or_init(|| {
+        let mut bridge = TokenBridge::new();
+        bridge.register_handler(Box::new(|uri: &BstUri| {
+            if uri.is_valid() || !uri.token.is_empty() || uri.app_id > 0 {
+                Some(uri.clone())
+            } else {
+                None
+            }
+        }));
+        bridge
+    })
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProtocolActionExt {
     pub token: Option<String>,
@@ -74,6 +91,11 @@ impl Deref for ProtocolAction {
 pub struct ProtocolService;
 
 impl ProtocolService {
+    /// Routes a raw `bst://` URI through the shared `TokenBridge` dispatcher.
+    pub fn dispatch_bst(raw_url: &str) -> Option<BstUri> {
+        shared_token_bridge().handle_uri(raw_url)
+    }
+
     pub fn parse(raw_url: &str) -> Option<ProtocolAction> {
         let trimmed = raw_url.trim();
         let trimmed_lower = trimmed.to_ascii_lowercase();
@@ -82,6 +104,12 @@ impl ProtocolService {
         if !is_luatools && !is_bst {
             return None;
         }
+
+        let bst_dispatched = if is_bst {
+            Self::dispatch_bst(trimmed)
+        } else {
+            None
+        };
 
         let parsed = Url::parse(trimmed).ok()?;
         let host_raw = parsed.host_str().unwrap_or("");
@@ -128,6 +156,32 @@ impl ProtocolService {
                 }
             }
             (host_lower, aid?)
+        } else if let Some(bst) = bst_dispatched.as_ref().filter(|b| b.app_id > 0) {
+            if bst.token.eq_ignore_ascii_case("silent")
+                || bst.params.get("silent").is_some_and(|v| {
+                    v == "1" || v.eq_ignore_ascii_case("true") || v.is_empty()
+                })
+            {
+                silent = true;
+            }
+            if !bst.token.is_empty() && !bst.token.eq_ignore_ascii_case("silent") {
+                token = Some(bst.token.clone());
+            } else {
+                for seg in &segments {
+                    if seg.eq_ignore_ascii_case("silent") {
+                        silent = true;
+                    } else if token.is_none() {
+                        token = Some((*seg).to_string());
+                    }
+                }
+            }
+            let q_kind = bst
+                .params
+                .get("kind")
+                .or_else(|| bst.params.get("action"))
+                .map(|v| v.to_ascii_lowercase())
+                .unwrap_or_else(|| "install".to_string());
+            (q_kind, bst.app_id)
         } else if let Ok(aid) = host_lower.parse::<u32>() {
             for seg in &segments {
                 if seg.eq_ignore_ascii_case("silent") {
@@ -147,17 +201,29 @@ impl ProtocolService {
         };
 
         if token.is_none() {
-            token = parsed
-                .query_pairs()
-                .find(|(k, _)| k.eq_ignore_ascii_case("token"))
-                .map(|(_, v)| v.to_string())
-                .filter(|s| !s.is_empty());
+            token = bst_dispatched
+                .as_ref()
+                .and_then(|b| b.params.get("token"))
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .or_else(|| {
+                    parsed
+                        .query_pairs()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("token"))
+                        .map(|(_, v)| v.to_string())
+                        .filter(|s| !s.is_empty())
+                });
         }
 
-        let mut source = parsed
-            .query_pairs()
-            .find(|(k, _)| k == "source")
-            .map(|(_, v)| v.to_string());
+        let mut source = bst_dispatched
+            .as_ref()
+            .and_then(|b| b.params.get("source").cloned())
+            .or_else(|| {
+                parsed
+                    .query_pairs()
+                    .find(|(k, _)| k == "source")
+                    .map(|(_, v)| v.to_string())
+            });
 
         if source.is_none() && is_bst {
             source = Some("bst".to_string());
@@ -279,5 +345,12 @@ mod tests {
         assert!(!e.silent);
         assert_eq!(e.token, None);
         assert_eq!(e.redeem_code.as_deref(), Some("VIP-CODE-2026"));
+
+        let dispatched = ProtocolService::dispatch_bst("bst://1245620/my%2Ftok?source=hubcap&v=2")
+            .expect("TokenBridge should dispatch valid bst:// URI");
+        assert_eq!(dispatched.app_id, 1245620);
+        assert_eq!(dispatched.token, "my/tok");
+        assert_eq!(dispatched.version, 2);
+        assert!(ProtocolService::dispatch_bst("luatools://install/1245620").is_none());
     }
 }

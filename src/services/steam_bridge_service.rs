@@ -3,6 +3,7 @@
 //! with the LuaTools Linux GUI.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,11 +17,17 @@ use crate::services::steam_service::detect_steam_install;
 use crate::services::update_service::UpdateService;
 use crate::steam_bridge::{
     binary_reader::{scan_steam_binaries, BinaryFile},
+    credentials::legacycdkey::LegacyCdKeyStore,
+    denuvo_auth::{DenuvoAuthConfig, DenuvoAuthService},
     ipc::{self, IpcClient, IpcMessage},
     memory_patch::MemoryPatch,
+    ost_platform::steam_credential_store::{
+        get_active_user as cred_get_active_user, initialize as cred_initialize, Status as CredStatus,
+    },
     pattern_db::{BinaryComponent, PatternChannel, PatternDb},
     preload_loader::{self, find_steam_pid, steam_integrated, LD_SO_PRELOAD_PATH},
     ticket_store::{AppTicketData, TicketStore},
+    token_bridge::{BstUri, TokenBridge},
 };
 
 /// Result of bridge installation or binary pattern scan.
@@ -67,22 +74,43 @@ pub struct BridgeStatus {
     pub steam_ui_patterns: Option<String>,
     pub tickets_loaded: bool,
     pub apps_with_tickets: Vec<u32>,
+    pub active_account_id: Option<u32>,
+    pub active_universe: Option<String>,
     pub install_progress: f32,
     pub install_status: String,
 }
 
 /// Main service handle.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SteamBridgeService {
     pub status: Arc<Mutex<BridgeStatus>>,
     pub ticket_store: Arc<Mutex<TicketStore>>,
+    pub legacy_cd_key_store: Arc<Mutex<LegacyCdKeyStore>>,
+    pub denuvo_auth: Arc<Mutex<DenuvoAuthService>>,
+    pub token_bridge: Arc<Mutex<TokenBridge>>,
     pub overrides: Arc<Mutex<BridgeOverrides>>,
     pub pattern_db: PatternDb,
     pub installed_patches: Arc<Mutex<Vec<MemoryPatch>>>,
     steam_installation: Option<SteamInstallation>,
+    config_dir: PathBuf,
+    is_sandboxed: bool,
     overrides_path: PathBuf,
     lib_target_path: PathBuf,
     launcher_path: PathBuf,
+}
+
+impl fmt::Debug for SteamBridgeService {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SteamBridgeService")
+            .field("status", &self.status)
+            .field("ticket_store", &self.ticket_store)
+            .field("legacy_cd_key_store", &self.legacy_cd_key_store)
+            .field("overrides", &self.overrides)
+            .field("steam_installation", &self.steam_installation)
+            .field("config_dir", &self.config_dir)
+            .field("is_sandboxed", &self.is_sandboxed)
+            .finish()
+    }
 }
 
 impl Default for SteamBridgeService {
@@ -117,6 +145,7 @@ impl SteamBridgeService {
             }
         };
 
+        let is_sandboxed = sandbox_dir.is_some();
         let config_dir = installation
             .as_ref()
             .map(|i| i.config_path.clone())
@@ -127,9 +156,37 @@ impl SteamBridgeService {
                     .unwrap_or_else(TicketStore::default_path)
             });
 
+        if !is_sandboxed {
+            cred_initialize(&config_dir);
+        }
+
         let mut ticket_store = TicketStore::new(&config_dir);
         let _ = ticket_store.load();
         let apps_with_tickets = ticket_store.list_app_ids().unwrap_or_default();
+
+        let mut legacy_cd_key_store = LegacyCdKeyStore::new(&config_dir);
+        let _ = legacy_cd_key_store.load();
+
+        let mut token_bridge = TokenBridge::new();
+        token_bridge.register_handler(Box::new(|uri: &BstUri| {
+            if uri.is_valid() {
+                Some(uri.clone())
+            } else {
+                None
+            }
+        }));
+
+        let (active_account_id, active_universe) = if !is_sandboxed {
+            let mut acct = 0u32;
+            let mut univ = String::new();
+            if cred_get_active_user(&mut acct, &mut univ) == CredStatus::Ok {
+                (Some(acct), Some(univ))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
 
         let overrides_path = data_dir.join("bridge_overrides.json");
         let overrides: BridgeOverrides = fs::read_to_string(&overrides_path)
@@ -141,7 +198,7 @@ impl SteamBridgeService {
         let status = BridgeStatus {
             steam_detected: installation.is_some(),
             steam_root: installation.as_ref().map(|i| i.root.clone()),
-            steam_pid: if sandbox_dir.is_none() {
+            steam_pid: if !is_sandboxed {
                 find_steam_pid()
             } else {
                 None
@@ -150,19 +207,26 @@ impl SteamBridgeService {
             integration_lib_path: lib_target_path.is_file().then(|| lib_target_path.clone()),
             launcher_installed: launcher_path.is_file(),
             system_preload_enabled: sys_preload,
-            integration_active: sandbox_dir.is_none() && check_ipc_or_maps_active(),
+            integration_active: !is_sandboxed && check_ipc_or_maps_active(),
             tickets_loaded: installation.is_some(),
             apps_with_tickets,
+            active_account_id,
+            active_universe,
             ..Default::default()
         };
 
         Self {
             status: Arc::new(Mutex::new(status)),
             ticket_store: Arc::new(Mutex::new(ticket_store)),
+            legacy_cd_key_store: Arc::new(Mutex::new(legacy_cd_key_store)),
+            denuvo_auth: Arc::new(Mutex::new(DenuvoAuthService::new())),
+            token_bridge: Arc::new(Mutex::new(token_bridge)),
             overrides: Arc::new(Mutex::new(overrides)),
             pattern_db: PatternDb::new(),
             installed_patches: Arc::new(Mutex::new(Vec::new())),
             steam_installation: installation,
+            config_dir,
+            is_sandboxed,
             overrides_path,
             lib_target_path,
             launcher_path,
@@ -171,10 +235,26 @@ impl SteamBridgeService {
 
     pub fn set_steam_installation(&mut self, installation: Option<SteamInstallation>) {
         self.steam_installation = installation.clone();
+        if let Some(inst) = &installation {
+            self.config_dir = inst.config_path.clone();
+            if !self.is_sandboxed {
+                cred_initialize(&inst.config_path);
+            }
+            let mut cd_store = self
+                .legacy_cd_key_store
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *cd_store = LegacyCdKeyStore::new(&inst.config_path);
+            let _ = cd_store.load();
+        }
         let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
         status.steam_detected = installation.is_some();
         status.steam_root = installation.as_ref().map(|i| i.root.clone());
-        status.steam_pid = find_steam_pid();
+        status.steam_pid = if !self.is_sandboxed {
+            find_steam_pid()
+        } else {
+            None
+        };
         status.integration_lib_installed = self.lib_target_path.is_file();
         status.integration_lib_path = self
             .lib_target_path
@@ -182,7 +262,7 @@ impl SteamBridgeService {
             .then(|| self.lib_target_path.clone());
         status.launcher_installed = self.launcher_path.is_file();
         status.system_preload_enabled = is_in_ld_so_preload(&self.lib_target_path);
-        status.integration_active = check_ipc_or_maps_active();
+        status.integration_active = !self.is_sandboxed && check_ipc_or_maps_active();
         // Reset per-installation scan metadata so stale state never leaks across roots
         status.steam_client_found = false;
         status.steam_ui_found = false;
@@ -197,9 +277,22 @@ impl SteamBridgeService {
             let _ = store.load();
             status.tickets_loaded = true;
             status.apps_with_tickets = store.list_app_ids().unwrap_or_default();
+            if !self.is_sandboxed {
+                let mut acct = 0u32;
+                let mut univ = String::new();
+                if cred_get_active_user(&mut acct, &mut univ) == CredStatus::Ok {
+                    status.active_account_id = Some(acct);
+                    status.active_universe = Some(univ);
+                } else {
+                    status.active_account_id = None;
+                    status.active_universe = None;
+                }
+            }
         } else {
             status.tickets_loaded = false;
             status.apps_with_tickets.clear();
+            status.active_account_id = None;
+            status.active_universe = None;
         }
     }
 
@@ -642,6 +735,11 @@ impl SteamBridgeService {
             ov.legacy_cd_keys.insert(app_id, key.clone());
             self.save_overrides(&ov);
         }
+        let _ = self
+            .legacy_cd_key_store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_override(app_id, key.clone());
         let _ = self.send_ipc_message(IpcMessage::SetLegacyCdKey { app_id, key });
     }
 
@@ -651,16 +749,94 @@ impl SteamBridgeService {
             ov.legacy_cd_keys.remove(&app_id);
             self.save_overrides(&ov);
         }
+        let _ = self
+            .legacy_cd_key_store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove_override(app_id);
         let _ = self.send_ipc_message(IpcMessage::RemoveLegacyCdKey { app_id });
     }
 
     pub fn get_legacy_cd_key(&self, app_id: u32) -> Option<String> {
-        self.overrides
+        if let Some(key) = self
+            .overrides
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .legacy_cd_keys
             .get(&app_id)
             .cloned()
+        {
+            return Some(key);
+        }
+        self.legacy_cd_key_store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(app_id)
+            .ok()
+            .and_then(|d| d.override_key.clone())
+    }
+
+    /// Resolves a legacy CD key from `LegacyCdKeyStore`, falling back to deterministic synthesis
+    /// for the active Steam account (from `steam_credential_store::get_active_user`).
+    pub fn resolve_legacy_cd_key(&self, app_id: u32) -> Option<String> {
+        let account_id = self.active_steam_user().map(|(id, _)| id).unwrap_or(0);
+        let mut store = self
+            .legacy_cd_key_store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        LegacyCdKeyStore::resolve(&mut store, app_id, account_id)
+            .ok()
+            .flatten()
+    }
+
+    /// Returns `(account_id, universe)` for the active Steam user if detected.
+    pub fn active_steam_user(&self) -> Option<(u32, String)> {
+        if !self.is_sandboxed {
+            let mut account_id = 0u32;
+            let mut universe = String::new();
+            if cred_get_active_user(&mut account_id, &mut universe) == CredStatus::Ok {
+                return Some((account_id, universe));
+            }
+        }
+        let status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        status
+            .active_account_id
+            .zip(status.active_universe.clone())
+    }
+
+    pub fn configure_denuvo_auth(&self, config: DenuvoAuthConfig) {
+        self.denuvo_auth
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .configure(config);
+    }
+
+    pub fn register_denuvo_app(&self, app_id: u32) {
+        self.denuvo_auth
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .register_denuvo_app(app_id);
+    }
+
+    pub fn unregister_denuvo_app(&self, app_id: u32) {
+        self.denuvo_auth
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unregister_denuvo_app(app_id);
+    }
+
+    pub fn is_denuvo_app(&self, app_id: u32) -> bool {
+        self.denuvo_auth
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_denuvo_protected(app_id)
+    }
+
+    pub fn dispatch_bst_uri(&self, uri: &str) -> Option<BstUri> {
+        self.token_bridge
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .handle_uri(uri)
     }
 
     pub fn set_depot_key(&self, depot_id: u32, key: String) {
@@ -918,5 +1094,34 @@ mod tests {
         assert!(!cleared.patterns_loaded);
         assert!(!cleared.tickets_loaded);
         assert!(cleared.apps_with_tickets.is_empty());
+    }
+
+    #[test]
+    fn wires_denuvo_token_bridge_and_legacy_cd_key_store_in_sandbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = SteamBridgeService::with_paths(None, Some(tmp.path().to_path_buf()));
+
+        svc.set_legacy_cd_key(1245620, "KEY-ABCD-EFGH".into());
+        assert_eq!(
+            svc.get_legacy_cd_key(1245620).as_deref(),
+            Some("KEY-ABCD-EFGH")
+        );
+        assert_eq!(
+            svc.resolve_legacy_cd_key(1245620).as_deref(),
+            Some("KEY-ABCD-EFGH")
+        );
+
+        let bst = svc.dispatch_bst_uri("bst://1245620/session_tok").unwrap();
+        assert_eq!(bst.app_id, 1245620);
+        assert_eq!(bst.token, "session_tok");
+
+        svc.configure_denuvo_auth(DenuvoAuthConfig {
+            enabled: true,
+            pool_steam_id: Some(76_561_198_028_121_353),
+            ..Default::default()
+        });
+        svc.register_denuvo_app(1245620);
+        assert!(svc.is_denuvo_app(1245620));
+        svc.unregister_denuvo_app(1245620);
     }
 }

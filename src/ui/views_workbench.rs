@@ -1050,6 +1050,7 @@ impl LuaToolsApp {
             ui.set_min_height(body_h);
 
             let mut click_qr_login = false;
+            let mut click_refresh_info = false;
 
             // Output folder + Steam Login / Selection controls
             egui::Sides::new().show(
@@ -1093,6 +1094,12 @@ impl LuaToolsApp {
                             }
                         }
                     }
+                    if ghost_button(ui, "Refresh Info")
+                        .on_hover_text("Invalidate cached SteamCMD depot metadata and fetch fresh info")
+                        .clicked()
+                    {
+                        click_refresh_info = true;
+                    }
                     ui.add_enabled_ui(!self.depots_downloading, |ui| {
                         if secondary_button(ui, "Sign In (QR)")
                             .on_hover_text(
@@ -1105,6 +1112,10 @@ impl LuaToolsApp {
                     });
                 },
             );
+
+            if click_refresh_info {
+                self.refresh_depot_info_async(_app_id, ui.ctx());
+            }
 
             if click_qr_login {
                 let _ = self.settings_service.save();
@@ -1510,6 +1521,28 @@ impl LuaToolsApp {
                                 .size(12.0)
                                 .color(Palette::TEXT_MUTED),
                             );
+                            if let Some(ref dir) = install_dir {
+                                ui.add_space(6.0);
+                                let recorded_hashes = self.asset_hash_service.get_hashes(aid);
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 8.0;
+                                    if secondary_button(ui, "Verify Integrity (SHA-256)")
+                                        .on_hover_text(
+                                            "Hash and verify key game executables/DLLs using AssetHashService",
+                                        )
+                                        .clicked()
+                                    {
+                                        self.verify_game_integrity_async(aid, dir.clone(), ui.ctx());
+                                    }
+                                    if !recorded_hashes.is_empty() {
+                                        status_badge(
+                                            ui,
+                                            &format!("{} hashed asset(s)", recorded_hashes.len()),
+                                            BadgeTone::Ready,
+                                        );
+                                    }
+                                });
+                            }
                             ui.add_space(14.0);
 
                             let items = self.fixes_items.clone();

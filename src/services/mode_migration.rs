@@ -13,6 +13,27 @@ use std::convert::TryFrom;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::steam_bridge::ost_platform::pe::Image;
+
+fn inspect_legacy_pe(path: &Path, lower_name: &str) -> (bool, usize, bool) {
+    if !(lower_name.ends_with(".dll") || lower_name.ends_with(".dll.bak")) {
+        return (false, 0, false);
+    }
+    let Some(path_str) = path.to_str() else {
+        return (false, 0, false);
+    };
+    let Ok(img) = Image::new(path_str) else {
+        return (false, 0, false);
+    };
+    if !img.is_valid() {
+        return (false, 0, false);
+    }
+    let section_count = img.sections().len();
+    let has_steam_exports = img.find_export("SteamAPI_Init").is_ok()
+        || img.find_export("SteamAPI_RestartAppIfNecessary").is_ok();
+    (true, section_count, has_steam_exports)
+}
+
 /// Legacy mode values from the C# version
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "PascalCase")]
@@ -144,18 +165,28 @@ impl ModeMigration {
                         || lower == "smokeapi.config.json"
                         || lower == "smokeapi.json"
                     {
+                        let (is_valid_pe, pe_section_count, has_steam_api_exports) =
+                            inspect_legacy_pe(&path, &lower);
                         out.push(LegacyUnlockerFile {
                             relative_path: rel_str,
                             unlocker_kind: "SmokeAPI".to_string(),
                             is_backup_orig: false,
+                            is_valid_pe,
+                            pe_section_count,
+                            has_steam_api_exports,
                         });
                     } else if lower.starts_with("greenluma")
                         && (lower.ends_with(".dll") || lower.ends_with(".ini"))
                     {
+                        let (is_valid_pe, pe_section_count, has_steam_api_exports) =
+                            inspect_legacy_pe(&path, &lower);
                         out.push(LegacyUnlockerFile {
                             relative_path: rel_str,
                             unlocker_kind: "GreenLuma".to_string(),
                             is_backup_orig: false,
+                            is_valid_pe,
+                            pe_section_count,
+                            has_steam_api_exports,
                         });
                     } else if lower == "bst.dll"
                         || lower == "bst64.dll"
@@ -165,10 +196,15 @@ impl ModeMigration {
                         || lower == "opensteamtool.dll"
                         || lower == "opensteamtools.dll"
                     {
+                        let (is_valid_pe, pe_section_count, has_steam_api_exports) =
+                            inspect_legacy_pe(&path, &lower);
                         out.push(LegacyUnlockerFile {
                             relative_path: rel_str,
                             unlocker_kind: "BST".to_string(),
                             is_backup_orig: false,
+                            is_valid_pe,
+                            pe_section_count,
+                            has_steam_api_exports,
                         });
                     } else if lower == "steam_api64_o.dll"
                         || lower == "steam_api_o.dll"
@@ -177,10 +213,15 @@ impl ModeMigration {
                         || lower == "steam_api64.dll.bak"
                         || lower == "steam_api.dll.bak"
                     {
+                        let (is_valid_pe, pe_section_count, has_steam_api_exports) =
+                            inspect_legacy_pe(&path, &lower);
                         out.push(LegacyUnlockerFile {
                             relative_path: rel_str,
                             unlocker_kind: "OriginalBackup".to_string(),
                             is_backup_orig: true,
+                            is_valid_pe,
+                            pe_section_count,
+                            has_steam_api_exports,
                         });
                     }
                 }
@@ -271,6 +312,12 @@ pub struct LegacyUnlockerFile {
     pub relative_path: String,
     pub unlocker_kind: String,
     pub is_backup_orig: bool,
+    #[serde(default)]
+    pub is_valid_pe: bool,
+    #[serde(default)]
+    pub pe_section_count: usize,
+    #[serde(default)]
+    pub has_steam_api_exports: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -409,5 +456,44 @@ mod tests {
         let bkp = game_dir.join(".luatools-backup/legacy-unlockers");
         assert!(bkp.join("smokeapi64.dll").exists());
         assert!(bkp.join("steam_api64_o.dll").exists());
+    }
+
+    #[test]
+    fn test_scan_legacy_dll_inspects_valid_pe_headers_safely() {
+        let tmp = tempfile::tempdir().unwrap();
+        let game_dir = tmp.path().join("PeGame");
+        fs::create_dir_all(&game_dir).unwrap();
+
+        // Synthetic valid PE64 DLL with 1 section
+        let mut pe = vec![0u8; 0x400];
+        pe[0..2].copy_from_slice(&0x5A4Du16.to_le_bytes());
+        pe[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        pe[0x80..0x84].copy_from_slice(&0x0000_4550u32.to_le_bytes());
+        let fh = 0x84;
+        pe[fh + 2..fh + 4].copy_from_slice(&1u16.to_le_bytes());
+        pe[fh + 16..fh + 18].copy_from_slice(&240u16.to_le_bytes());
+        let opt = fh + 20;
+        pe[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
+        let sec = opt + 240;
+        pe[sec..sec + 5].copy_from_slice(b".text");
+        pe[sec + 8..sec + 12].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        pe[sec + 36..sec + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes());
+
+        fs::write(game_dir.join("smokeapi64.dll"), &pe).unwrap();
+        fs::write(game_dir.join("bst.dll"), b"NOT_A_PE_DUMMY").unwrap();
+
+        let scanned = ModeMigration::scan_game_for_legacy_unlockers(&game_dir);
+        assert_eq!(scanned.len(), 2);
+        let bst = scanned.iter().find(|f| f.relative_path == "bst.dll").unwrap();
+        assert!(!bst.is_valid_pe);
+        assert_eq!(bst.pe_section_count, 0);
+
+        let smoke = scanned
+            .iter()
+            .find(|f| f.relative_path == "smokeapi64.dll")
+            .unwrap();
+        assert!(smoke.is_valid_pe);
+        assert_eq!(smoke.pe_section_count, 1);
     }
 }

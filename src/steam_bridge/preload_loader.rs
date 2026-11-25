@@ -17,6 +17,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::steam_bridge::ost_platform::process::{
+    get_environment_variable_value, get_image_path, get_process_command_line,
+};
+
 /// Error type for preload operations.
 #[derive(Debug, thiserror::Error)]
 pub enum PreloadError {
@@ -84,6 +88,7 @@ pub fn is_steam_client_process(comm: &str, exe_path: Option<&Path>) -> bool {
 
 pub fn find_steam_pid() -> Option<u32> {
     let my_pid = std::process::id();
+    let mut preloaded_fallback_pid = None;
     let mut fallback_pid = None;
 
     if let Ok(entries) = fs::read_dir("/proc") {
@@ -96,7 +101,7 @@ pub fn find_steam_pid() -> Option<u32> {
                 continue;
             }
             let comm = fs::read_to_string(format!("/proc/{}/comm", pid)).unwrap_or_default();
-            let exe = fs::read_link(format!("/proc/{}/exe", pid)).ok();
+            let exe = get_image_path(pid).map(PathBuf::from);
 
             if is_steam_client_process(&comm, exe.as_deref()) {
                 // Prefer the 64-bit steamrt64/steam main process when both 32-bit and 64-bit exist
@@ -107,13 +112,17 @@ pub fn find_steam_pid() -> Option<u32> {
                 {
                     return Some(pid);
                 }
+                if preloaded_fallback_pid.is_none() && has_preload_env(pid, integration_lib_name())
+                {
+                    preloaded_fallback_pid = Some(pid);
+                }
                 if fallback_pid.is_none() {
                     fallback_pid = Some(pid);
                 }
             }
         }
     }
-    fallback_pid
+    preloaded_fallback_pid.or(fallback_pid)
 }
 
 /// Returns `true` when `/proc/<pid>` belongs to any Steam client, webhelper, overlay,
@@ -231,16 +240,8 @@ pub fn find_all_steam_pids() -> Vec<u32> {
                 continue;
             }
             let comm = fs::read_to_string(format!("/proc/{}/comm", pid)).unwrap_or_default();
-            let exe = fs::read_link(format!("/proc/{}/exe", pid)).ok();
-            let cmdline = fs::read(format!("/proc/{}/cmdline", pid))
-                .map(|b| {
-                    b.split(|&c| c == 0)
-                        .filter(|s| !s.is_empty())
-                        .map(|s| String::from_utf8_lossy(s).into_owned())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
-                .unwrap_or_default();
+            let exe = get_image_path(pid).map(PathBuf::from);
+            let cmdline = get_process_command_line(pid).unwrap_or_default();
 
             if is_any_steam_process(&comm, exe.as_deref(), &cmdline) {
                 pids.push(pid);
@@ -333,6 +334,18 @@ pub fn is_loaded(pid: u32, lib_name: &str) -> bool {
     } else {
         false
     }
+}
+
+/// Checks whether a running process has `lib_name` configured in `LD_PRELOAD` or `LD_AUDIT`
+/// via `/proc/<pid>/environ`.
+pub fn has_preload_env(pid: u32, lib_name: &str) -> bool {
+    if pid == 0 || lib_name.is_empty() {
+        return false;
+    }
+    get_environment_variable_value(pid, "LD_PRELOAD")
+        .is_some_and(|v| v.contains(lib_name))
+        || get_environment_variable_value(pid, "LD_AUDIT")
+            .is_some_and(|v| v.contains(lib_name))
 }
 
 fn map_preload_io_err(err: std::io::Error) -> PreloadError {
@@ -708,5 +721,15 @@ mod tests {
         let txt = fs::read_to_string(&escaped_script).unwrap();
         assert!(txt.contains("My \\$Steam/steam.sh"));
         assert!(txt.contains("lib\\`dir\\\"/libsteam_integration.so"));
+    }
+
+    #[test]
+    fn has_preload_env_handles_invalid_and_self_pid_safely() {
+        assert!(!has_preload_env(0, "libsteam_integration.so"));
+        assert!(!has_preload_env(std::process::id(), ""));
+        assert!(!has_preload_env(
+            std::process::id(),
+            "definitely_not_preloaded_xyz_123.so"
+        ));
     }
 }

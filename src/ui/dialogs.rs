@@ -883,11 +883,12 @@ impl LuaToolsApp {
         });
 
         if do_save {
-            if let Some(inst) = &self.steam_service.installation {
+            let steam_root = self.steam_service.installation.as_ref().map(|i| i.root.clone());
+            if let Some(root) = steam_root {
                 if crate::services::steam_service::SteamService::is_steam_running() {
                     let _ = crate::services::steam_service::SteamService::terminate_steam_instances();
                 }
-                let svc = LaunchOptionsService::new(inst.root.clone());
+                let svc = LaunchOptionsService::new(root.clone());
                 let prev_entries = svc.get_launch_entries(app_id);
                 match svc.save_launch_entries(app_id, &self.launch_options_modal.entries) {
                     Ok(m) => {
@@ -899,6 +900,8 @@ impl LuaToolsApp {
                         );
                         self.launch_options_modal.feedback = m.clone();
                         self.notify(m, ToastKind::Success);
+                        // LT-57: Automatically restart Steam after successful save
+                        let _ = crate::services::steam_service::SteamService::relaunch_steam_sls(Some(&root));
                     }
                     Err(m) => {
                         self.launch_options_modal.feedback = m.clone();
@@ -911,11 +914,12 @@ impl LuaToolsApp {
             }
         }
         if do_restore {
-            if let Some(inst) = &self.steam_service.installation {
+            let steam_root = self.steam_service.installation.as_ref().map(|i| i.root.clone());
+            if let Some(root) = steam_root {
                 if crate::services::steam_service::SteamService::is_steam_running() {
                     let _ = crate::services::steam_service::SteamService::terminate_steam_instances();
                 }
-                let svc = LaunchOptionsService::new(inst.root.clone());
+                let svc = LaunchOptionsService::new(root.clone());
                 match svc.restore_backup() {
                     Ok(m) => {
                         let reloaded = svc.get_launch_entries(app_id);
@@ -924,6 +928,8 @@ impl LuaToolsApp {
                         self.launch_options_modal.entries = reloaded;
                         self.launch_options_modal.feedback = m.clone();
                         self.notify(m, ToastKind::Success);
+                        // LT-57: Automatically restart Steam after successful restore
+                        let _ = crate::services::steam_service::SteamService::relaunch_steam_sls(Some(&root));
                     }
                     Err(m) => {
                         self.launch_options_modal.feedback = m.clone();

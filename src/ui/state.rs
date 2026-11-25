@@ -244,7 +244,18 @@ pub enum AppMessage {
         ok: bool,
         msg: String,
     },
+    GameIntegrityChecked {
+        app_id: u32,
+        checked: usize,
+        ok: bool,
+        msg: String,
+    },
     FilePickedForGameInjectionSo(PathBuf),
+    ShowWindow,
+    HideWindow,
+    OpenSettings,
+    RestartSteamRequested,
+    QuitRequested,
 }
 
 // ===== Modal Dialog States =====

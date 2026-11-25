@@ -3,10 +3,24 @@
 //! Port of usefulsteamtools `Pipe/Features/Auth/DenuvoAuth.cpp`.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
+use std::os::raw::c_void;
 use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::steam_bridge::ost_platform::http;
+
 const DEFAULT_TICKET_TTL_SECS: u32 = 86_400;
+const MAX_AUTH_RESPONSE_BYTES: u32 = 64 * 1024;
+const AUTH_HTTP_TIMEOUT_MS: u32 = 2_000;
+
+fn is_http_url(url: &str) -> bool {
+    url.get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+        || url
+            .get(..8)
+            .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+}
 
 fn now_unix_secs() -> u64 {
     SystemTime::now()
@@ -219,9 +233,14 @@ impl DenuvoAuthService {
     }
 
     fn store_auth_ticket(&self, app_id: u32, ticket: &[u8]) {
+        self.store_auth_ticket_with_ttl(app_id, ticket, DEFAULT_TICKET_TTL_SECS);
+    }
+
+    fn store_auth_ticket_with_ttl(&self, app_id: u32, ticket: &[u8], ttl_secs: u32) {
         if ticket.is_empty() {
             return;
         }
+        let effective_ttl = ttl_secs.max(1);
         let mut store = self
             .stored_tickets
             .write()
@@ -231,14 +250,122 @@ impl DenuvoAuthService {
             StoredTicket {
                 bytes: ticket.to_vec(),
                 stored_at: now_unix_secs(),
-                ttl_secs: DEFAULT_TICKET_TTL_SECS,
+                ttl_secs: effective_ttl,
             },
         );
         log::debug!(
-            "[denuvo] stored auth ticket for app {} ({} bytes)",
+            "[denuvo] stored auth ticket for app {} ({} bytes, ttl={}s)",
             app_id,
-            ticket.len()
+            ticket.len(),
+            effective_ttl
         );
+    }
+
+    /// Fetch a Denuvo ticket from `config.auth_url` via `ost_platform::http::Execute`.
+    fn fetch_remote_auth_ticket(
+        &self,
+        app_id: u32,
+        pool_steam_id: u64,
+        nonce: &[u8],
+    ) -> Result<(Vec<u8>, u32), String> {
+        let base_url = self
+            .config
+            .auth_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .ok_or_else(|| "No auth_url configured".to_string())?;
+
+        if !is_http_url(base_url) {
+            return Err(format!("Unsupported auth_url scheme: {}", base_url));
+        }
+
+        let target_url = format!("{}/ticket/{}", base_url.trim_end_matches('/'), app_id);
+        let payload = serde_json::json!({
+            "app_id": app_id,
+            "steam_id": pool_steam_id.to_string(),
+            "nonce": hex::encode(nonce),
+        });
+        let body_str = payload.to_string();
+        let body_bytes = body_str.as_bytes();
+        let body_len = u32::try_from(body_bytes.len())
+            .map_err(|_| "Auth request payload exceeds u32 length".to_string())?;
+
+        let mut header_lines = String::from("Content-Type: application/json\r\nAccept: application/json, text/plain\r\n");
+        if let Some(cid) = self.config.client_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let clean = cid.replace(['\r', '\n'], "");
+            header_lines.push_str(&format!("X-Client-Id: {}\r\n", clean));
+        }
+        if let Some(sec) = self
+            .config
+            .client_secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let clean = sec.replace(['\r', '\n'], "");
+            header_lines.push_str(&format!("X-Client-Secret: {}\r\n", clean));
+        }
+        let headers_cstr = CString::new(header_lines)
+            .map_err(|_| "Auth headers contain interior NUL byte".to_string())?;
+
+        let resp = http::Execute(
+            "POST",
+            &target_url,
+            body_bytes.as_ptr() as *const c_void,
+            body_len,
+            headers_cstr.as_ptr(),
+            AUTH_HTTP_TIMEOUT_MS,
+            AUTH_HTTP_TIMEOUT_MS,
+            AUTH_HTTP_TIMEOUT_MS,
+            AUTH_HTTP_TIMEOUT_MS,
+            MAX_AUTH_RESPONSE_BYTES,
+        );
+
+        if !resp.ok {
+            let snippet: String = resp.body.chars().take(160).collect();
+            return Err(format!(
+                "Remote Denuvo auth failed (status={}): {}",
+                resp.status, snippet
+            ));
+        }
+
+        let trimmed = resp.body.trim();
+        if trimmed.is_empty() {
+            return Err("Remote Denuvo auth returned empty body".to_string());
+        }
+
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if json.get("success").and_then(|v| v.as_bool()) == Some(false) {
+                let err_msg = json
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Remote auth rejected request");
+                return Err(err_msg.to_string());
+            }
+
+            let ticket_str = json
+                .get("ticket")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "Remote Denuvo auth JSON missing non-empty 'ticket'".to_string())?;
+
+            let ticket_bytes =
+                hex::decode(ticket_str).unwrap_or_else(|_| ticket_str.as_bytes().to_vec());
+            let ttl = json
+                .get("expires_in")
+                .and_then(|v| v.as_u64())
+                .map(|v| v.clamp(1, u64::from(u32::MAX)) as u32)
+                .unwrap_or(DEFAULT_TICKET_TTL_SECS);
+            return Ok((ticket_bytes, ttl));
+        }
+
+        let ticket_bytes = hex::decode(trimmed).unwrap_or_else(|_| trimmed.as_bytes().to_vec());
+        if ticket_bytes.is_empty() {
+            return Err("Remote Denuvo auth returned empty ticket".to_string());
+        }
+        Ok((ticket_bytes, DEFAULT_TICKET_TTL_SECS))
     }
 
     pub fn fetch_auth_ticket(&self, app_id: u32, nonce: &[u8]) -> Option<DenuvoAuthResult> {
@@ -246,7 +373,7 @@ impl DenuvoAuthService {
             return None;
         }
 
-        let _pool_sid = self.config.pool_steam_id?;
+        let pool_sid = self.config.pool_steam_id?;
         let now = now_unix_secs();
 
         log::debug!(
@@ -278,6 +405,37 @@ impl DenuvoAuthService {
                     error: None,
                     expires_in: remaining,
                 });
+            }
+        }
+
+        if self
+            .config
+            .auth_url
+            .as_deref()
+            .is_some_and(|u| !u.trim().is_empty())
+        {
+            match self.fetch_remote_auth_ticket(app_id, pool_sid, nonce) {
+                Ok((ticket_bytes, ttl)) => {
+                    self.store_auth_ticket_with_ttl(app_id, &ticket_bytes, ttl);
+                    let mut payload = ticket_bytes;
+                    if !nonce.is_empty() {
+                        payload.extend_from_slice(nonce);
+                    }
+                    return Some(DenuvoAuthResult {
+                        success: true,
+                        ticket: Some(payload),
+                        error: None,
+                        expires_in: ttl,
+                    });
+                }
+                Err(err) => {
+                    return Some(DenuvoAuthResult {
+                        success: false,
+                        ticket: None,
+                        error: Some(err),
+                        expires_in: 0,
+                    });
+                }
             }
         }
 
@@ -375,6 +533,30 @@ impl DenuvoAuth {
         self.service.is_denuvo_protected(app_id)
     }
 
+    pub fn register_denuvo_app(&self, app_id: u32) {
+        self.service.register_denuvo_app(app_id);
+    }
+
+    pub fn unregister_denuvo_app(&self, app_id: u32) {
+        self.service.unregister_denuvo_app(app_id);
+    }
+
+    pub fn should_force_denuvo(&self, app_id: u32) -> bool {
+        self.service.should_force_denuvo(app_id)
+    }
+
+    pub fn get_pool_steam_id(&self, app_id: u32) -> Option<u64> {
+        self.service.get_pool_steam_id(app_id)
+    }
+
+    pub fn revoke(&self, app_id: u32) {
+        self.service.revoke(app_id);
+    }
+
+    pub fn cleanup_expired(&self, max_age_secs: u64) {
+        self.service.cleanup_expired(max_age_secs);
+    }
+
     pub fn fetch_auth_ticket(&self, app_id: u32, nonce: &[u8]) -> Option<DenuvoAuthResult> {
         self.service.fetch_auth_ticket(app_id, nonce)
     }
@@ -392,6 +574,7 @@ mod tests {
 
         auth.configure(DenuvoAuthConfig {
             enabled: true,
+            auth_url: None,
             pool_steam_id: Some(76_561_198_028_121_353),
             ..Default::default()
         });
@@ -438,5 +621,86 @@ mod tests {
         });
         assert!(!auth.on_handshake(1245620, 100));
         assert!(auth.fetch_auth_ticket(1245620, b"n").is_none());
+    }
+
+    #[test]
+    fn remote_fetch_rejects_invalid_scheme_offline() {
+        let mut auth = DenuvoAuth::new();
+        auth.configure(DenuvoAuthConfig {
+            enabled: true,
+            auth_url: Some("ftp://invalid.example".to_string()),
+            pool_steam_id: Some(76_561_198_028_121_353),
+            ..Default::default()
+        });
+        let res = auth.fetch_auth_ticket(1245620, b"nonce").unwrap();
+        assert!(!res.success);
+        assert!(res.ticket.is_none());
+        assert!(res
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("Unsupported auth_url scheme")));
+    }
+
+    #[test]
+    fn remote_fetch_closed_loopback_port_fails_fast() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let mut auth = DenuvoAuth::new();
+        auth.configure(DenuvoAuthConfig {
+            enabled: true,
+            auth_url: Some(format!("http://{}", addr)),
+            pool_steam_id: Some(76_561_198_028_121_353),
+            ..Default::default()
+        });
+        let res = auth.fetch_auth_ticket(1245620, b"nonce").unwrap();
+        assert!(!res.success);
+        assert!(res.ticket.is_none());
+        assert!(res.error.is_some());
+    }
+
+    #[test]
+    fn remote_fetch_succeeds_against_local_http_and_caches() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut req_buf = [0u8; 1024];
+                let _ = stream.read(&mut req_buf);
+                let body = r#"{"success":true,"ticket":"deadbeef","expires_in":3600}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let mut auth = DenuvoAuth::new();
+        auth.configure(DenuvoAuthConfig {
+            enabled: true,
+            auth_url: Some(format!("http://{}", addr)),
+            client_id: Some("lt-test".to_string()),
+            client_secret: None,
+            pool_steam_id: Some(76_561_198_028_121_353),
+        });
+        auth.register_denuvo_app(1245620);
+
+        let first = auth.fetch_auth_ticket(1245620, &[0x01, 0x02]).unwrap();
+        assert!(first.success);
+        assert_eq!(first.ticket, Some(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02]));
+        assert_eq!(first.expires_in, 3600);
+
+        // Second call must hit local cache even though the single-accept server has exited.
+        let second = auth.fetch_auth_ticket(1245620, &[0x03]).unwrap();
+        assert!(second.success);
+        assert_eq!(second.ticket, Some(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x03]));
+
+        handle.join().unwrap();
     }
 }

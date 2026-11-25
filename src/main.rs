@@ -12,8 +12,21 @@ use luatools_linux::services::protocol_service::ProtocolService;
 use luatools_linux::services::settings_service::SettingsService;
 use luatools_linux::services::steam_service::detect_steam_install;
 use luatools_linux::services::update_service::UpdateService;
+use luatools_linux::steam_bridge::ost_platform::{dialog, trap};
 use luatools_linux::ui::app::LuaToolsApp;
 use luatools_linux::VERSION;
+
+fn has_display_session() -> bool {
+    std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty())
+        || std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+}
+
+fn report_fatal_error(title: &str, message: &str, allow_dialog: bool) {
+    eprintln!("ERROR :: {}", message);
+    if allow_dialog && has_display_session() {
+        let _ = dialog::show_warning(title, message);
+    }
+}
 
 enum IpcCommand {
     Focus,
@@ -118,6 +131,7 @@ impl eframe::App for AppWrapper {
 }
 
 fn main() -> eframe::Result<()> {
+    let main_exe_path = trap::get_main_executable_path().ok();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut initial_protocol_url: Option<String> = None;
     let mut qa_screenshots_dir: Option<PathBuf> = None;
@@ -132,17 +146,23 @@ fn main() -> eframe::Result<()> {
                 return Ok(());
             }
             "--check" => {
+                let exe_label = main_exe_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
                 let steam = detect_steam_install(None);
                 match steam {
                     Some(inst) => println!(
-                        "OK :: LuaTools Linux v{} · Steam={} ({} libraries)",
+                        "OK :: LuaTools Linux v{} · Exe={} · Steam={} ({} libraries)",
                         VERSION,
+                        exe_label,
                         inst.root.display(),
                         inst.libraries.len()
                     ),
                     None => println!(
-                        "OK :: LuaTools Linux v{} · Steam=not detected (standalone ready)",
-                        VERSION
+                        "OK :: LuaTools Linux v{} · Exe={} · Steam=not detected (standalone ready)",
+                        VERSION,
+                        exe_label
                     ),
                 }
                 return Ok(());
@@ -168,7 +188,7 @@ fn main() -> eframe::Result<()> {
                         return Ok(());
                     }
                     Err(e) => {
-                        eprintln!("ERROR :: {}", e);
+                        report_fatal_error("LuaTools Linux — Update Error", &e, true);
                         std::process::exit(1);
                     }
                 }
@@ -190,7 +210,8 @@ fn main() -> eframe::Result<()> {
                 match settings.set_autostart(true) {
                     Ok(_) => println!("OK :: LuaTools autostart enabled (~/.config/autostart/luatools.desktop)"),
                     Err(e) => {
-                        eprintln!("ERROR :: Failed to enable autostart: {}", e);
+                        let msg = format!("Failed to enable autostart: {}", e);
+                        report_fatal_error("LuaTools Linux — Autostart Error", &msg, true);
                         std::process::exit(1);
                     }
                 }
@@ -201,7 +222,8 @@ fn main() -> eframe::Result<()> {
                 match settings.set_autostart(false) {
                     Ok(_) => println!("OK :: LuaTools autostart disabled"),
                     Err(e) => {
-                        eprintln!("ERROR :: Failed to disable autostart: {}", e);
+                        let msg = format!("Failed to disable autostart: {}", e);
+                        report_fatal_error("LuaTools Linux — Autostart Error", &msg, true);
                         std::process::exit(1);
                     }
                 }
@@ -323,7 +345,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    if let Err(err) = eframe::run_native(
         "LuaTools Linux",
         native_options,
         Box::new(move |cc| {
@@ -370,7 +392,17 @@ fn main() -> eframe::Result<()> {
                 _instance_lock: instance_lock,
             }))
         }),
-    )
+    ) {
+        let exe_note = main_exe_path
+            .as_ref()
+            .map(|p| format!(" ({})", p.display()))
+            .unwrap_or_default();
+        let msg = format!("LuaTools Linux{} failed to start GUI: {}", exe_note, err);
+        report_fatal_error("LuaTools Linux — Startup Error", &msg, true);
+        return Err(err);
+    }
+
+    Ok(())
 }
 
 fn build_app_icon() -> egui::IconData {

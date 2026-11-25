@@ -1,19 +1,19 @@
-//! HotReloadService — watches `stplug-in/` via `inotify` for `.lua` file changes,
-//! logs recent events for GUI inspection, and notifies `bridge_lib` over IPC.
+//! HotReloadService — watches `stplug-in/` via `ost_platform::directory_watch` for `.lua`
+//! file changes, logs recent events for GUI inspection, and notifies `bridge_lib` over IPC.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
 use chrono::Utc;
-use inotify::{EventMask, Inotify, WatchMask};
 
 use crate::steam_bridge::ipc::{IpcClient, IpcMessage};
+use crate::steam_bridge::ost_platform::directory_watch::{
+    wait_any, ChangeAction, WaitStatus, Watch,
+};
 
 const MAX_RECENT_EVENTS: usize = 30;
 
@@ -107,81 +107,63 @@ impl HotReloadService {
             }
         }
 
+        let mut watch = Watch::new();
+        let watch_dir_str = watch_dir.to_string_lossy().to_string();
+        if !watch.open(&watch_dir_str, 8192) {
+            self.running.store(false, Ordering::SeqCst);
+            return Err(format!("Failed to watch {}", watch_dir.display()));
+        }
+
         let running = Arc::clone(&self.running);
         let recent = Arc::clone(&self.recent);
         let callback = self.change_callback.clone();
 
         thread::spawn(move || {
-            let mut inotify = match Inotify::init() {
-                Ok(i) => i,
-                Err(e) => {
-                    eprintln!("[hot_reload] inotify init failed: {}", e);
-                    running.store(false, Ordering::SeqCst);
-                    return;
-                }
-            };
-
-            let watch_mask = WatchMask::MODIFY
-                | WatchMask::CREATE
-                | WatchMask::DELETE
-                | WatchMask::MOVED_FROM
-                | WatchMask::MOVED_TO;
-
-            if let Err(e) = inotify.watches().add(&watch_dir, watch_mask) {
-                eprintln!("[hot_reload] failed to add watch: {}", e);
-                running.store(false, Ordering::SeqCst);
-                return;
-            }
-
-            let mut buffer = [0u8; 4096];
             while running.load(Ordering::Relaxed) {
-                match inotify.read_events(&mut buffer) {
-                    Ok(events) => {
-                        for event in events {
-                            if let Some(name) = event.name {
-                                let path = watch_dir.join(name);
-                                if path.extension().and_then(|e| e.to_str()) == Some("lua") {
-                                    let event_type = if event.mask.contains(EventMask::CREATE) {
-                                        FileChangeType::Created
-                                    } else if event.mask.contains(EventMask::DELETE) {
-                                        FileChangeType::Deleted
-                                    } else if event
-                                        .mask
-                                        .intersects(EventMask::MOVED_TO | EventMask::MOVED_FROM)
-                                    {
-                                        FileChangeType::Moved
-                                    } else {
-                                        FileChangeType::Modified
-                                    };
+                let wait = wait_any(&mut [&mut watch], 50);
+                if wait.status == WaitStatus::Failed {
+                    break;
+                }
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+                for change in watch.drain() {
+                    if change.relative_path.is_empty() {
+                        continue;
+                    }
+                    let path = watch_dir.join(&change.relative_path);
+                    if path.extension().and_then(|e| e.to_str()) == Some("lua") {
+                        let event_type = match change.action {
+                            ChangeAction::Added => FileChangeType::Created,
+                            ChangeAction::Removed => FileChangeType::Deleted,
+                            ChangeAction::RenamedOldName | ChangeAction::RenamedNewName => {
+                                FileChangeType::Moved
+                            }
+                            ChangeAction::Modified => FileChangeType::Modified,
+                        };
 
-                                    let change = FileChangeEvent {
-                                        timestamp: Utc::now().format("%H:%M:%S").to_string(),
-                                        path,
-                                        event_type,
-                                    };
+                        let file_event = FileChangeEvent {
+                            timestamp: Utc::now().format("%H:%M:%S").to_string(),
+                            path,
+                            event_type,
+                        };
 
-                                    {
-                                        let mut log = recent.lock().unwrap();
-                                        log.push_front(change.clone());
-                                        while log.len() > MAX_RECENT_EVENTS {
-                                            log.pop_back();
-                                        }
-                                    }
-
-                                    let _ = send_hot_reload_ipc(&change);
-                                    if let Some(cb) = &callback {
-                                        cb(change);
-                                    }
-                                }
+                        {
+                            let mut log = recent.lock().unwrap();
+                            log.push_front(file_event.clone());
+                            while log.len() > MAX_RECENT_EVENTS {
+                                log.pop_back();
                             }
                         }
+
+                        let _ = send_hot_reload_ipc(&file_event);
+                        if let Some(cb) = &callback {
+                            cb(file_event);
+                        }
                     }
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(150));
-                    }
-                    Err(_) => break,
                 }
             }
+            watch.cancel();
             running.store(false, Ordering::SeqCst);
         });
 
@@ -232,6 +214,7 @@ fn send_hot_reload_ipc(event: &FileChangeEvent) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn watches_lua_creations_and_stops_cleanly() {

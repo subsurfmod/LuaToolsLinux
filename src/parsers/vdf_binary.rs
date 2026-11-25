@@ -386,6 +386,63 @@ impl AppInfoFile {
         }
     }
 
+    /// Extracts the change number for a specific app from appinfo.vdf.
+    /// The change number is stored in the app's meta section at offset 8 (4 bytes) for v27, or offset 8 for v28/v29.
+    pub fn extract_app_change_number(path: &Path, app_id: u32) -> Option<u64> {
+        let af = Self::open(path).ok()?;
+        let Some(&(offset, _size)) = af.index_map.get(&app_id) else {
+            return None;
+        };
+        let meta_len = af.meta_length();
+        if meta_len < 12 {
+            return None;
+        }
+        let mut f = File::open(path).ok()?;
+        f.seek(SeekFrom::Start(offset + 8)).ok()?;
+        let mut meta = vec![0u8; 12];
+        f.read_exact(&mut meta).ok()?;
+        // Change number is at offset 8 in meta (bytes 8-11 for u32, or bytes 8-15 for u64 in v28+)
+        if af.magic >= MAGIC_28 {
+            Some(u64::from_le_bytes(meta[8..16].try_into().ok()?))
+        } else {
+            Some(u32::from_le_bytes(meta[8..12].try_into().ok()?) as u64)
+        }
+    }
+
+    /// Extracts launch options for a specific app from appinfo.vdf.
+    pub fn extract_launch_options(path: &Path, app_id: u32) -> Option<Vec<LaunchEntry>> {
+        let af = Self::open(path).ok()?;
+        let Some(root) = af.read_app(app_id).ok()? else {
+            return None;
+        };
+        let body = root.get_table("appinfo").unwrap_or(&root);
+        let config = body.get_table("config")?;
+        let launch = config.get_table("launch")?;
+
+        let mut out = Vec::new();
+        for prop in &launch.items {
+            if let VdfValue::Table(t) = &prop.value {
+                let cfg = t.get_table("config");
+                let lt = t.get_text("type");
+                out.push(LaunchEntry {
+                    index: prop.name.clone(),
+                    executable: t.get_text("executable"),
+                    arguments: t.get_text("arguments"),
+                    workingdir: t.get_text("workingdir"),
+                    description: t.get_text("description"),
+                    launch_type: if lt.is_empty() {
+                        "default".to_string()
+                    } else {
+                        lt
+                    },
+                    oslist: cfg.map(|c| c.get_text("oslist")).unwrap_or_default(),
+                    osarch: cfg.map(|c| c.get_text("osarch")).unwrap_or_default(),
+                });
+            }
+        }
+        Some(out)
+    }
+
     pub fn read_app(&self, app_id: u32) -> Result<Option<VdfTable>, String> {
         let Some(&(offset, size)) = self.index_map.get(&app_id) else {
             return Ok(None);

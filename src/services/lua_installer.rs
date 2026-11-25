@@ -14,6 +14,9 @@ use crate::models::steam::SteamInstallation;
 use crate::parsers::lua_parser::{LuaContents, LuaFileParser};
 use crate::services::settings_service::SettingsService;
 use crate::services::slssteam_service::SlssteamService;
+use crate::steam_bridge::credentials::appticket::{write_app_ticket_to, write_e_ticket_to};
+use crate::steam_bridge::credentials::legacycdkey::LegacyCdKeyStore;
+use crate::steam_bridge::ticket_store::{AppTicketData, TicketStore};
 
 #[derive(Debug, Clone, Default)]
 pub struct InstallResult {
@@ -166,7 +169,9 @@ impl LuaInstaller {
         }
 
         if let Some(sls) = sls_svc {
-            Self::sync_with_slssteam(sls, app_id, &parsed);
+            Self::sync_with_slssteam_to(sls, app_id, &parsed, &self.steam_installation.config_path);
+        } else {
+            Self::sync_credentials_to_config_dir(&self.steam_installation.config_path, &parsed);
         }
 
         InstallResult {
@@ -512,6 +517,45 @@ impl LuaInstaller {
     }
 
     pub fn sync_with_slssteam(sls: &mut SlssteamService, app_id: u32, lua: &LuaContents) {
+        Self::sync_with_slssteam_to(sls, app_id, lua, &TicketStore::default_path());
+    }
+
+    pub fn sync_credentials_to_config_dir(config_dir: &Path, lua: &LuaContents) {
+        if !lua.app_tickets.is_empty() || !lua.e_tickets.is_empty() {
+            for (&aid, app_ticket) in &lua.app_tickets {
+                let e_ticket = lua.e_tickets.get(&aid).cloned();
+                let _ = write_app_ticket_to(
+                    config_dir,
+                    AppTicketData {
+                        app_id: aid,
+                        app_ticket: Some(app_ticket.clone()),
+                        e_ticket,
+                        ..Default::default()
+                    },
+                );
+            }
+            for (&aid, e_ticket) in &lua.e_tickets {
+                if !lua.app_tickets.contains_key(&aid) {
+                    let _ = write_e_ticket_to(config_dir, aid, e_ticket.clone());
+                }
+            }
+        }
+
+        if !lua.legacy_cd_keys.is_empty() {
+            let mut cdkey_store = LegacyCdKeyStore::new(config_dir);
+            let _ = cdkey_store.load();
+            for (&aid, cdkey) in &lua.legacy_cd_keys {
+                let _ = cdkey_store.set_override(aid, cdkey.clone());
+            }
+        }
+    }
+
+    fn sync_with_slssteam_to(
+        sls: &mut SlssteamService,
+        app_id: u32,
+        lua: &LuaContents,
+        config_dir: &Path,
+    ) {
         sls.add_additional_app(app_id);
         if sls.get_fake_app_id(app_id).is_none() {
             sls.set_fake_app_id(app_id, 480);
@@ -555,28 +599,8 @@ impl LuaInstaller {
 
         let _ = sls.save();
 
-        // Also persist AppTicket / ETicket to TicketStore if present
-        if !lua.app_tickets.is_empty() || !lua.e_tickets.is_empty() {
-            let mut store = crate::steam_bridge::ticket_store::TicketStore::default();
-            for (&aid, app_ticket) in &lua.app_tickets {
-                let e_ticket = lua.e_tickets.get(&aid).cloned();
-                let _ = store.set(crate::steam_bridge::ticket_store::AppTicketData {
-                    app_id: aid,
-                    app_ticket: Some(app_ticket.clone()),
-                    e_ticket,
-                    ..Default::default()
-                });
-            }
-            for (&aid, e_ticket) in &lua.e_tickets {
-                if !lua.app_tickets.contains_key(&aid) {
-                    let _ = store.set(crate::steam_bridge::ticket_store::AppTicketData {
-                        app_id: aid,
-                        e_ticket: Some(e_ticket.clone()),
-                        ..Default::default()
-                    });
-                }
-            }
-        }
+        // Persist AppTicket, ETicket, and LegacyCDKey overrides to Steam's config dir
+        Self::sync_credentials_to_config_dir(config_dir, lua);
 
         // Try writing depot keys to <Steam>/config/config.vdf if writable so upstream AceSLS/SLSsteam reads them
         if let Some(home) = dirs::home_dir() {
@@ -720,5 +744,58 @@ mod tests {
             Some(&mut sls),
         );
         assert!(any_res.ok && any_res.lua_installed);
+    }
+
+    #[test]
+    fn install_lua_persists_tickets_and_legacy_cdkeys_to_steam_config() {
+        use crate::steam_bridge::credentials::appticket::{get_e_ticket_from, read_app_ticket_from};
+
+        let dir = tempfile::tempdir().unwrap();
+        let steam_root = dir.path().join("Steam");
+        let stplug = steam_root.join("config/stplug-in");
+        fs::create_dir_all(&stplug).unwrap();
+
+        let inst = SteamInstallation {
+            root: steam_root.clone(),
+            libraries: vec![SteamLibrary::new(steam_root.clone())],
+            config_path: steam_root.join("config"),
+            stplug_in_path: stplug,
+        };
+        let vault = LuaVault::new(Some(inst.clone()), Some(dir.path().join("vault")));
+        let installer = LuaInstaller::new(inst.clone(), vault);
+        let mut settings = SettingsService::new(Some(dir.path().join("settings.json")));
+        let mut sls = SlssteamService::new(Some(dir.path().join("sls.yaml")));
+
+        let lua_src = "\
+            addappid(1245620)\n\
+            setAppTicket(1245620, \"deadbeef01\")\n\
+            setETicket(1245620, \"cafebabe02\")\n\
+            setETicket(730, \"feedface03\")\n\
+            setlegacycdkey(1245620, \"AAAA-BBBB-CCCC-DDDD\")\n";
+
+        let res = installer.install_lua(
+            1245620,
+            lua_src,
+            false,
+            None,
+            Some("cred-test"),
+            Some(&mut settings),
+            Some(&mut sls),
+        );
+        assert!(res.ok);
+
+        let ticket = read_app_ticket_from(&inst.config_path, 1245620)
+            .unwrap()
+            .expect("AppTicket persisted");
+        assert_eq!(ticket.app_ticket.as_deref(), Some("deadbeef01"));
+        assert_eq!(ticket.e_ticket.as_deref(), Some("cafebabe02"));
+        assert_eq!(
+            get_e_ticket_from(&inst.config_path, 730).unwrap().as_deref(),
+            Some("feedface03")
+        );
+
+        let mut cdkeys = LegacyCdKeyStore::new(&inst.config_path);
+        let cd = cdkeys.get(1245620).expect("LegacyCDKey persisted");
+        assert_eq!(cd.override_key.as_deref(), Some("AAAA-BBBB-CCCC-DDDD"));
     }
 }
