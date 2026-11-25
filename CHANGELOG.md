@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.2.6] - 2026-11-25
+
+### v3.2.2 Audit Complete Fix & Steamless Native Integration
+- **DepotDownloader `-remember-password` Fix** (`src/services/depot_downloader.rs`): Fixed conditional logic to always include `-remember-password` alongside both `-username` and `-qr` flags, preventing "`-remember-password can not be used without -username or -qr`" error.
+- **Manifest URL Protocol Guard** (`src/services/download_queue.rs`): Added early rejection of `manifest://` URLs in generic download queue with clear error message directing to dedicated manifest download functions (HubcapService/LuaToolsApiClient).
+- **AppliedFixRecord game_dir Deserialization** (`src/services/applied_fix_index.rs`, `src/services/fixes_service.rs`): Added custom deserializer `deserialize_option_path_buf` with `#[serde(default, deserialize_with)]` to gracefully handle missing/null/invalid `game_dir` values in JSON records.
+- **Steamless Native Integration** (`src/ui/app.rs`, `src/services/steamless_service.rs`): Connected `patch_game_native()` (using steamflatline) to the "Remove SteamStub" UI button with fallback to CLI tool if native fails. Removes external Steamless dependency for SteamStub DRM removal.
+
+---
+
 ## [3.2.4] - 2026-11-25
 
 ### 0B Install Issue Fix & Steamflatline Native Port Complete

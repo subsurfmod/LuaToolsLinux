@@ -3,7 +3,7 @@ members = [".", "bridge_lib", "steam_auto_patch_linux"]
 
 [package]
 name = "luatools-linux"
-version = "3.2.5"
+version = "3.2.6"
 edition = "2021"
 description = "Native lightweight Rust workstation for Steam stplug-in lua manifests, LuaVault variants, depot downloads, and game fixes"
 license = "MIT"
