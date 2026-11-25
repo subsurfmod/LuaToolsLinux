@@ -4,7 +4,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
+use std::fs;
 use std::os::raw::c_void;
+use std::path::Path;
 use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -560,6 +562,161 @@ impl DenuvoAuth {
     pub fn fetch_auth_ticket(&self, app_id: u32, nonce: &[u8]) -> Option<DenuvoAuthResult> {
         self.service.fetch_auth_ticket(app_id, nonce)
     }
+
+    /// Scan a game executable for Denuvo protection (BST-54).
+    pub fn scan_executable(&self, exe_path: &Path) -> ProtectionScanReport {
+        self.service.scan_executable(exe_path)
+    }
+
+    /// Recursively scan a game directory for Denuvo-protected executables and auto-register (BST-54).
+    pub fn scan_game_folder(&self, app_id: u32, game_dir: &Path) -> ProtectionScanReport {
+        self.service.scan_game_folder(app_id, game_dir)
+    }
+}
+
+/// Denuvo heuristic detection method (BST-54).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenuvoDetectionMethod {
+    None,
+    LegacySectionString,
+    OepPattern,
+    ProtectedBlobSection,
+}
+
+/// Protection scan report matching usefulsteamtools::ProtectionScanReport (BST-54).
+#[derive(Debug, Clone)]
+pub struct ProtectionScanReport {
+    pub denuvo_detected: bool,
+    pub method: DenuvoDetectionMethod,
+    pub section_name: Option<String>,
+    pub file_size: u64,
+}
+
+impl DenuvoAuthService {
+    /// Scan a PE executable for Denuvo signatures (BST-54).
+    pub fn scan_executable(&self, exe_path: &Path) -> ProtectionScanReport {
+        scan_protection_pe(exe_path)
+    }
+
+    /// Scan a game folder for any Denuvo-protected PE executable and auto-register the app (BST-54).
+    pub fn scan_game_folder(&self, app_id: u32, game_dir: &Path) -> ProtectionScanReport {
+        if let Ok(entries) = fs::read_dir(game_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_file()
+                    && p.extension()
+                        .map(|e| e.eq_ignore_ascii_case("exe"))
+                        .unwrap_or(false)
+                {
+                    let report = scan_protection_pe(&p);
+                    if report.denuvo_detected {
+                        self.register_denuvo_app(app_id);
+                        return report;
+                    }
+                }
+            }
+        }
+        ProtectionScanReport {
+            denuvo_detected: false,
+            method: DenuvoDetectionMethod::None,
+            section_name: None,
+            file_size: 0,
+        }
+    }
+}
+
+/// Core PE binary scanner for Denuvo protection signatures (BST-54).
+///
+/// Ported from `usefulsteamtools::PipeManager::DenuvoAuth::RunProtectionScan`:
+/// 1. OEP Pattern scan: `48 B9 44 4F 44 45 4E 55 56 4F` (`mov rcx, 'DODENUVO'`)
+/// 2. Legacy Section String scan: `.arch`, `.srdata`, `.xpdata`, `.xdata`, `.xtls` containing `"DENUVO"`
+/// 3. Protected W+X blob section: simultaneous write + execute flags with packed multi-MB payload
+pub fn scan_protection_pe(exe_path: &Path) -> ProtectionScanReport {
+    let path_str = match exe_path.to_str() {
+        Some(s) => s,
+        None => {
+            return ProtectionScanReport {
+                denuvo_detected: false,
+                method: DenuvoDetectionMethod::None,
+                section_name: None,
+                file_size: 0,
+            }
+        }
+    };
+    let image = match crate::steam_bridge::ost_platform::pe::Image::new(path_str) {
+        Ok(img) if img.is_valid() => img,
+        _ => {
+            return ProtectionScanReport {
+                denuvo_detected: false,
+                method: DenuvoDetectionMethod::None,
+                section_name: None,
+                file_size: 0,
+            }
+        }
+    };
+
+    let file_bytes = image.bytes();
+    let file_size = image.file_size();
+
+    // 1. OEP Pattern scan: 48 B9 44 4F 44 45 4E 55 56 4F (mov rcx, 'DODENUVO')
+    const DENUVO_OEP_PATTERN: [u8; 10] = [
+        0x48, 0xB9, 0x44, 0x4F, 0x44, 0x45, 0x4E, 0x55, 0x56, 0x4F,
+    ];
+    if file_bytes
+        .windows(DENUVO_OEP_PATTERN.len())
+        .any(|w| w == DENUVO_OEP_PATTERN)
+    {
+        let ep_rva = image.entry_point_rva();
+        let sec_name = image.section_containing_rva(ep_rva).map(|s| s.name.clone());
+        return ProtectionScanReport {
+            denuvo_detected: true,
+            method: DenuvoDetectionMethod::OepPattern,
+            section_name: sec_name,
+            file_size,
+        };
+    }
+
+    // 2. Legacy Section String scan (".arch", ".srdata", ".xpdata", ".xdata", ".xtls" containing "DENUVO")
+    const LEGACY_SECTIONS: &[&str] = &[".arch", ".srdata", ".xpdata", ".xdata", ".xtls"];
+    for sec in image.sections() {
+        let name_lower = sec.name.to_ascii_lowercase();
+        if LEGACY_SECTIONS.iter().any(|&ls| name_lower.starts_with(ls)) {
+            let offset = sec.raw_offset as usize;
+            let size = sec.raw_size as usize;
+            if let Some(sec_slice) = file_bytes.get(offset..offset.saturating_add(size)) {
+                if sec_slice
+                    .windows(6)
+                    .any(|w| w == b"DENUVO" || w == b"denuvo")
+                {
+                    return ProtectionScanReport {
+                        denuvo_detected: true,
+                        method: DenuvoDetectionMethod::LegacySectionString,
+                        section_name: Some(sec.name.clone()),
+                        file_size,
+                    };
+                }
+            }
+        }
+    }
+
+    // 3. Protected W+X blob section (executable + writable with multi-MB payload)
+    for sec in image.sections() {
+        if sec.is_executable_and_writable() && sec.raw_size >= 1_000_000 {
+            return ProtectionScanReport {
+                denuvo_detected: true,
+                method: DenuvoDetectionMethod::ProtectedBlobSection,
+                section_name: Some(sec.name.clone()),
+                file_size,
+            };
+        }
+    }
+
+    ProtectionScanReport {
+        denuvo_detected: false,
+        method: DenuvoDetectionMethod::None,
+        section_name: None,
+        file_size,
+    }
 }
 
 #[cfg(test)]
@@ -702,5 +859,44 @@ mod tests {
         assert_eq!(second.ticket, Some(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x03]));
 
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_denuvo_protection_scan_heuristics() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // 1. Non-PE file returns no detection
+        let dummy = tmp.path().join("plain.exe");
+        fs::write(&dummy, b"NOT A PE").unwrap();
+        let rep1 = scan_protection_pe(&dummy);
+        assert!(!rep1.denuvo_detected);
+
+        // 2. Build synthetic PE64 with OEP pattern
+        let mut pe = vec![0u8; 0x1000];
+        pe[0..2].copy_from_slice(&0x5A4Du16.to_le_bytes()); // MZ
+        pe[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        pe[0x80..0x84].copy_from_slice(&0x0000_4550u32.to_le_bytes()); // PE00
+        let fh = 0x84;
+        pe[fh + 2..fh + 4].copy_from_slice(&1u16.to_le_bytes()); // 1 section
+        pe[fh + 16..fh + 18].copy_from_slice(&240u16.to_le_bytes()); // opt header size
+        let opt = fh + 20;
+        pe[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes()); // PE64
+        let sec = opt + 240;
+        pe[sec..sec + 5].copy_from_slice(b".text");
+        pe[sec + 8..sec + 12].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes()); // RVA
+        pe[sec + 16..sec + 20].copy_from_slice(&0x400u32.to_le_bytes()); // raw size
+        pe[sec + 20..sec + 24].copy_from_slice(&0x400u32.to_le_bytes()); // raw offset
+        pe[sec + 36..sec + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes());
+
+        // Plant OEP pattern in code
+        let pattern = [0x48, 0xB9, 0x44, 0x4F, 0x44, 0x45, 0x4E, 0x55, 0x56, 0x4F];
+        pe[0x500..0x50A].copy_from_slice(&pattern);
+
+        let oep_exe = tmp.path().join("oep_denuvo.exe");
+        fs::write(&oep_exe, &pe).unwrap();
+        let rep2 = scan_protection_pe(&oep_exe);
+        assert!(rep2.denuvo_detected);
+        assert_eq!(rep2.method, DenuvoDetectionMethod::OepPattern);
     }
 }

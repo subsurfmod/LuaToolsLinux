@@ -41,6 +41,6 @@ pub mod depot_cache_migration;
 pub mod download_queue;
 pub mod launch_mod_store;
 pub mod telemetry_service;
-// pub mod tray_service;  -- temporarily disabled due to system deps
+pub mod tray_service;
 pub mod update_service;
 pub mod wired_service;

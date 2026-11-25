@@ -27,6 +27,17 @@ if [ -n "${LD_PRELOAD:-}" ]; then
   export LD_PRELOAD="$CLEANED_PRELOAD"
 fi
 
+# LT-20: Auto-launch LuaTools minimized in background if in PATH and not already running
+if command -v luatools >/dev/null 2>&1; then
+  if ! pgrep -x luatools >/dev/null 2>&1; then
+    luatools --minimized --tray-locked >/dev/null 2>&1 &
+  fi
+elif [ -x "${HOME}/.local/bin/luatools" ]; then
+  if ! pgrep -x luatools >/dev/null 2>&1; then
+    "${HOME}/.local/bin/luatools" --minimized --tray-locked >/dev/null 2>&1 &
+  fi
+fi
+
 STEAM_SLS="${HOME}/.local/bin/steam-sls"
 
 # If ~/.local/bin/steam-sls exists and is executable, execute it directly

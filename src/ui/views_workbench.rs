@@ -1731,6 +1731,10 @@ impl LuaToolsApp {
         );
 
         if save_all {
+            let auto_ok = self
+                .settings_service
+                .set_autostart(self.settings_service.settings.autostart)
+                .is_ok();
             let sls_ok = self.slssteam_service.save();
             let app_ok = self.settings_service.save();
             self.telemetry_service
@@ -1750,7 +1754,7 @@ impl LuaToolsApp {
             let _ = self
                 .play_unowned_service
                 .sync_plugin_file(&self.slssteam_service);
-            if sls_ok && app_ok {
+            if sls_ok && app_ok && auto_ok {
                 self.notify(
                     "Saved settings.json and SLSsteam config.yaml",
                     ToastKind::Success,
@@ -1890,22 +1894,6 @@ impl LuaToolsApp {
                 &mut self.settings_service.settings.donate_keys,
                 "Contribute newly discovered depot decryption keys from Steam config.vdf",
             );
-            if ui
-                .checkbox(
-                    &mut self.settings_service.settings.autostart,
-                    "Start LuaTools on system login (--minimized)",
-                )
-                .changed()
-            {
-                let enable = self.settings_service.settings.autostart;
-                if let Err(e) = self.settings_service.set_autostart(enable) {
-                    self.notify(
-                        format!("Failed to update login autostart: {}", e),
-                        ToastKind::Warning,
-                    );
-                }
-                let _ = self.settings_service.save();
-            }
 
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -1941,6 +1929,106 @@ impl LuaToolsApp {
                 }
             });
         });
+
+        ui.add_space(16.0);
+
+        let tray_ready = self.tray_service.is_tray_available();
+        let autostart_active = self.settings_service.settings.autostart;
+        let mut autostart_toggled: Option<bool> = None;
+        let mut tray_prefs_changed = false;
+
+        paper_card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 10.0;
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    ui.label(
+                        RichText::new("Desktop Autostart & System Tray")
+                            .font(display_font(17.5))
+                            .color(Palette::TEXT_PRIMARY),
+                    );
+                },
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if tray_ready {
+                        status_badge(ui, "System Tray Active", BadgeTone::Ready);
+                    } else {
+                        status_badge(ui, "Taskbar Fallback", BadgeTone::Neutral);
+                    }
+                    if autostart_active {
+                        status_badge(ui, "Autostart On", BadgeTone::Blue);
+                    } else {
+                        status_badge(ui, "Autostart Off", BadgeTone::Muted);
+                    }
+                },
+            );
+            ui.label(
+                RichText::new(
+                    "Manage XDG login autostart (~/.config/autostart/luatools.desktop) and background system tray behavior.",
+                )
+                .size(12.5)
+                .color(Palette::TEXT_MUTED),
+            );
+
+            if ui
+                .checkbox(
+                    &mut self.settings_service.settings.autostart,
+                    "Start LuaTools automatically on OS login (--minimized --tray-locked)",
+                )
+                .on_hover_text(
+                    "Writes or removes ~/.config/autostart/luatools.desktop (also controllable via --autostart-enable / --autostart-disable)",
+                )
+                .changed()
+            {
+                autostart_toggled = Some(self.settings_service.settings.autostart);
+            }
+
+            if ui
+                .checkbox(
+                    &mut self.settings_service.settings.close_to_tray,
+                    "Keep running in system tray when closing window (falls back safely to normal close if no tray host exists)",
+                )
+                .changed()
+            {
+                tray_prefs_changed = true;
+            }
+
+            if ui
+                .checkbox(
+                    &mut self.settings_service.settings.minimize_to_tray,
+                    "Hide window to system tray when minimized (stays in taskbar if no tray host exists)",
+                )
+                .changed()
+            {
+                tray_prefs_changed = true;
+            }
+        });
+
+        if let Some(enable) = autostart_toggled {
+            match self.settings_service.set_autostart(enable) {
+                Ok(()) => {
+                    self.notify(
+                        if enable {
+                            "Enabled OS login autostart (~/.config/autostart/luatools.desktop)"
+                        } else {
+                            "Disabled OS login autostart"
+                        },
+                        ToastKind::Success,
+                    );
+                }
+                Err(e) => {
+                    self.settings_service.sync_autostart_from_disk();
+                    self.notify(
+                        format!("Failed to update login autostart: {}", e),
+                        ToastKind::Warning,
+                    );
+                }
+            }
+        }
+        if tray_prefs_changed {
+            let _ = self.settings_service.save();
+        }
     }
 
     fn render_settings_account(&mut self, ui: &mut egui::Ui) {

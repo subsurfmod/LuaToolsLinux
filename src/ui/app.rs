@@ -51,7 +51,7 @@ use crate::services::steam_library_service::SteamLibraryService;
 use crate::services::steam_service::SteamService;
 use crate::services::applied_fix_index::AppliedFixIndexService;
 use crate::services::telemetry_service::TelemetryService;
-// use crate::services::tray_service::TrayService;  -- temporarily disabled
+use crate::services::tray_service::TrayService;
 use crate::services::update_service::UpdateService;
 use crate::services::wired_service::WiredService;
 use crate::ui::state::{
@@ -120,7 +120,11 @@ pub struct LuaToolsApp {
     pub telemetry_service: TelemetryService,
     pub asset_hash_service: AssetHashService,
     pub applied_fix_index: AppliedFixIndexService,
-    // pub tray_service: TrayService,  -- temporarily disabled
+    pub tray_service: TrayService,
+    pub quit_requested: bool,
+    pub prev_viewport_minimized: bool,
+    pub suppress_minimize_hook_frames: u8,
+    pub tray_hide_notified: bool,
 
     // Async Channels
     pub egui_ctx: Option<egui::Context>,
@@ -341,7 +345,11 @@ impl LuaToolsApp {
             telemetry_service,
             asset_hash_service,
             applied_fix_index: AppliedFixIndexService::default(),
-            // tray_service: TrayService::default(),  -- temporarily disabled
+            tray_service: TrayService::default(),
+            quit_requested: false,
+            prev_viewport_minimized: false,
+            suppress_minimize_hook_frames: 0,
+            tray_hide_notified: false,
             egui_ctx: Some(cc.egui_ctx.clone()),
             msg_tx,
             msg_rx,
@@ -469,9 +477,10 @@ impl LuaToolsApp {
                 // Run depot cache migration (LT-34)
                 crate::services::depot_cache_migration::run_depot_cache_migration(&app.steam_service);
             }
-            // Initialize system tray (temporarily disabled due to system deps)
-            // let _ = app.tray_service.initialize();
-            // app.tray_service.set_app_message_sender(app.msg_tx.clone());
+            // Initialize system tray (LT-07) with live host verification
+            app.tray_service.set_app_message_sender(app.msg_tx.clone());
+            app.tray_service.set_egui_context(cc.egui_ctx.clone());
+            let _ = app.tray_service.initialize();
 
             app.probe_bridge_async(&cc.egui_ctx);
             app.fetch_featured_async(&cc.egui_ctx);
@@ -533,7 +542,7 @@ impl LuaToolsApp {
             String::new(),
             "0102030405060708".into(),
         );
-        // let tray_service = TrayService::default();  -- temporarily disabled
+        let tray_service = TrayService::default();
         let (msg_tx, msg_rx) = mpsc::channel();
         let (rpc_tx, rpc_rx) = mpsc::channel();
 
@@ -577,7 +586,11 @@ impl LuaToolsApp {
             telemetry_service,
             asset_hash_service: AssetHashService::new(),
             applied_fix_index: AppliedFixIndexService::default(),
-            // tray_service,  -- temporarily disabled
+            tray_service,
+            quit_requested: false,
+            prev_viewport_minimized: false,
+            suppress_minimize_hook_frames: 0,
+            tray_hide_notified: false,
             egui_ctx: Some(ctx.clone()),
             msg_tx,
             msg_rx,
@@ -886,6 +899,8 @@ impl LuaToolsApp {
             self.hot_reload_service
                 .update_watch_dir(&inst.stplug_in_path);
             self.wired_service.steam_root = Some(inst.root.clone());
+            self.api_client.set_steam_root(Some(inst.root.clone()));
+            self.app_info_cache.set_steam_root(Some(inst.root.clone()));
             self.cover_cache.set_steam_root(Some(inst.root.clone()));
             if self.slssteam_service.config.play_not_owned {
                 let _ = self
@@ -957,6 +972,8 @@ impl LuaToolsApp {
             self.steam_library_service.steam_installation = None;
             self.steam_bridge_service.set_steam_installation(None);
             self.wired_service.steam_root = None;
+            self.api_client.set_steam_root(None);
+            self.app_info_cache.set_steam_root(None);
             self.cover_cache.set_steam_root(None);
             if let Some(mut srv) = self.http_server.take() {
                 srv.stop();
@@ -978,39 +995,27 @@ impl LuaToolsApp {
             self.slssteam_service.config.exists(),
         );
         if let Some(inst) = &self.steam_service.installation {
-            let _ = SteamLibraryService::migrate_depotcache_dir(
-                &inst.root.join("config/depotcache"),
-                &inst.root.join("depotcache"),
-            );
+            if inst.root.join("config/depotcache").exists() {
+                let _ = crate::services::depot_cache_migration::DepotCacheMigrationService::from_steam_service(
+                    &self.steam_service,
+                )
+                .run();
+            }
             if !self.pics_drift_checked {
                 self.pics_drift_checked = true;
-                let store = crate::parsers::vdf_binary::LaunchModStore::default();
-                let mods = store.load_mods();
-                if !mods.is_empty() {
-                    let svc = crate::parsers::vdf_binary::LaunchOptionsService::new(inst.root.clone());
-                    let mut drifted_apps = 0usize;
-                    for (&aid, m) in &mods {
-                        let live_entries = svc.get_launch_entries(aid);
-                        if store.check_drift(aid, &live_entries) {
-                            let _ = store.rebase_if_needed(
-                                aid,
-                                m.change_number.wrapping_add(1),
-                                live_entries,
-                            );
-                            if svc.save_launch_entries(aid, &m.desired).is_ok() {
-                                drifted_apps += 1;
-                            }
-                        }
-                    }
-                    if drifted_apps > 0 {
-                        self.notify(
-                            format!(
-                                "Detected Steam PICS update on {} app(s); launch options rebased.",
-                                drifted_apps
-                            ),
-                            ToastKind::Info,
-                        );
-                    }
+                let mut store = crate::services::launch_mod_store::LaunchModStore::new(None);
+                let drifted_apps = crate::services::launch_mod_store::reconcile_startup_drift(
+                    &self.steam_service,
+                    &mut store,
+                );
+                if drifted_apps > 0 {
+                    self.notify(
+                        format!(
+                            "Detected Steam PICS update on {} app(s); launch options rebased.",
+                            drifted_apps
+                        ),
+                        ToastKind::Info,
+                    );
                 }
             }
         }
@@ -1026,6 +1031,12 @@ impl LuaToolsApp {
             self.library_rows.clear();
             return;
         };
+        if inst.root.join("config/depotcache").exists() {
+            let _ = crate::services::depot_cache_migration::DepotCacheMigrationService::from_steam_service(
+                &self.steam_service,
+            )
+            .run();
+        }
         self.applist_cache.ensure_loaded();
 
         let mut installed_names: HashMap<u32, String> = HashMap::new();
@@ -3173,33 +3184,93 @@ impl LuaToolsApp {
                     self.integration_modal.proc_lib_input = path.to_string_lossy().to_string();
                 }
                 AppMessage::ShowWindow => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    // self.tray_service.set_visibility(true);  -- temporarily disabled
+                    self.restore_from_tray(ctx);
                 }
                 AppMessage::HideWindow => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                    // self.tray_service.set_visibility(false);  -- temporarily disabled
+                    self.hide_to_tray(ctx);
                 }
                 AppMessage::OpenSettings => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.restore_from_tray(ctx);
+                    self.settings_service.sync_autostart_from_disk();
                     self.active_view = ActiveView::Settings;
-                    // self.tray_service.set_visibility(true);  -- temporarily disabled
                 }
                 AppMessage::RestartSteamRequested => {
                     self.trigger_restart_steam(ctx);
                 }
                 AppMessage::QuitRequested => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    self.request_quit(ctx);
                 }
             }
         }
     }
 
+    pub fn can_hide_to_tray(&self) -> bool {
+        self.tray_service.is_tray_available()
+    }
+
+    pub fn should_intercept_close_to_tray(&self, cli_tray_locked: bool) -> bool {
+        if self.quit_requested {
+            return false;
+        }
+        let want_close_to_tray = cli_tray_locked || self.settings_service.settings.close_to_tray;
+        want_close_to_tray && self.can_hide_to_tray()
+    }
+
+    pub fn restore_from_tray(&mut self, ctx: &egui::Context) {
+        self.suppress_minimize_hook_frames = 6;
+        self.prev_viewport_minimized = false;
+        self.tray_service.set_visibility(true);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    pub fn hide_to_tray(&mut self, ctx: &egui::Context) {
+        if self.can_hide_to_tray() {
+            self.tray_service.set_visibility(false);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            if !self.tray_hide_notified {
+                self.tray_hide_notified = true;
+                self.tray_service.show_notification(
+                    "LuaTools Linux",
+                    "LuaTools is running in the system tray. Use the tray icon to restore or quit.",
+                );
+            }
+        } else {
+            // Safe fallback when no desktop tray host exists: iconify in taskbar rather than hiding headless
+            self.tray_service.set_visibility(true);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+    }
+
+    pub fn request_quit(&mut self, ctx: &egui::Context) {
+        self.quit_requested = true;
+        self.tray_service.cleanup();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    pub fn handle_minimize_to_tray_hook(&mut self, ctx: &egui::Context) {
+        let cur_min = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        if self.suppress_minimize_hook_frames > 0 {
+            self.suppress_minimize_hook_frames -= 1;
+            self.prev_viewport_minimized = cur_min;
+            return;
+        }
+        let just_minimized = cur_min && !self.prev_viewport_minimized;
+        self.prev_viewport_minimized = cur_min;
+
+        if just_minimized
+            && self.tray_service.is_visible()
+            && self.settings_service.settings.minimize_to_tray
+            && self.can_hide_to_tray()
+        {
+            self.hide_to_tray(ctx);
+        }
+    }
+
     fn handle_shortcuts_and_drops(&mut self, ctx: &egui::Context) {
+        let mut trigger_quit = false;
         ctx.input_mut(|i| {
             if i.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::K))
                 || i.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::L))
@@ -3229,12 +3300,16 @@ impl LuaToolsApp {
             if i.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::Num7))
                 || i.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::Comma))
             {
+                self.settings_service.sync_autostart_from_disk();
                 self.active_view = ActiveView::Settings;
             }
             if i.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::Q)) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                trigger_quit = true;
             }
         });
+        if trigger_quit {
+            self.request_quit(ctx);
+        }
 
         let (had_raw_drops, dropped): (bool, Vec<PathBuf>) = ctx.input(|i| {
             let has_any = !i.raw.dropped_files.is_empty();
@@ -3571,7 +3646,7 @@ impl LuaToolsApp {
         }
         if let Some(exe) = click_relaunch_exe {
             match UpdateService::relaunch_binary(&exe) {
-                Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Ok(()) => self.request_quit(ctx),
                 Err(e) => self.notify(e, ToastKind::Warning),
             }
         }
@@ -3606,6 +3681,7 @@ impl LuaToolsApp {
                         )
                         .clicked()
                         {
+                            self.settings_service.sync_autostart_from_disk();
                             self.active_view = ActiveView::Settings;
                         }
                         ui.add_space(4.0);
@@ -3901,7 +3977,7 @@ impl LuaToolsApp {
         ];
 
         if qa.step >= steps.len() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            self.request_quit(ctx);
             return;
         }
 
@@ -3933,8 +4009,55 @@ use std::sync::Arc;
 impl eframe::App for LuaToolsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_messages(ctx);
+        self.handle_minimize_to_tray_hook(ctx);
         self.handle_shortcuts_and_drops(ctx);
         self.render_shell(ctx);
         self.drive_qa_screenshots(ctx);
+    }
+}
+
+#[cfg(test)]
+mod tray_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn test_close_and_minimize_to_tray_never_leave_headless_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let mut app = LuaToolsApp::new_headless_demo(&ctx, tmp.path());
+
+        // 1. Without an active desktop tray host, close-to-tray MUST NOT intercept close
+        app.tray_service.set_tray_available_for_test(false);
+        app.settings_service.settings.close_to_tray = true;
+        assert!(!app.should_intercept_close_to_tray(false));
+        assert!(!app.should_intercept_close_to_tray(true));
+
+        // Calling hide_to_tray without a tray host keeps tray_service visible (taskbar minimize fallback)
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.hide_to_tray(ctx);
+        });
+        assert!(app.tray_service.is_visible());
+
+        // 2. With an active desktop tray host, close-to-tray intercepts close and hides to tray
+        app.tray_service.set_tray_available_for_test(true);
+        assert!(app.should_intercept_close_to_tray(false));
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.hide_to_tray(ctx);
+        });
+        assert!(!app.tray_service.is_visible());
+
+        // 3. Restoring from tray marks window visible and arms minimize suppression frames
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.restore_from_tray(ctx);
+        });
+        assert!(app.tray_service.is_visible());
+        assert!(app.suppress_minimize_hook_frames > 0);
+
+        // 4. Explicit Quit (Tray -> Quit or Ctrl+Q) always bypasses close-to-tray interception
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.request_quit(ctx);
+        });
+        assert!(app.quit_requested);
+        assert!(!app.should_intercept_close_to_tray(true));
     }
 }

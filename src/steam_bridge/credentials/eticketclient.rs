@@ -29,6 +29,9 @@ static ETICKET_CLIENT: OnceLock<Arc<EticketClient>> = OnceLock::new();
 /// Fresh eticket cache, keyed by `app_id`, holding nonce-bound ticket bytes.
 static FRESH_ETICKET_CACHE: OnceLock<Mutex<HashMap<u32, Vec<u8>>>> = OnceLock::new();
 
+/// Custom runtime eticket endpoint configured via `seteticketurl(...)` in Lua config (BST-07).
+static CUSTOM_ETICKET_URL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
 /// Online fix app ID (Spacewar).
 pub const ONLINE_FIX_APP_ID: u32 = 480;
 
@@ -37,6 +40,36 @@ pub const ONLINE_FIX_APP_ID: u32 = 480;
 pub struct EticketClient;
 
 impl EticketClient {
+    /// Configure runtime on-demand eticket endpoint (BST-07).
+    pub fn set_custom_url(url: &str) {
+        let trimmed = url.trim();
+        if is_http_url(trimmed) {
+            let mut lock = CUSTOM_ETICKET_URL
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *lock = Some(trimmed.to_string());
+        }
+    }
+
+    /// Returns the currently active runtime on-demand eticket endpoint, if configured (BST-07).
+    pub fn get_custom_url() -> Option<String> {
+        CUSTOM_ETICKET_URL
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Reset any custom eticket endpoint.
+    pub fn clear_custom_url() {
+        let mut lock = CUSTOM_ETICKET_URL
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *lock = None;
+    }
+
     /// Get the global eticket client instance.
     pub fn global() -> &'static Self {
         ETICKET_CLIENT
@@ -59,6 +92,14 @@ impl EticketClient {
         if app_id == 0 {
             return None;
         }
+
+        // 1. Try remote on-demand eticket endpoint if set via seteticketurl (BST-07)
+        if let Some(custom_url) = Self::get_custom_url() {
+            if let Some(fresh) = Self::fetch_remote_eticket(&custom_url, app_id, nonce, fallback_steam_id) {
+                return Some(fresh);
+            }
+        }
+
         let mut store = TicketStore::new(config_dir);
         let data = store.get(app_id).ok()?;
 
@@ -227,6 +268,21 @@ pub fn has_cached_fresh_eticket(app_id: u32) -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     cache.contains_key(&app_id)
+}
+
+/// Sets the runtime on-demand eticket endpoint from `seteticketurl` in Lua scripts (BST-07).
+pub fn set_eticket_url(url: &str) {
+    EticketClient::set_custom_url(url);
+}
+
+/// Gets the currently configured runtime on-demand eticket endpoint (BST-07).
+pub fn get_eticket_url() -> Option<String> {
+    EticketClient::get_custom_url()
+}
+
+/// Clears any configured runtime on-demand eticket endpoint (BST-07).
+pub fn clear_eticket_url() {
+    EticketClient::clear_custom_url();
 }
 
 #[cfg(test)]

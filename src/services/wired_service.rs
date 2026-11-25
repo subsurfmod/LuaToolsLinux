@@ -5,7 +5,7 @@
 //! `.tar.zst` / `.7z` extraction, ZipSlip path-traversal protection, `~/.local/share/ACCELA`
 //! and `~/.local/share/SLSsteam` installation, `ACCELA.conf` & `SLSsteam/config.yaml` defaults,
 //! and a `~/.local/bin/steam-sls` `LD_AUDIT` launcher helper.
-use crate::services::file_hash::FileHashService;
+use crate::services::file_hash::{FileHash, FileHashService};
 
 use std::fs::{self, File};
 use std::io;
@@ -35,6 +35,8 @@ pub struct WiredStatus {
     pub slssteam_installed: bool,
     pub accela_dir: PathBuf,
     pub slssteam_dir: PathBuf,
+    pub slssteam_sha256: Option<String>,
+    pub library_inject_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,12 +117,34 @@ impl WiredService {
         self.is_accela_installed() && self.is_slssteam_installed()
     }
 
+    /// Computes the SHA-256 hash of the installed `SLSsteam.so` unlocker binary (LT-65).
+    pub fn slssteam_sha256(&self) -> Option<String> {
+        let p = self.slssteam_dir().join("SLSsteam.so");
+        if p.is_file() {
+            FileHash::try_new(&p, "SLSsteam.so").ok().map(|h| h.sha256)
+        } else {
+            None
+        }
+    }
+
+    /// Computes the SHA-256 hash of the installed `library-inject.so` bridge library (LT-65).
+    pub fn library_inject_sha256(&self) -> Option<String> {
+        let p = self.slssteam_dir().join("library-inject.so");
+        if p.is_file() {
+            FileHash::try_new(&p, "library-inject.so").ok().map(|h| h.sha256)
+        } else {
+            None
+        }
+    }
+
     pub fn status(&self) -> WiredStatus {
         WiredStatus {
             accela_installed: self.is_accela_installed(),
             slssteam_installed: self.is_slssteam_installed(),
             accela_dir: self.accela_dir(),
             slssteam_dir: self.slssteam_dir(),
+            slssteam_sha256: self.slssteam_sha256(),
+            library_inject_sha256: self.library_inject_sha256(),
         }
     }
 

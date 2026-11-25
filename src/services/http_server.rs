@@ -832,20 +832,26 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
+    fn get_free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
     #[test]
     fn serves_ping_and_rpc_cleanly() {
         let dir = tempfile::tempdir().unwrap();
         let (tx, _rx) = mpsc::channel();
-        let mut srv = HttpServerService::start(16779, dir.path().to_path_buf(), tx, None).unwrap();
+        let port = get_free_port();
+        let mut srv = HttpServerService::start(port, dir.path().to_path_buf(), tx, None).unwrap();
 
-        let ping: Value = ureq::get("http://127.0.0.1:16779/ping")
+        let ping: Value = ureq::get(&format!("http://127.0.0.1:{}/ping", port))
             .call()
             .unwrap()
             .into_json()
             .unwrap();
         assert_eq!(ping["ok"], true);
 
-        let rpc: Value = ureq::post("http://127.0.0.1:16779/rpc")
+        let rpc: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
             .send_json(json!({ "method": "HasLuaToolsForApp", "args": { "appid": 1245620 } }))
             .unwrap()
             .into_json()
@@ -860,9 +866,10 @@ mod tests {
     fn handles_cors_preflight_and_headers() {
         let dir = tempfile::tempdir().unwrap();
         let (tx, _rx) = mpsc::channel();
-        let mut srv = HttpServerService::start(16780, dir.path().to_path_buf(), tx, None).unwrap();
+        let port = get_free_port();
+        let mut srv = HttpServerService::start(port, dir.path().to_path_buf(), tx, None).unwrap();
 
-        let resp = ureq::request("OPTIONS", "http://127.0.0.1:16780/rpc")
+        let resp = ureq::request("OPTIONS", &format!("http://127.0.0.1:{}/rpc", port))
             .set("Origin", "https://store.steampowered.com")
             .set("Access-Control-Request-Method", "POST")
             .set("Access-Control-Request-Headers", "Content-Type, X-Requested-With")
@@ -881,115 +888,116 @@ mod tests {
     fn handles_store_plugin_and_extended_routes() {
         let dir = tempfile::tempdir().unwrap();
         let (tx, rx) = mpsc::channel();
-        let mut srv = HttpServerService::start(16781, dir.path().to_path_buf(), tx, None).unwrap();
+        let port = get_free_port();
+        let mut srv = HttpServerService::start(port, dir.path().to_path_buf(), tx, None).unwrap();
 
         // 1. /has
-        let has1: Value = ureq::get("http://127.0.0.1:16781/has/1245620").call().unwrap().into_json().unwrap();
+        let has1: Value = ureq::get(&format!("http://127.0.0.1:{}/has/1245620", port)).call().unwrap().into_json().unwrap();
         assert_eq!(has1["has"], false);
 
-        let has2: Value = ureq::get("http://127.0.0.1:16781/has?appid=1245620").call().unwrap().into_json().unwrap();
+        let has2: Value = ureq::get(&format!("http://127.0.0.1:{}/has?appid=1245620", port)).call().unwrap().into_json().unwrap();
         assert_eq!(has2["has"], false);
 
         // 2. /add
-        let add1: Value = ureq::get("http://127.0.0.1:16781/add/1245620").call().unwrap().into_json().unwrap();
+        let add1: Value = ureq::get(&format!("http://127.0.0.1:{}/add/1245620", port)).call().unwrap().into_json().unwrap();
         assert_eq!(add1["queued"], true);
         assert!(matches!(rx.try_recv().unwrap(), RpcUiEvent::AddApp(1245620)));
 
         // Create a dummy .lua
         std::fs::write(dir.path().join("1245620.lua"), "addappid(1245620)").unwrap();
-        let has3: Value = ureq::get("http://127.0.0.1:16781/has/1245620").call().unwrap().into_json().unwrap();
+        let has3: Value = ureq::get(&format!("http://127.0.0.1:{}/has/1245620", port)).call().unwrap().into_json().unwrap();
         assert_eq!(has3["has"], true);
 
         // 3. /apps / /installed
-        let apps: Value = ureq::get("http://127.0.0.1:16781/apps").call().unwrap().into_json().unwrap();
+        let apps: Value = ureq::get(&format!("http://127.0.0.1:{}/apps", port)).call().unwrap().into_json().unwrap();
         assert_eq!(apps["apps"], json!([1245620]));
 
         // 4. /remove
-        let rem: Value = ureq::get("http://127.0.0.1:16781/remove/1245620").call().unwrap().into_json().unwrap();
+        let rem: Value = ureq::get(&format!("http://127.0.0.1:{}/remove/1245620", port)).call().unwrap().into_json().unwrap();
         assert_eq!(rem["removed"], true);
         assert!(matches!(rx.try_recv().unwrap(), RpcUiEvent::RemovedApp(1245620)));
 
         // 5. /open/fix and /open/settings
-        let fix: Value = ureq::get("http://127.0.0.1:16781/open/fix/1245620").call().unwrap().into_json().unwrap();
+        let fix: Value = ureq::get(&format!("http://127.0.0.1:{}/open/fix/1245620", port)).call().unwrap().into_json().unwrap();
         assert_eq!(fix["ok"], true);
         assert!(matches!(rx.try_recv().unwrap(), RpcUiEvent::OpenFix(1245620)));
 
-        let set: Value = ureq::get("http://127.0.0.1:16781/open/settings").call().unwrap().into_json().unwrap();
+        let set: Value = ureq::get(&format!("http://127.0.0.1:{}/open/settings", port)).call().unwrap().into_json().unwrap();
         assert_eq!(set["ok"], true);
         assert!(matches!(rx.try_recv().unwrap(), RpcUiEvent::OpenSettings));
 
         // 6. Extended routes: /version, /status, /config, /info/1245620
-        let ver: Value = ureq::get("http://127.0.0.1:16781/version").call().unwrap().into_json().unwrap();
+        let ver: Value = ureq::get(&format!("http://127.0.0.1:{}/version", port)).call().unwrap().into_json().unwrap();
         assert_eq!(ver["ok"], true);
 
-        let st: Value = ureq::get("http://127.0.0.1:16781/status").call().unwrap().into_json().unwrap();
+        let st: Value = ureq::get(&format!("http://127.0.0.1:{}/status", port)).call().unwrap().into_json().unwrap();
         assert_eq!(st["status"], "running");
 
-        let cfg: Value = ureq::get("http://127.0.0.1:16781/config").call().unwrap().into_json().unwrap();
+        let cfg: Value = ureq::get(&format!("http://127.0.0.1:{}/config", port)).call().unwrap().into_json().unwrap();
         assert_eq!(cfg["ok"], true);
 
-        let inf: Value = ureq::get("http://127.0.0.1:16781/info/1245620").call().unwrap().into_json().unwrap();
+        let inf: Value = ureq::get(&format!("http://127.0.0.1:{}/info/1245620", port)).call().unwrap().into_json().unwrap();
         assert_eq!(inf["ok"], true);
 
         // 7. Raw manifest routes: /manifest/:depotid/:gid & /api/givemethemanifestpunk
         std::fs::write(dir.path().join("1245621_987654321.manifest"), b"MANIFEST_BYTES_SAMPLE").unwrap();
-        let mf_resp = ureq::get("http://127.0.0.1:16781/manifest/1245621/987654321").call().unwrap();
+        let mf_resp = ureq::get(&format!("http://127.0.0.1:{}/manifest/1245621/987654321", port)).call().unwrap();
         assert_eq!(mf_resp.status(), 200);
         let mut mf_bytes = Vec::new();
         mf_resp.into_reader().read_to_end(&mut mf_bytes).unwrap();
         assert_eq!(mf_bytes, b"MANIFEST_BYTES_SAMPLE");
 
-        let punk_resp = ureq::get("http://127.0.0.1:16781/api/givemethemanifestpunk?depotid=1245621&gid=987654321").call().unwrap();
+        let punk_resp = ureq::get(&format!("http://127.0.0.1:{}/api/givemethemanifestpunk?depotid=1245621&gid=987654321", port)).call().unwrap();
         assert_eq!(punk_resp.status(), 200);
         let mut punk_bytes = Vec::new();
         punk_resp.into_reader().read_to_end(&mut punk_bytes).unwrap();
         assert_eq!(punk_bytes, b"MANIFEST_BYTES_SAMPLE");
 
         // 8. 13 Extended LTSP routes verification
-        let add_st: Value = ureq::get("http://127.0.0.1:16781/add-status/1245620").call().unwrap().into_json().unwrap();
+        let add_st: Value = ureq::get(&format!("http://127.0.0.1:{}/add-status/1245620", port)).call().unwrap().into_json().unwrap();
         assert_eq!(add_st["success"], true);
 
-        let add_src: Value = ureq::post("http://127.0.0.1:16781/add-source/1245620")
+        let add_src: Value = ureq::post(&format!("http://127.0.0.1:{}/add-source/1245620", port))
             .send_json(json!({ "source": "Sadie (Morrenus)" })).unwrap().into_json().unwrap();
         assert_eq!(add_src["success"], true);
 
-        let chk_src: Value = ureq::get("http://127.0.0.1:16781/check-sources/1245620").call().unwrap().into_json().unwrap();
+        let chk_src: Value = ureq::get(&format!("http://127.0.0.1:{}/check-sources/1245620", port)).call().unwrap().into_json().unwrap();
         assert_eq!(chk_src["success"], true);
 
-        let dl: Value = ureq::post("http://127.0.0.1:16781/download/1245620")
+        let dl: Value = ureq::post(&format!("http://127.0.0.1:{}/download/1245620", port))
             .send_json(json!({ "source": "Sadie (Morrenus)" })).unwrap().into_json().unwrap();
         assert_eq!(dl["success"], true);
 
-        let dl_st: Value = ureq::get("http://127.0.0.1:16781/download-status/1245620").call().unwrap().into_json().unwrap();
+        let dl_st: Value = ureq::get(&format!("http://127.0.0.1:{}/download-status/1245620", port)).call().unwrap().into_json().unwrap();
         assert_eq!(dl_st["success"], true);
 
-        let cancel: Value = ureq::post("http://127.0.0.1:16781/cancel/1245620")
+        let cancel: Value = ureq::post(&format!("http://127.0.0.1:{}/cancel/1245620", port))
             .send_json(json!({})).unwrap().into_json().unwrap();
         assert_eq!(cancel["success"], true);
 
-        let open_url: Value = ureq::post("http://127.0.0.1:16781/open-url")
+        let open_url: Value = ureq::post(&format!("http://127.0.0.1:{}/open-url", port))
             .send_json(json!({ "url": "https://example.com" })).unwrap().into_json().unwrap();
         assert_eq!(open_url["success"], true);
 
-        let r_steam: Value = ureq::post("http://127.0.0.1:16781/restart-steam")
+        let r_steam: Value = ureq::post(&format!("http://127.0.0.1:{}/restart-steam", port))
             .send_json(json!({})).unwrap().into_json().unwrap();
         assert_eq!(r_steam["success"], true);
 
-        let chk_up: Value = ureq::post("http://127.0.0.1:16781/check-updates")
+        let chk_up: Value = ureq::post(&format!("http://127.0.0.1:{}/check-updates", port))
             .send_json(json!({})).unwrap().into_json().unwrap();
         assert_eq!(chk_up["success"], true);
 
-        let l_apps_get: Value = ureq::get("http://127.0.0.1:16781/loaded-apps").call().unwrap().into_json().unwrap();
+        let l_apps_get: Value = ureq::get(&format!("http://127.0.0.1:{}/loaded-apps", port)).call().unwrap().into_json().unwrap();
         assert_eq!(l_apps_get["success"], true);
 
-        let l_apps_post: Value = ureq::post("http://127.0.0.1:16781/loaded-apps")
+        let l_apps_post: Value = ureq::post(&format!("http://127.0.0.1:{}/loaded-apps", port))
             .send_json(json!({})).unwrap().into_json().unwrap();
         assert_eq!(l_apps_post["success"], true);
 
-        let api_l: Value = ureq::get("http://127.0.0.1:16781/api-list").call().unwrap().into_json().unwrap();
+        let api_l: Value = ureq::get(&format!("http://127.0.0.1:{}/api-list", port)).call().unwrap().into_json().unwrap();
         assert_eq!(api_l["success"], true);
 
-        let icon: Value = ureq::get("http://127.0.0.1:16781/icon").call().unwrap().into_json().unwrap();
+        let icon: Value = ureq::get(&format!("http://127.0.0.1:{}/icon", port)).call().unwrap().into_json().unwrap();
         assert_eq!(icon["success"], false);
 
         srv.stop();

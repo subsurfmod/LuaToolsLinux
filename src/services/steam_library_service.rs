@@ -256,50 +256,27 @@ impl SteamLibraryService {
         Self::migrate_depotcache_dir(&legacy_dir, &target_dir)
     }
 
-    /// Migrates all `.manifest` files from `legacy_dir` to `target_dir`.
+    /// Migrates all `.manifest` files from `legacy_dir` to `target_dir` via `DepotCacheMigrationService`.
     pub fn migrate_depotcache_dir(
         legacy_dir: &std::path::Path,
         target_dir: &std::path::Path,
     ) -> Result<DepotCacheMigrationResult, String> {
-        if !legacy_dir.is_dir() {
-            return Ok(DepotCacheMigrationResult::default());
-        }
-        if let Err(e) = fs::create_dir_all(target_dir) {
+        let report =
+            crate::services::depot_cache_migration::DepotCacheMigrationService::migrate_dir(
+                legacy_dir, target_dir,
+            )?;
+        if report.failed_count > 0 && report.migrated_count == 0 {
             return Err(format!(
-                "Cannot create depotcache directory '{}': {}",
-                target_dir.display(),
-                e
+                "Failed to migrate {} manifest(s) from '{}'",
+                report.failed_count,
+                legacy_dir.display()
             ));
         }
-
-        let mut res = DepotCacheMigrationResult::default();
-        let entries = match fs::read_dir(legacy_dir) {
-            Ok(e) => e,
-            Err(e) => return Err(format!("Cannot read legacy depotcache dir: {}", e)),
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                if name.ends_with(".manifest") {
-                    let target_path = target_dir.join(name);
-                    if target_path.exists() {
-                        res.skipped_count += 1;
-                    } else if let Err(e) = fs::copy(&path, &target_path) {
-                        return Err(format!("Failed to migrate '{}': {}", name, e));
-                    } else {
-                        // LT-34: Remove source manifest after verified copy
-                        let _ = fs::remove_file(&path);
-                        res.migrated_count += 1;
-                        res.migrated_files.push(name.to_string());
-                    }
-                }
-            }
-        }
-        Ok(res)
+        Ok(DepotCacheMigrationResult {
+            migrated_count: report.migrated_count,
+            skipped_count: report.skipped_count,
+            migrated_files: report.migrated_files,
+        })
     }
 }
 

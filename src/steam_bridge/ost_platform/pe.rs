@@ -380,6 +380,11 @@ impl Image {
         self.entry_point_rva
     }
 
+    /// Returns a slice of the raw PE image bytes.
+    pub fn bytes(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
+
     /// Returns all sections of the image.
     pub fn sections(&self) -> &[Section] {
         &self.sections

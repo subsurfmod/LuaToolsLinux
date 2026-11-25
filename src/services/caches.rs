@@ -158,6 +158,7 @@ impl GameDetails {
 #[derive(Debug, Clone)]
 pub struct SteamAppInfoCache {
     cache_dir: PathBuf,
+    steam_root: Option<PathBuf>,
     mem: Arc<Mutex<HashMap<u32, GameDetails>>>,
     last_req: Arc<Mutex<Option<Instant>>>,
 }
@@ -174,9 +175,14 @@ impl SteamAppInfoCache {
         let _ = fs::create_dir_all(&dir);
         Self {
             cache_dir: dir,
+            steam_root: None,
             mem: Arc::new(Mutex::new(HashMap::new())),
             last_req: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn set_steam_root(&mut self, root: Option<PathBuf>) {
+        self.steam_root = root;
     }
 
     pub fn get(&self, app_id: u32) -> Option<GameDetails> {
@@ -219,8 +225,9 @@ impl SteamAppInfoCache {
             .timeout_connect(Duration::from_secs(8))
             .timeout(Duration::from_secs(15))
             .build();
-        let lang = crate::services::steam_service::SteamService::detect_steam_language(None)
-            .unwrap_or_else(|| "english".into());
+        let lang = crate::services::steam_service::SteamService::detect_steam_store_language(
+            self.steam_root.as_deref(),
+        );
         let url = format!(
             "https://store.steampowered.com/api/appdetails?appids={}&l={}",
             app_id,
@@ -664,9 +671,13 @@ impl CoverCache {
             *last = Some(Instant::now());
         }
 
+        let lang = crate::services::steam_service::SteamService::detect_steam_store_language(
+            self.steam_root.as_deref(),
+        );
         let url = format!(
-            "https://store.steampowered.com/api/appdetails?appids={}&filters=basic",
-            app_id
+            "https://store.steampowered.com/api/appdetails?appids={}&filters=basic&l={}",
+            app_id,
+            urlencoding::encode(&lang)
         );
         let Ok(resp) = agent.get(&url).set("User-Agent", STEAM_HTTP_UA).call() else {
             return Vec::new();

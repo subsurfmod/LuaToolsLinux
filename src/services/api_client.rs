@@ -323,14 +323,45 @@ impl HubcapService {
     }
 }
 
+pub const STEAM_STORE_BASE_URL: &str = "https://store.steampowered.com";
+
 #[derive(Debug, Clone)]
 pub struct LuaToolsApiClient {
     pub auth: AuthService,
+    pub steam_root: Option<PathBuf>,
+    store_base_url: String,
 }
 
 impl LuaToolsApiClient {
     pub fn new(auth: AuthService) -> Self {
-        Self { auth }
+        Self {
+            auth,
+            steam_root: None,
+            store_base_url: STEAM_STORE_BASE_URL.to_string(),
+        }
+    }
+
+    pub fn with_steam_root(mut self, steam_root: Option<PathBuf>) -> Self {
+        self.steam_root = steam_root;
+        self
+    }
+
+    pub fn set_steam_root(&mut self, steam_root: Option<PathBuf>) {
+        self.steam_root = steam_root;
+    }
+
+    pub fn with_store_base_url(mut self, store_base_url: impl Into<String>) -> Self {
+        let trimmed = store_base_url.into();
+        self.store_base_url = trimmed.trim_end_matches('/').to_string();
+        self
+    }
+
+    /// Resolves the Steam Store query language (`l=<lang>`) from Steam's `config.vdf` / `registry.vdf`,
+    /// falling back to `"english"` when unavailable (LT-16).
+    pub fn store_language(&self) -> String {
+        crate::services::steam_service::SteamService::detect_steam_store_language(
+            self.steam_root.as_deref(),
+        )
     }
 
     fn agent() -> ureq::Agent {
@@ -345,10 +376,10 @@ impl LuaToolsApiClient {
         if trimmed.is_empty() {
             return Ok(Vec::new());
         }
-        let lang = crate::services::steam_service::SteamService::detect_steam_language(None)
-            .unwrap_or_else(|| "english".into());
+        let lang = self.store_language();
         let url = format!(
-            "https://store.steampowered.com/api/storesearch/?term={}&l={}&cc=US",
+            "{}/api/storesearch/?term={}&l={}&cc=US",
+            self.store_base_url,
             urlencoding::encode(trimmed),
             urlencoding::encode(&lang)
         );
@@ -400,9 +431,12 @@ impl LuaToolsApiClient {
     }
 
     pub fn get_featured(&self) -> (Vec<SteamFeaturedItem>, Vec<SteamFeaturedItem>) {
-        let lang = crate::services::steam_service::SteamService::detect_steam_language(None)
-            .unwrap_or_else(|| "english".into());
-        let url = format!("https://store.steampowered.com/api/featuredcategories?cc=us&l={}", urlencoding::encode(&lang));
+        let lang = self.store_language();
+        let url = format!(
+            "{}/api/featuredcategories?cc=us&l={}",
+            self.store_base_url,
+            urlencoding::encode(&lang)
+        );
         let Ok(resp) = Self::agent()
             .get(&url)
             .set(
@@ -456,6 +490,37 @@ impl LuaToolsApiClient {
         };
 
         (parse_cat("top_sellers"), parse_cat("new_releases"))
+    }
+
+    /// Queries localized Steam Store `appdetails` metadata using detected Steam UI language (LT-16).
+    pub fn get_store_app_details(&self, app_id: u32) -> Result<Value, String> {
+        let lang = self.store_language();
+        let url = format!(
+            "{}/api/appdetails?appids={}&cc=us&l={}",
+            self.store_base_url,
+            app_id,
+            urlencoding::encode(&lang)
+        );
+        let payload: Value = Self::agent()
+            .get(&url)
+            .set(
+                "User-Agent",
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            )
+            .call()
+            .map_err(|e| e.to_string())?
+            .into_json()
+            .map_err(|e| e.to_string())?;
+        let entry = payload
+            .get(app_id.to_string())
+            .ok_or_else(|| format!("Missing appdetails entry for {}", app_id))?;
+        if entry.get("success").and_then(|v| v.as_bool()) != Some(true) {
+            return Err(format!("Steam Store appdetails unsuccessful for {}", app_id));
+        }
+        entry
+            .get("data")
+            .cloned()
+            .ok_or_else(|| format!("Missing appdetails data for {}", app_id))
     }
 
     pub fn check_sources(&self, app_id: u32) -> BTreeMap<String, String> {
@@ -1049,5 +1114,86 @@ mod tests {
 
         assert_eq!(fs::read(&dest).unwrap(), payload);
         assert!((max_pct - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn store_metadata_queries_use_config_vdf_language_and_fallback_to_english() {
+        let dir = tempfile::tempdir().unwrap();
+        let steam_with_lang = dir.path().join("SteamSchinese");
+        fs::create_dir_all(steam_with_lang.join("config")).unwrap();
+        fs::write(
+            steam_with_lang.join("config/config.vdf"),
+            r#"
+"InstallConfigStore"
+{
+    "Software"
+    {
+        "Valve"
+        {
+            "Steam"
+            {
+                "Language"		"schinese"
+            }
+        }
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let steam_without_lang = dir.path().join("SteamNoConfig");
+        fs::create_dir_all(&steam_without_lang).unwrap();
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_ip().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut seen_urls = Vec::new();
+            for _ in 0..4 {
+                let req = server.recv().unwrap();
+                let url = req.url().to_string();
+                let body = if url.starts_with("/api/storesearch/") {
+                    r#"{"items":[{"id":1245620,"name":"ELDEN RING","tiny_image":"https://example.com/1.jpg"}]}"#
+                } else if url.starts_with("/api/featuredcategories") {
+                    r#"{"top_sellers":{"items":[{"type":0,"id":1245620,"name":"ELDEN RING","large_capsule_image":"https://example.com/c.jpg"}]},"new_releases":{"items":[]}}"#
+                } else {
+                    r#"{"1245620":{"success":true,"data":{"name":"ELDEN RING","steam_appid":1245620}}}"#
+                };
+                seen_urls.push(url);
+                let resp = tiny_http::Response::from_string(body).with_header(
+                    tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
+                );
+                let _ = req.respond(resp);
+            }
+            seen_urls
+        });
+
+        let auth = AuthService::new(Some(dir.path().join("auth.json")));
+        let client_zh = LuaToolsApiClient::new(auth.clone())
+            .with_steam_root(Some(steam_with_lang))
+            .with_store_base_url(format!("http://{}", addr));
+        assert_eq!(client_zh.store_language(), "schinese");
+
+        let search_items = client_zh.search_store("elden").unwrap();
+        assert_eq!(search_items.len(), 1);
+        assert_eq!(search_items[0].app_id, 1245620);
+
+        let (top, _) = client_zh.get_featured();
+        assert_eq!(top.len(), 1);
+
+        let details = client_zh.get_store_app_details(1245620).unwrap();
+        assert_eq!(details.get("name").and_then(|v| v.as_str()), Some("ELDEN RING"));
+
+        // Fallback to "english" when config.vdf has no language
+        let client_en = LuaToolsApiClient::new(auth)
+            .with_steam_root(Some(steam_without_lang))
+            .with_store_base_url(format!("http://{}", addr));
+        assert_eq!(client_en.store_language(), "english");
+        let _ = client_en.search_store("elden").unwrap();
+
+        let urls = handle.join().unwrap();
+        assert!(urls[0].contains("l=schinese"), "search_store url: {}", urls[0]);
+        assert!(urls[1].contains("l=schinese"), "get_featured url: {}", urls[1]);
+        assert!(urls[2].contains("l=schinese"), "appdetails url: {}", urls[2]);
+        assert!(urls[3].contains("l=english"), "fallback url: {}", urls[3]);
     }
 }

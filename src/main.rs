@@ -89,7 +89,15 @@ impl eframe::App for AppWrapper {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if self.initial_minimized {
             self.initial_minimized = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            if self.inner.can_hide_to_tray() {
+                self.inner.tray_service.set_visibility(false);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            } else {
+                // No system tray host available — ensure window is visible in taskbar (minimized), never headless!
+                self.inner.tray_service.set_visibility(true);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
         }
 
         let mut had_ipc = false;
@@ -97,9 +105,7 @@ impl eframe::App for AppWrapper {
             had_ipc = true;
             match cmd {
                 IpcCommand::Focus => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.inner.restore_from_tray(ctx);
                 }
                 IpcCommand::TrayLock => {
                     self.tray_locked = true;
@@ -109,9 +115,7 @@ impl eframe::App for AppWrapper {
                         .map(|a| a.silent)
                         .unwrap_or(false);
                     if !is_silent {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        self.inner.restore_from_tray(ctx);
                     }
                     self.inner.handle_protocol_url(&url, ctx);
                 }
@@ -121,9 +125,11 @@ impl eframe::App for AppWrapper {
             ctx.request_repaint();
         }
 
-        if self.tray_locked && ctx.input(|i| i.viewport().close_requested()) {
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.inner.should_intercept_close_to_tray(self.tray_locked)
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            self.inner.hide_to_tray(ctx);
         }
 
         self.inner.update(ctx, frame);

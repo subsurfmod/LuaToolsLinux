@@ -5,7 +5,7 @@ use std::thread;
 
 use eframe::egui::{self, Align, ComboBox, Layout, Margin, RichText, ScrollArea, TextEdit};
 
-use crate::parsers::vdf_binary::{LaunchEntry, LaunchOptionsService};
+use crate::parsers::vdf_binary::LaunchEntry;
 use crate::services::game_process_injection_service::InjectionConfig;
 use crate::services::telemetry_service::TelemetryService;
 use crate::ui::app::LuaToolsApp;
@@ -751,6 +751,7 @@ impl LuaToolsApp {
         let mut do_save = false;
         let mut do_restore = false;
 
+        let steam_running = crate::services::launch_mod_store::is_any_steam_running();
         let app_id = self.launch_options_modal.app_id;
         egui::Window::new(format!(
             "Launch Options — {} (#{})",
@@ -768,12 +769,15 @@ impl LuaToolsApp {
                 .corner_radius(egui::CornerRadius::same(4))
                 .inner_margin(Margin::symmetric(12, 8))
                 .show(ui, |ui| {
+                    let banner_msg = if steam_running {
+                        "Steam is currently running — saving or restoring will cleanly shut down Steam, update appinfo.vdf, and relaunch Steam via SLSsteam so changes aren't overwritten on exit."
+                    } else {
+                        "Steam is closed — changes will be written directly to appinfo.vdf and tracked for automatic PICS rebase."
+                    };
                     ui.label(
-                        RichText::new(
-                            "Close Steam completely before saving changes to appinfo.vdf so Steam does not overwrite them on exit.",
-                        )
-                        .size(12.0)
-                        .color(Palette::WARN_TEXT),
+                        RichText::new(banner_msg)
+                            .size(12.0)
+                            .color(Palette::WARN_TEXT),
                     );
                 });
 
@@ -885,23 +889,22 @@ impl LuaToolsApp {
         if do_save {
             let steam_root = self.steam_service.installation.as_ref().map(|i| i.root.clone());
             if let Some(root) = steam_root {
-                if crate::services::steam_service::SteamService::is_steam_running() {
-                    let _ = crate::services::steam_service::SteamService::terminate_steam_instances();
-                }
-                let svc = LaunchOptionsService::new(root.clone());
-                let prev_entries = svc.get_launch_entries(app_id);
-                match svc.save_launch_entries(app_id, &self.launch_options_modal.entries) {
-                    Ok(m) => {
-                        let _ = crate::parsers::vdf_binary::LaunchModStore::default().save_mod(
-                            app_id,
-                            0,
-                            prev_entries,
-                            self.launch_options_modal.entries.clone(),
-                        );
-                        self.launch_options_modal.feedback = m.clone();
-                        self.notify(m, ToastKind::Success);
-                        // LT-57: Automatically restart Steam after successful save
-                        let _ = crate::services::steam_service::SteamService::relaunch_steam_sls(Some(&root));
+                let mut store = crate::services::launch_mod_store::LaunchModStore::new(None);
+                match crate::services::launch_mod_store::save_launch_options_coordinated(
+                    &root,
+                    app_id,
+                    &self.launch_options_modal.entries,
+                    &mut store,
+                ) {
+                    Ok(res) => {
+                        self.launch_options_modal.entries = res.entries;
+                        self.launch_options_modal.feedback = res.message.clone();
+                        let tone = if res.restart_error.is_some() {
+                            ToastKind::Warning
+                        } else {
+                            ToastKind::Success
+                        };
+                        self.notify(res.message, tone);
                     }
                     Err(m) => {
                         self.launch_options_modal.feedback = m.clone();
@@ -916,20 +919,23 @@ impl LuaToolsApp {
         if do_restore {
             let steam_root = self.steam_service.installation.as_ref().map(|i| i.root.clone());
             if let Some(root) = steam_root {
-                if crate::services::steam_service::SteamService::is_steam_running() {
-                    let _ = crate::services::steam_service::SteamService::terminate_steam_instances();
-                }
-                let svc = LaunchOptionsService::new(root.clone());
-                match svc.restore_backup() {
-                    Ok(m) => {
-                        let reloaded = svc.get_launch_entries(app_id);
+                let mut store = crate::services::launch_mod_store::LaunchModStore::new(None);
+                match crate::services::launch_mod_store::restore_launch_backup_coordinated(
+                    &root,
+                    app_id,
+                    &mut store,
+                ) {
+                    Ok(res) => {
                         self.launch_options_modal.selected_idx =
-                            (!reloaded.is_empty()).then_some(0);
-                        self.launch_options_modal.entries = reloaded;
-                        self.launch_options_modal.feedback = m.clone();
-                        self.notify(m, ToastKind::Success);
-                        // LT-57: Automatically restart Steam after successful restore
-                        let _ = crate::services::steam_service::SteamService::relaunch_steam_sls(Some(&root));
+                            (!res.entries.is_empty()).then_some(0);
+                        self.launch_options_modal.entries = res.entries;
+                        self.launch_options_modal.feedback = res.message.clone();
+                        let tone = if res.restart_error.is_some() {
+                            ToastKind::Warning
+                        } else {
+                            ToastKind::Success
+                        };
+                        self.notify(res.message, tone);
                     }
                     Err(m) => {
                         self.launch_options_modal.feedback = m.clone();

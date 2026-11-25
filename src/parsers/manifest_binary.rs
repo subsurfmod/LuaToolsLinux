@@ -12,7 +12,7 @@ use std::path::Path;
 
 use bytes::Buf;
 use sha1::{Digest as Sha1Digest, Sha1};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use thiserror::Error;
 use zip::read::ZipArchive;
 

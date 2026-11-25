@@ -386,38 +386,41 @@ impl AppInfoFile {
         }
     }
 
-    /// Extracts the change number for a specific app from appinfo.vdf.
-    /// The change number is stored in the app's meta section at offset 8 (4 bytes) for v27, or offset 8 for v28/v29.
+    /// Extracts the PICS change number for a specific app from appinfo.vdf.
+    /// Per-app metadata layout (v27 = 40 bytes, v28/v29 = 60 bytes):
+    ///   [0..4]   info_state (u32)
+    ///   [4..8]   last_updated (u32)
+    ///   [8..16]  pics_token (u64)
+    ///   [16..36] sha1_text ([u8; 20])
+    ///   [36..40] change_number (u32)
+    ///   [40..60] sha1_binary ([u8; 20], v28/v29)
     pub fn extract_app_change_number(path: &Path, app_id: u32) -> Option<u64> {
         let af = Self::open(path).ok()?;
-        let Some(&(offset, _size)) = af.index_map.get(&app_id) else {
-            return None;
-        };
+        let &(offset, _size) = af.index_map.get(&app_id)?;
         let meta_len = af.meta_length();
-        if meta_len < 12 {
+        if meta_len < 40 {
             return None;
         }
         let mut f = File::open(path).ok()?;
         f.seek(SeekFrom::Start(offset + 8)).ok()?;
-        let mut meta = vec![0u8; 12];
+        let mut meta = vec![0u8; meta_len];
         f.read_exact(&mut meta).ok()?;
-        // Change number is at offset 8 in meta (bytes 8-11 for u32, or bytes 8-15 for u64 in v28+)
-        if af.magic >= MAGIC_28 {
-            Some(u64::from_le_bytes(meta[8..16].try_into().ok()?))
-        } else {
-            Some(u32::from_le_bytes(meta[8..12].try_into().ok()?) as u64)
-        }
+        Some(u32::from_le_bytes(meta[36..40].try_into().ok()?) as u64)
     }
 
     /// Extracts launch options for a specific app from appinfo.vdf.
+    /// Returns `None` if `appinfo.vdf` cannot be read or `app_id` is absent,
+    /// and `Some(Vec::new())` if the app exists without a `config/launch` table.
     pub fn extract_launch_options(path: &Path, app_id: u32) -> Option<Vec<LaunchEntry>> {
         let af = Self::open(path).ok()?;
-        let Some(root) = af.read_app(app_id).ok()? else {
-            return None;
-        };
+        let root = af.read_app(app_id).ok()??;
         let body = root.get_table("appinfo").unwrap_or(&root);
-        let config = body.get_table("config")?;
-        let launch = config.get_table("launch")?;
+        let Some(config) = body.get_table("config") else {
+            return Some(Vec::new());
+        };
+        let Some(launch) = config.get_table("launch") else {
+            return Some(Vec::new());
+        };
 
         let mut out = Vec::new();
         for prop in &launch.items {
@@ -799,6 +802,112 @@ mod tests {
         let reloaded = svc.get_launch_entries(1245620);
         assert_eq!(reloaded.len(), 2);
         assert_eq!(reloaded[1].arguments, "-eac-nop-loaded");
+    }
+
+    #[test]
+    fn test_lt54_lt55_preserves_unmodelled_keys_and_property_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let appcache = dir.path().join("appcache");
+        fs::create_dir_all(&appcache).unwrap();
+        let vdf_path = appcache.join("appinfo.vdf");
+
+        // String table includes unmodelled keys: BetaKey, ownsdlc, vacmodulefilename, description_loc
+        let strings = [
+            "appinfo",
+            "config",
+            "launch",
+            "0",
+            "executable",
+            "type",
+            "BetaKey",
+            "ownsdlc",
+            "vacmodulefilename",
+            "description_loc",
+        ];
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&[TYPE_TABLE]); // appinfo
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        blob.extend_from_slice(&[TYPE_TABLE]); // config
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.extend_from_slice(&[TYPE_TABLE]); // launch
+        blob.extend_from_slice(&2u32.to_le_bytes());
+        blob.extend_from_slice(&[TYPE_TABLE]); // slot "0"
+        blob.extend_from_slice(&3u32.to_le_bytes());
+
+        // Modelled keys
+        blob.extend_from_slice(&[TYPE_STRING]);
+        blob.extend_from_slice(&4u32.to_le_bytes()); // executable
+        blob.extend_from_slice(b"game.exe\0");
+
+        blob.extend_from_slice(&[TYPE_STRING]);
+        blob.extend_from_slice(&5u32.to_le_bytes()); // type
+        blob.extend_from_slice(b"default\0");
+
+        // Unmodelled keys: BetaKey (string), ownsdlc (int32), vacmodulefilename (string), description_loc (table/token)
+        blob.extend_from_slice(&[TYPE_STRING]);
+        blob.extend_from_slice(&6u32.to_le_bytes()); // BetaKey
+        blob.extend_from_slice(b"public_beta\0");
+
+        blob.extend_from_slice(&[TYPE_INT32]);
+        blob.extend_from_slice(&7u32.to_le_bytes()); // ownsdlc
+        blob.extend_from_slice(&12345i32.to_le_bytes());
+
+        blob.extend_from_slice(&[TYPE_STRING]);
+        blob.extend_from_slice(&8u32.to_le_bytes()); // vacmodulefilename
+        blob.extend_from_slice(b"vac_game.dll\0");
+
+        blob.extend_from_slice(&[TYPE_STRING]);
+        blob.extend_from_slice(&9u32.to_le_bytes()); // description_loc
+        blob.extend_from_slice(b"#Launch_Description\0");
+
+        blob.extend_from_slice(&[TYPE_END, TYPE_END, TYPE_END, TYPE_END, TYPE_END]);
+
+        let meta = vec![0u8; 60];
+        let entry_size = (meta.len() + blob.len()) as i32;
+
+        let mut file_bytes = Vec::new();
+        file_bytes.extend_from_slice(&MAGIC_29.to_le_bytes());
+        file_bytes.extend_from_slice(&1u32.to_le_bytes());
+        file_bytes.extend_from_slice(&0i64.to_le_bytes());
+        file_bytes.extend_from_slice(&480u32.to_le_bytes()); // AppID 480
+        file_bytes.extend_from_slice(&entry_size.to_le_bytes());
+        file_bytes.extend_from_slice(&meta);
+        file_bytes.extend_from_slice(&blob);
+        file_bytes.extend_from_slice(&0u32.to_le_bytes());
+
+        let table_pos = file_bytes.len() as i64;
+        file_bytes.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+        for s in &strings {
+            file_bytes.extend_from_slice(s.as_bytes());
+            file_bytes.push(0);
+        }
+        file_bytes[8..16].copy_from_slice(&table_pos.to_le_bytes());
+        fs::write(&vdf_path, &file_bytes).unwrap();
+
+        let svc = LaunchOptionsService::new(dir.path().to_path_buf());
+        let mut entries = svc.get_launch_entries(480);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].executable, "game.exe");
+
+        // Update modelled executable and arguments in slot 0
+        entries[0].executable = "game_modded.exe".to_string();
+        entries[0].arguments = "-novid -freq 144".to_string();
+
+        svc.save_launch_entries(480, &entries).unwrap();
+
+        // Verify unmodelled keys are preserved in appinfo.vdf
+        let af = AppInfoFile::open(&vdf_path).unwrap();
+        let root = af.read_app(480).unwrap().unwrap();
+        let body = root.get_table("appinfo").unwrap();
+        let launch = body.get_table("config").unwrap().get_table("launch").unwrap();
+        let slot0 = launch.get_table("0").unwrap();
+
+        assert_eq!(slot0.get_text("executable"), "game_modded.exe");
+        assert_eq!(slot0.get_text("arguments"), "-novid -freq 144");
+        assert_eq!(slot0.get_text("BetaKey"), "public_beta");
+        assert_eq!(slot0.get_text("ownsdlc"), "12345");
+        assert_eq!(slot0.get_text("vacmodulefilename"), "vac_game.dll");
+        assert_eq!(slot0.get_text("description_loc"), "#Launch_Description");
     }
 }
 

@@ -14,6 +14,7 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -88,6 +89,7 @@ pub fn is_steam_client_process(comm: &str, exe_path: Option<&Path>) -> bool {
 
 pub fn find_steam_pid() -> Option<u32> {
     let my_pid = std::process::id();
+    let my_uid = unsafe { libc::geteuid() };
     let mut preloaded_fallback_pid = None;
     let mut fallback_pid = None;
 
@@ -99,6 +101,13 @@ pub fn find_steam_pid() -> Option<u32> {
             };
             if pid == my_pid {
                 continue;
+            }
+            if my_uid != 0 {
+                if let Ok(meta) = e.metadata() {
+                    if meta.uid() != my_uid {
+                        continue;
+                    }
+                }
             }
             let comm = fs::read_to_string(format!("/proc/{}/comm", pid)).unwrap_or_default();
             let exe = get_image_path(pid).map(PathBuf::from);
@@ -228,6 +237,7 @@ pub fn is_any_steam_process(comm: &str, exe_path: Option<&Path>, cmdline: &str) 
 pub fn find_all_steam_pids() -> Vec<u32> {
     let my_pid = std::process::id();
     let my_ppid = unsafe { libc::getppid() }.max(0) as u32;
+    let my_uid = unsafe { libc::geteuid() };
     let mut pids = Vec::new();
 
     if let Ok(entries) = fs::read_dir("/proc") {
@@ -238,6 +248,13 @@ pub fn find_all_steam_pids() -> Vec<u32> {
             };
             if pid == my_pid || pid == my_ppid || pid <= 1 {
                 continue;
+            }
+            if my_uid != 0 {
+                if let Ok(meta) = e.metadata() {
+                    if meta.uid() != my_uid {
+                        continue;
+                    }
+                }
             }
             let comm = fs::read_to_string(format!("/proc/{}/comm", pid)).unwrap_or_default();
             let exe = get_image_path(pid).map(PathBuf::from);

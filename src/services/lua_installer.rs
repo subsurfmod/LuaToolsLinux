@@ -548,6 +548,11 @@ impl LuaInstaller {
                 let _ = cdkey_store.set_override(aid, cdkey.clone());
             }
         }
+
+        // BST-07: Wire on-demand eticket URLs from seteticketurl()
+        for url in &lua.eticket_urls {
+            crate::steam_bridge::credentials::eticketclient::set_eticket_url(url);
+        }
     }
 
     fn sync_with_slssteam_to(

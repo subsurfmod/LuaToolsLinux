@@ -200,30 +200,198 @@ impl SteamService {
         Self::relaunch_steam_sls(root)
     }
 
-    /// Extracts language string from VDF text (matches `"Language"\s+"([^"]+)"` or `"language"\s+"([^"]+)"`).
+    /// Extracts Steam's UI language string from VDF text (`config.vdf` or `registry.vdf`).
+    /// Prefers `"Language"` inside the `"Steam"` section (`Software -> Valve -> Steam`) so per-app
+    /// `"apps" -> "<appid>" -> "language"` entries in `config.vdf` never shadow the client UI language.
     pub fn parse_language_from_vdf_text(content: &str) -> Option<String> {
+        let mut section_stack: Vec<String> = Vec::new();
+        let mut pending_section: Option<String> = None;
+        let mut fallback_lang: Option<String> = None;
+
+        for raw_line in content.lines() {
+            let line = match raw_line.find("//") {
+                Some(idx) => &raw_line[..idx],
+                None => raw_line,
+            }
+            .trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            let tokens = Self::extract_vdf_line_tokens(line);
+            for tok in tokens {
+                match tok {
+                    VdfLineToken::OpenBrace => {
+                        let sec = pending_section
+                            .take()
+                            .unwrap_or_default()
+                            .to_ascii_lowercase();
+                        section_stack.push(sec);
+                    }
+                    VdfLineToken::CloseBrace => {
+                        pending_section = None;
+                        let _ = section_stack.pop();
+                    }
+                    VdfLineToken::KeyOnly(k) => {
+                        pending_section = Some(k);
+                    }
+                    VdfLineToken::KeyValue(k, v) => {
+                        pending_section = None;
+                        if k.eq_ignore_ascii_case("language") {
+                            if let Some(normalized) = Self::normalize_steam_language_token(&v) {
+                                let in_apps_or_depots = section_stack
+                                    .iter()
+                                    .any(|s| s == "apps" || s == "depots");
+                                let in_steam_section = section_stack
+                                    .last()
+                                    .map(|s| s == "steam")
+                                    .unwrap_or(false)
+                                    && !in_apps_or_depots;
+                                if in_steam_section {
+                                    return Some(normalized);
+                                }
+                                if !in_apps_or_depots && fallback_lang.is_none() {
+                                    fallback_lang = Some(normalized);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if fallback_lang.is_some() {
+            return fallback_lang;
+        }
+
         let re = regex::Regex::new(r#"(?i)"language"\s+"([^"]+)""#).ok()?;
         re.captures(content)
             .and_then(|c| c.get(1))
-            .map(|m| m.as_str().trim().to_ascii_lowercase())
+            .and_then(|m| Self::normalize_steam_language_token(m.as_str()))
     }
 
-    /// Reads Steam UI language from `registry.vdf` or `config.vdf`.
+    fn normalize_steam_language_token(raw: &str) -> Option<String> {
+        let trimmed = raw.trim().to_ascii_lowercase();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            Some(trimmed)
+        } else {
+            None
+        }
+    }
+
+    fn extract_vdf_line_tokens(line: &str) -> Vec<VdfLineToken> {
+        let mut out = Vec::new();
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        let mut strings_on_line: Vec<String> = Vec::new();
+
+        let flush_strings = |strings: &mut Vec<String>, out: &mut Vec<VdfLineToken>| {
+            let mut idx = 0;
+            while idx < strings.len() {
+                if idx + 1 < strings.len() {
+                    out.push(VdfLineToken::KeyValue(
+                        strings[idx].clone(),
+                        strings[idx + 1].clone(),
+                    ));
+                    idx += 2;
+                } else {
+                    out.push(VdfLineToken::KeyOnly(strings[idx].clone()));
+                    idx += 1;
+                }
+            }
+            strings.clear();
+        };
+
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b.is_ascii_whitespace() {
+                i += 1;
+                continue;
+            }
+            if b == b'{' {
+                flush_strings(&mut strings_on_line, &mut out);
+                out.push(VdfLineToken::OpenBrace);
+                i += 1;
+                continue;
+            }
+            if b == b'}' {
+                flush_strings(&mut strings_on_line, &mut out);
+                out.push(VdfLineToken::CloseBrace);
+                i += 1;
+                continue;
+            }
+            if b == b'"' {
+                i += 1;
+                let mut buf = String::new();
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        if let Some(ch) = line[i + 1..].chars().next() {
+                            buf.push(ch);
+                            i += 1 + ch.len_utf8();
+                            continue;
+                        }
+                    }
+                    if bytes[i] == b'"' {
+                        i += 1;
+                        break;
+                    }
+                    if let Some(ch) = line[i..].chars().next() {
+                        buf.push(ch);
+                        i += ch.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+                strings_on_line.push(buf);
+                continue;
+            }
+            i += 1;
+        }
+        flush_strings(&mut strings_on_line, &mut out);
+        out
+    }
+
+    /// Reads Steam UI language from `config/config.vdf` (primary) or `registry.vdf` (fallback).
     pub fn detect_steam_language(override_root: Option<&Path>) -> Option<String> {
         let mut candidate_files = Vec::new();
 
-        if let Some(root) = override_root {
-            candidate_files.push(root.join("registry.vdf"));
+        if let Some(root) = override_root.filter(|p| !p.as_os_str().is_empty()) {
             candidate_files.push(root.join("config").join("config.vdf"));
-        }
+            candidate_files.push(root.join("registry.vdf"));
+        } else {
+            let cfg_override = crate::services::settings_service::SettingsService::default()
+                .settings
+                .steam_path_override;
+            if let Some(ov_root) = Some(cfg_override.trim())
+                .filter(|s| !s.is_empty())
+                .and_then(expand_tilde)
+            {
+                candidate_files.push(ov_root.join("config").join("config.vdf"));
+                candidate_files.push(ov_root.join("registry.vdf"));
+            }
 
-        if let Some(home) = dirs::home_dir() {
-            candidate_files.push(home.join(".local/share/Steam/registry.vdf"));
-            candidate_files.push(home.join(".local/share/Steam/config/config.vdf"));
-            candidate_files.push(home.join(".steam/steam/registry.vdf"));
-            candidate_files.push(home.join(".steam/steam/config/config.vdf"));
-            candidate_files.push(home.join(".steam/debian-installation/registry.vdf"));
-            candidate_files.push(home.join(".steam/debian-installation/config/config.vdf"));
+            if let Some(home) = dirs::home_dir() {
+                candidate_files.push(home.join(".local/share/Steam/config/config.vdf"));
+                candidate_files.push(home.join(".steam/steam/config/config.vdf"));
+                candidate_files.push(home.join(".steam/root/config/config.vdf"));
+                candidate_files.push(home.join(".steam/debian-installation/config/config.vdf"));
+                candidate_files.push(
+                    home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam/config/config.vdf"),
+                );
+                candidate_files.push(home.join(".steam/registry.vdf"));
+                candidate_files.push(home.join(".local/share/Steam/registry.vdf"));
+                candidate_files.push(home.join(".steam/steam/registry.vdf"));
+                candidate_files.push(home.join(".steam/debian-installation/registry.vdf"));
+                candidate_files.push(
+                    home.join(".var/app/com.valvesoftware.Steam/.steam/registry.vdf"),
+                );
+            }
         }
 
         for p in candidate_files {
@@ -240,19 +408,48 @@ impl SteamService {
         None
     }
 
+    /// Detects Steam Store API language token (`l=<lang>`) from `config.vdf` / `registry.vdf`,
+    /// falling back to `"english"` when no Steam language is configured or readable.
+    pub fn detect_steam_store_language(override_root: Option<&Path>) -> String {
+        Self::detect_steam_language(override_root).unwrap_or_else(|| "english".to_string())
+    }
+
+    /// Instance method returning the Steam Store API language token (`"english"`, `"schinese"`, etc.).
+    pub fn store_language(&self) -> String {
+        let root = self.installation.as_ref().map(|i| i.root.as_path());
+        Self::detect_steam_store_language(root)
+    }
+
     /// Maps Steam's internal language string (`schinese`, `russian`, `english`, etc.)
     /// to 2-letter UI language code (`zh`, `ru`, `en`, etc.).
     pub fn steam_lang_to_ui_code(steam_lang: &str) -> &'static str {
         match steam_lang.trim().to_ascii_lowercase().as_str() {
             "schinese" | "tchinese" | "chinese" | "zh" => "zh",
             "russian" | "ru" => "ru",
-            "spanish" | "es" => "es",
+            "spanish" | "latam" | "es" => "es",
             "german" | "de" => "de",
             "french" | "fr" => "fr",
             "brazilian" | "portuguese" | "pt" => "pt",
             "japanese" | "ja" => "ja",
             "italian" | "it" => "it",
             "koreana" | "korean" | "ko" => "ko",
+            "polish" | "pl" => "pl",
+            "dutch" | "nl" => "nl",
+            "turkish" | "tr" => "tr",
+            "arabic" | "ar" => "ar",
+            "thai" | "th" => "th",
+            "vietnamese" | "vi" => "vi",
+            "ukrainian" | "uk" => "uk",
+            "czech" | "cs" => "cs",
+            "hungarian" | "hu" => "hu",
+            "romanian" | "ro" => "ro",
+            "swedish" | "sv" => "sv",
+            "danish" | "da" => "da",
+            "finnish" | "fi" => "fi",
+            "norwegian" | "no" => "no",
+            "bulgarian" | "bg" => "bg",
+            "greek" | "el" => "el",
+            "indonesian" | "id" => "id",
             _ => "en",
         }
     }
@@ -268,6 +465,14 @@ impl SteamService {
         let root = self.installation.as_ref().map(|i| i.root.as_path());
         Self::detect_steam_ui_language_code(root)
     }
+}
+
+#[derive(Debug, Clone)]
+enum VdfLineToken {
+    OpenBrace,
+    CloseBrace,
+    KeyOnly(String),
+    KeyValue(String, String),
 }
 
 #[cfg(test)]
@@ -309,5 +514,57 @@ mod tests {
         assert_eq!(SteamService::steam_lang_to_ui_code("schinese"), "zh");
         assert_eq!(SteamService::steam_lang_to_ui_code("russian"), "ru");
         assert_eq!(SteamService::steam_lang_to_ui_code("english"), "en");
+    }
+
+    #[test]
+    fn test_config_vdf_language_detection_ignores_per_app_override_and_falls_back_to_english() {
+        let dir = tempfile::tempdir().unwrap();
+        let steam_root = dir.path().join("Steam");
+        fs::create_dir_all(steam_root.join("config")).unwrap();
+
+        // Empty root without config.vdf falls back to "english"
+        assert_eq!(SteamService::detect_steam_language(Some(&steam_root)), None);
+        assert_eq!(
+            SteamService::detect_steam_store_language(Some(&steam_root)),
+            "english"
+        );
+
+        // config.vdf where per-app "apps" entry appears BEFORE Steam client "Language"
+        let config_vdf = r#"
+"InstallConfigStore"
+{
+    "Software"
+    {
+        "Valve"
+        {
+            "Steam"
+            {
+                "apps"
+                {
+                    "480"
+                    {
+                        "language"		"english"
+                    }
+                }
+                "Language"		"japanese"
+            }
+        }
+    }
+}
+"#;
+        fs::write(steam_root.join("config/config.vdf"), config_vdf).unwrap();
+
+        assert_eq!(
+            SteamService::detect_steam_language(Some(&steam_root)),
+            Some("japanese".to_string())
+        );
+        assert_eq!(
+            SteamService::detect_steam_store_language(Some(&steam_root)),
+            "japanese"
+        );
+        assert_eq!(
+            SteamService::detect_steam_ui_language_code(Some(&steam_root)),
+            Some("ja".to_string())
+        );
     }
 }
