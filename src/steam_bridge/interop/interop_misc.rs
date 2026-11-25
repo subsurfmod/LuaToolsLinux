@@ -1128,12 +1128,6 @@ impl OtherGameData {
     }
 }
 
-/// Encode a protobuf tag (field_num << 3 | wire_type).
-fn encode_tag(field_num: u32, wire_type: u8, out: &mut Vec<u8>) {
-    let tag = (field_num << 3) | u32::from(wire_type);
-    encode_varint(tag as u64, out);
-}
-
 /// Encode a varint.
 fn encode_varint(mut val: u64, out: &mut Vec<u8>) {
     loop {

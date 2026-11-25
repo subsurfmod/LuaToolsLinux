@@ -48,6 +48,8 @@ pub struct AppliedFixRecord {
     pub app_id: u32,
     pub fix_id: String,
     pub applied_at: String,
+    #[serde(default)]
+    pub game_dir: Option<PathBuf>,
     pub files: Vec<FixFileEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wine_dll_overrides: Option<String>,
@@ -452,6 +454,7 @@ impl FixesService {
             app_id,
             fix_id: fix_id.to_string(),
             applied_at: Utc::now().to_rfc3339(),
+            game_dir: Some(game_dir.to_path_buf()),
             files: records.clone(),
             wine_dll_overrides: wine_overrides_str,
         };

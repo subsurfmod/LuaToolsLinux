@@ -15,23 +15,20 @@
 //!   - If code received: patch header (eresult=OK) + body (manifest_request_code)
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::steam_bridge::interop::interop_misc::resolve_app_id;
-use crate::steam_bridge::interop::active_download_count;
 use crate::steam_bridge::manifest_hooks::{ensure_manifest_cached, get_seen_depot, report_missing_manifest};
 
-const JOB_ID_BASE: u64 = 0x7E52_0000_0000_0000;
 const PENDING_TIMEOUT: Duration = Duration::from_secs(12); // 12s wait for async fetch
 const MSG_GET_MANIFEST_REQUEST_CODE: u32 = 151; // eMsg 151
 const MSG_GET_MANIFEST_REQUEST_CODE_RESPONSE: u32 = 147; // eMsg 147
 
 static MANIFEST_STATE: OnceLock<Mutex<ManifestState>> = OnceLock::new();
 static MANIFEST_ACTIVE: AtomicBool = AtomicBool::new(false);
-static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(JOB_ID_BASE);
 
 fn manifest_state() -> &'static Mutex<ManifestState> {
     MANIFEST_STATE.get_or_init(|| Mutex::new(ManifestState::new()))
@@ -72,16 +69,6 @@ impl ManifestState {
 
     fn set_steam_root(&mut self, root: std::path::PathBuf) {
         self.steam_root = Some(root);
-    }
-
-    fn next_job_id(&self) -> u64 {
-        let id = NEXT_JOB_ID.fetch_add(1, Ordering::SeqCst);
-        if id == 0 {
-            NEXT_JOB_ID.store(JOB_ID_BASE, Ordering::SeqCst);
-            JOB_ID_BASE
-        } else {
-            id
-        }
     }
 
     fn is_lua_depot(&self, depot_id: u32) -> bool {
@@ -516,11 +503,6 @@ pub fn expire_manifest_stale() {
     let now = Instant::now();
     state.sent_requests.retain(|_, req| now.duration_since(req.sent_at) < PENDING_TIMEOUT);
     // Note: pending_fetches are kept until response or disconnect
-}
-
-/// Check if we have active downloads
-fn has_active_downloads() -> bool {
-    active_download_count() > 0
 }
 
 #[cfg(test)]

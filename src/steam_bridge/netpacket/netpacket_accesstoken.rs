@@ -15,11 +15,6 @@ use crate::steam_bridge::interop::ipc::{
     self, fnv1a_hash, FuncHash, HandlerFn, IpcContext, IpcInterface,
 };
 
-/// Steam message ID for CMsgClientPICSProductInfoRequest.
-const K_EMSG_CLIENT_PICS_PRODUCT_INFO_REQUEST: u32 = 8903;
-/// Maximum body size for NetPacket messages.
-const K_MAX_BODY_SIZE: usize = 65536;
-
 /// FuncHash for CMsgClientPICSProductInfoRequest send handler.
 const NETPACKET_ACCESSTOKEN_PICS_PRODUCT_INFO_REQUEST_FNHASH: FuncHash =
     fnv1a_hash("CMsgClientPICSProductInfoRequest");

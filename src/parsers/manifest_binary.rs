@@ -124,8 +124,10 @@ impl ManifestFile {
         if !meta.filenames_encrypted {
             return true;
         }
-        // Manifest filenames are encrypted: check valid 64-char hex key
-        true
+        // Manifest filenames are encrypted: try to decrypt at least one filename
+        let mut key_arr = [0u8; 32];
+        key_arr.copy_from_slice(key_bytes);
+        crate::parsers::manifest_binary::validate_aes_key(path, &key_arr).unwrap_or(false)
     }
 
     fn read_tag(d: &[u8], o: &mut usize) -> Option<(u32, u8)> {

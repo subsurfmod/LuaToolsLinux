@@ -33,7 +33,7 @@ use crate::services::cloud_redirect_service::CloudRedirectService;
 use crate::services::depot_downloader::DepotDownloaderService;
 use crate::services::depot_info::{AppDepotInfo, ContentDepot, SteamDepotInfo};
 use crate::services::donate_keys::DonateKeysService;
-use crate::services::download_queue::{DownloadQueue, DownloadTask};
+use crate::services::download_queue::DownloadQueue;
 use crate::services::external_tools::{ExternalToolsManager, ToolStatusInfo};
 use crate::services::fixes_service::FixesService;
 use crate::services::game_process_injection_service::GameProcessInjectionService;
@@ -1508,29 +1508,6 @@ impl LuaToolsApp {
         let gname = self.acquire_details.as_ref().map(|d| d.name.clone());
         let tx = self.msg_tx.clone();
         let ctx_c = ctx.clone();
-        let queue = self.download_queue.clone();
-
-        let task_id = format!(
-            "acquire_{}_{}",
-            app_id,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0)
-        );
-        let task = DownloadTask {
-            id: task_id,
-            app_id,
-            label: gname.clone().unwrap_or_else(|| format!("AppID {}", app_id)),
-            source: source.clone(),
-            url: format!("manifest://{}/{}", source, app_id),
-            dest_path: std::env::temp_dir()
-                .join(format!("luatools_dl_{}", app_id))
-                .join(format!("{}.zip", app_id)),
-            total_bytes: None,
-            priority: 10,
-        };
-        queue.enqueue(task);
 
         thread::spawn(move || {
             let tmp = std::env::temp_dir().join(format!("luatools_dl_{}", app_id));

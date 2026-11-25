@@ -15,7 +15,8 @@ pub struct AppliedFixRecord {
     pub app_id: u32,
     pub fix_id: String,
     pub applied_at: String,
-    pub game_dir: PathBuf,
+    #[serde(default)]
+    pub game_dir: Option<PathBuf>,
     pub files: Vec<AppliedFixFileEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wine_dll_overrides: Option<String>,
@@ -188,7 +189,7 @@ mod tests {
             app_id: 123,
             fix_id: "online-fix:abc123".into(),
             applied_at: chrono::Utc::now().to_rfc3339(),
-            game_dir: PathBuf::from("/home/user/games/123"),
+            game_dir: Some(PathBuf::from("/home/user/games/123")),
             files: vec![],
             wine_dll_overrides: None,
         };

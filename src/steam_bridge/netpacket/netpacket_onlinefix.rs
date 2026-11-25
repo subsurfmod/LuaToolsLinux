@@ -449,15 +449,6 @@ fn handle_send_games_played_netpacket(ctx: &mut crate::steam_bridge::netpacket::
     }
 }
 
-/// Delegate to RichPresence::TrackSend for presence tracking.
-/// This is called after modifying the GamesPlayed message.
-fn track_rich_presence_send(app_id: u32) {
-    // Delegate to RichPresence tracking
-    // In the C++ code, this calls Hooks_NetPacket_RichPresence::TrackSend
-    // Here we just log for now - the actual RichPresence module would handle this
-    log::debug!("OnlineFix: Delegating to RichPresence::TrackSend for appId={}", app_id);
-}
-
 pub fn install_onlinefix() -> Result<(), String> {
     register_onlinefix_handlers();
     ONLINEFIX_ACTIVE.store(true, Ordering::Release);
