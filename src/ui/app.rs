@@ -989,6 +989,7 @@ impl LuaToolsApp {
     pub fn refresh_all_local_state(&mut self) {
         self.slssteam_service.reload();
         self.depot_downloader.slssteam_service = Some(self.slssteam_service.clone());
+        self.applied_fix_index.rebuild_index(&self.steam_service);
         self.telemetry_service.update_runtime_context(
             self.steam_service.is_available(),
             self.steam_service.libraries().len(),

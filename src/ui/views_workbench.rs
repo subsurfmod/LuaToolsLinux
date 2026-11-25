@@ -1659,6 +1659,7 @@ impl LuaToolsApp {
                             if let Some((fid, dir)) = act_rev {
                                 let res = FixesService::unfix_game(&dir, &fid);
                                 if res.ok {
+                                    self.applied_fix_index.remove_fix(aid, &fid);
                                     self.notify(
                                         format!(
                                             "Reverted {} file(s) for AppID {}",
@@ -2611,6 +2612,23 @@ impl LuaToolsApp {
                     match ProtocolService::register_desktop_handler() {
                         Ok(m) => self.notify(m, ToastKind::Success),
                         Err(m) => self.notify(m, ToastKind::Warning),
+                    }
+                }
+                if secondary_button(ui, "Install Store Page Plugin (LTSP)").clicked() {
+                    if let Some(inst) = &self.steam_service.installation {
+                        let plugin_svc = crate::services::plugin_installer_service::PluginInstallerService::new(None);
+                        match plugin_svc.ensure_luatools_js_installed(Some(&inst.root)) {
+                            Ok(path) => self.notify(
+                                format!("Installed Steam Store Plugin to {}", path.display()),
+                                ToastKind::Success,
+                            ),
+                            Err(e) => self.notify(
+                                format!("Failed to install Store Plugin: {}", e),
+                                ToastKind::Warning,
+                            ),
+                        }
+                    } else {
+                        self.notify("Steam installation not detected.", ToastKind::Warning);
                     }
                 }
             });

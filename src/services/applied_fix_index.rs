@@ -117,22 +117,37 @@ impl AppliedFixIndexService {
         let mut count = 0;
 
         for lib in steam_service.libraries() {
-            let fix_dir = lib.path.join(crate::services::fixes_service::FIX_DIR_NAME);
-            if !fix_dir.exists() || !fix_dir.is_dir() {
-                continue;
+            let mut search_dirs = vec![
+                lib.path.join(crate::services::fixes_service::FIX_DIR_NAME),
+            ];
+            for sub in ["steamapps/common", "common"] {
+                let common_path = lib.path.join(sub);
+                if let Ok(entries) = fs::read_dir(&common_path) {
+                    for entry in entries.flatten() {
+                        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                            search_dirs.push(entry.path().join(crate::services::fixes_service::FIX_DIR_NAME));
+                        }
+                    }
+                }
             }
 
-            if let Ok(entries) = fs::read_dir(&fix_dir) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.extension().and_then(|e| e.to_str()) != Some("json") {
-                        continue;
-                    }
+            for fix_dir in search_dirs {
+                if !fix_dir.exists() || !fix_dir.is_dir() {
+                    continue;
+                }
 
-                    if let Ok(content) = fs::read_to_string(&p) {
-                        if let Ok(record) = serde_json::from_str::<AppliedFixRecord>(&content) {
-                            new_records.entry(record.app_id).or_default().push(record);
-                            count += 1;
+                if let Ok(entries) = fs::read_dir(&fix_dir) {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if p.extension().and_then(|e| e.to_str()) != Some("json") {
+                            continue;
+                        }
+
+                        if let Ok(content) = fs::read_to_string(&p) {
+                            if let Ok(record) = serde_json::from_str::<AppliedFixRecord>(&content) {
+                                new_records.entry(record.app_id).or_default().push(record);
+                                count += 1;
+                            }
                         }
                     }
                 }
