@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.2.2] - 2026-11-25
+
+### Legacy C++ Cleanup & Final Audit Closure
+- **Pruned Legacy C++ Tree**:
+  - Removed obsolete `usefulsteamtools/` directory (151 files, 21,669 lines) completely superseded by native Linux Rust implementations in `src/steam_bridge/` and primary workspace services.
+  - Retained 100% test pass rate across all 466 workspace unit, integration, and UI tests.
+
+---
+
 ## [3.2.0] - 2026-11-25
 
 ### BetterSteamTools Linux Port & Steam Bridge Networking

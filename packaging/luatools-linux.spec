@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           luatools-linux
-Version:        3.2.0
+Version:        3.2.2
 Release:        1%{?dist}
 Summary:        Native Rust workstation for Steam stplug-in lua manifests, depots, and fixes
 License:        MIT
@@ -48,6 +48,8 @@ install -m 0644 %{_sourcedir}/luatools.desktop %{buildroot}%{_datadir}/applicati
 %{_datadir}/icons/hicolor/scalable/apps/luatools.svg
 
 %changelog
+* Wed Nov 25 2026 LuaTools Linux Contributors <noreply@lua.tools> - 3.2.2-1
+- Release v3.2.2: Complete removal of legacy C++ usefulsteamtools reference tree, full audit closure across all 155 units from Luatools complete.txt, and end-to-end workspace verification
 * Wed Nov 25 2026 LuaTools Linux Contributors <noreply@lua.tools> - 3.2.0-1
 - Release v3.2.0: Complete BetterSteamTools Linux port, native Steam client netpacket protocol handling & online-fix licensing, hardened SLSsteam de-sync on uninstall, case-insensitive DLL overrides, and full forensic audit fixes
 * Wed Nov 25 2026 LuaTools Linux Contributors <noreply@lua.tools> - 3.1.0-1
