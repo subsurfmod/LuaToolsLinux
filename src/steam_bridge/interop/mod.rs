@@ -45,6 +45,11 @@ pub use interop_package::{
     License, AppOwnership,
 };
 
+pub use interop_decryption::{
+    has_depot_decryption_key, install as interop_decryption_install,
+    uninstall as interop_decryption_uninstall,
+};
+
 pub use interop_steamui::{
     install as interop_steamui_install, uninstall as interop_steamui_uninstall,
     queue_removal, cancel_removal, active_download_count,

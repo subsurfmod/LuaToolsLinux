@@ -614,21 +614,22 @@ pub fn notify_license_changed() {
     );
 }
 
-/// Get depot IDs from Lua config (placeholder - integrates with lua_config).
+/// Get depot IDs from Lua config (addappid directives and SLSsteam config).
+/// Returns AppIDs that should be injected into Package 0 to make them appear owned.
 fn get_all_depot_ids() -> Vec<u32> {
-    // This would be populated by the Lua config system
-    // For now return empty - will be wired up when LuaConfig is fully implemented
-    Vec::new()
+    crate::steam_bridge::interop::bridge_lib::get_all_depot_ids()
 }
 
-/// Take pending removals (placeholder).
+/// Take pending removals from Lua config system.
+/// Returns AppIDs that should be removed from Package 0.
 fn take_pending_removals() -> Vec<u32> {
-    Vec::new()
+    crate::steam_bridge::interop::bridge_lib::take_pending_removals()
 }
 
-/// Take pending additions (placeholder).
+/// Take pending additions from Lua config system.
+/// Returns AppIDs that should be added to Package 0.
 fn take_pending_additions() -> Vec<u32> {
-    Vec::new()
+    crate::steam_bridge::interop::bridge_lib::take_pending_additions()
 }
 
 /// Resolve function address using pattern scanning.

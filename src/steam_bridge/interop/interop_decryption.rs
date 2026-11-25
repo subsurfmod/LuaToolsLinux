@@ -10,6 +10,39 @@ use std::sync::{Mutex, OnceLock};
 use crate::steam_bridge::memory_patch::{self, MemoryPatch, JMP_ABS64_LEN};
 use crate::steam_bridge::pattern_db::{BinaryComponent, PatternChannel, PatternDb};
 
+/// Robustly decode a hex string to bytes, handling common formats:
+/// - Plain hex: "0123456789abcdef..."
+/// - With 0x prefix: "0x0123456789abcdef..."
+/// - With whitespace: "01 23 45 67 89 ab cd ef ..."
+fn decode_hex_robust(hex: &str) -> Option<Vec<u8>> {
+    let trimmed = hex.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Strip 0x/0X prefix if present
+    let without_prefix = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+
+    // Remove all whitespace
+    let cleaned: String = without_prefix.chars().filter(|c| !c.is_whitespace()).collect();
+
+    if cleaned.is_empty() || !cleaned.len().is_multiple_of(2) {
+        return None;
+    }
+
+    // Decode hex pairs
+    let mut out = Vec::with_capacity(cleaned.len() / 2);
+    let bytes = cleaned.as_bytes();
+    for chunk in bytes.as_chunks::<2>().0 {
+        let s = std::str::from_utf8(chunk).ok()?;
+        out.push(u8::from_str_radix(s, 16).ok()?);
+    }
+    Some(out)
+}
+
 /// ConfigStore type enum.
 #[allow(dead_code)]
 pub mod EConfigStore {
@@ -79,9 +112,9 @@ unsafe extern "C" fn config_store_get_binary_detour(
             std::ffi::CStr::from_ptr(key_name).to_string_lossy().to_string()
         };
 
-        log::debug!(
-            "[InteropDecryption] ConfigStoreGetBinary called for pObject={:x}, eConfigStore={}, KeyName='{}'",
-            p_object, e_config_store, name
+        eprintln!(
+            "[InteropDecryption] ConfigStoreGetBinary called: pObject={:x}, eConfigStore={}, KeyName='{}', key_size={}",
+            p_object, e_config_store, name, key_size
         );
 
         // Record appticket keys for forge fallback
@@ -108,7 +141,7 @@ unsafe extern "C" fn config_store_get_binary_detour(
                 if let Ok(depot_id) = depot_id_str.parse::<u32>() {
                     if let Some(decryption_key) = get_decryption_key(depot_id) {
                         if key_size as usize >= decryption_key.len() {
-                            log::info!(
+                            eprintln!(
                                 "[InteropDecryption] Providing decryption key for depot {}: {}",
                                 depot_id,
                                 hex::encode(&decryption_key)
@@ -120,11 +153,16 @@ unsafe extern "C" fn config_store_get_binary_detour(
                             );
                             return decryption_key.len() as i32;
                         }
-                        log::warn!(
+                        eprintln!(
                             "[InteropDecryption] Decryption key for depot {} is too large ({} bytes) for buffer ({} bytes)",
                             depot_id,
                             decryption_key.len(),
                             key_size
+                        );
+                    } else {
+                        eprintln!(
+                            "[InteropDecryption] No decryption key available for depot {} (not in Lua config or bridge_lib depot_keys)",
+                            depot_id
                         );
                     }
                 }
@@ -189,9 +227,31 @@ pub fn read_config_store_local_binary(key_name: &str) -> Vec<u8> {
 /// Get decryption key for a depot (integrates with LuaConfig / bridge_lib depot_keys).
 fn get_decryption_key(depot_id: u32) -> Option<Vec<u8>> {
     // Try to get from bridge_lib's depot_keys store
+    let hex = crate::steam_bridge::interop::bridge_lib::read_depot_key(depot_id)?;
+
+    // Use robust hex decoder that handles 0x prefix and whitespace
+    let key_bytes = decode_hex_robust(&hex)?;
+
+    // Validate key length (Steam depot decryption keys are 32 bytes / 256-bit AES)
+    if key_bytes.len() != 32 {
+        log::warn!(
+            "[InteropDecryption] Depot {} decryption key has invalid length ({} bytes, expected 32): hex='{}'",
+            depot_id,
+            key_bytes.len(),
+            hex
+        );
+        return None;
+    }
+
+    Some(key_bytes)
+}
+
+/// Check if a depot decryption key is available (public API for verification).
+pub fn has_depot_decryption_key(depot_id: u32) -> bool {
     crate::steam_bridge::interop::bridge_lib::read_depot_key(depot_id)
-        .and_then(|hex| hex::decode(hex.trim()).ok())
-        .filter(|b| b.len() == 32)
+        .and_then(|hex| decode_hex_robust(&hex))
+        .map(|b| b.len() == 32)
+        .unwrap_or(false)
 }
 
 /// Get cached app ownership ticket.
@@ -285,6 +345,10 @@ pub fn install(steam_root: &std::path::Path) -> Result<(), String> {
             .unwrap_or_else(|e| e.into_inner())
             .push(patch);
         log::info!("Installed ConfigStoreGetBinary hook at 0x{:x}", addr);
+        eprintln!("[InteropDecryption] ConfigStoreGetBinary hook installed at runtime address 0x{:x}", addr);
+    } else {
+        log::warn!("ConfigStoreGetBinary pattern not found; ConfigStoreGetBinary hook NOT installed");
+        eprintln!("[InteropDecryption] WARNING: ConfigStoreGetBinary pattern not found; ConfigStoreGetBinary hook NOT installed");
     }
 
     log::info!("InteropDecryption hooks installed");

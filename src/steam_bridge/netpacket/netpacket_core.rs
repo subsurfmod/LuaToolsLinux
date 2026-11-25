@@ -674,7 +674,7 @@ fn register_all_submodule_handlers() {
         name: "Licenses::HandleRecv_LicenseList".to_string(),
         handler: Arc::new(|ctx| {
             log::debug!("Licenses Recv: CMsgClientLicenseList (780)");
-            Ok(())
+            crate::steam_bridge::netpacket::netpacket_licenses::handle_recv_client_license_list_post_ipc(ctx)
         }),
     });
 

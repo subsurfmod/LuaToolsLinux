@@ -100,6 +100,11 @@ static PENDING_ETICKETS: OnceLock<RwLock<HashMap<u64, u32>>> = OnceLock::new();
 static CACHED_TICKETS: OnceLock<RwLock<HashMap<u32, AppTicketData>>> = OnceLock::new();
 static NEXT_CALL_HANDLE: AtomicU64 = AtomicU64::new(0x4C55_4154_0000_0001);
 
+/// Pending depot additions from Lua config hot-reload
+static PENDING_ADDITIONS: OnceLock<RwLock<Vec<u32>>> = OnceLock::new();
+/// Pending depot removals from Lua config hot-reload
+static PENDING_REMOVALS: OnceLock<RwLock<Vec<u32>>> = OnceLock::new();
+
 static ORIGINAL_BIS: OnceLock<RwLock<Option<BisSubscribedAppFn>>> = OnceLock::new();
 static ORIGINAL_GET_APP_ID: OnceLock<RwLock<Option<GetAppIdFn>>> = OnceLock::new();
 static ORIGINAL_GET_APP_OWNERSHIP_TICKET: OnceLock<RwLock<Option<GetAppOwnershipTicketFn>>> =
@@ -166,6 +171,14 @@ fn pending_etickets() -> &'static RwLock<HashMap<u64, u32>> {
 
 fn cached_tickets() -> &'static RwLock<HashMap<u32, AppTicketData>> {
     CACHED_TICKETS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn pending_additions() -> &'static RwLock<Vec<u32>> {
+    PENDING_ADDITIONS.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+fn pending_removals() -> &'static RwLock<Vec<u32>> {
+    PENDING_REMOVALS.get_or_init(|| RwLock::new(Vec::new()))
 }
 
 fn original_bis() -> &'static RwLock<Option<BisSubscribedAppFn>> {
@@ -510,6 +523,10 @@ unsafe extern "C" fn depot_decrypt_replacement(
     size: u32,
 ) -> bool {
     panic::catch_unwind(AssertUnwindSafe(|| {
+        eprintln!(
+            "[steam_integration] depot_decrypt_replacement called: depot_id={}, buffer={:p}, size={}",
+            depot_id, buffer, size
+        );
         let key_bytes_opt = read_lock(depot_keys())
             .get(&depot_id)
             .and_then(|hex| decode_hex_bytes(hex))
@@ -518,15 +535,27 @@ unsafe extern "C" fn depot_decrypt_replacement(
         let orig_opt = *read_lock(original_depot_decrypt());
         if let Some(original) = orig_opt {
             if original(this, depot_id, buffer, size) {
+                eprintln!("[steam_integration] depot_decrypt: original returned true for depot {}", depot_id);
                 return true;
             }
+            eprintln!("[steam_integration] depot_decrypt: original returned false for depot {}", depot_id);
         }
 
         if let Some(key_bytes) = key_bytes_opt {
             if !buffer.is_null() && size >= 32 {
                 std::ptr::copy_nonoverlapping(key_bytes.as_ptr(), buffer, 32);
+                eprintln!(
+                    "[steam_integration] depot_decrypt: provided key for depot {} ({} bytes)",
+                    depot_id, key_bytes.len()
+                );
                 return true;
             }
+            eprintln!(
+                "[steam_integration] depot_decrypt: buffer too small or null for depot {} (size={}, buffer={:p})",
+                depot_id, size, buffer
+            );
+        } else {
+            eprintln!("[steam_integration] depot_decrypt: no key configured for depot {}", depot_id);
         }
 
         false
@@ -1100,12 +1129,18 @@ fn try_install_steamclient_patches(steam_root: &Path) {
             installed_count += 1;
         }
     }
-    if let Some(addr) = resolve_runtime_target("depot_key_integration")
-        .or_else(|| resolve_runtime_target("depot_decrypt"))
-    {
+    let depot_addr = resolve_runtime_target("depot_key_integration")
+        .or_else(|| resolve_runtime_target("depot_decrypt"));
+    if let Some(addr) = depot_addr {
+        eprintln!("[steam_integration] installing depot_decrypt hook at runtime addr 0x{:x}", addr);
         if install_depot_decrypt_patch(addr) {
             installed_count += 1;
+            eprintln!("[steam_integration] depot_decrypt hook installed successfully");
         }
+    } else {
+        eprintln!(
+            "[steam_integration] WARNING: depot_key_integration/depot_decrypt pattern not found in pattern DB; depot decryption hook NOT installed"
+        );
     }
 
     eprintln!(
@@ -1661,10 +1696,121 @@ pub fn is_additional_app(app_id: u32) -> bool {
     read_lock(spoofed_apps()).contains(&app_id)
 }
 
+/// Get all additional apps (Lua-unlocked apps)
+pub fn get_additional_apps() -> Vec<u32> {
+    read_lock(spoofed_apps()).iter().copied().collect()
+}
+
+/// Exported C function to get all additional apps
+#[no_mangle]
+pub extern "C" fn get_additional_apps_c(out: *mut u32, max_len: u32) -> u32 {
+    let apps = get_additional_apps();
+    let len = apps.len().min(max_len as usize);
+    if !out.is_null() && len > 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(apps.as_ptr(), out, len);
+        }
+    }
+    len as u32
+}
+
+/// Get all depot IDs from Lua config (additional apps + depot keys)
+/// This collects all depot IDs that have keys or are configured as additional apps
+pub fn get_all_depot_ids() -> Vec<u32> {
+    let mut depots = Vec::new();
+
+    // Add depot IDs from depot_keys (depots with decryption keys)
+    for &did in read_lock(depot_keys()).keys() {
+        if !depots.contains(&did) {
+            depots.push(did);
+        }
+    }
+
+    // Add app IDs from spoofed_apps (additional apps / addappid)
+    for &aid in read_lock(spoofed_apps()).iter() {
+        if !depots.contains(&aid) {
+            depots.push(aid);
+        }
+    }
+
+    depots
+}
+
+/// Take pending depot additions from Lua config hot-reload
+pub fn take_pending_additions() -> Vec<u32> {
+    let mut additions = write_lock(pending_additions());
+    let result = additions.clone();
+    additions.clear();
+    result
+}
+
+/// Take pending depot removals from Lua config hot-reload
+pub fn take_pending_removals() -> Vec<u32> {
+    let mut removals = write_lock(pending_removals());
+    let result = removals.clone();
+    removals.clear();
+    result
+}
+
+/// Queue a depot addition from Lua config hot-reload
+pub fn queue_pending_addition(depot_id: u32) {
+    let mut additions = write_lock(pending_additions());
+    if !additions.contains(&depot_id) {
+        additions.push(depot_id);
+    }
+}
+
+/// Queue a depot removal from Lua config hot-reload
+pub fn queue_pending_removal(depot_id: u32) {
+    let mut removals = write_lock(pending_removals());
+    if !removals.contains(&depot_id) {
+        removals.push(depot_id);
+    }
+}
+
 /// Exported C reader for additional apps check
 #[no_mangle]
 pub extern "C" fn is_additional_app_c(app_id: u32) -> bool {
     is_additional_app(app_id)
+}
+
+/// Exported C function to get all depot IDs
+#[no_mangle]
+pub extern "C" fn get_all_depot_ids_c(out: *mut u32, max_len: u32) -> u32 {
+    let depots = get_all_depot_ids();
+    let len = depots.len().min(max_len as usize);
+    if !out.is_null() && len > 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(depots.as_ptr(), out, len);
+        }
+    }
+    len as u32
+}
+
+/// Exported C function to take pending additions
+#[no_mangle]
+pub extern "C" fn take_pending_additions_c(out: *mut u32, max_len: u32) -> u32 {
+    let additions = take_pending_additions();
+    let len = additions.len().min(max_len as usize);
+    if !out.is_null() && len > 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(additions.as_ptr(), out, len);
+        }
+    }
+    len as u32
+}
+
+/// Exported C function to take pending removals
+#[no_mangle]
+pub extern "C" fn take_pending_removals_c(out: *mut u32, max_len: u32) -> u32 {
+    let removals = take_pending_removals();
+    let len = removals.len().min(max_len as usize);
+    if !out.is_null() && len > 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(removals.as_ptr(), out, len);
+        }
+    }
+    len as u32
 }
 
 /// Exported C reader for legacy CD keys

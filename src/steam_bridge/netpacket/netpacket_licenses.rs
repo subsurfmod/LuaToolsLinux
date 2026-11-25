@@ -311,6 +311,37 @@ pub fn is_licenses_hook_active() -> bool {
     LICENSES_ACTIVE.load(Ordering::Acquire)
 }
 
+/// IPC adapter for Recv: CMsgClientLicenseList (780)
+/// Parses the license list from the NetPacket frame and feeds to Package 0 system.
+pub fn handle_recv_client_license_list_post_ipc(ctx: &mut crate::steam_bridge::netpacket::netpacket_core::NetPacketContext) -> Result<(), String> {
+    // The protobuf body starts at body_offset
+    let body = &ctx.frame_buffer[ctx.body_offset..];
+
+    if body.is_empty() {
+        log::debug!("Licenses: empty body received");
+        return Ok(());
+    }
+
+    let licenses = parse_client_license_list(body);
+
+    if !licenses.is_empty() {
+        log::info!("Licenses: parsed {} license(s) from CMsgClientLicenseList", licenses.len());
+        for lic in &licenses {
+            log::debug!("Licenses: package_id={}, access_token={}", lic.package_id, lic.access_token);
+        }
+
+        // Feed to Package 0 system
+        on_license_list(licenses);
+
+        // Try to dump owned depots now that we have licenses
+        try_dump_owned_depots();
+    } else {
+        log::debug!("Licenses: no licenses found in CMsgClientLicenseList");
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

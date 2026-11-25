@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.2.4] - 2026-11-25
+
+### 0B Install Issue Fix & Steamflatline Native Port Complete
+- **License NetPacket Handler** (`src/steam_bridge/netpacket/netpacket_core.rs`): Fixed STUB handler for eMsg 780 (CMsgClientLicenseList) to actually call `netpacket_licenses::handle_recv_client_license_list_post_ipc()` for processing licenses.
+- **Depot ID Resolution** (`src/steam_bridge/interop/bridge_lib.rs`, `interop_package.rs`): Implemented `get_all_depot_ids()` to collect depot IDs from Lua config (`addappid` directives), SLSsteam config (`additional_apps`), and GUI-managed bridge overrides. Added `take_pending_additions/removals()` for dynamic license updates.
+- **Manifest Hooks** (`src/steam_bridge/manifest_hooks.rs`): Fixed `BuildDepotDependency` and `YldLoadDepotManifest` hook installation - now properly resolves runtime addresses and installs 14-byte RIP-relative JMP patches.
+- **Steamflatline Native Port** (`src/steamflatline/`): Completed all SteamStub variant unpackers (v1.0, v2.0, v2.1, v3.0, v3.1 for x86 and x64) with proper PE parsing, XOR, XTEA, AES-256-CBC crypto.
+- **XTEA Implementation**: Verified XTEA pass1/pass2 decryption matches Steamless behavior.
+- **AES IV Rebuild**: Fixed `aes_rebuild_iv()` to match Steamless `AesHelper.RebuildIv()` behavior.
+- **Version Bump**: Updated to v3.2.4 to avoid updater breakage.
+
+---
+
 ## [3.2.3] - 2026-11-25
 
 ### v3.2.2 Audit Findings Fixed & Steamless Integration

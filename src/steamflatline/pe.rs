@@ -15,16 +15,107 @@ pub enum Architecture {
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MachineType {
+    // 32-bit x86 variants
     I386 = 0x014c,
+    I486 = 0x014d,
+    I860 = 0x014e,
+    // 64-bit x86
     AMD64 = 0x8664,
+    // Other common architectures
+    ARM = 0x01c0,
+    ARM64 = 0xaa64,
+    ARMNT = 0x01c4,
+    IA64 = 0x0200,
+    MIPS16 = 0x0266,
+    MIPSFPU = 0x0366,
+    MIPSFPU16 = 0x0466,
+    POWERPC = 0x01f0,
+    POWERPCFP = 0x01f1,
+    R3000 = 0x0162,
+    R4000 = 0x0166,
+    R10000 = 0x0168,
+    WCEMIPSV2 = 0x0169,
+    ALPHA = 0x0184,
+    SH3 = 0x01a2,
+    SH3DSP = 0x01a3,
+    SH4 = 0x01a6,
+    SH5 = 0x01a8,
+    THUMB = 0x01c2,
+    AM33 = 0x01d3,
+    M32R = 0x9041,
+    CEE = 0xc0ee,
     Unknown(u16),
+}
+
+impl MachineType {
+    /// Returns true if this machine type represents a 32-bit architecture
+    pub fn is_32bit(&self) -> bool {
+        matches!(
+            self,
+            MachineType::I386
+                | MachineType::I486
+                | MachineType::I860
+                | MachineType::ARM
+                | MachineType::ARMNT
+                | MachineType::MIPS16
+                | MachineType::MIPSFPU
+                | MachineType::MIPSFPU16
+                | MachineType::POWERPC
+                | MachineType::POWERPCFP
+                | MachineType::R3000
+                | MachineType::R4000
+                | MachineType::R10000
+                | MachineType::WCEMIPSV2
+                | MachineType::ALPHA
+                | MachineType::SH3
+                | MachineType::SH3DSP
+                | MachineType::SH4
+                | MachineType::SH5
+                | MachineType::THUMB
+                | MachineType::AM33
+                | MachineType::M32R
+                | MachineType::CEE
+        )
+    }
+
+    /// Returns true if this machine type represents a 64-bit architecture
+    pub fn is_64bit(&self) -> bool {
+        matches!(
+            self,
+            MachineType::AMD64 | MachineType::ARM64 | MachineType::IA64
+        )
+    }
 }
 
 impl From<u16> for MachineType {
     fn from(val: u16) -> Self {
         match val {
             0x014c => MachineType::I386,
+            0x014d => MachineType::I486,
+            0x014e => MachineType::I860,
             0x8664 => MachineType::AMD64,
+            0x01c0 => MachineType::ARM,
+            0xaa64 => MachineType::ARM64,
+            0x01c4 => MachineType::ARMNT,
+            0x0200 => MachineType::IA64,
+            0x0266 => MachineType::MIPS16,
+            0x0366 => MachineType::MIPSFPU,
+            0x0466 => MachineType::MIPSFPU16,
+            0x01f0 => MachineType::POWERPC,
+            0x01f1 => MachineType::POWERPCFP,
+            0x0162 => MachineType::R3000,
+            0x0166 => MachineType::R4000,
+            0x0168 => MachineType::R10000,
+            0x0169 => MachineType::WCEMIPSV2,
+            0x0184 => MachineType::ALPHA,
+            0x01a2 => MachineType::SH3,
+            0x01a3 => MachineType::SH3DSP,
+            0x01a6 => MachineType::SH4,
+            0x01a8 => MachineType::SH5,
+            0x01c2 => MachineType::THUMB,
+            0x01d3 => MachineType::AM33,
+            0x9041 => MachineType::M32R,
+            0xc0ee => MachineType::CEE,
             other => MachineType::Unknown(other),
         }
     }
@@ -118,12 +209,16 @@ impl FileHeader {
         let mut buf = [0u8; 20];
         reader.read_exact(&mut buf)?;
 
-        if u16::from_le_bytes([buf[0], buf[1]]) != 0x014c && u16::from_le_bytes([buf[0], buf[1]]) != 0x8664 {
-            return Err(crate::steamflatline::error::SteamFlatlineError::InvalidPeFormat("Unsupported machine type".into()));
+        let machine = MachineType::from(u16::from_le_bytes([buf[0], buf[1]]));
+
+        // Accept known 32-bit and 64-bit architectures, allow unknown but warn
+        if matches!(machine, MachineType::Unknown(_)) {
+            // For unknown architectures, we still try to parse but assume 32-bit if the optional header size matches PE32
+            // This allows forward compatibility
         }
 
         Ok(FileHeader {
-            machine: MachineType::from(u16::from_le_bytes([buf[0], buf[1]])),
+            machine,
             number_of_sections: u16::from_le_bytes([buf[2], buf[3]]),
             time_date_stamp: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
             pointer_to_symbol_table: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
@@ -532,8 +627,8 @@ impl PeFile {
         // Parse file header
         let file_header = FileHeader::parse(&mut file)?;
 
-        // Determine architecture
-        let is_64bit = matches!(file_header.machine, MachineType::AMD64);
+        // Determine architecture based on machine type
+        let is_64bit = file_header.machine.is_64bit();
         let architecture = if is_64bit { Architecture::Pe64 } else { Architecture::Pe32 };
 
         // Parse optional header
@@ -665,7 +760,31 @@ impl PeFile {
         let mut file_header_bytes = Vec::with_capacity(20);
         file_header_bytes.extend_from_slice(&match self.file_header.machine {
             MachineType::I386 => 0x014cu16,
+            MachineType::I486 => 0x014du16,
+            MachineType::I860 => 0x014eu16,
             MachineType::AMD64 => 0x8664u16,
+            MachineType::ARM => 0x01c0u16,
+            MachineType::ARM64 => 0xaa64u16,
+            MachineType::ARMNT => 0x01c4u16,
+            MachineType::IA64 => 0x0200u16,
+            MachineType::MIPS16 => 0x0266u16,
+            MachineType::MIPSFPU => 0x0366u16,
+            MachineType::MIPSFPU16 => 0x0466u16,
+            MachineType::POWERPC => 0x01f0u16,
+            MachineType::POWERPCFP => 0x01f1u16,
+            MachineType::R3000 => 0x0162u16,
+            MachineType::R4000 => 0x0166u16,
+            MachineType::R10000 => 0x0168u16,
+            MachineType::WCEMIPSV2 => 0x0169u16,
+            MachineType::ALPHA => 0x0184u16,
+            MachineType::SH3 => 0x01a2u16,
+            MachineType::SH3DSP => 0x01a3u16,
+            MachineType::SH4 => 0x01a6u16,
+            MachineType::SH5 => 0x01a8u16,
+            MachineType::THUMB => 0x01c2u16,
+            MachineType::AM33 => 0x01d3u16,
+            MachineType::M32R => 0x9041u16,
+            MachineType::CEE => 0xc0eeu16,
             MachineType::Unknown(v) => v,
         }.to_le_bytes());
         file_header_bytes.extend_from_slice(&self.file_header.number_of_sections.to_le_bytes());

@@ -8,13 +8,15 @@
 //! using 14-byte RIP-relative indirect jumps.
 
 use std::collections::HashMap;
+use std::os::raw::c_void;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
 
 use super::binary_reader::{BinaryFile, LoadedModuleMapping};
-use super::memory_patch::JMP_ABS64_LEN;
+use super::memory_patch::{self, MemoryPatch, JMP_ABS64_LEN};
 use super::pattern_db::{BinaryComponent, PatternChannel, PatternDb, PatternFile};
 
 /// Manifest override configuration.
@@ -28,6 +30,35 @@ impl ManifestOverride {
     pub fn new(gid: u64, size: Option<u64>) -> Self {
         Self { gid, size }
     }
+}
+
+/// Function pointer type for `BuildDepotDependency`:
+/// `void BuildDepotDependency(void* this, DepotEntry* entries, int count, ...)`
+type BuildDepotDependencyFn = unsafe extern "C" fn(*mut c_void, *mut DepotEntry, i32, ...) -> i64;
+
+/// Function pointer type for `YldLoadDepotManifest`:
+/// `bool YldLoadDepotManifest(void* this, u32 depot_id, u64 gid, ...)`
+type YldLoadDepotManifestFn = unsafe extern "C" fn(*mut c_void, u32, u64, ...) -> bool;
+
+/// Storage for original function pointers.
+static ORIGINAL_BUILD_DEPOT_DEPENDENCY: OnceLock<Mutex<Option<BuildDepotDependencyFn>>> =
+    OnceLock::new();
+static ORIGINAL_YLD_LOAD_DEPOT_MANIFEST: OnceLock<Mutex<Option<YldLoadDepotManifestFn>>> =
+    OnceLock::new();
+
+/// Storage for installed memory patches.
+static INSTALLED_MANIFEST_PATCHES: OnceLock<Mutex<Vec<MemoryPatch>>> = OnceLock::new();
+
+fn original_build_depot_dependency() -> &'static Mutex<Option<BuildDepotDependencyFn>> {
+    ORIGINAL_BUILD_DEPOT_DEPENDENCY.get_or_init(|| Mutex::new(None))
+}
+
+fn original_yld_load_depot_manifest() -> &'static Mutex<Option<YldLoadDepotManifestFn>> {
+    ORIGINAL_YLD_LOAD_DEPOT_MANIFEST.get_or_init(|| Mutex::new(None))
+}
+
+fn installed_manifest_patches() -> &'static Mutex<Vec<MemoryPatch>> {
+    INSTALLED_MANIFEST_PATCHES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 /// Global manifest overrides registry.
@@ -348,12 +379,157 @@ fn resolve_hook_target(
     client.vaddr_to_runtime_addr(vaddr, mapping, JMP_ABS64_LEN)
 }
 
-fn install_build_depot_hook(target_addr: u64) -> bool {
-    target_addr != 0
+/// Replacement function for `BuildDepotDependency`.
+/// This intercepts the call, applies manifest overrides, then calls the original.
+unsafe extern "C" fn build_depot_dependency_replacement(
+    this: *mut c_void,
+    entries: *mut DepotEntry,
+    count: i32,
+    _: ...
+) -> i64 {
+    panic::catch_unwind(AssertUnwindSafe(|| {
+        if !entries.is_null() && count > 0 {
+            let slice = std::slice::from_raw_parts_mut(entries, count as usize);
+            apply_depot_overrides(slice);
+        }
+
+        let orig = *original_build_depot_dependency()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(orig_fn) = orig {
+            return unsafe { orig_fn(this, entries, count) };
+        }
+        0
+    }))
+    .unwrap_or(0)
 }
 
-fn install_manifest_load_hook(target_addr: u64, steam_root: &std::path::Path) -> bool {
-    target_addr != 0 && !steam_root.as_os_str().is_empty()
+/// Replacement function for `YldLoadDepotManifest`.
+/// This pre-seeds the manifest cache and calls the original.
+unsafe extern "C" fn yld_load_depot_manifest_replacement(
+    this: *mut c_void,
+    depot_id: u32,
+    gid: u64,
+    _: ...
+) -> bool {
+    panic::catch_unwind(AssertUnwindSafe(|| {
+        // Pre-seed: check if manifest is already cached
+        let steam_root = std::env::var("STEAM_ROOT").ok().map(std::path::PathBuf::from);
+        if let Some(root) = steam_root {
+            if !ensure_manifest_cached(&root, 0, depot_id, gid) {
+                log::debug!("[manifest] YldLoadDepotManifest: pre-seed for depot={} gid={}", depot_id, gid);
+            }
+        }
+
+        let orig = *original_yld_load_depot_manifest()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(orig_fn) = orig {
+            return unsafe { orig_fn(this, depot_id, gid) };
+        }
+        false
+    }))
+    .unwrap_or(false)
+}
+
+fn install_build_depot_hook(target_addr: u64) -> bool {
+    if target_addr == 0 {
+        return false;
+    }
+
+    // Install the memory patch
+    let patch = unsafe {
+        memory_patch::patch_by_offset(
+            target_addr,
+            0,
+            build_depot_dependency_replacement as *const () as *mut u8,
+        )
+    };
+
+    match patch {
+        Ok(patch) => {
+            // Save the trampoline as the original function
+            if !patch.trampoline.is_null() {
+                unsafe {
+                    *original_build_depot_dependency()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(std::mem::transmute::<*mut u8, BuildDepotDependencyFn>(
+                            patch.trampoline,
+                        ));
+                }
+            }
+            installed_manifest_patches()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(patch);
+            log::info!("Installed BuildDepotDependency hook at 0x{:x}", target_addr);
+            true
+        }
+        Err(e) => {
+            log::warn!("Failed to install BuildDepotDependency hook: {}", e);
+            false
+        }
+    }
+}
+
+fn install_manifest_load_hook(target_addr: u64, _steam_root: &std::path::Path) -> bool {
+    if target_addr == 0 {
+        return false;
+    }
+
+    // Install the memory patch
+    let patch = unsafe {
+        memory_patch::patch_by_offset(
+            target_addr,
+            0,
+            yld_load_depot_manifest_replacement as *const () as *mut u8,
+        )
+    };
+
+    match patch {
+        Ok(patch) => {
+            // Save the trampoline as the original function
+            if !patch.trampoline.is_null() {
+                unsafe {
+                    *original_yld_load_depot_manifest()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(std::mem::transmute::<*mut u8, YldLoadDepotManifestFn>(
+                            patch.trampoline,
+                        ));
+                }
+            }
+            installed_manifest_patches()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(patch);
+            log::info!("Installed YldLoadDepotManifest hook at 0x{:x}", target_addr);
+            true
+        }
+        Err(e) => {
+            log::warn!("Failed to install YldLoadDepotManifest hook: {}", e);
+            false
+        }
+    }
+}
+
+/// Uninstall all manifest hooks and restore original functions.
+pub fn uninstall_manifest_hooks() -> Result<(), String> {
+    // Clear original function pointers
+    *original_build_depot_dependency()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+    *original_yld_load_depot_manifest()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+
+    // Uninstall all patches
+    let mut patches = installed_manifest_patches()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for mut patch in patches.drain(..) {
+        unsafe { patch.uninstall() }?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
