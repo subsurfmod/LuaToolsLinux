@@ -484,6 +484,11 @@ impl WiredService {
         fs::create_dir_all(&self.bin_dir)
             .map_err(|e| format!("Failed to create bin dir: {}", e))?;
         let wrapper = self.bin_dir.join("steam-sls");
+
+        // Build LD_PRELOAD with our integration library
+        let integration_lib = "/home/tejas/.local/lib/luatools/libsteam_integration.so";
+
+        // Build LD_AUDIT for SLSsteam (only library-inject.so to avoid 32-bit crashes with SLSsteam.so)
         let audit = if sls_dir.join("library-inject.so").is_file() {
             format!(
                 "{}:{}",
@@ -493,6 +498,7 @@ impl WiredService {
         } else {
             target_so.display().to_string()
         };
+
         let script = format!(
             "#!/usr/bin/env bash\n\
              # Auto-start LuaTools companion in background minimized to tray if available (LT-20)\n\
@@ -501,9 +507,13 @@ impl WiredService {
              elif [ -x \"$HOME/.local/bin/luatools\" ]; then\n\
                  \"$HOME/.local/bin/luatools\" --minimized --tray-locked &\n\
              fi\n\
-             export LD_AUDIT=\"{}\"\n\
+             # Include LuaTools integration library via LD_PRELOAD\n\
+             export LD_PRELOAD=\"{integration_lib}${{LD_PRELOAD:+:$LD_PRELOAD}}\"\n\
+             # SLSsteam via LD_AUDIT (only library-inject.so to avoid 32-bit crashes with SLSsteam.so)\n\
+             export LD_AUDIT=\"{audit}\"\n\
              exec steam \"$@\"\n",
-            audit
+            integration_lib = integration_lib,
+            audit = audit
         );
         fs::write(&wrapper, script)
             .map_err(|e| format!("Failed to write steam-sls wrapper: {}", e))?;
