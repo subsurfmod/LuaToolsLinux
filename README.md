@@ -4,7 +4,7 @@
   <p><strong>Add Steam games, set up SLSsteam, manage DLC &amp; depots, and apply game fixes on Linux.</strong></p>
   <p>
     <a href="https://github.com/subsurfmod/LuaToolsLinux/releases/latest">
-      <img src="https://img.shields.io/badge/DOWNLOAD%20v3.2.6-1A3A6B?style=for-the-badge&logo=github&logoColor=white" alt="Download v3.2.6">
+      <img src="https://img.shields.io/badge/DOWNLOAD%20v3.2.7-1A3A6B?style=for-the-badge&logo=github&logoColor=white" alt="Download v3.2.7">
     </a>
   </p>
 </div>

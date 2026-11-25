@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.2.7] - 2026-11-25
+
+### Steam Launcher Fixes & Depot Download Improvements
+- **Steam Launcher LD_PRELOAD Export** (`src/steam_bridge/preload_loader.rs`): Fixed launcher script to properly export `LD_PRELOAD` with our integration library (`libsteam_integration.so`). Previously `NEW_LD_PRELOAD` was computed but never exported, causing the bridge library not to load.
+- **LD_AUDIT Conflict Resolution** (`src/steam_bridge/preload_loader.rs`): Only use `LD_AUDIT` with SLSsteam libraries when not using `LD_PRELOAD` for our integration, preventing "wrong ELF class: ELFCLASS64" crashes on 32-bit Steam wrappers.
+- **DepotDownloader Auth Error Handling** (`src/services/depot_downloader.rs`): Added handling for `SteamKit2.AsyncJobFailedException` and authentication failures with clear user guidance to click 'Sign In (QR)'.
+- **UI Steam State Button** (`src/ui/app.rs`): Top-right button now correctly shows "Launch Steam" / "Restart Steam" / "Setup Steam" / "Rescan Steam" based on Steam running state and integration readiness. "Kill Steam" button available in Integration tab.
+- **Version Bump**: Updated to v3.2.7 to avoid updater breakage.
+
+---
+
 ## [3.2.6] - 2026-11-25
 
 ### v3.2.2 Audit Complete Fix & Steamless Native Integration
