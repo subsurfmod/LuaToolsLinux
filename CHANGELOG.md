@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.2.8] - 2026-11-26
+
+### Package 0 License Synthesis & Depot Download Fixes
+- **Package 0 DepotIdVec Population** (`src/steam_bridge/interop/interop_package.rs`): Fixed `init_fake_license_once()` and `notify_license_changed()` to populate BOTH `AppIdVec` (for license ownership checks) AND `DepotIdVec` (for Steam's content system to recognize downloadable depots). This fixes the "0B install" issue where games showed as owned but files couldn't be downloaded.
+- **Enhanced `has_depot()` Check** (`src/steam_bridge/interop/interop_package.rs`): Now checks both the owned depots cache AND Package 0's DepotIdVec directly, ensuring Lua-unlocked depots are recognized as downloadable.
+- **Cached Lua Entries** (`bridge_lib/src/lib.rs`): Added `update_cached_lua_entries()` during `load_persisted_state()` to collect all depot IDs from parsed `stplug-in/*.lua` files, ensuring `get_all_depot_ids()` includes all Lua-configured depots.
+- **7z Path Traversal Fix** (`src/services/wired_service.rs`): Fixed false positive rejection of legitimate files like `docs/LICENSE` by only matching actual path traversal patterns (`../`, `..\`, `/../`, `\..\`, `..` at start/end) instead of any `..` substring.
+- **DepotDownloader `-remember-password` Fix** (`src/services/depot_downloader.rs`): Fixed conditional logic - now only includes `-remember-password` when a username is provided; for anonymous login uses only `-qr` flag.
+- **Version Bump**: Updated to v3.2.8 to avoid updater breakage.
+
+---
+
+## [3.2.7] - 2026-11-25
+
+All notable changes to **LuaTools Linux** are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+---
+
 ## [3.2.7] - 2026-11-25
 
 ### Steam Launcher Fixes & Depot Download Improvements

@@ -664,7 +664,17 @@ pub fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
             for line in listing.lines() {
                 // Check for actual path traversal patterns (../ or ..\ as path components)
                 // Not just ".." anywhere in the filename (e.g., "docs/LICENSE" contains ".." in "LICENSE")
-                if line.contains("/../") || line.contains("\\..\\") || line.contains("../") || line.contains("..\\") {
+                // Only flag if it's a path component: starts with ../ or ..\, or contains /../ or \..\ or ends with /.. or \..
+                let is_traversal = line.starts_with("../")
+                    || line.starts_with("..\\")
+                    || line.contains("/../")
+                    || line.contains("\\..\\")
+                    || line.ends_with("/..")
+                    || line.ends_with("\\..")
+                    || line == ".."
+                    || line == "../"
+                    || line == "..\\";
+                if is_traversal {
                     return Err(format!("Rejected unsafe path-traversal entry in 7z: {}", line.trim()));
                 }
             }

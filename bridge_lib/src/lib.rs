@@ -788,8 +788,10 @@ fn load_persisted_state(steam_root: &Path) {
                 .unwrap_or(0);
             if let Ok(txt) = fs::read_to_string(&p) {
                 let parsed = LuaFileParser::parse_text(&txt, base_id);
+                let mut lua_depot_ids = Vec::new();
                 if base_id > 0 {
                     write_lock(spoofed_apps()).insert(base_id);
+                    lua_depot_ids.push(base_id);
                 }
                 for item in parsed.entries {
                     if item.has_key() {
@@ -799,11 +801,19 @@ fn load_persisted_state(steam_root: &Path) {
                     } else if item.id > 0 {
                         write_lock(spoofed_apps()).insert(item.id);
                     }
+                    // Collect all depot IDs from Lua entries
+                    if item.id > 0 {
+                        lua_depot_ids.push(item.id);
+                    }
                     if let Some(mid) = item.manifest_id {
                         if base_id > 0 {
                             write_lock(manifest_pins()).insert((base_id, item.id), mid);
                         }
                     }
+                }
+                // Update cached Lua entries for get_all_depot_ids
+                if !lua_depot_ids.is_empty() {
+                    update_cached_lua_entries(lua_depot_ids);
                 }
                 for (aid, tok) in parsed.tokens {
                     write_lock(cached_tickets()).entry(aid).or_insert_with(|| AppTicketData {
@@ -1714,8 +1724,8 @@ pub extern "C" fn get_additional_apps_c(out: *mut u32, max_len: u32) -> u32 {
     len as u32
 }
 
-/// Get all depot IDs from Lua config (additional apps + depot keys)
-/// This collects all depot IDs that have keys or are configured as additional apps
+/// Get all depot IDs from Lua config (additional apps + depot keys + Lua entries)
+/// This collects all depot IDs that should be injected into Package 0 to make them appear owned.
 pub fn get_all_depot_ids() -> Vec<u32> {
     let mut depots = Vec::new();
 
@@ -1733,7 +1743,35 @@ pub fn get_all_depot_ids() -> Vec<u32> {
         }
     }
 
+    // Add depot IDs from cached Lua config entries (stplug-in/*.lua files parsed at load time)
+    // These are depots that have keys or are entitlements in the Lua manifests
+    if let Ok(cached_entries) = read_cached_lua_entries() {
+        for &did in &cached_entries {
+            if !depots.contains(&did) {
+                depots.push(did);
+            }
+        }
+    }
+
     depots
+}
+
+/// Cached depot IDs from Lua config entries (stplug-in/*.lua files)
+static CACHED_LUA_ENTRIES: OnceLock<RwLock<Vec<u32>>> = OnceLock::new();
+
+fn cached_lua_entries() -> &'static RwLock<Vec<u32>> {
+    CACHED_LUA_ENTRIES.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+fn read_cached_lua_entries() -> Result<Vec<u32>, String> {
+    Ok(read_lock(cached_lua_entries()).clone())
+}
+
+/// Update cached Lua entries from parsed stplug-in Lua files
+/// Called during load_persisted_state to sync all depot IDs from Lua configs
+fn update_cached_lua_entries(depot_ids: Vec<u32>) {
+    let mut entries = write_lock(cached_lua_entries());
+    *entries = depot_ids;
 }
 
 /// Take pending depot additions from Lua config hot-reload

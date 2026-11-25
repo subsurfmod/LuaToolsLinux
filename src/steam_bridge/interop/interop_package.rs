@@ -272,9 +272,34 @@ pub fn get_owned_depots() -> (bool, Vec<u32>) {
 }
 
 /// Check if a depot is owned by the user.
+/// Checks both the owned depots cache (from license list) and Package 0's DepotIdVec.
 pub fn has_depot(depot_id: u32) -> bool {
-    let depots = owned_depots().lock().unwrap_or_else(|e| e.into_inner());
-    depots.contains(&depot_id)
+    // First check the owned depots cache
+    {
+        let depots = owned_depots().lock().unwrap_or_else(|e| e.into_inner());
+        if depots.contains(&depot_id) {
+            return true;
+        }
+    }
+
+    // Also check Package 0's DepotIdVec directly (injected depots)
+    let get_pkg_info_opt = *original_get_package_info()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(get_pkg_info) = get_pkg_info_opt {
+        let pkg_ptr = unsafe { get_pkg_info(0, K_INJECTED_PACKAGE_ID, K_INJECTED_PKG_ACCESS_TOKEN) };
+        if pkg_ptr != 0 {
+            let pkg = unsafe { &*(pkg_ptr as *const PackageInfo) };
+            for i in 0..pkg.depot_id_vec.size {
+                let id = unsafe { *pkg.depot_id_vec.memory.memory.add(i as usize) };
+                if id == depot_id {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 /// Check if an AppID is in additional_apps (Lua-unlocked, configured via addappid).
@@ -424,14 +449,15 @@ fn init_fake_license_once(pkg_ptr: usize) -> bool {
         return false;
     }
 
-    // Get depot IDs from Lua config (this would be populated by the Lua config system)
-    let app_ids = get_all_depot_ids();
-    if !app_ids.is_empty() {
-        let old_size = pkg.app_id_vec.size;
-        let num_to_add = app_ids.len() as i32;
+    // Get all depot IDs from Lua config (depot keys + additional apps + Lua entries)
+    let depot_ids = get_all_depot_ids();
+    if !depot_ids.is_empty() {
+        // Add to AppIdVec (for license ownership checks)
+        let old_app_size = pkg.app_id_vec.size;
+        let num_app_to_add = depot_ids.len() as i32;
         log::info!(
-            "[InteropPackage] InitFakeLicense(PackageId={}): adding {} apps, oldSize={}",
-            K_INJECTED_PACKAGE_ID, num_to_add, old_size
+            "[InteropPackage] InitFakeLicense(PackageId={}): adding {} apps to AppIdVec, oldSize={}",
+            K_INJECTED_PACKAGE_ID, num_app_to_add, old_app_size
         );
 
         let cutl_grow = match *original_cutl_memory_grow()
@@ -446,15 +472,36 @@ fn init_fake_license_once(pkg_ptr: usize) -> bool {
         };
 
         let vec_ptr = &mut pkg.app_id_vec as *mut _ as usize;
-        let result = unsafe { cutl_grow(vec_ptr, num_to_add) };
+        let result = unsafe { cutl_grow(vec_ptr, num_app_to_add) };
         if result == 0 {
             log::warn!("[InteropPackage] InitFakeLicense: failed to grow AppId vector");
             return false;
         }
 
-        for (i, &app_id) in app_ids.iter().enumerate() {
+        for (i, &app_id) in depot_ids.iter().enumerate() {
             unsafe {
-                *pkg.app_id_vec.memory.memory.add(old_size as usize + i) = app_id;
+                *pkg.app_id_vec.memory.memory.add(old_app_size as usize + i) = app_id;
+            }
+        }
+
+        // Also add to DepotIdVec (for content system to recognize downloadable depots)
+        let old_depot_size = pkg.depot_id_vec.size;
+        let num_depot_to_add = depot_ids.len() as i32;
+        log::info!(
+            "[InteropPackage] InitFakeLicense(PackageId={}): adding {} depots to DepotIdVec, oldSize={}",
+            K_INJECTED_PACKAGE_ID, num_depot_to_add, old_depot_size
+        );
+
+        let depot_vec_ptr = &mut pkg.depot_id_vec as *mut _ as usize;
+        let result = unsafe { cutl_grow(depot_vec_ptr, num_depot_to_add) };
+        if result == 0 {
+            log::warn!("[InteropPackage] InitFakeLicense: failed to grow DepotId vector");
+            return false;
+        }
+
+        for (i, &depot_id) in depot_ids.iter().enumerate() {
+            unsafe {
+                *pkg.depot_id_vec.memory.memory.add(old_depot_size as usize + i) = depot_id;
             }
         }
     }
@@ -549,6 +596,21 @@ pub fn notify_license_changed() {
                 break;
             }
         }
+        // Also remove from DepotIdVec
+        if pkg.depot_id_vec.memory.memory.is_null() || pkg.depot_id_vec.size == 0 {
+            continue;
+        }
+        for i in 0..pkg.depot_id_vec.size {
+            if unsafe { *pkg.depot_id_vec.memory.memory.add(i as usize) } == *id {
+                unsafe {
+                    *pkg.depot_id_vec.memory.memory.add(i as usize) =
+                        *pkg.depot_id_vec.memory.memory.add((pkg.depot_id_vec.size - 1) as usize);
+                }
+                pkg.depot_id_vec.size -= 1;
+                log::debug!("[InteropPackage] NotifyLicenseChanged: removed DepotId {}", id);
+                break;
+            }
+        }
     }
 
     // Process additions
@@ -556,7 +618,8 @@ pub fn notify_license_changed() {
     let mut added_ids = std::collections::HashSet::new();
     log::debug!("[InteropPackage] NotifyLicenseChanged: processing {} additions", additions.len());
     if !additions.is_empty() {
-        let old_size = pkg.app_id_vec.size;
+        // Add to AppIdVec
+        let old_app_size = pkg.app_id_vec.size;
         let cutl_grow = match *original_cutl_memory_grow()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -573,13 +636,28 @@ pub fn notify_license_changed() {
         if result != 0 {
             for (i, &app_id) in additions.iter().enumerate() {
                 unsafe {
-                    *pkg.app_id_vec.memory.memory.add(old_size as usize + i) = app_id;
+                    *pkg.app_id_vec.memory.memory.add(old_app_size as usize + i) = app_id;
                 }
                 added_ids.insert(app_id);
-                log::debug!("[InteropPackage] NotifyLicenseChanged: inserted AppId {} at [{}]", app_id, old_size + i as u32);
+                log::debug!("[InteropPackage] NotifyLicenseChanged: inserted AppId {} at [{}]", app_id, old_app_size + i as u32);
             }
         } else {
             log::warn!("[InteropPackage] NotifyLicenseChanged: failed to grow AppId vector for additions");
+        }
+
+        // Also add to DepotIdVec
+        let old_depot_size = pkg.depot_id_vec.size;
+        let depot_vec_ptr = &mut pkg.depot_id_vec as *mut _ as usize;
+        let result = unsafe { cutl_grow(depot_vec_ptr, additions.len() as i32) };
+        if result != 0 {
+            for (i, &depot_id) in additions.iter().enumerate() {
+                unsafe {
+                    *pkg.depot_id_vec.memory.memory.add(old_depot_size as usize + i) = depot_id;
+                }
+                log::debug!("[InteropPackage] NotifyLicenseChanged: inserted DepotId {} at [{}]", depot_id, old_depot_size + i as u32);
+            }
+        } else {
+            log::warn!("[InteropPackage] NotifyLicenseChanged: failed to grow DepotId vector for additions");
         }
     }
 

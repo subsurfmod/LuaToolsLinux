@@ -344,8 +344,9 @@ impl DepotDownloaderService {
             args.push(clean_user.to_string());
             args.push("-remember-password".to_string());
         } else {
+            // Only use -qr for anonymous login; -remember-password requires -username or explicit QR flow
+            // DepotDownloader requires -username when using -remember-password
             args.push("-qr".to_string());
-            args.push("-remember-password".to_string());
         }
         args
     }
@@ -682,6 +683,8 @@ impl DepotDownloaderService {
                 shell_quote(clean_user)
             ));
         } else {
+            // Only use -remember-password with -qr if we have a username or QR code
+            // DepotDownloader requires -username or -qr when using -remember-password
             shell_cmd.push_str(" -qr -remember-password");
         }
         let full_script = format!(
@@ -1028,7 +1031,8 @@ mod tests {
             .windows(2)
             .any(|w| w == ["-manifestfile", "/tmp/3321461_1669007755731719796.manifest"]));
         assert!(!args.iter().any(|a| a == "-username"));
-        assert!(args.iter().any(|a| a == "-remember-password"), "-remember-password should be used with -qr login");
+        // -remember-password requires -username, so for anonymous login we only use -qr
+        assert!(!args.iter().any(|a| a == "-remember-password"), "-remember-password should NOT be used without -username");
         assert!(args.iter().any(|a| a == "-qr"), "-qr should be present for anonymous login");
         assert!(args.windows(2).any(|w| w == ["-max-downloads", "8"]));
         assert!(args
