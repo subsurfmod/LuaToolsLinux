@@ -355,6 +355,48 @@ pub fn is_userstats_hook_active() -> bool {
     USERSTATS_ACTIVE.load(Ordering::Acquire)
 }
 
+/// IPC adapter for Send: Player.GetUserStats#1 (service method call)
+pub fn handle_send_get_user_stats_post_ipc(ctx: &mut crate::steam_bridge::netpacket::netpacket_core::NetPacketContext) -> Result<(), String> {
+    let mut ipc_ctx = crate::steam_bridge::interop::ipc::IpcContext {
+        pipe: std::ptr::null_mut(),
+        read_buffer: ctx.frame_buffer.clone(),
+        write_buffer: ctx.frame_buffer.clone(),
+        interface_id: crate::steam_bridge::interop::ipc::IpcInterface::IClientUser,
+        func_hash: crate::steam_bridge::interop::ipc::fnv1a_hash("GetUserStats"),
+        app_id: ctx.app_id,
+    };
+    handle_send_get_user_stats_post(&mut ipc_ctx);
+    ctx.frame_buffer = ipc_ctx.write_buffer;
+    Ok(())
+}
+
+/// IPC adapter for Send: ClientGetUserStats (legacy)
+pub fn handle_send_client_get_user_stats_post_ipc(ctx: &mut crate::steam_bridge::netpacket::netpacket_core::NetPacketContext) -> Result<(), String> {
+    let mut ipc_ctx = crate::steam_bridge::interop::ipc::IpcContext {
+        pipe: std::ptr::null_mut(),
+        read_buffer: ctx.frame_buffer.clone(),
+        write_buffer: ctx.frame_buffer.clone(),
+        interface_id: crate::steam_bridge::interop::ipc::IpcInterface::IClientUser,
+        func_hash: crate::steam_bridge::interop::ipc::fnv1a_hash("ClientGetUserStats"),
+        app_id: ctx.app_id,
+    };
+    handle_send_client_get_user_stats_post(&mut ipc_ctx);
+    ctx.frame_buffer = ipc_ctx.write_buffer;
+    Ok(())
+}
+
+/// IPC adapter for Recv: Player.GetUserStats#1 response
+pub fn handle_recv_get_user_stats_response_ipc(ctx: &mut crate::steam_bridge::netpacket::netpacket_core::NetPacketContext) -> Result<(), String> {
+    handle_recv_get_user_stats_response(&mut ctx.frame_buffer, ctx.app_id);
+    Ok(())
+}
+
+/// IPC adapter for Recv: ClientGetUserStatsResponse
+pub fn handle_recv_client_get_user_stats_response_ipc(ctx: &mut crate::steam_bridge::netpacket::netpacket_core::NetPacketContext) -> Result<(), String> {
+    handle_recv_client_get_user_stats_response(&mut ctx.frame_buffer, ctx.app_id);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

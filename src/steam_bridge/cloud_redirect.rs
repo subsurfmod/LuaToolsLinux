@@ -316,6 +316,22 @@ impl Default for CloudRedirectHost {
     }
 }
 
+// Global instance for inter-module access
+static CLOUD_REDIRECT_HOST: std::sync::OnceLock<CloudRedirectHost> = std::sync::OnceLock::new();
+
+/// Get or create the global CloudRedirectHost instance
+pub fn get_cloud_redirect_host() -> &'static CloudRedirectHost {
+    CLOUD_REDIRECT_HOST.get_or_init(CloudRedirectHost::new)
+}
+
+pub fn set_account_id(account_id: u32) {
+    get_cloud_redirect_host().set_account_id(account_id);
+}
+
+pub fn notify_app_running(app_id: u32, running: bool) {
+    get_cloud_redirect_host().notify_app_running(app_id, running);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

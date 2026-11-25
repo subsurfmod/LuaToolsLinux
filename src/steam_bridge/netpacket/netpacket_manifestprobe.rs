@@ -309,6 +309,39 @@ pub fn expire_manifest_probe_stale() {
     probe.expire_stale();
 }
 
+/// IPC adapter for Send: ContentServerDirectory.GetManifestRequestCode#1
+pub fn handle_send_get_manifest_request_code(ctx: &mut crate::steam_bridge::netpacket::netpacket_core::NetPacketContext) -> Result<(), String> {
+    // The manifest probe handles send via capture_manifest_probe_context
+    // This is a placeholder for future send-side manipulation if needed
+    log::debug!("ManifestProbe Send: GetManifestRequestCode");
+
+    // Also call the manifest module's handler for async fetch
+    let body_offset = ctx.body_offset.min(ctx.frame_buffer.len());
+    let (hdr, body) = ctx.frame_buffer.split_at_mut(body_offset);
+    crate::steam_bridge::netpacket::netpacket_manifest::handle_send_get_manifest_request_code(hdr, body, None);
+
+    Ok(())
+}
+
+/// IPC adapter for Recv: ContentServerDirectory.GetManifestRequestCode#1 response
+pub fn handle_recv_get_manifest_request_code_response(ctx: &mut crate::steam_bridge::netpacket::netpacket_core::NetPacketContext) -> Result<(), String> {
+    // Extract job_id from the protobuf header (bytes 4-12 after MsgHdr)
+    if ctx.frame_buffer.len() < 20 {
+        return Ok(());
+    }
+    let job_id = u64::from_le_bytes([
+        ctx.frame_buffer[12], ctx.frame_buffer[13], ctx.frame_buffer[14], ctx.frame_buffer[15],
+        ctx.frame_buffer[16], ctx.frame_buffer[17], ctx.frame_buffer[18], ctx.frame_buffer[19],
+    ]);
+    let body = &ctx.frame_buffer[ctx.body_offset..];
+    let hdr = &ctx.frame_buffer[..ctx.body_offset.min(ctx.frame_buffer.len())];
+
+    if let Some(request_code) = handle_manifest_probe_recv(job_id, body, hdr) {
+        log::debug!("ManifestProbe Recv: Got request code 0x{:x}", request_code);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

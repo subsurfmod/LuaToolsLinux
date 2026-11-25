@@ -310,6 +310,12 @@ pub fn handle_recv_get_app_ownership_ticket_extended_data_response(
     );
 }
 
+/// IPC adapter for Recv: MsgClientGetAppOwnershipTicketResponse (858)
+pub fn handle_recv_get_app_ownership_ticket_response_ipc(ctx: &mut crate::steam_bridge::netpacket::netpacket_core::NetPacketContext) -> Result<(), String> {
+    handle_recv_get_app_ownership_ticket_response(&mut ctx.frame_buffer, ctx.app_id);
+    Ok(())
+}
+
 pub fn install_ownershipticket() -> Result<(), String> {
     register_ownershipticket_handlers();
     OWNERSHIPTICKET_ACTIVE.store(true, Ordering::Release);

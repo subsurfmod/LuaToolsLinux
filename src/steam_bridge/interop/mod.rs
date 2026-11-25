@@ -7,6 +7,8 @@ pub mod interop_ipc;
 pub mod interop_ipc_isteamuser;
 pub mod interop_ipc_isteamutils;
 pub mod interop_misc;
+pub mod interop_package;
+pub mod interop_steamui;
 pub mod ipc;
 
 pub use interop_ipc::{
@@ -26,9 +28,23 @@ pub use interop_ipc_isteamutils::{
 
 pub use interop_misc::{
     ensure_buffer_capacity, get_app_id_for_current_pipe, get_game_name_by_app_id,
-    install as interop_misc_install, is_online_fix_active, notify_networking_sockets_used,
+    install as interop_misc_install, is_online_fix_active, is_lua_unlocked, notify_networking_sockets_used,
     register_ipc_handlers, resolve_app_id, set_suppress_app_id_flip,
     should_report_online_fix_app_id,
+    FriendEntry, ClanData, OtherGameData, PersonaStateMsg,
+};
+
+pub use interop_package::{
+    install as interop_package_install, uninstall as interop_package_uninstall,
+    on_license_list, try_dump_owned_depots, get_owned_depots, has_depot,
+    notify_license_changed, K_INJECTED_PACKAGE_ID, K_INJECTED_PKG_ACCESS_TOKEN,
+    License, AppOwnership,
+};
+
+pub use interop_steamui::{
+    install as interop_steamui_install, uninstall as interop_steamui_uninstall,
+    queue_removal, cancel_removal, active_download_count,
+    EAppState, EAppOwnershipFlags, EAppChangeFlags, CSteamApp, CAppOverviewChange,
 };
 
 pub use ipc::{

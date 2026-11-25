@@ -362,6 +362,805 @@ pub fn get_game_name_by_app_id(app_id: u32) -> String {
     name
 }
 
+/// Check if an AppID is Lua-unlocked (in additional_apps, i.e., configured via addappid).
+/// This mirrors LuaConfig::HasDepot(appId) from Windows.
+pub fn is_lua_unlocked(app_id: u32) -> bool {
+    crate::steam_bridge::interop::interop_package::has_depot(app_id)
+}
+
+/// Friend entry in CMsgClientPersonaState.
+#[derive(Debug, Clone, Default)]
+pub struct FriendEntry {
+    pub friendid: Option<u64>,
+    pub persona_state: Option<u32>,
+    pub game_played_app_id: Option<u32>,
+    pub game_server_ip: Option<u32>,
+    pub game_server_port: Option<u32>,
+    pub persona_state_flags: Option<u32>,
+    pub online_session_instances: Option<u32>,
+    pub persona_set_by_user: Option<bool>,
+    pub player_name: Option<String>,
+    pub query_port: Option<u32>,
+    pub steamid_source: Option<u64>,
+    pub avatar_hash: Option<Vec<u8>>,
+    pub last_logoff: Option<u32>,
+    pub last_logon: Option<u32>,
+    pub last_seen_online: Option<u32>,
+    pub clan_rank: Option<u32>,
+    pub game_name: Option<String>,
+    pub gameid: Option<u64>,
+    pub game_data_blob: Option<Vec<u8>>,
+    pub clan_data: Option<ClanData>,
+    pub clan_tag: Option<String>,
+    pub rich_presence: Vec<(String, String)>,
+    pub broadcast_id: Option<u64>,
+    pub game_lobby_id: Option<u64>,
+    pub watching_broadcast_accountid: Option<u32>,
+    pub watching_broadcast_appid: Option<u32>,
+    pub watching_broadcast_viewers: Option<u32>,
+    pub watching_broadcast_title: Option<String>,
+    pub is_community_banned: Option<bool>,
+    pub player_name_pending_review: Option<bool>,
+    pub avatar_pending_review: Option<bool>,
+    pub on_steam_deck: Option<bool>,
+    pub other_game_data: Vec<OtherGameData>,
+    pub gaming_device_type: Option<u32>,
+}
+
+/// Clan data in CMsgClientPersonaState.
+#[derive(Debug, Clone, Default)]
+pub struct ClanData {
+    pub ogg_app_id: Option<u32>,
+    pub chat_group_id: Option<u64>,
+}
+
+/// Other game data in CMsgClientPersonaState.
+#[derive(Debug, Clone, Default)]
+pub struct OtherGameData {
+    pub gameid: Option<u64>,
+    pub rich_presence: Vec<(String, String)>,
+}
+
+/// CMsgClientPersonaState message for RichPresence handling.
+#[derive(Debug, Clone, Default)]
+pub struct PersonaStateMsg {
+    pub status_flags: u32,
+    pub friends: Vec<FriendEntry>,
+}
+
+impl PersonaStateMsg {
+    /// Parse CMsgClientPersonaState from protobuf body.
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        let mut msg = Self::default();
+        let mut pos = 0;
+        let size = data.len();
+
+        while pos < size {
+            if pos >= size { break; }
+            let tag = data[pos];
+            pos += 1;
+            let field_num = tag >> 3;
+            let wire_type = tag & 0x07;
+
+            if field_num == 1 && wire_type == 0 {
+                // status_flags (varint)
+                let (val, bytes) = decode_varint(&data[pos..])?;
+                msg.status_flags = val as u32;
+                pos += bytes;
+            } else if field_num == 2 && wire_type == 2 {
+                // friends (repeated length-delimited)
+                let (len, len_bytes) = decode_varint(&data[pos..])?;
+                pos += len_bytes;
+                if pos + len as usize > size {
+                    break;
+                }
+                let friend_data = &data[pos..pos + len as usize];
+                pos += len as usize;
+                if let Some(friend) = Self::parse_friend(friend_data) {
+                    msg.friends.push(friend);
+                }
+            } else {
+                // Skip unknown field
+                match wire_type {
+                    0 => { let _ = decode_varint(&data[pos..]); }
+                    1 => { if pos + 8 <= size { pos += 8; } }
+                    2 => {
+                        let (len, len_bytes) = decode_varint(&data[pos..])?;
+                        pos += len_bytes + len as usize;
+                    }
+                    5 => { if pos + 4 <= size { pos += 4; } }
+                    _ => break,
+                }
+            }
+        }
+        Some(msg)
+    }
+
+    fn parse_friend(data: &[u8]) -> Option<FriendEntry> {
+        let mut entry = FriendEntry::default();
+        let mut pos = 0;
+        let size = data.len();
+
+        while pos < size {
+            if pos >= size { break; }
+            let tag = data[pos];
+            pos += 1;
+            let field_num = tag >> 3;
+            let wire_type = tag & 0x07;
+
+            match (field_num, wire_type) {
+                (1, 0) => { // friendid (fixed64)
+                    let (val, bytes) = decode_varint(&data[pos..])?;
+                    entry.friendid = Some(val);
+                    pos += bytes;
+                }
+                (2, 0) => { // persona_state
+                    let (val, bytes) = decode_varint(&data[pos..])?;
+                    entry.persona_state = Some(val as u32);
+                    pos += bytes;
+                }
+                (3, 0) => { // game_played_app_id
+                    let (val, bytes) = decode_varint(&data[pos..])?;
+                    entry.game_played_app_id = Some(val as u32);
+                    pos += bytes;
+                }
+                (4, 5) => { // game_server_ip
+                    if pos + 4 <= size {
+                        entry.game_server_ip = Some(u32::from_le_bytes([
+                            data[pos], data[pos+1], data[pos+2], data[pos+3]
+                        ]));
+                        pos += 4;
+                    }
+                }
+                (5, 5) => { // game_server_port
+                    if pos + 4 <= size {
+                        entry.game_server_port = Some(u32::from_le_bytes([
+                            data[pos], data[pos+1], data[pos+2], data[pos+3]
+                        ]));
+                        pos += 4;
+                    }
+                }
+                (6, 0) => { // persona_state_flags
+                    let (val, bytes) = decode_varint(&data[pos..])?;
+                    entry.persona_state_flags = Some(val as u32);
+                    pos += bytes;
+                }
+                (7, 0) => { // online_session_instances
+                    let (val, bytes) = decode_varint(&data[pos..])?;
+                    entry.online_session_instances = Some(val as u32);
+                    pos += bytes;
+                }
+                (10, 0) => { // persona_set_by_user
+                    let (val, bytes) = decode_varint(&data[pos..])?;
+                    entry.persona_set_by_user = Some(val != 0);
+                    pos += bytes;
+                }
+                (15, 2) => { // player_name
+                    let (len, len_bytes) = decode_varint(&data[pos..])?;
+                    pos += len_bytes;
+                    if pos + len as usize <= size {
+                        entry.player_name = String::from_utf8(data[pos..pos+len as usize].to_vec()).ok();
+                        pos += len as usize;
+                    }
+                }
+                (20, 5) => { // query_port
+                    if pos + 4 <= size {
+                        entry.query_port = Some(u32::from_le_bytes([
+                            data[pos], data[pos+1], data[pos+2], data[pos+3]
+                        ]));
+                        pos += 4;
+                    }
+                }
+                (25, 1) => { // steamid_source (fixed64)
+                    if pos + 8 <= size {
+                        entry.steamid_source = Some(u64::from_le_bytes([
+                            data[pos], data[pos+1], data[pos+2], data[pos+3],
+                            data[pos+4], data[pos+5], data[pos+6], data[pos+7],
+                        ]));
+                        pos += 8;
+                    }
+                }
+                (31, 2) => { // avatar_hash
+                    let (len, len_bytes) = decode_varint(&data[pos..])?;
+                    pos += len_bytes;
+                    if pos + len as usize <= size {
+                        entry.avatar_hash = Some(data[pos..pos+len as usize].to_vec());
+                        pos += len as usize;
+                    }
+                }
+                (45, 0) => { // last_logoff
+                    let (val, bytes) = decode_varint(&data[pos..])?;
+                    entry.last_logoff = Some(val as u32);
+                    pos += bytes;
+                }
+                (46, 0) => { // last_logon
+                    let (val, bytes) = decode_varint(&data[pos..])?;
+                    entry.last_logon = Some(val as u32);
+                    pos += bytes;
+                }
+                (47, 0) => { // last_seen_online
+                    let (val, bytes) = decode_varint(&data[pos..])?;
+                    entry.last_seen_online = Some(val as u32);
+                    pos += bytes;
+                }
+                (50, 0) => { // clan_rank
+                    let (val, bytes) = decode_varint(&data[pos..])?;
+                    entry.clan_rank = Some(val as u32);
+                    pos += bytes;
+                }
+                (55, 2) => { // game_name
+                    let (len, len_bytes) = decode_varint(&data[pos..])?;
+                    pos += len_bytes;
+                    if pos + len as usize <= size {
+                        entry.game_name = String::from_utf8(data[pos..pos+len as usize].to_vec()).ok();
+                        pos += len as usize;
+                    }
+                }
+                (56, 1) => { // gameid (fixed64)
+                    if pos + 8 <= size {
+                        entry.gameid = Some(u64::from_le_bytes([
+                            data[pos], data[pos+1], data[pos+2], data[pos+3],
+                            data[pos+4], data[pos+5], data[pos+6], data[pos+7],
+                        ]));
+                        pos += 8;
+                    }
+                }
+                (60, 2) => { // game_data_blob
+                    let (len, len_bytes) = decode_varint(&data[pos..])?;
+                    pos += len_bytes;
+                    if pos + len as usize <= size {
+                        entry.game_data_blob = Some(data[pos..pos+len as usize].to_vec());
+                        pos += len as usize;
+                    }
+                }
+                (64, 2) => { // clan_data
+                    let (len, len_bytes) = decode_varint(&data[pos..])?;
+                    pos += len_bytes;
+                    if pos + len as usize <= size {
+                        entry.clan_data = Self::parse_clan_data(&data[pos..pos+len as usize]);
+                        pos += len as usize;
+                    }
+                }
+                (65, 2) => { // clan_tag
+                    let (len, len_bytes) = decode_varint(&data[pos..])?;
+                    pos += len_bytes;
+                    if pos + len as usize <= size {
+                        entry.clan_tag = String::from_utf8(data[pos..pos+len as usize].to_vec()).ok();
+                        pos += len as usize;
+                    }
+                }
+                (71, 2) => { // rich_presence (repeated KV)
+                    let (len, len_bytes) = decode_varint(&data[pos..])?;
+                    pos += len_bytes;
+                    if pos + len as usize <= size {
+                        let kv_data = &data[pos..pos+len as usize];
+                        if let Some((k, v)) = Self::parse_kv(kv_data) {
+                            entry.rich_presence.push((k, v));
+                        }
+                        pos += len as usize;
+                    }
+                }
+                (72, 1) => { // broadcast_id
+                    if pos + 8 <= size {
+                        entry.broadcast_id = Some(u64::from_le_bytes([
+                            data[pos], data[pos+1], data[pos+2], data[pos+3],
+                            data[pos+4], data[pos+5], data[pos+6], data[pos+7],
+                        ]));
+                        pos += 8;
+                    }
+                }
+                (73, 1) => { // game_lobby_id
+                    if pos + 8 <= size {
+                        entry.game_lobby_id = Some(u64::from_le_bytes([
+                            data[pos], data[pos+1], data[pos+2], data[pos+3],
+                            data[pos+4], data[pos+5], data[pos+6], data[pos+7],
+                        ]));
+                        pos += 8;
+                    }
+                }
+                (74, 0) => { // watching_broadcast_accountid
+                    let (val, bytes) = decode_varint(&data[pos..])?;
+                    entry.watching_broadcast_accountid = Some(val as u32);
+                    pos += bytes;
+                }
+                (75, 0) => { // watching_broadcast_appid
+                    let (val, bytes) = decode_varint(&data[pos..])?;
+                    entry.watching_broadcast_appid = Some(val as u32);
+                    pos += bytes;
+                }
+                (76, 0) => { // watching_broadcast_viewers
+                    let (val, bytes) = decode_varint(&data[pos..])?;
+                    entry.watching_broadcast_viewers = Some(val as u32);
+                    pos += bytes;
+                }
+                (77, 2) => { // watching_broadcast_title
+                    let (len, len_bytes) = decode_varint(&data[pos..])?;
+                    pos += len_bytes;
+                    if pos + len as usize <= size {
+                        entry.watching_broadcast_title = String::from_utf8(data[pos..pos+len as usize].to_vec()).ok();
+                        pos += len as usize;
+                    }
+                }
+                (78, 0) => { // is_community_banned
+                    let (val, bytes) = decode_varint(&data[pos..])?;
+                    entry.is_community_banned = Some(val != 0);
+                    pos += bytes;
+                }
+                (79, 0) => { // player_name_pending_review
+                    let (val, bytes) = decode_varint(&data[pos..])?;
+                    entry.player_name_pending_review = Some(val != 0);
+                    pos += bytes;
+                }
+                (80, 0) => { // avatar_pending_review
+                    let (val, bytes) = decode_varint(&data[pos..])?;
+                    entry.avatar_pending_review = Some(val != 0);
+                    pos += bytes;
+                }
+                (81, 0) => { // on_steam_deck
+                    let (val, bytes) = decode_varint(&data[pos..])?;
+                    entry.on_steam_deck = Some(val != 0);
+                    pos += bytes;
+                }
+                (82, 2) => { // other_game_data (repeated)
+                    let (len, len_bytes) = decode_varint(&data[pos..])?;
+                    pos += len_bytes;
+                    if pos + len as usize <= size {
+                        if let Some(other) = Self::parse_other_game_data(&data[pos..pos+len as usize]) {
+                            entry.other_game_data.push(other);
+                        }
+                        pos += len as usize;
+                    }
+                }
+                (83, 0) => { // gaming_device_type
+                    let (val, bytes) = decode_varint(&data[pos..])?;
+                    entry.gaming_device_type = Some(val as u32);
+                    pos += bytes;
+                }
+                _ => {
+                    // Skip unknown field
+                    match wire_type {
+                        0 => { let _ = decode_varint(&data[pos..]); }
+                        1 => { if pos + 8 <= size { pos += 8; } }
+                        2 => {
+                            let (len, len_bytes) = decode_varint(&data[pos..])?;
+                            pos += len_bytes + len as usize;
+                        }
+                        5 => { if pos + 4 <= size { pos += 4; } }
+                        _ => break,
+                    }
+                }
+            }
+        }
+        Some(entry)
+    }
+
+    fn parse_clan_data(data: &[u8]) -> Option<ClanData> {
+        let mut clan = ClanData::default();
+        let mut pos = 0;
+        let size = data.len();
+
+        while pos < size {
+            if pos >= size { break; }
+            let tag = data[pos];
+            pos += 1;
+            let field_num = tag >> 3;
+            let wire_type = tag & 0x07;
+
+            match (field_num, wire_type) {
+                (1, 0) => { // ogg_app_id
+                    let (val, bytes) = decode_varint(&data[pos..])?;
+                    clan.ogg_app_id = Some(val as u32);
+                    pos += bytes;
+                }
+                (2, 1) => { // chat_group_id (fixed64)
+                    if pos + 8 <= size {
+                        clan.chat_group_id = Some(u64::from_le_bytes([
+                            data[pos], data[pos+1], data[pos+2], data[pos+3],
+                            data[pos+4], data[pos+5], data[pos+6], data[pos+7],
+                        ]));
+                        pos += 8;
+                    }
+                }
+                _ => {
+                    match wire_type {
+                        0 => { let _ = decode_varint(&data[pos..]); }
+                        1 => { if pos + 8 <= size { pos += 8; } }
+                        2 => {
+                            let (len, len_bytes) = decode_varint(&data[pos..])?;
+                            pos += len_bytes + len as usize;
+                        }
+                        5 => { if pos + 4 <= size { pos += 4; } }
+                        _ => break,
+                    }
+                }
+            }
+        }
+        Some(clan)
+    }
+
+    fn parse_kv(data: &[u8]) -> Option<(String, String)> {
+        let mut key = String::new();
+        let mut value = String::new();
+        let mut pos = 0;
+        let size = data.len();
+
+        while pos < size {
+            if pos >= size { break; }
+            let tag = data[pos];
+            pos += 1;
+            let field_num = tag >> 3;
+            let wire_type = tag & 0x07;
+
+            if field_num == 1 && wire_type == 2 {
+                // key
+                let (len, len_bytes) = decode_varint(&data[pos..])?;
+                pos += len_bytes;
+                if pos + len as usize <= size {
+                    key = String::from_utf8(data[pos..pos+len as usize].to_vec()).ok()?;
+                    pos += len as usize;
+                }
+            } else if field_num == 2 && wire_type == 2 {
+                // value
+                let (len, len_bytes) = decode_varint(&data[pos..])?;
+                pos += len_bytes;
+                if pos + len as usize <= size {
+                    value = String::from_utf8(data[pos..pos+len as usize].to_vec()).ok()?;
+                    pos += len as usize;
+                }
+            } else {
+                match wire_type {
+                    0 => { let _ = decode_varint(&data[pos..]); }
+                    1 => { if pos + 8 <= size { pos += 8; } }
+                    2 => {
+                        let (len, len_bytes) = decode_varint(&data[pos..])?;
+                        pos += len_bytes + len as usize;
+                    }
+                    5 => { if pos + 4 <= size { pos += 4; } }
+                    _ => break,
+                }
+            }
+        }
+        if !key.is_empty() {
+            Some((key, value))
+        } else {
+            None
+        }
+    }
+
+    fn parse_other_game_data(data: &[u8]) -> Option<OtherGameData> {
+        let mut other = OtherGameData::default();
+        let mut pos = 0;
+        let size = data.len();
+
+        while pos < size {
+            if pos >= size { break; }
+            let tag = data[pos];
+            pos += 1;
+            let field_num = tag >> 3;
+            let wire_type = tag & 0x07;
+
+            if field_num == 1 && wire_type == 1 {
+                // gameid (fixed64)
+                if pos + 8 <= size {
+                    other.gameid = Some(u64::from_le_bytes([
+                        data[pos], data[pos+1], data[pos+2], data[pos+3],
+                        data[pos+4], data[pos+5], data[pos+6], data[pos+7],
+                    ]));
+                    pos += 8;
+                }
+            } else if field_num == 2 && wire_type == 2 {
+                // rich_presence (repeated KV)
+                let (len, len_bytes) = decode_varint(&data[pos..])?;
+                pos += len_bytes;
+                if pos + len as usize <= size {
+                    let kv_data = &data[pos..pos+len as usize];
+                    if let Some((k, v)) = Self::parse_kv(kv_data) {
+                        other.rich_presence.push((k, v));
+                    }
+                    pos += len as usize;
+                }
+            } else {
+                match wire_type {
+                    0 => { let _ = decode_varint(&data[pos..]); }
+                    1 => { if pos + 8 <= size { pos += 8; } }
+                    2 => {
+                        let (len, len_bytes) = decode_varint(&data[pos..])?;
+                        pos += len_bytes + len as usize;
+                    }
+                    5 => { if pos + 4 <= size { pos += 4; } }
+                    _ => break,
+                }
+            }
+        }
+        Some(other)
+    }
+
+    /// Serialize PersonaStateMsg to protobuf bytes.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+
+        // status_flags (field 1, varint)
+        out.push(0x08); // tag = 1 << 3 | 0
+        encode_varint(self.status_flags as u64, &mut out);
+
+        // friends (field 2, repeated length-delimited)
+        for friend in &self.friends {
+            let friend_bytes = friend.serialize();
+            out.push(0x12); // tag = 2 << 3 | 2
+            encode_varint(friend_bytes.len() as u64, &mut out);
+            out.extend_from_slice(&friend_bytes);
+        }
+
+        out
+    }
+}
+
+impl FriendEntry {
+    /// Serialize FriendEntry to protobuf bytes.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+
+        if let Some(v) = self.friendid {
+            out.push(0x08); // tag = 1 << 3 | 0
+            encode_varint(v, &mut out);
+        }
+        if let Some(v) = self.persona_state {
+            out.push(0x10); // tag = 2 << 3 | 0
+            encode_varint(v as u64, &mut out);
+        }
+        if let Some(v) = self.game_played_app_id {
+            out.push(0x18); // tag = 3 << 3 | 0
+            encode_varint(v as u64, &mut out);
+        }
+        if let Some(v) = self.game_server_ip {
+            out.push(0x25); // tag = 4 << 3 | 5
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        if let Some(v) = self.game_server_port {
+            out.push(0x2D); // tag = 5 << 3 | 5
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        if let Some(v) = self.persona_state_flags {
+            out.push(0x30); // tag = 6 << 3 | 0
+            encode_varint(v as u64, &mut out);
+        }
+        if let Some(v) = self.online_session_instances {
+            out.push(0x38); // tag = 7 << 3 | 0
+            encode_varint(v as u64, &mut out);
+        }
+        if let Some(v) = self.persona_set_by_user {
+            out.push(0x50); // tag = 10 << 3 | 0
+            encode_varint(if v { 1 } else { 0 }, &mut out);
+        }
+        if let Some(v) = &self.player_name {
+            out.push(0x7A); // tag = 15 << 3 | 2
+            encode_varint(v.len() as u64, &mut out);
+            out.extend_from_slice(v.as_bytes());
+        }
+        if let Some(v) = self.query_port {
+            out.push(0xA5); // tag = 20 << 3 | 5
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        if let Some(v) = self.steamid_source {
+            out.push(0xC9); // tag = 25 << 3 | 1
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        if let Some(v) = &self.avatar_hash {
+            out.push(0xF2); // tag = 31 << 3 | 2
+            encode_varint(v.len() as u64, &mut out);
+            out.extend_from_slice(v);
+        }
+        if let Some(v) = self.last_logoff {
+            // tag = 45 << 3 | 0 = 360 = 0x168
+            out.push(0x68); out.push(0x02);
+            encode_varint(v as u64, &mut out);
+        }
+        if let Some(v) = self.last_logon {
+            // tag = 46 << 3 | 0 = 368 = 0x170
+            out.push(0x70); out.push(0x02);
+            encode_varint(v as u64, &mut out);
+        }
+        if let Some(v) = self.last_seen_online {
+            // tag = 47 << 3 | 0 = 376 = 0x178
+            out.push(0x78); out.push(0x02);
+            encode_varint(v as u64, &mut out);
+        }
+        if let Some(v) = self.clan_rank {
+            // tag = 50 << 3 | 0 = 400 = 0x190
+            out.push(0x90); out.push(0x03);
+            encode_varint(v as u64, &mut out);
+        }
+        if let Some(v) = &self.game_name {
+            // tag = 55 << 3 | 2 = 442 = 0x1BA
+            out.push(0xBA); out.push(0x03);
+            encode_varint(v.len() as u64, &mut out);
+            out.extend_from_slice(v.as_bytes());
+        }
+        if let Some(v) = self.gameid {
+            // tag = 56 << 3 | 1 = 449 = 0x1C1
+            out.push(0xC1); out.push(0x03);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        if let Some(v) = &self.game_data_blob {
+            // tag = 60 << 3 | 2 = 482 = 0x1E2
+            out.push(0xE2); out.push(0x03);
+            encode_varint(v.len() as u64, &mut out);
+            out.extend_from_slice(v);
+        }
+        if let Some(v) = &self.clan_data {
+            let clan_bytes = v.serialize();
+            // tag = 64 << 3 | 2 = 514 = 0x202
+            out.push(0x02); out.push(0x02);
+            encode_varint(clan_bytes.len() as u64, &mut out);
+            out.extend_from_slice(&clan_bytes);
+        }
+        if let Some(v) = &self.clan_tag {
+            // tag = 65 << 3 | 2 = 522 = 0x20A
+            out.push(0x0A); out.push(0x02);
+            encode_varint(v.len() as u64, &mut out);
+            out.extend_from_slice(v.as_bytes());
+        }
+        for (k, v) in &self.rich_presence {
+            let kv_bytes = Self::serialize_kv(k, v);
+            // tag = 71 << 3 | 2 = 570 = 0x23A
+            out.push(0x3A); out.push(0x02);
+            encode_varint(kv_bytes.len() as u64, &mut out);
+            out.extend_from_slice(&kv_bytes);
+        }
+        if let Some(v) = self.broadcast_id {
+            // tag = 72 << 3 | 1 = 577 = 0x241
+            out.push(0x41); out.push(0x02);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        if let Some(v) = self.game_lobby_id {
+            // tag = 73 << 3 | 1 = 585 = 0x249
+            out.push(0x49); out.push(0x02);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        if let Some(v) = self.watching_broadcast_accountid {
+            // tag = 74 << 3 | 0 = 592 = 0x250
+            out.push(0x50); out.push(0x02);
+            encode_varint(v as u64, &mut out);
+        }
+        if let Some(v) = self.watching_broadcast_appid {
+            // tag = 75 << 3 | 0 = 600 = 0x258
+            out.push(0x58); out.push(0x02);
+            encode_varint(v as u64, &mut out);
+        }
+        if let Some(v) = self.watching_broadcast_viewers {
+            // tag = 76 << 3 | 0 = 608 = 0x260
+            out.push(0x60); out.push(0x02);
+            encode_varint(v as u64, &mut out);
+        }
+        if let Some(v) = &self.watching_broadcast_title {
+            // tag = 77 << 3 | 2 = 618 = 0x26A
+            out.push(0x6A); out.push(0x02);
+            encode_varint(v.len() as u64, &mut out);
+            out.extend_from_slice(v.as_bytes());
+        }
+        if let Some(v) = self.is_community_banned {
+            // tag = 78 << 3 | 0 = 624 = 0x270
+            out.push(0x70); out.push(0x02);
+            encode_varint(if v { 1 } else { 0 }, &mut out);
+        }
+        if let Some(v) = self.player_name_pending_review {
+            // tag = 79 << 3 | 0 = 632 = 0x278
+            out.push(0x78); out.push(0x02);
+            encode_varint(if v { 1 } else { 0 }, &mut out);
+        }
+        if let Some(v) = self.avatar_pending_review {
+            // tag = 80 << 3 | 0 = 640 = 0x280
+            out.push(0x80); out.push(0x02);
+            encode_varint(if v { 1 } else { 0 }, &mut out);
+        }
+        if let Some(v) = self.on_steam_deck {
+            // tag = 81 << 3 | 0 = 648 = 0x288
+            out.push(0x88); out.push(0x02);
+            encode_varint(if v { 1 } else { 0 }, &mut out);
+        }
+        for other in &self.other_game_data {
+            let other_bytes = other.serialize();
+            // tag = 82 << 3 | 2 = 658 = 0x292
+            out.push(0x92); out.push(0x02);
+            encode_varint(other_bytes.len() as u64, &mut out);
+            out.extend_from_slice(&other_bytes);
+        }
+        if let Some(v) = self.gaming_device_type {
+            // tag = 83 << 3 | 0 = 664 = 0x298
+            out.push(0x98); out.push(0x02);
+            encode_varint(v as u64, &mut out);
+        }
+
+        out
+    }
+
+    fn serialize_kv(key: &str, value: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        // key (field 1, length-delimited)
+        out.push(0x0A); // tag = 1 << 3 | 2
+        encode_varint(key.len() as u64, &mut out);
+        out.extend_from_slice(key.as_bytes());
+        // value (field 2, length-delimited)
+        out.push(0x12); // tag = 2 << 3 | 2
+        encode_varint(value.len() as u64, &mut out);
+        out.extend_from_slice(value.as_bytes());
+        out
+    }
+}
+
+impl ClanData {
+    fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if let Some(v) = self.ogg_app_id {
+            out.push(0x08); // tag = 1 << 3 | 0
+            encode_varint(v as u64, &mut out);
+        }
+        if let Some(v) = self.chat_group_id {
+            out.push(0x11); // tag = 2 << 3 | 1
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+}
+
+impl OtherGameData {
+    fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if let Some(v) = self.gameid {
+            out.push(0x09); // tag = 1 << 3 | 1
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for (k, v) in &self.rich_presence {
+            let kv_bytes = FriendEntry::serialize_kv(k, v);
+            out.push(0x12); // tag = 2 << 3 | 2
+            encode_varint(kv_bytes.len() as u64, &mut out);
+            out.extend_from_slice(&kv_bytes);
+        }
+        out
+    }
+}
+
+/// Encode a protobuf tag (field_num << 3 | wire_type).
+fn encode_tag(field_num: u32, wire_type: u8, out: &mut Vec<u8>) {
+    let tag = (field_num << 3) | u32::from(wire_type);
+    encode_varint(tag as u64, out);
+}
+
+/// Encode a varint.
+fn encode_varint(mut val: u64, out: &mut Vec<u8>) {
+    loop {
+        let mut byte = (val & 0x7F) as u8;
+        val >>= 7;
+        if val != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if val == 0 {
+            break;
+        }
+    }
+}
+
+/// Decode a varint from slice.
+fn decode_varint(slice: &[u8]) -> Option<(u64, usize)> {
+    let mut result: u64 = 0;
+    let mut shift: u32 = 0;
+    for (idx, &byte) in slice.iter().enumerate() {
+        if idx >= 10 {
+            return None;
+        }
+        if idx == 9 && byte > 1 {
+            return None;
+        }
+        result |= u64::from(byte & 0x7F) << shift;
+        if (byte & 0x80) == 0 {
+            return Some((result, idx + 1));
+        }
+        shift += 7;
+    }
+    None
+}
+
 /// Register misc IPC handlers (safe no-op hook point).
 pub fn register_ipc_handlers() -> Result<(), String> {
     log::debug!("[InteropMisc] IPC handlers registered");

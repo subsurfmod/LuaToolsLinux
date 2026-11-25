@@ -281,6 +281,12 @@ pub fn handle_recv_get_encrypted_app_ticket_response(write_buf: &mut Vec<u8>, ap
     );
 }
 
+/// IPC adapter for Recv: CMsgClientRequestEncryptedAppTicketResponse (5527)
+pub fn handle_recv_request_encrypted_app_ticket_response_ipc(ctx: &mut crate::steam_bridge::netpacket::netpacket_core::NetPacketContext) -> Result<(), String> {
+    handle_recv_get_encrypted_app_ticket_response(&mut ctx.frame_buffer, ctx.app_id);
+    Ok(())
+}
+
 pub fn install_eticket() -> Result<(), String> {
     register_eticket_handlers();
     ETICKET_ACTIVE.store(true, Ordering::Release);
