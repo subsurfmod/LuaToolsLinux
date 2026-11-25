@@ -10,6 +10,7 @@ use crate::services::steam_service::SteamService;
 const APPLIED_FIXES_FILENAME: &str = "applied_fixes.json";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppliedFixRecord {
     pub app_id: u32,
     pub fix_id: String,
@@ -21,6 +22,7 @@ pub struct AppliedFixRecord {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppliedFixFileEntry {
     pub relative_path: String,
     pub action: String, // "modified" | "added"
@@ -29,10 +31,16 @@ pub struct AppliedFixFileEntry {
     pub hash_after: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AppliedFixIndexService {
     path: PathBuf,
     pub records: BTreeMap<u32, Vec<AppliedFixRecord>>,
+}
+
+impl Default for AppliedFixIndexService {
+    fn default() -> Self {
+        Self::new(None)
+    }
 }
 
 impl AppliedFixIndexService {

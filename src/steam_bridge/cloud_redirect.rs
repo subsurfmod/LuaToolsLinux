@@ -324,6 +324,10 @@ pub fn get_cloud_redirect_host() -> &'static CloudRedirectHost {
     CLOUD_REDIRECT_HOST.get_or_init(CloudRedirectHost::new)
 }
 
+pub fn is_cloud_redirect_active() -> bool {
+    get_cloud_redirect_host().is_active()
+}
+
 pub fn set_account_id(account_id: u32) {
     get_cloud_redirect_host().set_account_id(account_id);
 }

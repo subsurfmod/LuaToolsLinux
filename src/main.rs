@@ -109,6 +109,7 @@ impl eframe::App for AppWrapper {
                 }
                 IpcCommand::TrayLock => {
                     self.tray_locked = true;
+                    self.inner.tray_locked = true;
                 }
                 IpcCommand::Url(url) => {
                     let is_silent = ProtocolService::parse(&url)
@@ -399,18 +400,25 @@ fn main() -> eframe::Result<()> {
                 });
             }
 
-            let inner = LuaToolsApp::new_with_tray_hint(
+            let is_silent_init = initial_protocol_url
+                .as_ref()
+                .and_then(|u| ProtocolService::parse(u))
+                .map(|a| a.silent)
+                .unwrap_or(false);
+
+            let mut inner = LuaToolsApp::new_with_tray_hint(
                 cc,
                 initial_protocol_url,
                 qa_screenshots_dir,
-                minimized || tray_locked,
+                minimized || tray_locked || is_silent_init,
             );
+            inner.tray_locked = tray_locked;
 
             Ok(Box::new(AppWrapper {
                 inner,
                 ipc_rx,
                 tray_locked,
-                initial_minimized: minimized,
+                initial_minimized: minimized || is_silent_init,
                 sock_path,
                 _instance_lock: instance_lock,
             }))

@@ -13,7 +13,7 @@ use walkdir_lite::collect_files_recursive;
 use crate::models::config::default_luatools_data_dir;
 use crate::services::depot_downloader::{which_in_path, DepotDownloaderService};
 use crate::services::proxied_file_downloader::ProxiedFileDownloader;
-use crate::services::wired_service::extract_archive;
+use crate::services::wired_service::{extract_archive, find_7z_bin};
 
 #[derive(Debug, Clone)]
 pub struct ExternalToolSpec {
@@ -354,13 +354,26 @@ impl ExternalToolsManager {
                 }
 
                 progress_cb(0.85 + (idx as f32) * 0.05, format!("Extracting {}...", safe_aname));
+                if key == "goldberg" && safe_aname.ends_with(".7z") && find_7z_bin().is_none() {
+                    let err_msg = "7-Zip ('7z' or 'p7zip') is not installed. Goldberg Windows DLLs (.dll) for Proton games cannot be extracted. Please install p7zip / 7zip.".to_string();
+                    log::warn!("{}", err_msg);
+                    progress_cb(0.90, format!("Warning: {}", err_msg));
+                    let _ = fs::remove_file(&archive_path);
+                    continue;
+                }
                 let extract_res = extract_archive(&archive_path, &tool_dir);
                 let _ = fs::remove_file(&archive_path);
                 if let Err(e) = extract_res {
                     // LNX-08: If Goldberg Windows .7z archive cannot be extracted because 7z is missing on host,
-                    // do not abort the overall Linux Goldberg install
+                    // do not abort the overall Linux Goldberg install, but report a clear error warning/toast message
                     if key == "goldberg" && safe_aname.ends_with(".7z") {
-                        log::warn!("Could not extract Goldberg Windows archive {}: {} (proceeding with Linux binaries)", safe_aname, e);
+                        let err_msg = if find_7z_bin().is_none() {
+                            "7-Zip ('7z' / 'p7zip') is missing. Cannot extract Goldberg Windows DLLs for Proton games. Please install p7zip or 7zip.".to_string()
+                        } else {
+                            format!("Failed to extract Goldberg Windows DLLs ({}): {}", safe_aname, e)
+                        };
+                        log::warn!("{}", err_msg);
+                        progress_cb(0.90, format!("Warning: {}", err_msg));
                     } else {
                         last_err = Some(format!("Extraction failed ({}): {}", repo, e));
                         dl_failed = true;
@@ -510,7 +523,9 @@ impl ExternalToolsManager {
         if let Some(unpacked_path) = unpacked {
             let backup_path = PathBuf::from(format!("{}.orig.bak", target_exe.display()));
             if !backup_path.exists() {
-                let _ = fs::copy(target_exe, &backup_path);
+                fs::copy(target_exe, &backup_path).map_err(|e| {
+                    format!("Failed to create backup {}: {}", backup_path.display(), e)
+                })?;
             }
             fs::rename(&unpacked_path, target_exe).map_err(|e| {
                 format!(
@@ -524,7 +539,7 @@ impl ExternalToolsManager {
                 target_exe.file_name().unwrap_or_default().to_string_lossy()
             ))
         } else {
-            Ok(format!(
+            Err(format!(
                 "StubRemover completed on {} (no .unpacked.exe output detected; file may not be protected with SteamStub)",
                 target_exe.file_name().unwrap_or_default().to_string_lossy()
             ))

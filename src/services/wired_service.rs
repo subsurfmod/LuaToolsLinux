@@ -469,29 +469,46 @@ impl WiredService {
         }
 
         // Install a clean user-local `steam-sls` wrapper script in `~/.local/bin/steam-sls`
-        if fs::create_dir_all(&self.bin_dir).is_ok() {
-            let wrapper = self.bin_dir.join("steam-sls");
-            let audit = if sls_dir.join("library-inject.so").is_file() {
-                format!(
-                    "{}:{}",
-                    sls_dir.join("library-inject.so").display(),
-                    target_so.display()
-                )
-            } else {
-                target_so.display().to_string()
-            };
-            let script = format!(
-                "#!/usr/bin/env bash\n\
-                 export LD_AUDIT=\"{}\"\n\
-                 exec steam \"$@\"\n",
-                audit
-            );
-            if fs::write(&wrapper, script).is_ok() {
-                let _ = fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755));
-            }
-        }
+        let _ = self.write_steam_sls_wrapper(&target_so, &sls_dir);
 
         Ok(target_so)
+    }
+
+    /// Generates and installs a clean user-local `steam-sls` wrapper script in `~/.local/bin/steam-sls`.
+    /// Includes optional background auto-start `luatools --minimized --tray-locked &` (LT-20).
+    pub fn write_steam_sls_wrapper(
+        &self,
+        target_so: &Path,
+        sls_dir: &Path,
+    ) -> Result<PathBuf, String> {
+        fs::create_dir_all(&self.bin_dir)
+            .map_err(|e| format!("Failed to create bin dir: {}", e))?;
+        let wrapper = self.bin_dir.join("steam-sls");
+        let audit = if sls_dir.join("library-inject.so").is_file() {
+            format!(
+                "{}:{}",
+                sls_dir.join("library-inject.so").display(),
+                target_so.display()
+            )
+        } else {
+            target_so.display().to_string()
+        };
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             # Auto-start LuaTools companion in background minimized to tray if available (LT-20)\n\
+             if command -v luatools >/dev/null 2>&1; then\n\
+                 luatools --minimized --tray-locked &\n\
+             elif [ -x \"$HOME/.local/bin/luatools\" ]; then\n\
+                 \"$HOME/.local/bin/luatools\" --minimized --tray-locked &\n\
+             fi\n\
+             export LD_AUDIT=\"{}\"\n\
+             exec steam \"$@\"\n",
+            audit
+        );
+        fs::write(&wrapper, script)
+            .map_err(|e| format!("Failed to write steam-sls wrapper: {}", e))?;
+        let _ = fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755));
+        Ok(wrapper)
     }
 
     pub fn install_all<F>(&self, mut progress_cb: F) -> Result<(), String>
@@ -576,7 +593,7 @@ fn select_slssteam_asset(assets: &[Value], has_7z: bool, has_zstd: bool) -> Opti
     })
 }
 
-fn find_7z_bin() -> Option<PathBuf> {
+pub fn find_7z_bin() -> Option<PathBuf> {
     for cmd in ["7z", "7zz", "7za"] {
         if let Some(p) = which_in_path(cmd) {
             return Some(p);
@@ -789,6 +806,8 @@ mod tests {
         assert!(installed_so.is_file());
         assert!(svc.is_slssteam_installed());
         assert!(svc.bin_dir.join("steam-sls").is_file());
+        let wrapper_content = fs::read_to_string(svc.bin_dir.join("steam-sls")).unwrap();
+        assert!(wrapper_content.contains("luatools --minimized --tray-locked &"));
         assert!(svc.config_dir.join("SLSsteam/config.yaml").is_file());
 
         // 2. Build a synthetic ACCELA AppImage & install

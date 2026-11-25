@@ -292,7 +292,7 @@ impl LuaEditor {
         }
         .ok_or_else(|| "Failed to update LuaVault variant.".to_string())?;
 
-        vault.set_edit_base(self.app_id, Some(variant.hash.clone()));
+        vault.set_edit_base(self.app_id, None);
 
         if let Some(ref parsed) = self.parsed {
             crate::services::lua_installer::LuaInstaller::sync_with_slssteam(
@@ -398,17 +398,17 @@ mod tests {
         ed.set_text("addappid(1245620)\n".into(), 1245620);
         let v1 = ed.save_to_vault_and_sync(&vault, &mut sls).unwrap();
         assert_eq!(vault.get_variants(1245620).len(), 1);
-        assert_eq!(vault.get_edit_base(1245620), Some(v1.hash.clone()));
+        assert_eq!(vault.get_edit_base(1245620), None);
 
-        // Subsequent save updates in-place instead of creating duplicate variant
+        // Subsequent save without edit_base saves text cleanly and clears base
         ed.set_text(
             "addappid(1245620)\naddappid(2778580) -- Shadow of the Erdtree\n".into(),
             1245620,
         );
         let v2 = ed.save_to_vault_and_sync(&vault, &mut sls).unwrap();
         assert_ne!(v1.hash, v2.hash);
-        assert_eq!(vault.get_variants(1245620).len(), 1);
-        assert_eq!(vault.get_edit_base(1245620), Some(v2.hash));
+        assert_eq!(vault.get_variants(1245620).len(), 2);
+        assert_eq!(vault.get_edit_base(1245620), None);
         assert!(sls.config.additional_apps.contains(&1245620));
         assert!(sls
             .config

@@ -157,6 +157,7 @@ impl AuthService {
     pub fn sign_out(&self) {
         *self.session.lock().unwrap() = None;
         let _ = fs::remove_file(&self.auth_file);
+        let _ = fs::remove_file(self.auth_file.with_extension("enc"));
     }
 
     pub fn sign_in_with_browser(&self, timeout_secs: u64) -> Result<AuthSession, String> {

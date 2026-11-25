@@ -482,6 +482,15 @@ impl LuaInstaller {
         if !p.exists() {
             return InstallResult::err(format!("Lua file not found for AppID {}", app_id));
         }
+
+        // Read and parse lua content BEFORE deleting the file to clean up SLSsteam mappings cleanly
+        let parsed_lua = if remove_from_slssteam && sls_svc.is_some() {
+            self.read_lua_text(app_id)
+                .map(|txt| LuaFileParser::parse_text(&txt, app_id))
+        } else {
+            None
+        };
+
         if let Err(e) = fs::remove_file(&p) {
             return InstallResult::err(format!("Failed to delete lua file: {}", e));
         }
@@ -497,9 +506,8 @@ impl LuaInstaller {
                 sls.remove_pinned_app(app_id);
                 sls.config.dlc_data.remove(&app_id);
 
-                // If installed lua exists or was read, clean up depot keys & manifest overrides
-                if let Some(txt) = self.read_lua_text(app_id) {
-                    let parsed = LuaFileParser::parse_text(&txt, app_id);
+                // Clean up depot keys & manifest overrides parsed prior to file deletion
+                if let Some(parsed) = parsed_lua {
                     for entry in &parsed.entries {
                         sls.config.depot_keys.remove(&entry.id);
                         sls.remove_manifest_override(entry.id);

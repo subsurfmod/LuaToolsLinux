@@ -3,55 +3,24 @@
 //! Port of usefulsteamtools `Hooks_NetPacket_Cloud` namespace in Interop_NetPacket.cpp.
 
 use std::collections::VecDeque;
-use std::fmt;
-use std::os::raw::c_void;
 use std::sync::{Arc, LazyLock, Mutex};
 
-use crate::steam_bridge::cloud_redirect::{CloudRedirectHost, is_cloud_redirect_active};
-use crate::steam_bridge::interop::interop_misc::resolve_app_id;
-use crate::steam_bridge::interop::ipc::{
-    self, fnv1a_hash, FuncHash, HandlerFn, IpcContext, IpcInterface,
+use crate::steam_bridge::cloud_redirect::{
+    get_cloud_redirect_host, is_cloud_redirect_active,
 };
 use crate::steam_bridge::netpacket::netpacket_core::{
-    NetPacketContext, NetPacketDirection, register_netpacket_handler,
+    NetPacketContext, NetPacketDirection, NetPacketHandler, register_netpacket_handler,
+    K_EMSG_SERVICE_METHOD_CALL_FROM_CLIENT,
 };
 
-const NETPACKET_CLOUD_SERVICE_METHOD_CALL_FNHASH: FuncHash = fnv1a_hash("ServiceMethodCallFromClient");
-
-/// Cloud RPC handler registration.
-#[derive(Clone)]
-pub struct CloudHandler {
-    pub interface_id: IpcInterface,
-    pub func_hash: FuncHash,
-    pub name: String,
-    pub fencepost: u32,
-    pub argc: u32,
-    pub pre_handler: Option<HandlerFn>,
-    pub post_handler: Option<HandlerFn>,
-}
-
-impl fmt::Debug for CloudHandler {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CloudHandler")
-            .field("interface_id", &self.interface_id)
-            .field("func_hash", &self.func_hash)
-            .field("name", &self.name)
-            .finish()
-    }
-}
-
-static CLOUD_HANDLERS: LazyLock<Mutex<Vec<CloudHandler>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static CLOUD_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Pending Cloud responses to inject via carrier packets.
-static PENDING_CLOUD_RESPONSES: LazyLock<Mutex<VecDeque<Vec<u8>>>> = LazyLock::new(|| Mutex::new(VecDeque::new()));
+static PENDING_CLOUD_RESPONSES: LazyLock<Mutex<VecDeque<Vec<u8>>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::new()));
 
 /// Local SteamID captured from outbound headers.
 static LOCAL_STEAM_ID: LazyLock<Mutex<u64>> = LazyLock::new(|| Mutex::new(0));
-
-fn cloud_handlers() -> &'static Mutex<Vec<CloudHandler>> {
-    &CLOUD_HANDLERS
-}
 
 fn pending_responses() -> &'static Mutex<VecDeque<Vec<u8>>> {
     &PENDING_CLOUD_RESPONSES
@@ -82,7 +51,7 @@ fn read_varint(data: &[u8]) -> Option<(u64, usize)> {
     None
 }
 
-/// Find a specific varint field by tag number.
+/// Find a specific varint field by tag number in protobuf encoded bytes.
 fn find_varint_field(data: &[u8], target_field: u32) -> Option<u64> {
     let mut pos = 0;
     while pos < data.len() {
@@ -94,16 +63,54 @@ fn find_varint_field(data: &[u8], target_field: u32) -> Option<u64> {
             return read_varint(&data[pos..]).map(|(v, _)| v);
         }
         match wire_type {
-            0 => { let _ = read_varint(&data[pos..])?; }
-            1 => { if pos + 8 > data.len() { return None; } pos += 8; }
+            0 => {
+                let (_, consumed) = read_varint(&data[pos..])?;
+                pos += consumed;
+            }
+            1 => {
+                if pos + 8 > data.len() {
+                    return None;
+                }
+                pos += 8;
+            }
             2 => {
                 let (len, consumed) = read_varint(&data[pos..])?;
                 pos += consumed;
-                if pos + len as usize > data.len() { return None; }
-                pos += len as usize;
+                let len = len as usize;
+                if pos + len > data.len() {
+                    return None;
+                }
+                pos += len;
             }
-            5 => { if pos + 4 > data.len() { return None; } pos += 4; }
+            5 => {
+                if pos + 4 > data.len() {
+                    return None;
+                }
+                pos += 4;
+            }
             _ => return None,
+        }
+    }
+    None
+}
+
+/// Search for Cloud.* service method name in the buffer.
+fn extract_cloud_job_name(data: &[u8]) -> Option<String> {
+    let needle = b"Cloud.";
+    for i in 0..data.len().saturating_sub(needle.len()) {
+        if &data[i..i + needle.len()] == needle {
+            let mut end = i + needle.len();
+            while end < data.len() {
+                let b = data[end];
+                if b.is_ascii_alphanumeric() || b == b'.' || b == b'#' || b == b'_' {
+                    end += 1;
+                } else {
+                    break;
+                }
+            }
+            if let Ok(s) = std::str::from_utf8(&data[i..end]) {
+                return Some(s.to_string());
+            }
         }
     }
     None
@@ -125,7 +132,9 @@ fn encode_varint(mut val: u64, out: &mut Vec<u8>) {
             byte |= 0x80;
         }
         out.push(byte);
-        if val == 0 { break; }
+        if val == 0 {
+            break;
+        }
     }
 }
 
@@ -140,137 +149,141 @@ fn build_response_header(job_id: u64, job_name: &str, eresult: i32) -> Vec<u8> {
     // field 2: jobid_target (varint)
     hdr.push(0x10); // tag 2, wire type 0
     encode_varint(job_id, &mut hdr);
-    // field 3: eresult (varint, zigzag for negative but eresult is positive)
+    // field 3: eresult (varint)
     hdr.push(0x18); // tag 3, wire type 0
     encode_varint(eresult as u64, &mut hdr);
     hdr
 }
 
 /// Handle outbound ServiceMethodCallFromClient for Cloud.* RPCs.
-pub fn handle_send_cloud_rpc(ctx: &mut IpcContext) -> Result<(), String> {
+pub fn handle_send_cloud_rpc(ctx: &mut NetPacketContext) -> Result<(), String> {
     if !is_cloud_redirect_active() {
         return Ok(());
     }
 
     // Capture local SteamID from header if present
-    if ctx.read_buffer.len() >= 8 {
-        let mut hdr_buf = [0u8; 8];
-        hdr_buf.copy_from_slice(&ctx.read_buffer[0..8]);
-        if let Some((steam_id, _)) = read_varint(&hdr_buf) {
+    if ctx.is_proto && ctx.frame_buffer.len() >= 20 {
+        if let Some(steam_id) = find_varint_field(&ctx.frame_buffer[8..], 1) {
             if steam_id != 0 {
                 *local_steam_id().lock().unwrap() = steam_id;
             }
         }
     }
 
-    // Parse job name from header (first varint after MsgHdr)
-    // We need the target_job_name field from the CMsgProtoBufHeader
-    // For simplicity, we'll check if the context has job_name info
-    let job_name = ctx.job_name.as_deref().unwrap_or("");
-    if !job_name.starts_with("Cloud.") {
+    // Find Cloud job name
+    let job_name = match extract_cloud_job_name(&ctx.frame_buffer) {
+        Some(name) => name,
+        None => return Ok(()),
+    };
+
+    let mut app_id = extract_app_id(&job_name, ctx.body());
+    if app_id == 0 {
+        app_id = ctx.app_id;
+    }
+    let cloud_host = get_cloud_redirect_host();
+    if app_id == 0 || !cloud_host.is_app(app_id) {
         return Ok(());
     }
 
-    let app_id = extract_app_id(job_name, &ctx.read_buffer);
-    if app_id == 0 || !CloudRedirectHost::is_app(app_id) {
-        return Ok(());
-    }
-
-    let account_id = (*local_steam_id().lock().unwrap() & 0xFFFFFFFF) as u32;
+    let account_id = (*local_steam_id().lock().unwrap() & 0xFFFF_FFFF) as u32;
 
     // Call CloudRedirect to handle the RPC
-    let mut resp_buf = vec![0u8; 65536];
-    let mut resp_len: u32 = 0;
-    let mut eresult: i32 = 2; // Fail
-
-    if !CloudRedirectHost::handle_cloud_rpc(
-        job_name,
+    let (resp_data, eresult) = match cloud_host.handle_cloud_rpc(
+        &job_name,
         app_id,
         account_id,
-        &ctx.read_buffer,
-        &mut resp_buf,
-        &mut resp_len,
-        &mut eresult,
+        ctx.body().to_vec(),
     ) {
-        return Ok(()); // Not handled
-    }
+        Some((data, eresult)) => (data, eresult),
+        None => return Ok(()), // Not handled
+    };
 
-    // Build response packet
-    let job_id = ctx.job_id_source.unwrap_or(0);
-    let hdr_bytes = build_response_header(job_id, job_name, eresult);
+    // Extract job_id from header (bytes 8..16)
+    let job_id = if ctx.frame_buffer.len() >= 16 {
+        u64::from_le_bytes(ctx.frame_buffer[8..16].try_into().unwrap_or_default())
+    } else {
+        0
+    };
+
+    let hdr_bytes = build_response_header(job_id, &job_name, eresult);
 
     // Construct full frame: MsgHdr + header + body
-    const K_MSG_HDR_PROTO_FLAG: u32 = 0x80000000;
+    const K_MSG_HDR_PROTO_FLAG: u32 = 0x8000_0000;
     const K_E_MSG_SERVICE_METHOD_RESPONSE: u32 = 147;
 
-    let mut frame = Vec::with_capacity(4 + hdr_bytes.len() + resp_len as usize);
+    let mut frame = Vec::with_capacity(8 + hdr_bytes.len() + resp_data.len());
     frame.extend_from_slice(&(K_E_MSG_SERVICE_METHOD_RESPONSE | K_MSG_HDR_PROTO_FLAG).to_le_bytes());
     frame.extend_from_slice(&(hdr_bytes.len() as u32).to_le_bytes());
     frame.extend_from_slice(&hdr_bytes);
-    frame.extend_from_slice(&resp_buf[..resp_len as usize]);
-
-    // Queue for delivery via carrier packet
-    pending_responses().lock().unwrap().push_back(frame);
+    frame.extend_from_slice(&resp_data);
 
     log::debug!(
         "Cloud: handled {} app={} -> queued {}-byte response (eresult={})",
         job_name, app_id, frame.len(), eresult
     );
 
+    // Queue for delivery via carrier packet
+    pending_responses().lock().unwrap().push_back(frame);
+
     // Suppress original outbound
-    ctx.suppress_send = true;
+    ctx.frame_buffer.clear();
     Ok(())
 }
 
 /// Deliver any queued Cloud responses by borrowing the carrier packet.
-pub fn drain_cloud_responses(
+pub fn drain_cloud_responses<F>(
     carrier_ctx: &mut NetPacketContext,
-    invoke_original: impl FnOnce(&mut NetPacketContext),
-) {
-    let mut pending = pending_responses().lock().unwrap();
-    while let Some(frame) = pending.pop_front() {
-        let orig_data = carrier_ctx.data;
-        let orig_size = carrier_ctx.size;
-        carrier_ctx.data = frame.as_ptr() as *mut u8;
-        carrier_ctx.size = frame.len() as u32;
-        invoke_original(carrier_ctx);
-        carrier_ctx.data = orig_data;
-        carrier_ctx.size = orig_size;
-        log::debug!("Cloud: delivered {}-byte response", frame.len());
+    mut invoke_original: F,
+) -> Result<(), String>
+where
+    F: FnMut(&mut NetPacketContext) -> Result<(), String>,
+{
+    loop {
+        let frame = {
+            let mut pending = pending_responses().lock().unwrap();
+            if pending.is_empty() {
+                return Ok(());
+            }
+            pending.pop_front()
+        };
+
+        if let Some(frame) = frame {
+            let orig_frame = carrier_ctx.frame_buffer.clone();
+            let orig_hdr = carrier_ctx.msg_hdr;
+            let orig_body_offset = carrier_ctx.body_offset;
+            let orig_is_proto = carrier_ctx.is_proto;
+
+            carrier_ctx.replace_frame(frame);
+            let res = invoke_original(carrier_ctx);
+
+            carrier_ctx.frame_buffer = orig_frame;
+            carrier_ctx.msg_hdr = orig_hdr;
+            carrier_ctx.body_offset = orig_body_offset;
+            carrier_ctx.is_proto = orig_is_proto;
+
+            res?;
+        }
     }
 }
 
 /// Register Cloud handlers.
 pub fn register_cloud_handlers() {
-    let mut handlers = cloud_handlers().lock().unwrap();
-    let iface = IpcInterface::IClientUser; // Cloud uses IClientUser pipe
-
-    let send_post: HandlerFn = Arc::new(|ctx: &mut IpcContext| -> Result<(), String> {
-        handle_send_cloud_rpc(ctx)
-    });
-
-    handlers.push(CloudHandler {
-        interface_id: iface,
-        func_hash: NETPACKET_CLOUD_SERVICE_METHOD_CALL_FNHASH,
+    register_netpacket_handler(NetPacketHandler {
+        direction: NetPacketDirection::Send,
+        emsg: K_EMSG_SERVICE_METHOD_CALL_FROM_CLIENT,
+        target_job_hash: None,
         name: "Hooks_NetPacket_Cloud::HandleSend".to_string(),
-        fencepost: 0,
-        argc: 4,
-        pre_handler: None,
-        post_handler: Some(send_post.clone()),
+        handler: Arc::new(|ctx| {
+            handle_send_cloud_rpc(ctx)
+        }),
     });
-
-    register_netpacket_handler(
-        iface,
-        NETPACKET_CLOUD_SERVICE_METHOD_CALL_FNHASH,
-        "Hooks_NetPacket_Cloud::HandleSend",
-        NetPacketDirection::Send,
-        None,
-        Some(send_post),
-    );
 }
 
 /// Install Cloud hooks.
 pub fn install_cloud_hooks() -> Result<(), String> {
+    if CLOUD_ACTIVE.load(std::sync::atomic::Ordering::Acquire) {
+        return Ok(());
+    }
     register_cloud_handlers();
     CLOUD_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
     log::info!("Installed Cloud NetPacket hooks");
@@ -279,11 +292,11 @@ pub fn install_cloud_hooks() -> Result<(), String> {
 
 /// Uninstall Cloud hooks.
 pub fn uninstall_cloud_hooks() {
-    cloud_handlers().lock().unwrap().clear();
+    if !CLOUD_ACTIVE.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     pending_responses().lock().unwrap().clear();
     *local_steam_id().lock().unwrap() = 0;
-    let iface = IpcInterface::IClientUser;
-    let _ = ipc::unregister_handler(iface, NETPACKET_CLOUD_SERVICE_METHOD_CALL_FNHASH);
     CLOUD_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
     log::info!("Uninstalled Cloud NetPacket hooks");
 }
@@ -299,7 +312,7 @@ mod tests {
 
     #[test]
     fn test_varint_read_write() {
-        let test_vals = [0u64, 1, 127, 128, 16383, 16384, 0xFFFFFFFF, 0x100000000];
+        let test_vals = [0u64, 1, 127, 128, 16383, 16384, 0xFFFF_FFFF, 0x1_0000_0000];
         for val in test_vals {
             let mut buf = Vec::new();
             encode_varint(val, &mut buf);
@@ -324,8 +337,17 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_cloud_job_name() {
+        let sample = b"\x08\x01\x12\x17Cloud.GetUGCFileDetails#1\x18\x00";
+        assert_eq!(
+            extract_cloud_job_name(sample),
+            Some("Cloud.GetUGCFileDetails#1".to_string())
+        );
+    }
+
+    #[test]
     fn test_build_response_header() {
-        let hdr = build_response_header(0x123456789ABCDEFu64, "Cloud.Test#1", 1);
+        let hdr = build_response_header(0x1234_5678_9ABC_DEF0u64, "Cloud.Test#1", 1);
         assert!(!hdr.is_empty());
         // Should contain job name, jobid_target, eresult
         assert!(hdr.iter().any(|&b| b == 0x0A)); // field 1 tag

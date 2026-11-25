@@ -4,7 +4,7 @@
   <p><strong>Add Steam games, set up SLSsteam, manage DLC &amp; depots, and apply game fixes on Linux.</strong></p>
   <p>
     <a href="https://github.com/subsurfmod/LuaToolsLinux/releases/latest">
-      <img src="https://img.shields.io/badge/DOWNLOAD%20v3.1.0-1A3A6B?style=for-the-badge&logo=github&logoColor=white" alt="Download v3.1.0">
+      <img src="https://img.shields.io/badge/DOWNLOAD%20v3.2.0-1A3A6B?style=for-the-badge&logo=github&logoColor=white" alt="Download v3.2.0">
     </a>
   </p>
 </div>
@@ -50,10 +50,10 @@ Build packages locally with `./packaging/build-packages.sh`, or install a releas
 
 ```bash
 # Ubuntu / Debian / Pop!_OS
-sudo apt install ./dist/luatools-linux_3.1.0_amd64.deb
+sudo apt install ./dist/luatools-linux_3.2.0_amd64.deb
 
 # Fedora / RHEL / openSUSE
-sudo dnf install ./dist/luatools-linux-3.1.0-1.*.rpm
+sudo dnf install ./dist/luatools-linux-3.2.0-1.*.rpm
 ```
 
 ### Update & Uninstall

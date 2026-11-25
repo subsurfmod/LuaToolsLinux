@@ -83,6 +83,12 @@ impl CefBridgeService {
                     Ok(resp) => {
                         if let Ok(tabs) = resp.into_json::<Vec<Value>>() {
                             let mut store_count = 0usize;
+                            let active_tids: HashSet<String> = tabs
+                                .iter()
+                                .filter_map(|t| t.get("id").and_then(|v| v.as_str()).map(ToString::to_string))
+                                .collect();
+                            injected_tabs.retain(|tid| active_tids.contains(tid));
+
                             for tab in tabs {
                                 let url = tab.get("url").and_then(|v| v.as_str()).unwrap_or("");
                                 let ws = tab
@@ -92,11 +98,19 @@ impl CefBridgeService {
                                 let tid = tab.get("id").and_then(|v| v.as_str()).unwrap_or("");
                                 if url.contains("store.steampowered.com") && !ws.is_empty() {
                                     store_count += 1;
-                                    if !tid.is_empty()
-                                        && !injected_tabs.contains(tid)
-                                        && bridge_ws_tab(ws, port, steam_root.as_deref())
-                                    {
+                                    if !tid.is_empty() && !injected_tabs.contains(tid) {
                                         injected_tabs.insert(tid.to_string());
+                                        let ws_url = ws.to_string();
+                                        let stop_tab = Arc::clone(&stop);
+                                        let root_opt = steam_root.clone();
+                                        thread::spawn(move || {
+                                            bridge_ws_tab_with_stop(
+                                                &ws_url,
+                                                port,
+                                                root_opt.as_deref(),
+                                                Some(&stop_tab),
+                                            );
+                                        });
                                     }
                                 }
                             }
@@ -171,50 +185,55 @@ fn build_polyfill_js(http_port: u16) -> String {
   }};
   window.__lt_resolve = function(id, res) {{
     if (window.__lt_pending[id]) {{
-      window.__lt_pending[id](res);
+      let data = res;
+      if (typeof res === "string") {{
+        try {{ data = JSON.parse(res); }} catch(_) {{}}
+      }}
+      window.__lt_pending[id](data);
       delete window.__lt_pending[id];
     }}
   }};
   if (!window.Millennium) {{
-    window.Millennium = {{
-      callServerMethod: async function(a, b, c) {{
-        let method = "";
-        let args = {{}};
-        if (c !== undefined) {{
-          method = String(b || "");
-          args = c;
-        }} else if (b !== undefined) {{
-          if (typeof b === "object" && b !== null) {{
-            method = String(a || "");
-            args = b;
-          }} else {{
-            method = String(b || "");
-            args = {{}};
-          }}
-        }} else {{
-          method = String(a || "");
-          args = {{}};
-        }}
+    window.Millennium = {{}};
+  }}
+  window.Millennium.callServerMethod = function(a, b, c) {{
+    let method = "";
+    let args = {{}};
+    if (c !== undefined) {{
+      method = String(b || "");
+      args = c;
+    }} else if (b !== undefined) {{
+      if (typeof b === "object" && b !== null) {{
+        method = String(a || "");
+        args = b;
+      }} else {{
+        method = String(b || "");
+        args = {{}};
+      }}
+    }} else {{
+      method = String(a || "");
+      args = {{}};
+    }}
 
-        if (typeof args === "string") {{
-          try {{ args = JSON.parse(args); }} catch (_) {{}}
-        }}
+    if (typeof args === "string") {{
+      try {{ args = JSON.parse(args); }} catch (_) {{}}
+    }}
 
-        try {{
-          const r = await fetch(BASE + "/rpc", {{
-            method: "POST",
-            headers: {{"Content-Type": "application/json"}},
-            body: JSON.stringify({{method, args: args || {{}}}})
-          }});
-          return await r.text();
-        }} catch (e) {{
-          console.error("[LuaTools Polyfill] callServerMethod error:", e);
-          return JSON.stringify({{success: false, error: String(e)}});
-        }}
-      }},
-      callFrontendMethod: function() {{ return Promise.resolve(); }},
-      findElement: function() {{ return null; }}
-    }};
+    return new Promise(function(resolve) {{
+      const reqId = String(++window.__lt_req_id);
+      window.__lt_pending[reqId] = resolve;
+      window.__lt_queue.push({{
+        id: reqId,
+        method: method,
+        args: args || {{}}
+      }});
+    }});
+  }};
+  if (!window.Millennium.callFrontendMethod) {{
+    window.Millennium.callFrontendMethod = function() {{ return Promise.resolve(); }};
+  }}
+  if (!window.Millennium.findElement) {{
+    window.Millennium.findElement = function() {{ return null; }};
   }}
 }})();"#
     )
@@ -309,6 +328,15 @@ pub fn connect_ws_local(ws_url: &str) -> Result<WebSocket<TcpStream>, String> {
 }
 
 pub fn bridge_ws_tab(ws_url: &str, http_port: u16, steam_root: Option<&Path>) -> bool {
+    bridge_ws_tab_with_stop(ws_url, http_port, steam_root, None)
+}
+
+pub fn bridge_ws_tab_with_stop(
+    ws_url: &str,
+    http_port: u16,
+    steam_root: Option<&Path>,
+    stop: Option<&AtomicBool>,
+) -> bool {
     let mut js = build_polyfill_js(http_port);
     if let Ok(p) = ensure_luatools_js_installed(steam_root) {
         if let Ok(extra) = fs::read_to_string(p) {
@@ -377,54 +405,111 @@ pub fn bridge_ws_tab(ws_url: &str, http_port: u16, steam_root: Option<&Path>) ->
     }
     let _ = socket.read();
 
-    // 5. Poll window.__lt_drain() and dispatch queued RPC calls outside browser CSP
-    let drain_eval = json!({
-        "id": 5,
-        "method": "Runtime.evaluate",
-        "params": {
-            "expression": "typeof window.__lt_drain === 'function' ? window.__lt_drain() : '[]'",
-            "returnByValue": true
-        }
-    });
-    if socket.send(Message::Text(drain_eval.to_string().into())).is_ok() {
-        if let Ok(msg) = socket.read() {
-            if let Ok(txt) = msg.into_text() {
-                if let Ok(val) = serde_json::from_str::<Value>(&txt) {
-                    if let Some(res_str) = val.get("result").and_then(|r| r.get("result")).and_then(|r| r.get("value")).and_then(|v| v.as_str()) {
-                        if let Ok(queued) = serde_json::from_str::<Vec<Value>>(res_str) {
-                            for item in queued {
-                                if let Some(req_id) = item.get("id").and_then(|i| i.as_str()) {
-                                    let method = item.get("method").and_then(|m| m.as_str()).unwrap_or("");
-                                    let args = item.get("args").cloned().unwrap_or(json!({}));
-                                    let agent = ureq::AgentBuilder::new()
-                                        .timeout(std::time::Duration::from_secs(4))
-                                        .build();
-                                    let rpc_res = agent
-                                        .post(&format!("http://127.0.0.1:{}/rpc", http_port))
-                                        .send_json(json!({ "method": method, "args": args }))
-                                        .ok()
-                                        .and_then(|r| r.into_string().ok())
-                                        .unwrap_or_else(|| json!({ "success": true }).to_string());
+    // 5. Keep WebSocket open and poll window.__lt_drain() to dispatch queued RPC calls outside browser CSP
+    let mut cmd_id: i64 = 5;
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(4))
+        .build();
 
-                                    let resolve_js = format!(
-                                        "if (typeof window.__lt_resolve === 'function') window.__lt_resolve('{}', {});",
-                                        req_id, rpc_res
-                                    );
-                                    let resolve_cmd = json!({
-                                        "id": 6,
-                                        "method": "Runtime.evaluate",
-                                        "params": {
-                                            "expression": resolve_js
-                                        }
-                                    });
-                                    let _ = socket.send(Message::Text(resolve_cmd.to_string().into()));
-                                    let _ = socket.read();
+    loop {
+        if let Some(s) = stop {
+            if s.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+
+        let drain_eval = json!({
+            "id": cmd_id,
+            "method": "Runtime.evaluate",
+            "params": {
+                "expression": "typeof window.__lt_drain === 'function' ? window.__lt_drain() : '[]'",
+                "returnByValue": true
+            }
+        });
+        cmd_id += 1;
+
+        if socket.send(Message::Text(drain_eval.to_string().into())).is_err() {
+            break;
+        }
+
+        let msg = match socket.read() {
+            Ok(m) => m,
+            Err(e) => {
+                match e {
+                    tungstenite::Error::Io(ref io_err)
+                        if io_err.kind() == std::io::ErrorKind::WouldBlock
+                            || io_err.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        continue;
+                    }
+                    _ => break,
+                }
+            }
+        };
+
+        if let Ok(txt) = msg.into_text() {
+            if let Ok(val) = serde_json::from_str::<Value>(&txt) {
+                if let Some(res_str) = val
+                    .get("result")
+                    .and_then(|r| r.get("result"))
+                    .and_then(|r| r.get("value"))
+                    .and_then(|v| v.as_str())
+                {
+                    if let Ok(queued) = serde_json::from_str::<Vec<Value>>(res_str) {
+                        for item in queued {
+                            if let Some(req_id) = item.get("id").and_then(|i| i.as_str()) {
+                                let method = item
+                                    .get("method")
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("");
+                                let args = item.get("args").cloned().unwrap_or_else(|| json!({}));
+                                let rpc_res = agent
+                                    .post(&format!("http://127.0.0.1:{}/rpc", http_port))
+                                    .send_json(json!({ "method": method, "args": args }))
+                                    .ok()
+                                    .and_then(|r| r.into_string().ok())
+                                    .unwrap_or_else(|| json!({ "success": true }).to_string());
+
+                                let res_arg = match serde_json::from_str::<Value>(&rpc_res) {
+                                    Ok(v) => v.to_string(),
+                                    Err(_) => serde_json::to_string(&rpc_res).unwrap_or_else(|_| "{}".into()),
+                                };
+
+                                let resolve_js = format!(
+                                    "if (typeof window.__lt_resolve === 'function') window.__lt_resolve('{}', {});",
+                                    req_id, res_arg
+                                );
+                                let resolve_cmd = json!({
+                                    "id": cmd_id,
+                                    "method": "Runtime.evaluate",
+                                    "params": {
+                                        "expression": resolve_js
+                                    }
+                                });
+                                cmd_id += 1;
+                                if socket.send(Message::Text(resolve_cmd.to_string().into())).is_err() {
+                                    break;
                                 }
+                                let _ = socket.read();
                             }
                         }
                     }
                 }
             }
+        }
+
+        let mut stopped = false;
+        for _ in 0..5 {
+            if let Some(s) = stop {
+                if s.load(Ordering::Relaxed) {
+                    stopped = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        if stopped {
+            break;
         }
     }
 
@@ -507,5 +592,130 @@ mod tests {
         assert!(received[3].contains("Runtime.evaluate"));
         assert!(received[3].contains("http://127.0.0.1:6767"));
         assert!(received[4].contains("__lt_drain"));
+    }
+
+    #[test]
+    fn cdp_queue_drain_retrieves_requests_and_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rpc_tx, _rpc_rx) = std::sync::mpsc::channel();
+        let http_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let http_port = http_listener.local_addr().unwrap().port();
+        drop(http_listener);
+
+        let mut srv = crate::services::http_server::HttpServerService::start(
+            http_port,
+            dir.path().to_path_buf(),
+            rpc_tx,
+            None,
+        )
+        .unwrap();
+
+        let ws_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ws_port = ws_listener.local_addr().unwrap().port();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+
+        let server = thread::spawn(move || -> Vec<String> {
+            let (mut conn, _) = ws_listener.accept().unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 512];
+            loop {
+                let n = conn.read(&mut buf).unwrap();
+                req.extend_from_slice(&buf[..n]);
+                if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let req_str = String::from_utf8_lossy(&req);
+            let key = req_str
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.trim()
+                        .eq_ignore_ascii_case("sec-websocket-key")
+                        .then(|| v.trim().to_string())
+                })
+                .unwrap();
+
+            let mut sha = Sha1::new();
+            sha.update(key.as_bytes());
+            sha.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+            let accept = BASE64.encode(sha.finalize());
+
+            let resp = format!(
+                "HTTP/1.1 101 Switching Protocols\r\n\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Accept: {}\r\n\r\n",
+                accept
+            );
+            conn.write_all(resp.as_bytes()).unwrap();
+
+            let mut ws = WebSocket::from_raw_socket(conn, Role::Server, None);
+            let mut received = Vec::new();
+
+            // 1: Page.enable, 2: Page.setBypassCSP, 3: Page.addScript, 4: Runtime.eval polyfill
+            for _ in 0..4 {
+                if let Ok(msg) = ws.read() {
+                    if let Ok(text) = msg.into_text() {
+                        let id = serde_json::from_str::<Value>(&text)
+                            .ok()
+                            .and_then(|v| v.get("id").and_then(|i| i.as_i64()))
+                            .unwrap_or(1);
+                        received.push(text.to_string());
+                        let _ = ws.send(Message::Text(format!(r#"{{"id":{},"result":{{}}}}"#, id).into()));
+                    }
+                }
+            }
+
+            // 5: First drain eval -> return queued Ping request
+            if let Ok(msg) = ws.read() {
+                if let Ok(text) = msg.into_text() {
+                    let id = serde_json::from_str::<Value>(&text)
+                        .ok()
+                        .and_then(|v| v.get("id").and_then(|i| i.as_i64()))
+                        .unwrap_or(5);
+                    received.push(text.to_string());
+                    let payload = r#"[{"id":"req-42","method":"Ping","args":{}}]"#;
+                    let resp_body = json!({
+                        "id": id,
+                        "result": {
+                            "result": {
+                                "value": payload
+                            }
+                        }
+                    });
+                    let _ = ws.send(Message::Text(resp_body.to_string().into()));
+                }
+            }
+
+            // 6: bridge_ws_tab sends Runtime.evaluate with __lt_resolve
+            if let Ok(msg) = ws.read() {
+                if let Ok(text) = msg.into_text() {
+                    let id = serde_json::from_str::<Value>(&text)
+                        .ok()
+                        .and_then(|v| v.get("id").and_then(|i| i.as_i64()))
+                        .unwrap_or(6);
+                    received.push(text.to_string());
+                    let _ = ws.send(Message::Text(format!(r#"{{"id":{},"result":{{}}}}"#, id).into()));
+                }
+            }
+
+            // Signal stop and exit
+            stop_clone.store(true, Ordering::Relaxed);
+            received
+        });
+
+        let ws_url = format!("ws://127.0.0.1:{}/devtools/page/TAB1", ws_port);
+        assert!(bridge_ws_tab_with_stop(&ws_url, http_port, None, Some(&stop)));
+        let received = server.join().unwrap();
+        assert!(received.len() >= 6);
+        assert!(received[4].contains("__lt_drain"));
+        assert!(received[5].contains("__lt_resolve"));
+        assert!(received[5].contains("req-42"));
+        assert!(received[5].contains("pong"));
+
+        srv.stop();
     }
 }

@@ -143,7 +143,11 @@ fn parse_client_license_list(body: &[u8]) -> Vec<License> {
                     // Skip unknown field
                     match wire_type {
                         0 => { // varint
-                            let _ = decode_varint(&license_data[license_offset..]);
+                            if let Some((_, bytes)) = decode_varint(&license_data[license_offset..]) {
+                                license_offset += bytes;
+                            } else {
+                                break;
+                            }
                         }
                         1 => { // 64-bit
                             if license_offset + 8 <= license_data.len() {
@@ -176,7 +180,11 @@ fn parse_client_license_list(body: &[u8]) -> Vec<License> {
             // Skip unknown top-level field
             match wire_type {
                 0 => { // varint
-                    let _ = decode_varint(&body[offset..]);
+                    if let Some((_, bytes)) = decode_varint(&body[offset..]) {
+                        offset += bytes;
+                    } else {
+                        break;
+                    }
                 }
                 1 => { // 64-bit
                     if offset + 8 <= body.len() {
@@ -384,11 +392,11 @@ mod tests {
         // License field 2 (access_token): tag=0x10, varint 456
         let mut body = Vec::new();
         body.push(0x0A); // field 1, wire type 2 (length-delimited)
-        body.push(0x04); // length = 4
+        body.push(0x05); // length = 5
         body.push(0x08); // field 1, wire type 0 (varint)
         body.push(0x7B); // 123
         body.push(0x10); // field 2, wire type 0 (varint)
-        body.push(0xC8); // 456 (0xC8 = 200, need varint for 456)
+        body.push(0xC8); // 456 (0xC8 0x03)
         body.push(0x03); // continuation for 456 = 0xC8 0x03
 
         let licenses = parse_client_license_list(&body);
@@ -406,7 +414,7 @@ mod tests {
 
         // License 1
         body.push(0x0A); // field 1, wire type 2
-        body.push(0x06); // length = 6
+        body.push(0x05); // length = 5
         body.push(0x08); body.push(0x64); // package_id = 100
         body.push(0x10); body.push(0xC8); body.push(0x01); // access_token = 200 (0xC8 0x01)
 
@@ -429,7 +437,7 @@ mod tests {
         // License with package_id=0 should be skipped
         let mut body = Vec::new();
         body.push(0x0A); // field 1
-        body.push(0x02); // length = 2
+        body.push(0x04); // length = 4
         body.push(0x08); body.push(0x00); // package_id = 0
         body.push(0x10); body.push(0x01); // access_token = 1
 

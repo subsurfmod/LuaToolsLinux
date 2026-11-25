@@ -11,12 +11,13 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RpcUiEvent {
     AddApp(u32),
     OpenFix(u32),
     OpenSettings,
     RemovedApp(u32),
+    RestoreFromTray,
 }
 
 pub struct HttpServerService {
@@ -349,19 +350,34 @@ fn handle_request(
                     json!({ "success": true, "exists": exists, "result": exists }),
                 );
             }
-            "StartAddViaLuaTools" | "StartLuaToolsAdd" if rpc_aid > 0 => {
-                let game_name = args.get("name").and_then(|v| v.as_str()).map(ToString::to_string);
-                crate::services::plugin_add_service::start_headless_add(rpc_aid as u64, game_name, stplug_dir);
-                let _ = event_tx.send(RpcUiEvent::AddApp(rpc_aid));
-                notify();
-                send_json(req, 200, json!({ "success": true, "queued": true }));
+            "AddViaLuaTools" | "StartAddViaLuaTools" | "StartLuaToolsAdd" => {
+                if rpc_aid > 0 {
+                    let game_name = args.get("name").and_then(|v| v.as_str()).map(ToString::to_string);
+                    crate::services::plugin_add_service::start_headless_add(rpc_aid as u64, game_name, stplug_dir);
+                    let _ = event_tx.send(RpcUiEvent::AddApp(rpc_aid));
+                    notify();
+                    send_json(req, 200, json!({ "success": true, "queued": true, "appid": rpc_aid, "result": { "queued": true, "appid": rpc_aid } }));
+                } else {
+                    send_json(req, 400, json!({ "success": false, "error": "Missing or invalid appid" }));
+                }
             }
             "GetAddViaLuaToolsStatus" | "GetLuaToolsAddStatus" => {
                 let is_inst = rpc_aid > 0 && stplug_dir.join(format!("{}.lua", rpc_aid)).exists();
                 let state = crate::services::plugin_add_service::get_add_state(rpc_aid as u64, is_inst);
                 send_json(req, 200, json!({
                     "success": true,
-                    "result": { "status": if is_inst { "completed" } else { "downloading" } },
+                    "result": {
+                        "status": if is_inst { "completed" } else { "downloading" },
+                        "installed": is_inst,
+                        "appid": rpc_aid,
+                        "checking": state.checking,
+                        "fastFetch": state.fast_fetch,
+                        "sourcesLoaded": state.sources_loaded,
+                        "sources": state.sources,
+                        "installStatus": state.install_status,
+                        "installFailed": state.install_failed,
+                        "error": state.error,
+                    },
                     "state": state,
                     "appid": rpc_aid,
                     "checking": state.checking,
@@ -374,16 +390,39 @@ fn handle_request(
                     "installed": is_inst,
                 }));
             }
+            "CheckSources" | "CheckSource" => {
+                if rpc_aid > 0 {
+                    let is_inst = stplug_dir.join(format!("{}.lua", rpc_aid)).exists();
+                    let state = crate::services::plugin_add_service::get_add_state(rpc_aid as u64, is_inst);
+                    send_json(req, 200, json!({
+                        "success": true,
+                        "appid": rpc_aid,
+                        "results": state.sources,
+                        "sources": state.sources,
+                        "result": {
+                            "appid": rpc_aid,
+                            "sources": state.sources,
+                            "sourcesLoaded": state.sources_loaded,
+                        }
+                    }));
+                } else {
+                    send_json(req, 400, json!({ "success": false, "error": "Missing or invalid appid" }));
+                }
+            }
             "DeleteLuaToolsForApp" if rpc_aid > 0 => {
                 let _ = std::fs::remove_file(stplug_dir.join(format!("{}.lua", rpc_aid)));
                 let _ = event_tx.send(RpcUiEvent::RemovedApp(rpc_aid));
                 notify();
                 send_json(req, 200, json!({ "success": true }));
             }
-            "CheckForFixes" | "OpenFixes" if rpc_aid > 0 => {
-                let _ = event_tx.send(RpcUiEvent::OpenFix(rpc_aid));
-                notify();
-                send_json(req, 200, json!({ "success": true }));
+            "OpenFix" | "OpenFixes" | "CheckForFixes" => {
+                if rpc_aid > 0 {
+                    let _ = event_tx.send(RpcUiEvent::OpenFix(rpc_aid));
+                    notify();
+                    send_json(req, 200, json!({ "success": true, "appid": rpc_aid, "result": { "appid": rpc_aid } }));
+                } else {
+                    send_json(req, 400, json!({ "success": false, "error": "Missing or invalid appid" }));
+                }
             }
             "OpenSettings" => {
                 let _ = event_tx.send(RpcUiEvent::OpenSettings);
@@ -591,6 +630,8 @@ fn handle_request(
             .unwrap_or("");
         match validate_external_url(target_url) {
             Ok(safe_url) => {
+                let _ = event_tx.send(RpcUiEvent::RestoreFromTray);
+                notify();
                 if allow_external_spawn() {
                     let _ = std::process::Command::new("xdg-open").arg(&safe_url).spawn();
                 }
@@ -653,11 +694,19 @@ fn handle_request(
     }
 
 
-    // Route: /remove or /remove/:appid or /delete or /delete/:appid
+    // Route: /remove or /remove/:appid or /delete or /delete/:appid (POST only to prevent GET CSRF mutations)
     if parts.first() == Some(&"remove")
         || parts.first() == Some(&"delete")
         || (parts.len() == 2 && parts[0] == "api" && (parts[1] == "remove" || parts[1] == "delete"))
     {
+        if req.method() != &Method::Post {
+            send_json(
+                req,
+                405,
+                json!({ "error": "Method Not Allowed - POST required", "success": false }),
+            );
+            return;
+        }
         if aid > 0 {
             let _ = std::fs::remove_file(stplug_dir.join(format!("{}.lua", aid)));
             let _ = std::fs::remove_file(stplug_dir.join(format!("{}.lua.disabled", aid)));
@@ -892,7 +941,7 @@ mod tests {
     #[test]
     fn serves_ping_and_rpc_cleanly() {
         let dir = tempfile::tempdir().unwrap();
-        let (tx, _rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
         let port = get_free_port();
         let mut srv = HttpServerService::start(port, dir.path().to_path_buf(), tx, None).unwrap();
 
@@ -910,6 +959,43 @@ mod tests {
             .unwrap();
         assert_eq!(rpc["success"], true);
         assert_eq!(rpc["exists"], false);
+
+        // Test AddViaLuaTools
+        let rpc_add: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .send_json(json!({ "method": "AddViaLuaTools", "args": { "appid": 1245620 } }))
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(rpc_add["success"], true);
+        assert_eq!(rpc_add["queued"], true);
+        assert!(matches!(rx.try_recv().unwrap(), RpcUiEvent::AddApp(1245620)));
+
+        // Test GetAddViaLuaToolsStatus
+        let rpc_st: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .send_json(json!({ "method": "GetAddViaLuaToolsStatus", "args": { "appid": 1245620 } }))
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(rpc_st["success"], true);
+        assert!(rpc_st.get("result").is_some());
+
+        // Test CheckSources
+        let rpc_src: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .send_json(json!({ "method": "CheckSources", "args": { "appid": 1245620 } }))
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(rpc_src["success"], true);
+        assert!(rpc_src.get("sources").is_some());
+
+        // Test OpenFix
+        let rpc_fix: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .send_json(json!({ "method": "OpenFix", "args": { "appid": 1245620 } }))
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(rpc_fix["success"], true);
+        assert!(matches!(rx.try_recv().unwrap(), RpcUiEvent::OpenFix(1245620)));
 
         srv.stop();
     }
@@ -964,8 +1050,15 @@ mod tests {
         let apps: Value = ureq::get(&format!("http://127.0.0.1:{}/apps", port)).call().unwrap().into_json().unwrap();
         assert_eq!(apps["apps"], json!([1245620]));
 
-        // 4. /remove
-        let rem: Value = ureq::get(&format!("http://127.0.0.1:{}/remove/1245620", port)).call().unwrap().into_json().unwrap();
+        // 4. /remove (POST required to prevent GET CSRF mutations)
+        let rem_get = ureq::get(&format!("http://127.0.0.1:{}/remove/1245620", port)).call();
+        assert!(matches!(rem_get, Err(ureq::Error::Status(405, _))));
+
+        let rem: Value = ureq::post(&format!("http://127.0.0.1:{}/remove/1245620", port))
+            .send_json(json!({}))
+            .unwrap()
+            .into_json()
+            .unwrap();
         assert_eq!(rem["removed"], true);
         assert!(matches!(rx.try_recv().unwrap(), RpcUiEvent::RemovedApp(1245620)));
 
@@ -1042,6 +1135,7 @@ mod tests {
             .into_json()
             .unwrap();
         assert_eq!(open_url["success"], true);
+        assert!(matches!(rx.try_recv().unwrap(), RpcUiEvent::RestoreFromTray));
 
         let r_steam: Value = ureq::post(&format!("http://127.0.0.1:{}/restart-steam", port))
             .send_json(json!({})).unwrap().into_json().unwrap();

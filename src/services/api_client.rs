@@ -200,11 +200,22 @@ impl HubcapService {
             "https://lua.tools/api/givemethemanifestpunk/{}/{}",
             depot_id, gid
         );
-        if let Ok(resp) = agent
+        let mut req = agent
             .get(&luatools_url)
-            .set("User-Agent", MANIFEST_BACKEND_UA)
-            .call()
-        {
+            .set("User-Agent", MANIFEST_BACKEND_UA);
+        let auth_token = hubcap_api_key
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(String::from)
+            .or_else(|| {
+                crate::services::auth_service::AuthService::default()
+                    .get_valid_access_token()
+                    .ok()
+            });
+        if let Some(ref token) = auth_token {
+            req = req.set("Authorization", &format!("Bearer {}", token));
+        }
+        if let Ok(resp) = req.call() {
             let mut bytes = Vec::new();
             if resp.into_reader().take(64 * 1024 * 1024).read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
                 return Ok(bytes);
@@ -216,11 +227,13 @@ impl HubcapService {
             "{}/api/givemethemanifestpunk?depotid={}&gid={}",
             MANIFEST_BACKEND_URL, depot_id, gid
         );
-        if let Ok(resp) = agent
+        let mut req_primary = agent
             .get(&primary_url)
-            .set("User-Agent", MANIFEST_BACKEND_UA)
-            .call()
-        {
+            .set("User-Agent", MANIFEST_BACKEND_UA);
+        if let Some(ref token) = auth_token {
+            req_primary = req_primary.set("Authorization", &format!("Bearer {}", token));
+        }
+        if let Ok(resp) = req_primary.call() {
             let mut bytes = Vec::new();
             if resp.into_reader().take(64 * 1024 * 1024).read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
                 return Ok(bytes);
@@ -275,7 +288,13 @@ impl HubcapService {
         if let Some(parent) = dest_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        fs::write(dest_path, bytes).map_err(|e| format!("Failed to write manifest: {}", e))?;
+        fs::write(dest_path, &bytes).map_err(|e| format!("Failed to write manifest: {}", e))?;
+        if let Err(e) = crate::parsers::manifest_binary::read_manifest_file(dest_path) {
+            log::warn!(
+                "Downloaded raw manifest for depot {} gid {} failed binary decode check: {}",
+                depot_id, gid, e
+            );
+        }
         Ok(dest_path.to_path_buf())
     }
 

@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           luatools-linux
-Version:        3.1.0
+Version:        3.2.0
 Release:        1%{?dist}
 Summary:        Native Rust workstation for Steam stplug-in lua manifests, depots, and fixes
 License:        MIT
@@ -48,6 +48,8 @@ install -m 0644 %{_sourcedir}/luatools.desktop %{buildroot}%{_datadir}/applicati
 %{_datadir}/icons/hicolor/scalable/apps/luatools.svg
 
 %changelog
+* Wed Nov 25 2026 LuaTools Linux Contributors <noreply@lua.tools> - 3.2.0-1
+- Release v3.2.0: Complete BetterSteamTools Linux port, native Steam client netpacket protocol handling & online-fix licensing, hardened SLSsteam de-sync on uninstall, case-insensitive DLL overrides, and full forensic audit fixes
 * Wed Nov 25 2026 LuaTools Linux Contributors <noreply@lua.tools> - 3.1.0-1
 - Release v3.1.0: Complete 32-key AceSLS/SLSsteam config.yaml schema & ManifestIds u64 healing, Home Open button wired to Integration & Process Controls modal with 1-click Game Tools bar, surfaced action buttons across My Games / Add Games / Depots & Vault / Game Fixes / Settings, and concise plain-English README rewrite
 * Wed Nov 25 2026 LuaTools Linux Contributors <noreply@lua.tools> - 3.0.1-1

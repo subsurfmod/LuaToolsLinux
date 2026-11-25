@@ -3,9 +3,12 @@
 //! This module replaces Windows-specific hooking and IPC interception
 //! with Linux equivalents using memory_patch.rs and pattern_db.rs.
 
+pub mod interop_callbacks;
+pub mod interop_decryption;
 pub mod interop_ipc;
 pub mod interop_ipc_isteamuser;
 pub mod interop_ipc_isteamutils;
+pub mod interop_keyvalues;
 pub mod interop_misc;
 pub mod interop_package;
 pub mod interop_steamui;

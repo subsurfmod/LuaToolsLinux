@@ -77,6 +77,10 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+pub fn sanitize_fix_id(fix_id: &str) -> String {
+    fix_id.replace(':', "_")
+}
+
 pub fn is_safe_fix_id(fix_id: &str) -> bool {
     let s = fix_id.trim();
     !s.is_empty()
@@ -95,10 +99,10 @@ impl FixesService {
         if !is_safe_fix_id(fix_id) {
             return false;
         }
-        install_dir
-            .join(FIX_DIR_NAME)
-            .join(format!("{}.json", fix_id))
-            .exists()
+        let safe_file = format!("{}.json", sanitize_fix_id(fix_id));
+        let legacy_file = format!("{}.json", fix_id);
+        let dir = install_dir.join(FIX_DIR_NAME);
+        dir.join(&safe_file).exists() || dir.join(&legacy_file).exists()
     }
 
     pub fn apply_drm_fix_manifest<F>(
@@ -451,7 +455,7 @@ impl FixesService {
             files: records.clone(),
             wine_dll_overrides: wine_overrides_str,
         };
-        let record_file = fix_meta_dir.join(format!("{}.json", fix_id));
+        let record_file = fix_meta_dir.join(format!("{}.json", sanitize_fix_id(fix_id)));
         let js = match serde_json::to_string_pretty(&record) {
             Ok(s) => s,
             Err(e) => {
@@ -487,7 +491,15 @@ impl FixesService {
             return FixApplicationResult::err("Invalid fix ID.");
         }
         let fix_meta_dir = game_dir.join(FIX_DIR_NAME);
-        let record_file = fix_meta_dir.join(format!("{}.json", fix_id));
+        let safe_file = fix_meta_dir.join(format!("{}.json", sanitize_fix_id(fix_id)));
+        let legacy_file = fix_meta_dir.join(format!("{}.json", fix_id));
+        let record_file = if safe_file.is_file() {
+            safe_file
+        } else if legacy_file.is_file() {
+            legacy_file
+        } else {
+            return FixApplicationResult::err(format!("Fix record '{}' not found.", fix_id));
+        };
         let Ok(raw) = fs::read_to_string(&record_file) else {
             return FixApplicationResult::err(format!("Fix record '{}' not found.", fix_id));
         };
@@ -606,15 +618,34 @@ impl FixesService {
             }
             if let Ok(content) = read_wine_registry_text(&reg_path) {
                 let mut new_content = content.clone();
-                let section_prefix = "[Software\\Wine\\DllOverrides]";
-                if !new_content.contains(section_prefix) {
-                    new_content.push_str(&format!("\n{}\n", section_prefix));
+                let section_header = "[Software\\\\Wine\\\\DllOverrides]";
+                let mut found_section = None;
+                for (_idx, line) in new_content.lines().enumerate() {
+                    let trimmed = line.trim();
+                    let norm = trimmed.replace('/', "\\");
+                    if norm.eq_ignore_ascii_case("[Software\\Wine\\DllOverrides]")
+                        || norm.eq_ignore_ascii_case("[Software\\\\Wine\\\\DllOverrides]")
+                    {
+                        found_section = Some(line.to_string());
+                        break;
+                    }
                 }
+                let section_match = match found_section {
+                    Some(s) => s,
+                    None => {
+                        new_content.push_str(&format!("\n{}\n", section_header));
+                        section_header.to_string()
+                    }
+                };
                 for dll in dlls {
                     let entry = format!("\"{}\"= \"native,builtin\"", dll);
-                    if !new_content.contains(&entry) {
-                        if let Some(pos) = new_content.find(section_prefix) {
-                            let line_end = new_content[pos..].find('\n').map(|p| pos + p + 1).unwrap_or(pos + section_prefix.len());
+                    let dll_prefix = format!("\"{}\"=", dll.to_ascii_lowercase());
+                    let has_dll = new_content
+                        .lines()
+                        .any(|l| l.trim().to_ascii_lowercase().starts_with(&dll_prefix));
+                    if !has_dll {
+                        if let Some(pos) = new_content.find(&section_match) {
+                            let line_end = new_content[pos..].find('\n').map(|p| pos + p + 1).unwrap_or(pos + section_match.len());
                             new_content.insert_str(line_end, &format!("{}\n", entry));
                         }
                     }
@@ -651,8 +682,11 @@ impl FixesService {
             return None;
         }
         let fix_meta_dir = game_dir.join(FIX_DIR_NAME);
-        let record_file = fix_meta_dir.join(format!("{}.json", fix_id));
-        let raw = fs::read_to_string(&record_file).ok()?;
+        let safe_file = fix_meta_dir.join(format!("{}.json", sanitize_fix_id(fix_id)));
+        let legacy_file = fix_meta_dir.join(format!("{}.json", fix_id));
+        let raw = fs::read_to_string(&safe_file)
+            .or_else(|_| fs::read_to_string(&legacy_file))
+            .ok()?;
         let record = serde_json::from_str::<AppliedFixRecord>(&raw).ok()?;
         record.wine_dll_overrides
     }

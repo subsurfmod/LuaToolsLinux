@@ -5,6 +5,7 @@
 //! CloudRedirect integration for NetPacket messages, and license handling.
 
 pub mod netpacket_accesstoken;
+pub mod netpacket_cloud;
 pub mod netpacket_core;
 pub mod netpacket_eticket;
 pub mod netpacket_legacykey;
@@ -19,6 +20,9 @@ pub mod userstats;
 // Re-export key functions for easier access
 pub use netpacket_accesstoken::{
     install_accesstoken_hooks, is_accesstoken_hook_active, uninstall_accesstoken_hooks,
+};
+pub use netpacket_cloud::{
+    drain_cloud_responses, install_cloud_hooks, is_cloud_hook_active, uninstall_cloud_hooks,
 };
 pub use netpacket_core::{
     install_netpacket_core, is_netpacket_core_active, uninstall_netpacket_core,

@@ -505,7 +505,7 @@ mod tests {
 
         // Multi-byte
         assert_eq!(decode_varint(&[0x80, 0x01]), Some((128, 2)));
-        assert_eq!(decode_varint(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]), Some((268435455, 5)));
+        assert_eq!(decode_varint(&[0xFF, 0xFF, 0xFF, 0x7F]), Some((268435455, 4)));
 
         // Truncated
         assert!(decode_varint(&[0x80]).is_none());
@@ -534,7 +534,7 @@ mod tests {
 
         out.clear();
         encode_varint(268435455, &mut out);
-        assert_eq!(out, vec![0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
+        assert_eq!(out, vec![0xFF, 0xFF, 0xFF, 0x7F]);
     }
 
     #[test]

@@ -33,6 +33,7 @@ use crate::services::cloud_redirect_service::CloudRedirectService;
 use crate::services::depot_downloader::DepotDownloaderService;
 use crate::services::depot_info::{AppDepotInfo, ContentDepot, SteamDepotInfo};
 use crate::services::donate_keys::DonateKeysService;
+use crate::services::download_queue::{DownloadQueue, DownloadTask};
 use crate::services::external_tools::{ExternalToolsManager, ToolStatusInfo};
 use crate::services::fixes_service::FixesService;
 use crate::services::game_process_injection_service::GameProcessInjectionService;
@@ -45,6 +46,7 @@ use crate::services::play_unowned_service::PlayUnownedService;
 use crate::services::protocol_service::ProtocolService;
 use crate::services::settings_service::SettingsService;
 use crate::services::slssteam_service::SlssteamService;
+use crate::services::steamless_service::SteamlessService;
 use crate::services::steam_auto_crack_service::SteamAutoCrackService;
 use crate::services::steam_bridge_service::SteamBridgeService;
 use crate::services::steam_library_service::SteamLibraryService;
@@ -104,6 +106,7 @@ pub struct LuaToolsApp {
     pub hardware_service: HardwareAppIdService,
     pub depot_info_service: SteamDepotInfo,
     pub depot_downloader: DepotDownloaderService,
+    pub download_queue: Arc<DownloadQueue>,
     pub lua_vault: LuaVault,
     pub lua_installer: Option<LuaInstaller>,
     pub play_unowned_service: PlayUnownedService,
@@ -121,6 +124,7 @@ pub struct LuaToolsApp {
     pub asset_hash_service: AssetHashService,
     pub applied_fix_index: AppliedFixIndexService,
     pub tray_service: TrayService,
+    pub tray_locked: bool,
     pub quit_requested: bool,
     pub prev_viewport_minimized: bool,
     pub suppress_minimize_hook_frames: u8,
@@ -330,6 +334,8 @@ impl LuaToolsApp {
         let hot_reload_service = HotReloadService::new().on_change(move |_| {
             ctx_for_hr.request_repaint();
         });
+        let download_queue = Arc::new(DownloadQueue::default());
+        download_queue.start_worker();
         let sys_preload = steam_bridge_service.status().system_preload_enabled;
         let mut app = Self {
             settings_service,
@@ -346,6 +352,7 @@ impl LuaToolsApp {
             hardware_service,
             depot_info_service,
             depot_downloader,
+            download_queue,
             lua_vault,
             lua_installer: None,
             play_unowned_service: PlayUnownedService::new(steam_installation.clone()),
@@ -361,8 +368,9 @@ impl LuaToolsApp {
             tools_manager,
             telemetry_service,
             asset_hash_service,
-            applied_fix_index: AppliedFixIndexService::default(),
+            applied_fix_index: AppliedFixIndexService::new(None),
             tray_service: TrayService::default(),
+            tray_locked: force_tray,
             quit_requested: false,
             prev_viewport_minimized: false,
             suppress_minimize_hook_frames: 0,
@@ -506,7 +514,13 @@ impl LuaToolsApp {
             // Wire system tray callbacks; only load GTK3/AppIndicator3 (~25 MB) when tray behavior is enabled
             app.tray_service.set_app_message_sender(app.msg_tx.clone());
             app.tray_service.set_egui_context(cc.egui_ctx.clone());
+            let is_silent = initial_url
+                .as_ref()
+                .and_then(|u| ProtocolService::parse(u))
+                .map(|a| a.silent)
+                .unwrap_or(false);
             if force_tray
+                || is_silent
                 || app.settings_service.settings.close_to_tray
                 || app.settings_service.settings.minimize_to_tray
             {
@@ -581,6 +595,8 @@ impl LuaToolsApp {
 
         let steam_installation = steam_service.installation.clone();
         let steam_auto_crack = SteamAutoCrackService::new(tools_manager.clone());
+        let download_queue = Arc::new(DownloadQueue::new(Some(scratch_dir.join("downloads"))));
+        download_queue.start_worker();
         let mut app = Self {
             settings_service,
             auth_service,
@@ -596,6 +612,7 @@ impl LuaToolsApp {
             hardware_service,
             depot_info_service,
             depot_downloader,
+            download_queue,
             lua_vault,
             lua_installer: None,
             play_unowned_service: PlayUnownedService::new(steam_installation.clone()),
@@ -618,8 +635,9 @@ impl LuaToolsApp {
             tools_manager,
             telemetry_service,
             asset_hash_service: AssetHashService::new(),
-            applied_fix_index: AppliedFixIndexService::default(),
+            applied_fix_index: AppliedFixIndexService::new(None),
             tray_service,
+            tray_locked: false,
             quit_requested: false,
             prev_viewport_minimized: false,
             suppress_minimize_hook_frames: 0,
@@ -1490,6 +1508,29 @@ impl LuaToolsApp {
         let gname = self.acquire_details.as_ref().map(|d| d.name.clone());
         let tx = self.msg_tx.clone();
         let ctx_c = ctx.clone();
+        let queue = self.download_queue.clone();
+
+        let task_id = format!(
+            "acquire_{}_{}",
+            app_id,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        );
+        let task = DownloadTask {
+            id: task_id,
+            app_id,
+            label: gname.clone().unwrap_or_else(|| format!("AppID {}", app_id)),
+            source: source.clone(),
+            url: format!("manifest://{}/{}", source, app_id),
+            dest_path: std::env::temp_dir()
+                .join(format!("luatools_dl_{}", app_id))
+                .join(format!("{}.zip", app_id)),
+            total_bytes: None,
+            priority: 10,
+        };
+        queue.enqueue(task);
 
         thread::spawn(move || {
             let tmp = std::env::temp_dir().join(format!("luatools_dl_{}", app_id));
@@ -1651,7 +1692,13 @@ impl LuaToolsApp {
             aid,
         );
 
+        let disabled_depot_ids: std::collections::HashSet<u32> =
+            lua.disabled_entries.iter().map(|de| de.id).collect();
+
         for entry in lua.entries {
+            if disabled_depot_ids.contains(&entry.id) {
+                continue;
+            }
             if entry.id == aid && entry.manifest_id.is_none() && !entry.has_key() {
                 continue;
             }
@@ -1852,10 +1899,19 @@ impl LuaToolsApp {
                 ctx_p.request_repaint();
             }) {
                 Ok(exe) => {
+                    let mut msg = format!("Ready at {}", exe.display());
+                    if k_owned == "goldberg"
+                        && crate::services::wired_service::find_7z_bin().is_none()
+                    {
+                        msg = format!(
+                            "Goldberg Linux binaries ready at {}, but 7z/p7zip was missing on host (Windows DLLs for Proton not extracted).",
+                            exe.display()
+                        );
+                    }
                     let _ = tx.send(AppMessage::ToolFinished {
                         tool_key: k_owned,
                         ok: true,
-                        msg: format!("Ready at {}", exe.display()),
+                        msg,
                     });
                 }
                 Err(e) => {
@@ -1882,83 +1938,65 @@ impl LuaToolsApp {
             app_id,
             install_dir.display()
         );
-        let mgr = self.tools_manager.clone();
+        let steamless_service = SteamlessService::new(self.depot_downloader.clone());
         let ahs = self.asset_hash_service.clone();
         let tx = self.msg_tx.clone();
         let ctx_c = ctx.clone();
 
         thread::spawn(move || {
-            let mut exes = Vec::new();
-            for entry in walkdir::WalkDir::new(&install_dir)
+            let res = steamless_service.patch_game(app_id, &install_dir);
+            let mut unpacked_count = 0usize;
+            if let Ok(entries) = walkdir::WalkDir::new(&install_dir)
                 .max_depth(4)
                 .into_iter()
-                .flatten()
+                .collect::<Result<Vec<_>, _>>()
             {
-                let p = entry.path();
-                if entry.file_type().is_file() {
-                    if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-                        let low = name.to_ascii_lowercase();
-                        if low.ends_with(".exe")
-                            && !low.ends_with(".unpacked.exe")
-                            && !low.contains("redist")
-                            && !low.contains("vcredist")
-                            && !low.contains("directx")
-                            && !low.contains("dxsetup")
-                            && !low.contains("setup")
-                            && !low.contains("uninstall")
-                            && !low.contains("crash")
-                            && !low.contains("easyanticheat")
-                            && !low.contains("battleye")
-                        {
-                            exes.push(p.to_path_buf());
+                for entry in entries {
+                    let p = entry.path();
+                    if p.is_file() {
+                        if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                            if name.ends_with(".unpacked.exe") {
+                                let orig_path = if p.to_string_lossy().ends_with(".exe.unpacked.exe") {
+                                    PathBuf::from(p.to_string_lossy().trim_end_matches(".unpacked.exe"))
+                                } else {
+                                    p.with_extension("exe")
+                                };
+                                let bak_path = PathBuf::from(format!("{}.orig.bak", orig_path.display()));
+                                if !bak_path.exists() && orig_path.is_file() {
+                                    let _ = fs::copy(&orig_path, &bak_path);
+                                }
+                                if fs::rename(p, &orig_path).is_ok() {
+                                    unpacked_count += 1;
+                                    let _ = ahs.hash_file(
+                                        app_id,
+                                        &orig_path,
+                                        orig_path.file_name().and_then(|s| s.to_str()).unwrap_or(name),
+                                    );
+                                }
+                            }
                         }
                     }
                 }
             }
-            let (ok, msg) = if exes.is_empty() {
+            let total_unpacked = res.patched as usize + unpacked_count;
+            let (ok, msg) = if let Some(err) = res.error {
+                (false, err)
+            } else if total_unpacked > 0 {
                 (
-                    false,
+                    true,
                     format!(
-                        "No game .exe files found in {} for AppID {}.",
-                        install_dir.display(),
-                        app_id
+                        "Steamless unpacked {}/{} executable(s) for AppID {}.",
+                        total_unpacked, res.total, app_id
                     ),
                 )
             } else {
-                let mut unpacked = 0usize;
-                let mut last_err = None;
-                for exe in &exes {
-                    match mgr.launch_stub_remover(exe) {
-                        Ok(_) => {
-                            let fname = exe.file_name().and_then(|s| s.to_str()).unwrap_or("game.exe");
-                            let _ = ahs.hash_file(app_id, exe, fname);
-                            unpacked += 1;
-                        }
-                        Err(e) => last_err = Some(e),
-                    }
-                }
-                if unpacked > 0 {
-                    (
-                        true,
-                        format!(
-                            "Steamless unpacked {}/{} executable(s) for AppID {}.",
-                            unpacked,
-                            exes.len(),
-                            app_id
-                        ),
-                    )
-                } else {
-                    (
-                        false,
-                        last_err.unwrap_or_else(|| {
-                            format!(
-                                "No SteamStub protection unpacked across {} executable(s) for AppID {}.",
-                                exes.len(),
-                                app_id
-                            )
-                        }),
-                    )
-                }
+                (
+                    false,
+                    format!(
+                        "No SteamStub protection unpacked across {} executable(s) for AppID {}.",
+                        res.total, app_id
+                    ),
+                )
             };
             let _ = tx.send(AppMessage::ToolFinished {
                 tool_key: "stub_remover".to_string(),
@@ -2552,11 +2590,110 @@ impl LuaToolsApp {
             return;
         };
 
+        if act.silent {
+            if self.can_hide_to_tray() {
+                self.tray_service.set_visibility(false);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            } else {
+                self.tray_service.set_visibility(true);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
+        }
+
         if let Some(ref code) = act.redeem_code {
-            self.notify(
-                format!("Received redeem code '{}' via protocol handler.", code),
-                ToastKind::Info,
-            );
+            let code_str = code.trim().to_string();
+            // 1. Direct APPID:TOKEN or APPID/TOKEN syntax (e.g. "1245620:abc123token")
+            let mut resolved_direct = None;
+            if let Some((aid_s, tok)) = code_str.split_once(':').or_else(|| code_str.split_once('/')) {
+                if let Ok(aid) = aid_s.trim().parse::<u32>() {
+                    let t = tok.trim();
+                    if aid > 0 && !t.is_empty() {
+                        resolved_direct = Some((aid, t.to_string(), None::<String>, None::<String>));
+                    }
+                }
+            }
+
+            // 2. If not direct, query the online redemption endpoint
+            let redemption_result = if let Some(direct) = resolved_direct {
+                Some(direct)
+            } else {
+                let agent = ureq::AgentBuilder::new()
+                    .timeout(std::time::Duration::from_secs(6))
+                    .build();
+                let endpoints = [
+                    "https://luastools.xyz/drm/redeem",
+                    "https://tokeer.luastools.xyz/redeem",
+                ];
+                let mut res = None;
+                for ep in &endpoints {
+                    let resp = agent
+                        .post(ep)
+                        .set("Content-Type", "application/json")
+                        .send_json(serde_json::json!({ "code": code_str }));
+                    if let Ok(r) = resp {
+                        if let Ok(val) = r.into_json::<serde_json::Value>() {
+                            let app_id = val.get("app_id")
+                                .or_else(|| val.get("appid"))
+                                .and_then(|v| v.as_u64())
+                                .map(|v| v as u32)
+                                .unwrap_or(0);
+                            let token = val.get("token")
+                                .or_else(|| val.get("app_token"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| code_str.clone());
+                            let app_ticket = val.get("appticket")
+                                .or_else(|| val.get("app_ticket"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            let e_ticket = val.get("eticket")
+                                .or_else(|| val.get("e_ticket"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            if app_id > 0 {
+                                res = Some((app_id, token, app_ticket, e_ticket));
+                                break;
+                            }
+                        }
+                    }
+                }
+                res
+            };
+
+            if let Some((aid, tok, app_ticket, e_ticket)) = redemption_result {
+                self.slssteam_service.set_token(aid, tok);
+                let _ = self.slssteam_service.save();
+
+                if app_ticket.is_some() || e_ticket.is_some() {
+                    let ticket_data = crate::steam_bridge::ticket_store::AppTicketData {
+                        app_id: aid,
+                        steam_id: None,
+                        app_ticket,
+                        e_ticket,
+                        last_update: Some(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0),
+                        ),
+                    };
+                    let _ = self.steam_bridge_service.set_tickets(ticket_data);
+                }
+
+                self.notify(
+                    format!(
+                        "Redeemed code '{}' for AppID {}. Persisted into SLSsteam config.yaml and ticket store.",
+                        code_str, aid
+                    ),
+                    ToastKind::Success,
+                );
+            } else {
+                self.notify(
+                    format!("Received redeem code '{}' via protocol handler.", code_str),
+                    ToastKind::Info,
+                );
+            }
             return;
         }
 
@@ -2674,10 +2811,23 @@ impl LuaToolsApp {
 
         while let Ok(ev) = self.rpc_rx.try_recv() {
             match ev {
-                RpcUiEvent::AddApp(aid) => self.open_app_in_acquire(aid, ctx),
-                RpcUiEvent::OpenFix(aid) => self.open_app_in_fixes(aid, ctx),
-                RpcUiEvent::OpenSettings => self.active_view = ActiveView::Settings,
+                RpcUiEvent::AddApp(aid) => {
+                    self.restore_from_tray(ctx);
+                    self.open_app_in_acquire(aid, ctx);
+                }
+                RpcUiEvent::OpenFix(aid) => {
+                    self.restore_from_tray(ctx);
+                    self.open_app_in_fixes(aid, ctx);
+                }
+                RpcUiEvent::OpenSettings => {
+                    self.restore_from_tray(ctx);
+                    self.settings_service.sync_autostart_from_disk();
+                    self.active_view = ActiveView::Settings;
+                }
                 RpcUiEvent::RemovedApp(_) => self.refresh_all_local_state(),
+                RpcUiEvent::RestoreFromTray => {
+                    self.restore_from_tray(ctx);
+                }
             }
         }
 
@@ -3358,7 +3508,7 @@ impl LuaToolsApp {
         if self.quit_requested {
             return false;
         }
-        let want_close_to_tray = cli_tray_locked || self.settings_service.settings.close_to_tray;
+        let want_close_to_tray = cli_tray_locked || self.tray_locked || self.settings_service.settings.close_to_tray;
         want_close_to_tray && self.can_hide_to_tray()
     }
 
@@ -3454,7 +3604,15 @@ impl LuaToolsApp {
             }
         });
         if trigger_quit {
-            self.request_quit(ctx);
+            if self.tray_locked {
+                self.hide_to_tray(ctx);
+                self.notify(
+                    "LuaTools is locked to tray. Use Tray Menu > Quit to exit.",
+                    ToastKind::Info,
+                );
+            } else {
+                self.request_quit(ctx);
+            }
         }
 
         let (had_raw_drops, dropped): (bool, Vec<PathBuf>) = ctx.input(|i| {
@@ -4289,5 +4447,37 @@ mod tray_lifecycle_tests {
         });
         assert!(app.quit_requested);
         assert!(!app.should_intercept_close_to_tray(true));
+    }
+
+    #[test]
+    fn test_ctrl_q_with_tray_locked_hides_to_tray_instead_of_terminating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let mut app = LuaToolsApp::new_headless_demo(&ctx, tmp.path());
+        app.tray_locked = true;
+        app.tray_service.set_tray_available_for_test(true);
+
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Q,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        });
+
+        let _ = ctx.run(input, |ctx| {
+            app.handle_shortcuts_and_drops(ctx);
+        });
+
+        assert!(!app.quit_requested, "Ctrl+Q must not terminate when tray_locked is active");
+        assert!(!app.tray_service.is_visible(), "Window should be hidden to tray");
+        assert!(
+            app.active_toast
+                .as_ref()
+                .map(|t| t.text.contains("LuaTools is locked to tray. Use Tray Menu > Quit to exit."))
+                .unwrap_or(false),
+            "Expected tray lock toast notification"
+        );
     }
 }

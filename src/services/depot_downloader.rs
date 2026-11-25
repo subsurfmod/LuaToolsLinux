@@ -133,7 +133,11 @@ impl DepotDownloaderService {
             self.tool_dir.clone(),
             default_luatools_data_dir()
                 .join("tools")
+                .join("depotdownloadermod"),
+            default_luatools_data_dir()
+                .join("tools")
                 .join("depotdownloader"),
+            home.join(".local/share/LuaTools/depotdownloadermod"),
             home.join(".local/share/LuaTools/depotdownloader"),
             home.join("Applications"),
         ];
@@ -144,7 +148,10 @@ impl DepotDownloaderService {
             }
         }
 
-        which_in_path("DepotDownloader").or_else(|| which_in_path("depotdownloader"))
+        which_in_path("DepotDownloaderMod")
+            .or_else(|| which_in_path("depotdownloadermod"))
+            .or_else(|| which_in_path("DepotDownloader"))
+            .or_else(|| which_in_path("depotdownloader"))
     }
 
     fn scan_dir_for_bin(dir: &Path) -> Option<PathBuf> {
@@ -253,8 +260,17 @@ impl DepotDownloaderService {
     }
 
     pub fn is_mod_binary(tool_path: &Path) -> bool {
-        tool_path
+        let name_match = tool_path
             .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase().contains("mod"))
+            .unwrap_or(false);
+        if name_match {
+            return true;
+        }
+        tool_path
+            .parent()
+            .and_then(|p| p.file_name())
             .and_then(|s| s.to_str())
             .map(|s| s.to_ascii_lowercase().contains("mod"))
             .unwrap_or(false)
@@ -534,7 +550,12 @@ impl DepotDownloaderService {
             }
             let lua_path = inst.stplug_in_path.join(format!("{}.lua", app_id));
             if let Some(lua) = LuaFileParser::parse_file(&lua_path, app_id) {
+                let disabled_ids: std::collections::HashSet<u32> =
+                    lua.disabled_entries.iter().map(|de| de.id).collect();
                 for e in lua.entries {
+                    if disabled_ids.contains(&e.id) {
+                        continue;
+                    }
                     if let Some(k) = e.key {
                         if is_valid_depot_key(&k) {
                             keys.insert(e.id, k.trim().to_ascii_lowercase());
@@ -580,6 +601,7 @@ impl DepotDownloaderService {
         hubcap_api_key: Option<&str>,
     ) -> Option<PathBuf> {
         if let Some(existing) = Self::resolve_manifest_path(steam_inst, depot_id, manifest_id) {
+            let _ = crate::parsers::manifest_binary::read_manifest_file(&existing);
             return Some(existing);
         }
         let inst = steam_inst?;
@@ -588,10 +610,24 @@ impl DepotDownloaderService {
         let target_dir = inst.root.join("depotcache");
         let dest = target_dir.join(format!("{}_{}.manifest", depot_id, clean_gid));
         if HubcapService::download_raw_manifest_to_file(depot_id, gid, &dest, hubcap_api_key).is_ok() {
+            let _ = crate::parsers::manifest_binary::read_manifest_file(&dest);
             Some(dest)
         } else {
             None
         }
+    }
+
+    /// Validate AES decryption key against manifest binary (LT-62).
+    pub fn validate_depot_aes_key(manifest_path: &Path, hex_key: &str) -> bool {
+        if let Ok(bytes) = hex::decode(hex_key.trim()) {
+            if bytes.len() == 32 {
+                let mut key_arr = [0u8; 32];
+                key_arr.copy_from_slice(&bytes);
+                return crate::parsers::manifest_binary::validate_aes_key(manifest_path, &key_arr)
+                    .unwrap_or(true);
+            }
+        }
+        false
     }
 
     pub fn resolve_manifest_path(

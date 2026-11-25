@@ -206,19 +206,104 @@ impl ManifestClient {
         rx
     }
 
-    /// Synchronous manifest request code fetch using blocking HTTP
-    fn fetch_manifest_request_code_sync(
+    /// Synchronous manifest request code fetch using blocking HTTP with multi-endpoint fallback
+    pub fn fetch_manifest_request_code_sync(
         depot_id: u32,
         manifest_gid: u64,
-        _hubcap_api_key: Option<String>,
+        hubcap_api_key: Option<String>,
     ) -> Option<u64> {
-        // TODO: Implement actual HTTP fetch to manifest.opensteamtool.com, gmrc.wudrm.com, etc.
-        // For now, return None to indicate fetch not yet implemented
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(5))
+            .build();
+
+        // 1. If Hubcap API key is available, query Hubcap endpoint first
+        if let Some(ref api_key) = hubcap_api_key {
+            let key = api_key.trim();
+            if !key.is_empty() {
+                let hubcap_urls = [
+                    format!("https://api.hubcap.app/v1/depots/{}/manifests/{}/request_code", depot_id, manifest_gid),
+                    format!("https://manifest.opensteamtool.com/{}/{}", depot_id, manifest_gid),
+                ];
+                for url in &hubcap_urls {
+                    let req = agent.get(url).set("Authorization", &format!("Bearer {}", key));
+                    if let Ok(resp) = req.call() {
+                        if let Ok(text) = resp.into_string() {
+                            if let Some(code) = Self::parse_manifest_request_code(&text) {
+                                log::info!("[netpacket_manifest] Resolved request code {} from Hubcap/OST: {}", code, url);
+                                return Some(code);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Standard fallback endpoints: manifest.opensteamtool.com, gmrc.wudrm.com, manifest.steam.run
+        let endpoints = [
+            format!("https://manifest.opensteamtool.com/{}/{}", depot_id, manifest_gid),
+            format!("https://manifest.opensteamtool.com/{}", manifest_gid),
+            format!("http://gmrc.wudrm.com/manifest/{}", manifest_gid),
+            format!("https://manifest.steam.run/api/manifest/{}", manifest_gid),
+        ];
+
+        for url in &endpoints {
+            if let Ok(resp) = agent.get(url).call() {
+                if let Ok(text) = resp.into_string() {
+                    if let Some(code) = Self::parse_manifest_request_code(&text) {
+                        log::info!("[netpacket_manifest] Resolved request code {} from {}", code, url);
+                        return Some(code);
+                    }
+                }
+            }
+        }
+
         log::warn!(
-            "[netpacket_manifest] Sync fetch stub called for depot={} gid={}",
+            "[netpacket_manifest] Failed to resolve manifest request code for depot={} gid={}",
             depot_id, manifest_gid
         );
         None
+    }
+
+    /// Parse manifest request code from string (decimal, hex with 0x prefix, or JSON object)
+    pub fn parse_manifest_request_code(raw: &str) -> Option<u64> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        // Try JSON format e.g. {"content": "123456"} or {"code": 123456} or {"request_code": ...}
+        if trimmed.starts_with('{') {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if let Some(n) = val.get("content").or_else(|| val.get("code")).or_else(|| val.get("request_code")) {
+                    if let Some(num) = n.as_u64() {
+                        if num > 0 {
+                            return Some(num);
+                        }
+                    }
+                    if let Some(s) = n.as_str() {
+                        if let Some(parsed) = Self::parse_manifest_request_code(s) {
+                            return Some(parsed);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Try hex format "0x..." or decimal
+        if let Some(hex_part) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+            u64::from_str_radix(hex_part.trim(), 16).ok().filter(|&c| c > 0)
+        } else if let Ok(dec) = trimmed.parse::<u64>() {
+            if dec > 0 {
+                Some(dec)
+            } else {
+                None
+            }
+        } else if trimmed.len() == 16 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+            // Raw 16-hex characters
+            u64::from_str_radix(trimmed, 16).ok().filter(|&c| c > 0)
+        } else {
+            None
+        }
     }
 }
 
@@ -487,5 +572,27 @@ mod tests {
         assert_eq!(resp.manifest_request_code, 0xDEADBEEFCAFE0001);
         assert_eq!(resp.eresult, 1);
         assert!(resp.is_ok());
+    }
+
+    #[test]
+    fn test_manifest_request_code_parsing() {
+        assert_eq!(
+            ManifestClient::parse_manifest_request_code("123456789012345678"),
+            Some(123456789012345678)
+        );
+        assert_eq!(
+            ManifestClient::parse_manifest_request_code("0xDEADBEEFCAFE0001"),
+            Some(0xDEADBEEFCAFE0001)
+        );
+        assert_eq!(
+            ManifestClient::parse_manifest_request_code(r#"{"content": "9876543210123456"}"#),
+            Some(9876543210123456)
+        );
+        assert_eq!(
+            ManifestClient::parse_manifest_request_code(r#"{"code": 1122334455}"#),
+            Some(1122334455)
+        );
+        assert_eq!(ManifestClient::parse_manifest_request_code(""), None);
+        assert_eq!(ManifestClient::parse_manifest_request_code("invalid_text"), None);
     }
 }

@@ -49,6 +49,7 @@ impl FileChangeType {
 pub struct HotReloadService {
     watch_dir: Arc<Mutex<PathBuf>>,
     running: Arc<AtomicBool>,
+    thread_handle: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
     recent: Arc<Mutex<VecDeque<FileChangeEvent>>>,
     change_callback: Option<Arc<dyn Fn(FileChangeEvent) + Send + Sync>>,
 }
@@ -67,6 +68,7 @@ impl HotReloadService {
         Self {
             watch_dir: Arc::new(Mutex::new(default_dir)),
             running: Arc::new(AtomicBool::new(false)),
+            thread_handle: Arc::new(Mutex::new(None)),
             recent: Arc::new(Mutex::new(VecDeque::new())),
             change_callback: None,
         }
@@ -131,7 +133,7 @@ impl HotReloadService {
         let recent = Arc::clone(&self.recent);
         let callback = self.change_callback.clone();
 
-        thread::spawn(move || {
+        let handle = thread::spawn(move || {
             while running.load(Ordering::Relaxed) {
                 let wait = wait_any(&mut [&mut watch], 50);
                 if wait.status == WaitStatus::Failed {
@@ -180,11 +182,16 @@ impl HotReloadService {
             running.store(false, Ordering::SeqCst);
         });
 
+        *self.thread_handle.lock().unwrap() = Some(handle);
+
         Ok(())
     }
 
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
+        if let Some(handle) = self.thread_handle.lock().unwrap().take() {
+            let _ = handle.join();
+        }
     }
 
     pub fn is_running(&self) -> bool {

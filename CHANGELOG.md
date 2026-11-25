@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.2.0] - 2026-11-25
+
+### BetterSteamTools Linux Port & Steam Bridge Networking
+- **Native Steam Client Netpacket Protocol Handling (`src/steam_bridge/netpacket/`)**:
+  - Implemented client license list and online-fix protobuf netpacket decoders with wire-type varint parsing safeguards to prevent infinite-loop hangs during packet offset traversal.
+  - Added robust serialization and boundary test suites for single and multi-package client license lists and 28-bit/32-bit varint encoders/decoders.
+
+### Core Services & SLSsteam Synchronization
+- **Hardened Lua Uninstaller De-sync (`src/services/lua_installer.rs`)**:
+  - Ensured `<appid>.lua` content and depot keys / manifest overrides are read and parsed before file deletion, properly de-synchronizing SLSsteam configuration without leaving orphaned keys.
+- **Session & Inotify Watcher Lifecycle (`src/services/auth_service.rs`, `src/services/hot_reload_service.rs`)**:
+  - Removed persistent `auth.enc` alongside `auth.json` on sign-out to prevent automatic re-authentication.
+  - Added thread handle / lifecycle management to `HotReloadService` to guarantee termination of existing inotify watcher threads before spawning new watchers.
+- **Applied Fix Index Schema Alignment (`src/services/applied_fix_index.rs`, `src/ui/app.rs`)**:
+  - Configured default JSON persistence path and matched camelCase serialization attributes with fixes service.
+
+### Codecs, Fixes & Interop Hardening
+- **UTF-8 Binary VDF Keys (`src/parsers/vdf_binary.rs`)**:
+  - Ensured all property keys are encoded cleanly as UTF-8 rather than truncating Latin-1 byte slices.
+- **Filesystem & Wine Compatibility (`src/services/fixes_service.rs`)**:
+  - Sanitized colon characters in fix IDs when writing `.luatools-fix/<fix_id>.json` on FAT32/NTFS filesystems, and added case-insensitive, slash-tolerant matching for `[Software\Wine\DllOverrides]`.
+- **Editor Sync & API Authorization (`src/ui/lua_editor.rs`, `src/services/api_client.rs`, `src/services/github_proxy.rs`)**:
+  - Cleared base edit hash upon saving in the Lua editor to allow subsequent live syncs.
+  - Attached Authorization Bearer headers for manifest downloads when API tokens are present.
+  - Prevented duplicate host prefixes during GitHub proxy URL concatenation.
+
+---
+
 ## [3.1.0] - 2026-11-25
 
 ### SLSsteam Configuration & Schema Compatibility

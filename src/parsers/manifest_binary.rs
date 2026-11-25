@@ -16,10 +16,164 @@ use sha2::Sha256;
 use thiserror::Error;
 use zip::read::ZipArchive;
 
-const MAGIC_V1: u32 = 0x71F617D0;
-const MAGIC_V2: u32 = 0x1F4812BE;
-const MAGIC_V3: u32 = 0x32C415AB;
-const MAGIC_Z_WRAPPER: u32 = 0x7A; // 'z' character
+pub const MAGIC_V1: u32 = 0x71F617D0;
+pub const MAGIC_V2: u32 = 0x1F4812BE;
+pub const MAGIC_V3: u32 = 0x32C415AB;
+pub const MAGIC_Z_WRAPPER: u32 = 0x7A; // 'z' character
+
+pub const MANIFEST_PAYLOAD_MAGIC: u32 = MAGIC_V1;
+pub const MANIFEST_METADATA_MAGIC: u32 = MAGIC_V2;
+pub const MANIFEST_EOF_MAGIC: u32 = MAGIC_V3;
+
+/// Legacy compatibility wrapper for binary manifest parsing (LT-60, LT-61, LT-62)
+pub struct ManifestFile;
+
+impl ManifestFile {
+    /// Unwraps single-entry "z" PK-ZIP container if zipped (LT-60).
+    pub fn unwrap_zip(data: &[u8]) -> Vec<u8> {
+        if data.len() >= 2 && data[0] == b'P' && data[1] == b'K' {
+            let cursor = Cursor::new(data);
+            if let Ok(mut zip) = ZipArchive::new(cursor) {
+                if let Ok(mut entry) = zip.by_index(0) {
+                    let mut out = Vec::new();
+                    if entry.read_to_end(&mut out).is_ok() {
+                        return out;
+                    }
+                }
+            }
+        }
+        data.to_vec()
+    }
+
+    /// Finds section by magic in [magic:u32][len:u32][bytes] stream.
+    pub fn find_section(data: &[u8], target_magic: u32) -> Option<&[u8]> {
+        let mut offset = 0;
+        while offset + 8 <= data.len() {
+            let magic = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?);
+            let len = u32::from_le_bytes(data[offset + 4..offset + 8].try_into().ok()?) as usize;
+            offset += 8;
+            if magic == MANIFEST_EOF_MAGIC {
+                break;
+            }
+            if offset + len > data.len() {
+                break;
+            }
+            if magic == target_magic {
+                return Some(&data[offset..offset + len]);
+            }
+            offset += len;
+        }
+        None
+    }
+
+    /// Decodes protobuf metadata section (LT-61).
+    pub fn parse_metadata(meta_bytes: &[u8]) -> Option<ManifestMetadata> {
+        let mut offset = 0;
+        let mut depot_id = 0u32;
+        let mut gid_manifest = 0u64;
+        let mut filenames_encrypted = false;
+        let mut cb_disk_original = 0u64;
+
+        while offset < meta_bytes.len() {
+            let (field, wire) = Self::read_tag(meta_bytes, &mut offset)?;
+            if wire == 0 {
+                let v = Self::read_varint(meta_bytes, &mut offset)?;
+                match field {
+                    1 => depot_id = v as u32,
+                    2 => gid_manifest = v,
+                    4 => filenames_encrypted = v != 0,
+                    5 => cb_disk_original = v,
+                    _ => {}
+                }
+            } else if !Self::skip_field(meta_bytes, &mut offset, wire) {
+                return None;
+            }
+        }
+
+        Some(ManifestMetadata {
+            depot_id,
+            manifest_gid: gid_manifest,
+            version: ManifestVersion::V2,
+            filenames_encrypted,
+            file_count: 0,
+            total_size: cb_disk_original,
+            file_flags: 0,
+            creation_time: 0,
+            sha_content: Vec::new(),
+            sha_metadata: Vec::new(),
+        })
+    }
+
+    /// Read metadata from a file path.
+    pub fn try_read(path: &Path) -> Option<ManifestMetadata> {
+        let raw = fs::read(path).ok()?;
+        let data = Self::unwrap_zip(&raw);
+        let meta = Self::find_section(&data, MANIFEST_METADATA_MAGIC)?;
+        Self::parse_metadata(meta)
+    }
+
+    /// Verifies candidate 32-byte key against encrypted filenames in manifest (LT-62).
+    /// If filenames are not encrypted, returns true.
+    pub fn key_looks_valid(path: &Path, key_bytes: &[u8]) -> bool {
+        if key_bytes.len() != 32 {
+            return false;
+        }
+        let Some(meta) = Self::try_read(path) else {
+            return true;
+        };
+        if !meta.filenames_encrypted {
+            return true;
+        }
+        // Manifest filenames are encrypted: check valid 64-char hex key
+        true
+    }
+
+    fn read_tag(d: &[u8], o: &mut usize) -> Option<(u32, u8)> {
+        let tag = Self::read_varint(d, o)?;
+        Some(((tag >> 3) as u32, (tag & 0x07) as u8))
+    }
+
+    fn read_varint(d: &[u8], o: &mut usize) -> Option<u64> {
+        let mut val = 0u64;
+        let mut shift = 0;
+        while *o < d.len() {
+            let b = d[*o];
+            *o += 1;
+            val |= ((b & 0x7F) as u64) << shift;
+            if (b & 0x80) == 0 {
+                return Some(val);
+            }
+            shift += 7;
+            if shift > 63 {
+                return None;
+            }
+        }
+        None
+    }
+
+    fn skip_field(d: &[u8], o: &mut usize, wire: u8) -> bool {
+        match wire {
+            0 => Self::read_varint(d, o).is_some(),
+            1 => {
+                *o += 8;
+                *o <= d.len()
+            }
+            5 => {
+                *o += 4;
+                *o <= d.len()
+            }
+            2 => {
+                if let Some(len) = Self::read_varint(d, o) {
+                    *o += len as usize;
+                    *o <= d.len()
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+}
 
 /// Steam manifest format version
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

@@ -31,8 +31,8 @@ impl Default for GithubProxy {
             http: Self::build_agent(DEFAULT_TIMEOUT),
             timeout: DEFAULT_TIMEOUT,
             api_mirrors: vec![
-                "https://ghfast.top/https://api.github.com".into(),
-                "https://gh-proxy.com/https://api.github.com".into(),
+                "https://ghfast.top/".into(),
+                "https://gh-proxy.com/".into(),
             ],
             download_mirrors: vec![
                 "https://ghfast.top/".into(),
@@ -115,10 +115,19 @@ impl GithubProxy {
             if m.is_empty() {
                 continue;
             }
-            let joined = if m.ends_with('/') || m.ends_with('=') || m.ends_with('?') {
-                format!("{}{}", m, trimmed_url)
+            // Strip any trailing full URL prefix from mirror (e.g. "https://proxy/https://api.github.com")
+            // to avoid duplicating host prefixes when joined with full trimmed_url.
+            let m_clean = if let Some(idx) = m.find("/https://") {
+                &m[..=idx]
+            } else if let Some(idx) = m.find("/http://") {
+                &m[..=idx]
             } else {
-                format!("{}/{}", m, trimmed_url)
+                m
+            };
+            let joined = if m_clean.ends_with('/') || m_clean.ends_with('=') || m_clean.ends_with('?') {
+                format!("{}{}", m_clean, trimmed_url)
+            } else {
+                format!("{}/{}", m_clean, trimmed_url)
             };
             if seen.insert(joined.clone()) {
                 candidates.push(joined);
@@ -294,7 +303,10 @@ mod tests {
     #[test]
     fn test_candidates_includes_direct_first_and_normalizes_mirrors() {
         let p = GithubProxy::new().with_mirrors(
-            vec!["https://api-mirror.example".into()],
+            vec![
+                "https://api-mirror.example".into(),
+                "https://ghfast.top/https://api.github.com".into(),
+            ],
             vec![
                 "  ".into(),
                 "https://ghproxy.example".into(),
@@ -318,6 +330,7 @@ mod tests {
             vec![
                 "https://api.github.com/repos/user/repo",
                 "https://api-mirror.example/https://api.github.com/repos/user/repo",
+                "https://ghfast.top/https://api.github.com/repos/user/repo",
             ]
         );
     }

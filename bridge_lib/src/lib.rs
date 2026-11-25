@@ -40,7 +40,7 @@ use luatools_linux::steam_bridge::{
     },
     denuvo_auth::{DenuvoAuth, DenuvoAuthConfig},
     interop::{
-        interop_ipc,
+        interop_callbacks, interop_decryption, interop_ipc,
         interop_ipc_isteamuser::{
             handler_post_get_app_ownership_ticket, handler_post_get_encrypted_app_ticket,
             handler_post_get_steam_id, handler_post_request_encrypted_app_ticket,
@@ -49,7 +49,8 @@ use luatools_linux::steam_bridge::{
         interop_ipc_isteamutils::{
             install_iclientutils_handlers, record_encrypted_ticket, take_encrypted_ticket,
         },
-        interop_misc, ipc as interop_wire_ipc,
+        interop_keyvalues, interop_misc, interop_package, interop_steamui,
+        ipc as interop_wire_ipc,
     },
     ipc::{self, IpcServer},
     manifest_hooks::{
@@ -59,8 +60,9 @@ use luatools_linux::steam_bridge::{
     },
     memory_patch::{self, MemoryPatch, JMP_ABS64_LEN},
     netpacket::{
-        install_eticket_hooks, install_manifestprobe_hooks, install_ownershipticket_hooks,
-        install_userstats_hooks, netpacket_eticket::parse_eticket_steam_id,
+        install_cloud_hooks, install_eticket_hooks, install_manifestprobe_hooks,
+        install_netpacket_core, install_ownershipticket_hooks, install_userstats_hooks,
+        netpacket_eticket::parse_eticket_steam_id,
         netpacket_manifestprobe::expire_manifest_probe_stale,
         netpacket_ownershipticket::parse_ownershipticket_steam_id,
         userstats::{drain_achievements, fill_user_achievements_from_dir, queue_held_user_ach},
@@ -1001,6 +1003,25 @@ fn try_install_steamclient_patches(steam_root: &Path) {
     let _ = install_manifestprobe_hooks();
     let _ = install_ownershipticket_hooks();
     let _ = install_userstats_hooks();
+    let _ = install_cloud_hooks();
+    if let Err(e) = interop_callbacks::install(steam_root) {
+        eprintln!("[steam_integration] InteropCallbacks non-fatal fallback: {}", e);
+    }
+    if let Err(e) = interop_decryption::install(steam_root) {
+        eprintln!("[steam_integration] InteropDecryption non-fatal fallback: {}", e);
+    }
+    if let Err(e) = interop_keyvalues::install(steam_root) {
+        eprintln!("[steam_integration] InteropKeyValues non-fatal fallback: {}", e);
+    }
+    if let Err(e) = interop_package::install(steam_root) {
+        eprintln!("[steam_integration] InteropPackage non-fatal fallback: {}", e);
+    }
+    if let Err(e) = interop_steamui::install(steam_root) {
+        eprintln!("[steam_integration] InteropSteamUI non-fatal fallback: {}", e);
+    }
+    if let Err(e) = install_netpacket_core(steam_root) {
+        eprintln!("[steam_integration] NetPacketCore non-fatal fallback: {}", e);
+    }
 
     let pattern_db = PatternDb::new();
     let pf = match pattern_db.lookup_by_binary(
