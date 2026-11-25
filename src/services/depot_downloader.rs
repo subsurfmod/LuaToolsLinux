@@ -936,6 +936,14 @@ fn summarize_depotdownloader_failure(
     {
         return "Steam session expired or needs Steam Guard — click 'Sign In (QR)' to refresh saved credentials.".into();
     }
+    // Handle SteamKit2.AsyncJobFailedException
+    if low.contains("asyncjobfailedexception") || low.contains("async job failed") {
+        return "DepotDownloader async job failed — try clicking 'Sign In (QR)' to authenticate with Steam, then retry.".into();
+    }
+    // Handle authentication failures
+    if low.contains("authenticate") || low.contains("authentication failed") || low.contains("failed to authenticate") {
+        return "Failed to authenticate with Steam — set your Steam Username and click 'Sign In (QR)' first.".into();
+    }
     let meaningful_err = stderr_lines
         .iter()
         .rev()

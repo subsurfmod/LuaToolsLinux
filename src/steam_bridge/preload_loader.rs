@@ -501,6 +501,8 @@ pub fn generate_ld_preload_launcher(
          else\n\
            unset LD_PRELOAD\n\
          fi\n\
+         # Export our integration library via LD_PRELOAD\n\
+         export LD_PRELOAD=\"$NEW_LD_PRELOAD\"\n\
          # LT-20: Auto-launch LuaTools minimized in background if in PATH and not already running\n\
          if command -v luatools >/dev/null 2>&1; then\n\
            if ! pgrep -x luatools >/dev/null 2>&1; then\n\
@@ -520,7 +522,9 @@ pub fn generate_ld_preload_launcher(
            if [ -f \"$SLS_DIR/SLSsteam.so\" ]; then\n\
              AUDIT_LIBS=\"${{AUDIT_LIBS:+$AUDIT_LIBS:}}$SLS_DIR/SLSsteam.so\"\n\
            fi\n\
-           if [ -n \"$AUDIT_LIBS\" ]; then\n\
+           # Only use LD_AUDIT if we're NOT using LD_PRELOAD for our integration\n\
+           # (LD_AUDIT with SLSsteam.so causes crashes when 32-bit Steam wrapper loads it)\n\
+           if [ -n \"$AUDIT_LIBS\" ] && [ -z \"${{LD_PRELOAD:-}}\" ]; then\n\
              export LD_AUDIT=\"$AUDIT_LIBS\"\n\
            fi\n\
          fi\n\
