@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           luatools-linux
-Version:        3.2.2
+Version:        3.2.3
 Release:        1%{?dist}
 Summary:        Native Rust workstation for Steam stplug-in lua manifests, depots, and fixes
 License:        MIT
@@ -48,6 +48,8 @@ install -m 0644 %{_sourcedir}/luatools.desktop %{buildroot}%{_datadir}/applicati
 %{_datadir}/icons/hicolor/scalable/apps/luatools.svg
 
 %changelog
+* Wed Nov 25 2026 LuaTools Linux Contributors <noreply@lua.tools> - 3.2.3-1
+- Release v3.2.3: Fixed 7z path traversal false positives (docs/LICENSE), DepotDownloader -remember-password flag logic, DRM decryption keys via bridge_lib depot_keys, is_lua_unlocked checks additional_apps for Lua-unlocked games, licenses NetPacket hooks installed, ONLINE_FIX_APP_ID duplicate consolidated
 * Wed Nov 25 2026 LuaTools Linux Contributors <noreply@lua.tools> - 3.2.2-1
 - Release v3.2.2: Complete removal of legacy C++ usefulsteamtools reference tree, full audit closure across all 155 units from Luatools complete.txt, and end-to-end workspace verification
 * Wed Nov 25 2026 LuaTools Linux Contributors <noreply@lua.tools> - 3.2.0-1

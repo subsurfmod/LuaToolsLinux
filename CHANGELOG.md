@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.2.3] - 2026-11-25
+
+### v3.2.2 Audit Findings Fixed & Steamless Integration
+- **7z Path Traversal Fix** (`src/services/wired_service.rs`): Fixed false positive rejection of legitimate files like `docs/LICENSE` by only matching actual path traversal patterns (`../`, `..\\`, `/../`, `\..\`) instead of any `..` substring.
+- **DepotDownloader `-remember-password` Flag** (`src/services/depot_downloader.rs`): Fixed error "`-remember-password can not be used without -username or -qr`" by conditionally adding `-qr` flag when no username is provided.
+- **DRM Decryption Keys** (`src/steam_bridge/interop/interop_decryption.rs`): Wired depot decryption keys from `bridge_lib` depot_keys store via new `read_depot_key()` FFI call.
+- **Lua-Unlocked Games Download** (`src/steam_bridge/interop/interop_misc.rs`, `interop_package.rs`): `is_lua_unlocked()` now checks both owned depots AND `additional_apps` (games added via `addappid`), fixing games showing as unowned and refusing to download.
+- **Licenses NetPacket Hooks** (`bridge_lib/src/lib.rs`): Installed `netpacket_licenses::install_licenses_hooks()` in bridge_lib initialization.
+- **ONLINE_FIX_APP_ID Consolidation**: Removed duplicate constant definition across `interop_ipc_isteamuser.rs` and `interop_misc.rs`, now single source in `interop_misc.rs`.
+- **BridgeLib C Exports** (`bridge_lib/src/lib.rs`): Added `get_depot_key_c()` and `is_additional_app_c()` C-compatible exports for FFI.
+- **Steamless Integration**: `SteamlessService` already wraps Steamless CLI tool (native Rust port "steamflatline" pending).
+
+---
+
 ## [3.2.2] - 2026-11-25
 
 ### Legacy C++ Cleanup & Final Audit Closure
