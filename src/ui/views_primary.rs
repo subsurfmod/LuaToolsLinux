@@ -30,31 +30,24 @@ impl LuaToolsApp {
             .id_salt("home_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let mut open_new_lua = false;
                 let mut go_discover = false;
                 let mut go_guide = false;
 
                 section_header(
                     ui,
-                    "WORKSPACE",
-                    "Welcome back",
-                    "Drop manifest packages onto the sheet below or browse the Steam catalog",
+                    "HOME",
+                    "lets start crackin 😛",
+                    "Add Steam games in one click or drop game files below",
                     |ui| {
-                        if ghost_button(ui, "How to Use").clicked() {
+                        if ghost_button(ui, "Help").clicked() {
                             go_guide = true;
                         }
-                        if primary_button(ui, "Browse Catalog").clicked() {
+                        if primary_button(ui, "Add Games").clicked() {
                             go_discover = true;
-                        }
-                        if secondary_button(ui, "+ Create by AppID").clicked() {
-                            open_new_lua = true;
                         }
                     },
                 );
 
-                if open_new_lua {
-                    self.add_appid_modal.open = true;
-                }
                 if go_discover {
                     self.active_view = ActiveView::Acquire;
                 }
@@ -62,7 +55,7 @@ impl LuaToolsApp {
                     self.active_view = ActiveView::Guide;
                 }
 
-                // 1. Tactile Cut-Paper Drop Sheet (clean, spacious, zero duplicate URL inputs)
+                // 1. Tactile Cut-Paper Drop Sheet (simple, plain-English)
                 paper_card_padded(ui, Margin::symmetric(24, 22), |ui| {
                     egui::Sides::new().show(
                         ui,
@@ -73,13 +66,13 @@ impl LuaToolsApp {
                                 ui.vertical(|ui| {
                                     ui.spacing_mut().item_spacing.y = 4.0;
                                     ui.label(
-                                        RichText::new("Drop .lua, .manifest, or .zip packages here")
+                                        RichText::new("Drop game files here (.lua, .manifest, or .zip)")
                                             .font(display_font(17.5))
                                             .color(Palette::TEXT_PRIMARY),
                                     );
                                     ui.label(
                                         RichText::new(
-                                            "Automatically installs into Steam stplug-in, captures a LuaVault snapshot, and syncs SLSsteam",
+                                            "Files install automatically and sync with Steam",
                                         )
                                         .size(13.0)
                                         .color(Palette::TEXT_SECONDARY),
@@ -88,12 +81,12 @@ impl LuaToolsApp {
                             });
                         },
                         |ui| {
-                            if primary_button(ui, "Select Files…").clicked() {
+                            if primary_button(ui, "Browse Files…").clicked() {
                                 let tx = self.msg_tx.clone();
                                 let ctx = ui.ctx().clone();
                                 thread::spawn(move || {
                                     let files = pick_files_native(
-                                        "Select Lua, Manifest, or Zip Files",
+                                        "Select Game Files (.lua, .manifest, .zip)",
                                         Some("*.lua *.manifest *.zip"),
                                     );
                                     if !files.is_empty() {
@@ -108,15 +101,12 @@ impl LuaToolsApp {
 
                 ui.add_space(16.0);
 
-                // 2. Calm 3-Card Environment Summary (equal StripBuilder columns, 16px gaps)
+                // 2. Calm 3-Card Status Summary (clickable to open setup directly)
                 let steam_headline = match &self.steam_service.installation {
                     Some(i) => format!("{} Steam library folder(s)", i.libraries.len()),
-                    None => "Steam not detected".into(),
+                    None => "Steam not found".into(),
                 };
-                let steam_sub = format!(
-                    "{} configured .lua manifest(s)",
-                    self.recent_installed.len()
-                );
+                let steam_sub = format!("{} game(s) added", self.recent_installed.len());
                 let steam_tone = if self.steam_service.is_available() {
                     BadgeTone::Ready
                 } else {
@@ -124,29 +114,41 @@ impl LuaToolsApp {
                 };
 
                 let sls_cfg = &self.slssteam_service.config;
-                let sls_headline = if sls_cfg.exists() {
-                    format!("{} unlocked app(s)", sls_cfg.additional_apps.len())
+                let bridge_st = self.steam_bridge_service.status();
+                let unlocker_ready = self.steam_sls_installed
+                    || bridge_st.integration_lib_installed
+                    || bridge_st.launcher_installed
+                    || bridge_st.system_preload_enabled;
+                let sls_headline = if unlocker_ready {
+                    format!("{} game(s) unlocked", sls_cfg.additional_apps.len())
                 } else {
-                    "Not configured yet".into()
+                    "Click for 1-click setup".into()
                 };
-                let sls_sub = format!(
-                    "{} depot key(s) · PlayNotOwned: {}",
-                    sls_cfg.depot_keys.len(),
-                    if sls_cfg.play_not_owned { "On" } else { "Off" }
-                );
+                let sls_sub = if unlocker_ready {
+                    format!(
+                        "Play unowned games: {}",
+                        if sls_cfg.play_not_owned { "On" } else { "Off" }
+                    )
+                } else {
+                    "Needed to play added games in Steam".into()
+                };
 
                 let acct_headline = if self.auth_service.is_signed_in() {
                     self.auth_service.display_name()
                 } else {
-                    "Guest session".into()
+                    "Not signed in".into()
                 };
                 let acct_sub = if !self.settings_usage_text.is_empty() {
                     self.settings_usage_text.clone()
                 } else if self.auth_service.is_signed_in() {
                     "Signed in with Discord".into()
                 } else {
-                    "Sign in under Settings for cloud downloads".into()
+                    "Click to sign in for cloud downloads".into()
                 };
+
+                let mut click_steam_tile = false;
+                let mut click_unlocker_tile = false;
+                let mut click_account_tile = false;
 
                 ui.allocate_ui_with_layout(
                     Vec2::new(ui.available_width(), 98.0),
@@ -160,37 +162,45 @@ impl LuaToolsApp {
                             .size(Size::remainder())
                             .horizontal(|mut strip| {
                                 strip.cell(|ui| {
-                                    summary_paper_tile(
+                                    if summary_paper_tile(
                                         ui,
-                                        "STEAM ENGINE",
+                                        "STEAM",
                                         &steam_headline,
                                         &steam_sub,
                                         if self.steam_service.is_available() {
-                                            "Ready"
+                                            "Connected"
                                         } else {
                                             "Offline"
                                         },
                                         steam_tone,
-                                    );
+                                    )
+                                    .clicked()
+                                    {
+                                        click_steam_tile = true;
+                                    }
                                 });
                                 strip.empty();
                                 strip.cell(|ui| {
-                                    summary_paper_tile(
+                                    if summary_paper_tile(
                                         ui,
-                                        "SLSSTEAM CONFIG",
+                                        "STEAM UNLOCKER",
                                         &sls_headline,
                                         &sls_sub,
-                                        if sls_cfg.exists() { "Synced" } else { "Default" },
-                                        if sls_cfg.exists() {
-                                            BadgeTone::Blue
+                                        if unlocker_ready { "Ready" } else { "Setup" },
+                                        if unlocker_ready {
+                                            BadgeTone::Ready
                                         } else {
-                                            BadgeTone::Neutral
+                                            BadgeTone::Warn
                                         },
-                                    );
+                                    )
+                                    .clicked()
+                                    {
+                                        click_unlocker_tile = true;
+                                    }
                                 });
                                 strip.empty();
                                 strip.cell(|ui| {
-                                    summary_paper_tile(
+                                    if summary_paper_tile(
                                         ui,
                                         "ACCOUNT",
                                         &acct_headline,
@@ -198,115 +208,51 @@ impl LuaToolsApp {
                                         if self.auth_service.is_signed_in() {
                                             "Active"
                                         } else {
-                                            "Guest"
+                                            "Sign In"
                                         },
                                         if self.auth_service.is_signed_in() {
                                             BadgeTone::Blue
                                         } else {
                                             BadgeTone::Neutral
                                         },
-                                    );
+                                    )
+                                    .clicked()
+                                    {
+                                        click_account_tile = true;
+                                    }
                                 });
                             });
                     },
                 );
 
-                ui.add_space(12.0);
-
-                // Compact Live Hot-Reload & Steam Bridge Status Strip
-                let hr_running = self.hot_reload_service.is_running();
-                let hr_events = self.hot_reload_service.recent_events();
-                let bridge_st = self.steam_bridge_service.status();
-                let mut toggle_hr = false;
-                let mut open_bridge_tab = false;
-
-                paper_card_padded(ui, Margin::symmetric(16, 10), |ui| {
-                    ui.set_width(ui.available_width());
-                    egui::Sides::new().show(
-                        ui,
-                        |ui| {
-                            ui.spacing_mut().item_spacing.x = 10.0;
-                            if hr_running {
-                                status_badge(ui, "Hot-Reload Watching", BadgeTone::Ready);
-                            } else {
-                                status_badge(ui, "Hot-Reload Paused", BadgeTone::Muted);
-                            }
-                            if bridge_st.integration_active {
-                                status_badge(ui, "Steam Bridge Active", BadgeTone::Blue);
-                            } else if bridge_st.integration_lib_installed {
-                                status_badge(ui, "Bridge Library Staged", BadgeTone::Neutral);
-                            }
-                            let last_note = hr_events
-                                .first()
-                                .map(|ev| {
-                                    let fname = ev
-                                        .path
-                                        .file_name()
-                                        .and_then(|s| s.to_str())
-                                        .unwrap_or("file.lua");
-                                    format!(
-                                        "Last event: {} {} ({})",
-                                        ev.event_type.as_str(),
-                                        fname,
-                                        ev.timestamp
-                                    )
-                                })
-                                .unwrap_or_else(|| {
-                                    format!(
-                                        "stplug-in watcher: {}",
-                                        self.hot_reload_service.watch_dir().display()
-                                    )
-                                });
-                            ui.label(
-                                RichText::new(last_note)
-                                    .size(12.0)
-                                    .color(Palette::TEXT_MUTED),
-                            );
-                        },
-                        |ui| {
-                            ui.spacing_mut().item_spacing.x = 8.0;
-                            if ghost_button(ui, "Steam Integration ›").clicked() {
-                                open_bridge_tab = true;
-                            }
-                            let lbl = if hr_running {
-                                "Stop Watcher"
-                            } else {
-                                "Start Watcher"
-                            };
-                            if secondary_button(ui, lbl).clicked() {
-                                toggle_hr = true;
-                            }
-                        },
-                    );
-                });
-
-                if toggle_hr {
-                    if hr_running {
-                        self.hot_reload_service.stop();
-                    } else if let Err(e) = self.hot_reload_service.start() {
-                        self.notify(e, ToastKind::Warning);
-                    }
-                }
-                if open_bridge_tab {
+                if click_steam_tile {
                     self.active_view = ActiveView::Settings;
-                    self.settings_subtab = crate::ui::state::SettingsSubTab::SteamIntegration;
+                    self.settings_subtab = crate::ui::state::SettingsSubTab::General;
+                }
+                if click_unlocker_tile {
+                    self.active_view = ActiveView::Settings;
+                    self.settings_subtab = crate::ui::state::SettingsSubTab::Integrations;
+                }
+                if click_account_tile {
+                    self.active_view = ActiveView::Settings;
+                    self.settings_subtab = crate::ui::state::SettingsSubTab::Account;
                 }
 
-                ui.add_space(22.0);
+                ui.add_space(20.0);
 
-                // 3. Recently Configured Titles
+                // 3. Recently Added Games
                 egui::Sides::new().show(
                     ui,
                     |ui| {
                         ui.label(
-                            RichText::new("Recently Configured Games")
+                            RichText::new("Recently Added Games")
                                 .font(display_font(17.5))
                                 .color(Palette::TEXT_PRIMARY),
                         );
                     },
                     |ui| {
                         if !self.library_rows.is_empty()
-                            && ghost_button(ui, "View Full Library ›").clicked()
+                            && ghost_button(ui, "View All Games ›").clicked()
                         {
                             self.active_view = ActiveView::Library;
                         }
@@ -335,13 +281,13 @@ impl LuaToolsApp {
                         ui.vertical_centered(|ui| {
                             ui.spacing_mut().item_spacing.y = 6.0;
                             ui.label(
-                                RichText::new("No configured .lua manifests yet")
+                                RichText::new("No games added yet")
                                     .font(semibold_font(14.5))
                                     .color(Palette::TEXT_PRIMARY),
                             );
                             ui.label(
                                 RichText::new(
-                                    "Drop a package above, search a game in the top bar, or open Discover to get started.",
+                                    "Click Add Games above, search a title in the top bar, or drop a game file here.",
                                 )
                                 .size(13.0)
                                 .color(Palette::TEXT_MUTED),
@@ -439,13 +385,22 @@ impl LuaToolsApp {
     // ===== 2. DISCOVER (ACQUIRE) =====
 
     pub fn render_acquire(&mut self, ui: &mut egui::Ui) {
+        let mut do_refresh_catalog = false;
         section_header(
             ui,
-            "DISCOVER",
-            "Steam Catalog & Manifests",
-            "Browse featured releases or search any title to check manifest availability",
-            |_ui| {},
+            "ADD GAMES",
+            "Find & Add Steam Games",
+            "Search any Steam game or browse popular releases",
+            |ui| {
+                if ghost_button(ui, "Refresh").clicked() {
+                    do_refresh_catalog = true;
+                }
+            },
         );
+        if do_refresh_catalog {
+            self.featured_requested = true;
+            self.fetch_featured_async(ui.ctx());
+        }
 
         // Single Clean Filter & Search Toolbar
         let mut trigger_search = false;
@@ -542,8 +497,15 @@ impl LuaToolsApp {
                                 if entries.is_empty() {
                                     ui.add_space(24.0);
                                     ui.vertical_centered(|ui| {
+                                        let empty_msg = if self.acquire_tab != AcquireTab::SearchResults
+                                            && self.featured_requested
+                                        {
+                                            "Loading Steam catalog…"
+                                        } else {
+                                            "No games in this list yet"
+                                        };
                                         ui.label(
-                                            RichText::new("No games in this list yet")
+                                            RichText::new(empty_msg)
                                                 .color(Palette::TEXT_MUTED),
                                         );
                                     });
@@ -732,8 +694,7 @@ impl LuaToolsApp {
                                         ui.add_enabled_ui(
                                             !avail_providers.is_empty() && !self.acquire_busy,
                                             |ui| {
-                                                if primary_button(ui, "Install Manifest").clicked()
-                                                {
+                                                if primary_button(ui, "Install Game").clicked() {
                                                     let chosen = self
                                                         .acquire_selected_source
                                                         .clone()
@@ -753,7 +714,7 @@ impl LuaToolsApp {
                                         );
 
                                         if has_lua
-                                            && secondary_button(ui, "Open Workbench").clicked()
+                                            && secondary_button(ui, "Files & DLC").clicked()
                                         {
                                             self.open_game_in_depots(aid, ui.ctx());
                                         }
@@ -908,9 +869,9 @@ impl LuaToolsApp {
 
         section_header(
             ui,
-            "LIBRARY",
-            "Installed & Configured Games",
-            "Manage stplug-in manifests, SLSsteam overrides, and binary appinfo.vdf launch options",
+            "MY GAMES",
+            "My Games",
+            "Games added to Steam and LuaTools",
             |ui| {
                 if ghost_button(ui, "Refresh").clicked() {
                     do_refresh = true;
@@ -988,7 +949,7 @@ impl LuaToolsApp {
                 }
                 if chip_button(
                     ui,
-                    &format!("Configured ({})", lua_n),
+                    &format!("Added ({})", lua_n),
                     self.library_filter_mode == 1,
                 )
                 .clicked()
@@ -1006,7 +967,7 @@ impl LuaToolsApp {
                 }
                 if chip_button(
                     ui,
-                    &format!("Overrides ({})", over_n),
+                    &format!("Custom ({})", over_n),
                     self.library_filter_mode == 3,
                 )
                 .clicked()
@@ -1086,7 +1047,7 @@ impl LuaToolsApp {
                 .column(Column::remainder().at_least(200.0))
                 .column(Column::exact(150.0))
                 .column(Column::exact(145.0))
-                .column(Column::exact(210.0))
+                .column(Column::exact(236.0))
                 .header(32.0, |mut header| {
                     header.col(|ui| {
                         let mut all_selected = !filtered.is_empty()
@@ -1180,83 +1141,90 @@ impl LuaToolsApp {
 
                             row.col(|ui| {
                                 ui.spacing_mut().item_spacing.x = 6.0;
-                                if table_button(ui, "Depots", true).clicked() {
+                                if table_button(ui, "Files & DLC", true).clicked() {
                                     act_depots = Some(r.app_id);
                                 }
-                                if table_button(ui, "Configure", false).clicked() {
+                                if table_button(ui, "Options", false).clicked() {
                                     act_config = Some((r.app_id, r.name.clone()));
                                 }
                                 ui.menu_button("More", |ui| {
                                     ui.set_min_width(210.0);
-                                    if ui.button("Integration Actions…").clicked() {
-                                        act_integration = Some((
-                                            r.app_id,
-                                            r.name.clone(),
-                                            r.install_path.clone(),
-                                        ));
-                                        ui.close_menu();
-                                    }
-                                    if ui.button("Launch with Integration").clicked() {
-                                        act_launch_integrated =
-                                            Some((r.app_id, r.install_path.clone()));
-                                        ui.close_menu();
-                                    }
-                                    ui.separator();
-                                    if ui.button("Launch Options…").clicked() {
-                                        act_launch = Some((r.app_id, r.name.clone()));
-                                        ui.close_menu();
-                                    }
                                     if ui.button("Game Fixes…").clicked() {
                                         act_fixes = Some(r.app_id);
                                         ui.close_menu();
                                     }
-                                    if !r.installed {
-                                        if ui.button("Register in Steam Library (ACF)").clicked() {
-                                            act_add_lib = Some((r.app_id, r.name.clone()));
-                                            ui.close_menu();
-                                        }
-                                    } else if ui
-                                        .button("Unregister from Steam Library (ACF)")
-                                        .clicked()
-                                    {
-                                        act_rem_lib = Some(r.app_id);
-                                        ui.close_menu();
-                                    }
-                                    let is_unowned_on = self
-                                        .play_unowned_service
-                                        .is_app_enabled(r.app_id, &self.slssteam_service);
-                                    let unowned_lbl = if is_unowned_on {
-                                        "Disable Play Unowned"
-                                    } else {
-                                        "Enable Play Unowned"
-                                    };
-                                    if ui.button(unowned_lbl).clicked() {
-                                        act_toggle_unowned = Some((r.app_id, !is_unowned_on));
+                                    if ui.button("Launch Options…").clicked() {
+                                        act_launch = Some((r.app_id, r.name.clone()));
                                         ui.close_menu();
                                     }
                                     if let Some(ref p) = r.install_path {
-                                        if ui.button("Run SteamAutoPatch").clicked() {
-                                            act_autopatch = Some((r.app_id, p.clone()));
-                                            ui.close_menu();
-                                        }
-                                        if ui.button("Unpack SteamStub (Steamless)").clicked() {
-                                            act_steamless = Some((r.app_id, p.clone()));
-                                            ui.close_menu();
-                                        }
-                                        if ui.button("Clean Legacy Unlockers").clicked() {
-                                            act_migrate_legacy = Some((r.app_id, p.clone()));
-                                            ui.close_menu();
-                                        }
                                         if ui.button("Open Game Folder").clicked() {
                                             let _ = Command::new("xdg-open").arg(p).spawn();
                                             ui.close_menu();
                                         }
                                     }
+                                    ui.separator();
+                                    ui.menu_button("Advanced Tools", |ui| {
+                                        ui.set_min_width(220.0);
+                                        if ui.button("Quick Fix & Overrides…").clicked() {
+                                            act_integration = Some((
+                                                r.app_id,
+                                                r.name.clone(),
+                                                r.install_path.clone(),
+                                            ));
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("Launch with Integration").clicked() {
+                                            act_launch_integrated =
+                                                Some((r.app_id, r.install_path.clone()));
+                                            ui.close_menu();
+                                        }
+                                        ui.separator();
+                                        if !r.installed {
+                                            if ui.button("Add to Steam Library (ACF)").clicked() {
+                                                act_add_lib = Some((r.app_id, r.name.clone()));
+                                                ui.close_menu();
+                                            }
+                                        } else if ui
+                                            .button("Remove from Steam Library (ACF)")
+                                            .clicked()
+                                        {
+                                            act_rem_lib = Some(r.app_id);
+                                            ui.close_menu();
+                                        }
+                                        let is_unowned_on = self
+                                            .play_unowned_service
+                                            .is_app_enabled(r.app_id, &self.slssteam_service);
+                                        let unowned_lbl = if is_unowned_on {
+                                            "Disable Play Unowned"
+                                        } else {
+                                            "Enable Play Unowned"
+                                        };
+                                        if ui.button(unowned_lbl).clicked() {
+                                            act_toggle_unowned = Some((r.app_id, !is_unowned_on));
+                                            ui.close_menu();
+                                        }
+                                        if let Some(ref p) = r.install_path {
+                                            ui.separator();
+                                            if ui.button("Offline Patch (Goldberg)").clicked() {
+                                                act_autopatch = Some((r.app_id, p.clone()));
+                                                ui.close_menu();
+                                            }
+                                            if ui.button("Remove SteamStub DRM").clicked() {
+                                                act_steamless = Some((r.app_id, p.clone()));
+                                                ui.close_menu();
+                                            }
+                                            if ui.button("Clean Old Unlockers").clicked() {
+                                                act_migrate_legacy = Some((r.app_id, p.clone()));
+                                                ui.close_menu();
+                                            }
+                                        }
+                                    });
                                     if r.has_lua {
                                         ui.separator();
                                         if ui
                                             .button(
-                                                RichText::new("Remove .lua")
+                                                RichText::new("Remove from LuaTools")
                                                     .color(Palette::DANGER_TEXT),
                                             )
                                             .clicked()
@@ -1456,6 +1424,9 @@ impl LuaToolsApp {
         self.launch_options_modal.game_name = game_name;
         self.launch_options_modal.entries = entries;
         self.launch_options_modal.feedback.clear();
+        self.launch_options_modal.steam_running =
+            crate::services::launch_mod_store::is_any_steam_running();
+        self.launch_options_modal.busy = false;
         self.launch_options_modal.open = true;
     }
 }
@@ -1467,8 +1438,8 @@ fn summary_paper_tile(
     sub: &str,
     badge: &str,
     tone: BadgeTone,
-) {
-    paper_card_padded(ui, Margin::symmetric(16, 14), |ui| {
+) -> egui::Response {
+    let inner = paper_card_padded(ui, Margin::symmetric(16, 14), |ui| {
         ui.set_min_height(78.0);
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 5.0;
@@ -1493,6 +1464,15 @@ fn summary_paper_tile(
             ui.label(RichText::new(sub).size(12.0).color(Palette::TEXT_SECONDARY));
         });
     });
+    let resp = ui.interact(
+        inner.response.rect,
+        ui.id().with(("summary_tile", eyebrow)),
+        Sense::click(),
+    );
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
 }
 
 pub fn clean_list_row(

@@ -78,7 +78,20 @@ impl HotReloadService {
     }
 
     pub fn update_watch_dir<P: AsRef<Path>>(&self, path: P) {
-        *self.watch_dir.lock().unwrap() = path.as_ref().to_path_buf();
+        let new_path = path.as_ref().to_path_buf();
+        let changed = {
+            let mut guard = self.watch_dir.lock().unwrap_or_else(|e| e.into_inner());
+            if *guard != new_path {
+                *guard = new_path;
+                true
+            } else {
+                false
+            }
+        };
+        if changed && self.is_running() {
+            self.stop();
+            let _ = self.start();
+        }
     }
 
     pub fn watch_dir(&self) -> PathBuf {

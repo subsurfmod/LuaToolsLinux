@@ -466,12 +466,14 @@ impl FixesService {
             return FixApplicationResult::err(e.to_string());
         }
 
-        let _ = AppliedFixIndexService::default().record_fix_applied(
-            app_id,
-            fix_id,
-            game_dir,
-            applied.len(),
-        );
+        if !cfg!(test) && !game_dir.starts_with(std::env::temp_dir()) {
+            let _ = AppliedFixIndexService::default().record_fix_applied(
+                app_id,
+                fix_id,
+                game_dir,
+                applied.len(),
+            );
+        }
 
         FixApplicationResult {
             ok: true,
@@ -576,7 +578,9 @@ impl FixesService {
         }
         let _ = fs::remove_file(&record_file);
         let _ = fs::remove_dir_all(fix_meta_dir.join("backups").join(fix_id));
-        let _ = AppliedFixIndexService::default().record_fix_reverted(record.app_id, fix_id);
+        if !cfg!(test) && !game_dir.starts_with(std::env::temp_dir()) {
+            let _ = AppliedFixIndexService::default().record_fix_reverted(record.app_id, fix_id);
+        }
         FixApplicationResult {
             ok: true,
             error: None,

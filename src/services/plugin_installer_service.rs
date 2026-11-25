@@ -212,7 +212,12 @@ impl PluginInstallerService {
 
     pub fn install_default_luatools_js(&self, custom_target: Option<&Path>) -> Result<PathBuf, String> {
         let target_file = if let Some(p) = custom_target {
-            if p.is_dir() {
+            let is_js_file = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("js"))
+                .unwrap_or(false);
+            if p.is_dir() || !is_js_file {
                 p.join("luatools.js")
             } else {
                 p.to_path_buf()

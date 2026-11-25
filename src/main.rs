@@ -346,8 +346,24 @@ fn main() -> eframe::Result<()> {
         std::env::set_var("WINIT_UNIX_BACKEND", "x11");
     }
 
+    // On hybrid GPU Linux laptops (e.g. AMD/Intel + NVIDIA), libEGL probes every ICD by default
+    // and maps both Mesa/LLVM and NVIDIA shader compilers (~40+ MB extra RSS) for a simple 2D UI.
+    // Default to Mesa EGL unless the user explicitly requested PRIME offload or another ICD.
+    if std::env::var_os("__EGL_VENDOR_LIBRARY_FILENAMES").is_none()
+        && std::env::var_os("__NV_PRIME_RENDER_OFFLOAD").is_none()
+        && std::env::var_os("__GLX_VENDOR_LIBRARY_NAME").is_none()
+    {
+        let mesa_icd = Path::new("/usr/share/glvnd/egl_vendor.d/50_mesa.json");
+        if mesa_icd.is_file() {
+            std::env::set_var("__EGL_VENDOR_LIBRARY_FILENAMES", mesa_icd);
+        }
+    }
+
     let native_options = eframe::NativeOptions {
         viewport,
+        depth_buffer: 0,
+        stencil_buffer: 0,
+        multisampling: 0,
         ..Default::default()
     };
 
@@ -383,10 +399,11 @@ fn main() -> eframe::Result<()> {
                 });
             }
 
-            let inner = LuaToolsApp::new(
+            let inner = LuaToolsApp::new_with_tray_hint(
                 cc,
                 initial_protocol_url,
                 qa_screenshots_dir,
+                minimized || tray_locked,
             );
 
             Ok(Box::new(AppWrapper {

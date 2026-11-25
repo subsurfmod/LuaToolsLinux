@@ -47,7 +47,14 @@ impl LuaToolsApp {
             return Some(existing.clone());
         }
         let raw = guide_screenshot_bytes(key)?;
-        let decoded = image::load_from_memory(raw).ok()?.into_rgba8();
+        let img = image::load_from_memory(raw).ok()?;
+        let resized = if img.width() > 760 {
+            let new_h = ((img.height() as f32) * (760.0 / img.width() as f32)).round() as u32;
+            img.resize(760, new_h.max(1), image::imageops::FilterType::Triangle)
+        } else {
+            img
+        };
+        let decoded = resized.into_rgba8();
         let (w, h) = decoded.dimensions();
         let color_img =
             ColorImage::from_rgba_unmultiplied([w as usize, h as usize], decoded.as_raw());

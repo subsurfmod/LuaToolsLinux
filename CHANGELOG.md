@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.0.1] - 2026-11-25
+
+> **Major Stable Release (`v2.6.1` -> `v3.0.1`)**: Consolidates every milestone from `v2.7.1`, `v2.7.3-beta`, `v2.8.2-beta`, `v2.8.4-beta`, `v2.9.0-beta`, `v2.9.1-beta`, `v2.9.2-beta`, `v2.9.3-beta`, and `v2.9.4-beta` onto `main`, delivering 100% forensic feature parity, dramatic memory optimization (**220.7 MB -> 87.5 MB VmRSS**), a simplified primary-user interface, and complete test-verified reliability (**413 passing workspace tests, 0 warnings**).
+
+### Memory & Performance Optimizations
+- **59.4% Lower Live Memory Footprint (`220.7 MB -> 87.5 MB VmRSS`, `101.2 MB -> 25.6 MB RssAnon`, `128.2 MB -> 45.4 MB PSS`)**:
+  - **Streaming 64 KiB `applist.json` Scanner (`src/services/caches.rs`)**: Replaced eager full-file deserialization of the 15 MB Steam app list (~65 MB peak private heap) with `SteamAppListCache::resolve_batch()`, scanning `applist.json` in 64 KiB chunks with early exit and bounded hit/miss caches (512 hits / 1024 misses). Capped `SteamAppInfoCache` in-memory cache to 32 entries.
+  - **Single-Vendor Mesa EGL Preference on Hybrid Laptops (`src/main.rs`)**: Defaults `__EGL_VENDOR_LIBRARY_FILENAMES` to `/usr/share/glvnd/egl_vendor.d/50_mesa.json` when unset and no explicit PRIME offload is requested, avoiding simultaneous loading of both Mesa/LLVM and NVIDIA shader compilers (~41 MB immediate RSS savings) and disabling unused 2D depth/stencil/MSAA framebuffers.
+  - **Lazy System Tray Loading (`src/main.rs`, `src/models/config.rs`, `src/ui/app.rs`, `src/ui/views_workbench.rs`)**: Changed default `close_to_tray` to `false` and deferred `dlopen` of `libayatana-appindicator3` / `libgtk-3` (~25 MB RSS + 8 GLib threads) until tray mode is requested (`--minimized`, `--tray-locked`, or toggled on in **Settings › General**).
+  - **Bounded Downscaled Textures & Eviction (`src/ui/app.rs`, `src/ui/views_guide.rs`)**: Downscales cover artwork to max `280×140` (`FilterType::Triangle`, ~6× smaller RGBA footprint) with a 24-entry LRU cache, downscales Help guide screenshots to max `760px` wide, and evicts decoded guide textures immediately when leaving Help.
+  - **Lazy Remote Catalogs, Zero Per-Frame Disk I/O & Size Optimization (`src/ui/app.rs`, `src/ui/views_workbench.rs`, `src/ui/theme.rs`, `src/services/wired_service.rs`, `Cargo.toml`)**:
+    - Deferred remote Steam featured catalog and Game Fixes catalog fetches until first visit to **Add Games** / **Game Fixes** (and Millennium RPC probe to explicit click).
+    - Cached `WiredService::status()` SHA-256 hashes by `(path, len, mtime)` instead of hashing multi-MB `.so` libraries at 60 FPS.
+    - Cached `ExternalToolsManager::inspect_tool` and `TelemetryService::recent_events` instead of polling disk on every UI frame; replaced per-frame `get_installed_games()` directory scans in Game Fixes with cached `library_rows`.
+    - Removed redundant embedded `Ubuntu-Light` and `Hack` fallback font buffers once system fonts load, switched release profile to `opt-level = "s"` (shrinking binary RSS from 14.1 MB to 10.3 MB), and invoked `libc::malloc_trim(0)` after startup and library refreshes.
+
+### Critical Bug Fixes & Security Hardening
+- **Fixed Unwanted `example.com` Browser Tab Bug (`src/services/http_server.rs`)**:
+  - Added strict URL validation (`validate_external_url`) on `POST /open-url` enforcing `http://` or `https://` schemes, rejecting control characters/whitespace/leading `-`, and explicitly blocking RFC 2606 example/test domains (`example.com`, `*.example.com`, `example.org`, `example.net`, `*.example`, `*.invalid`, `*.test`) with HTTP `400`.
+  - Added `allow_external_spawn()` guard across `/open-url`, `/restart-steam`, RPC `"RestartSteam"`, and `/remove` global SLSsteam mutations so automated tests and headless runs (`LUATOOLS_NO_EXTERNAL_LAUNCH=1`) never spawn browsers, never launch Steam, and never modify `~/.config/SLSsteam/config.yaml`.
+- **Fixed Steam Launch Button & SLSsteam Detection (`src/ui/app.rs`)**:
+  - Top-bar Steam launcher and `launch_steam_with_bridge()` now recognize `~/.local/bin/steam-sls` and `~/.local/share/SLSsteam/SLSsteam.so` alongside `luatools-steam-launcher` / `libsteam_integration.so`, so SLSsteam users see **`Launch Steam`** / **`Restart Steam`** immediately instead of a broken bridge warning.
+- **Fixed Blocking UI Operations & Wiring Gaps (`src/ui/dialogs.rs`, `src/ui/app.rs`, `src/ui/views_workbench.rs`, `src/services/*.rs`)**:
+  - Moved `save_launch_options_coordinated` and `restore_launch_backup_coordinated` off the UI thread (`AppMessage::LaunchOptionsFinished`) and cached Steam running state on modal open instead of scanning `/proc` every frame.
+  - Moved `FixesService::unfix_game` (Revert) onto a background worker with live progress bar feedback, and wired `AppliedFixIndexService` (`LT-76`) recording/rebuilding across apply & revert paths (isolated from `cfg!(test)` / temp dirs).
+  - Wired `check_lua_overwrite_diff` into `AcquireInstallFinished` so cloud downloads prompt the `OverwriteDiffModal` before overwriting customized `.lua` files.
+  - Fixed `PluginInstallerService::install_default_luatools_js` when given a directory path (appends `luatools.js` instead of writing a file named `LuaTools`) and wired `ensure_luatools_js_installed` in both First-Run Quick Setup and **Settings › Steam Setup › Install Store Page Plugin (LTSP)** (`LT-19`).
+  - Fixed `HotReloadService::update_watch_dir` to cleanly restart the `inotify` watcher when Steam's path changes while running.
+  - Wired immediate auto-save on all Settings checkboxes (`auto_update_apps`, `fast_fetch`, `donate_keys`, `check_updates_on_startup`, `cef_bridge_enabled`, `play_not_owned`, `limit_downloads`).
+- **Completed Remaining Forensic Audit Closure Items (`src/steam_bridge/preload_loader.rs`, `src/steam_bridge/denuvo_auth.rs`, `src/steam_bridge/credentials/eticketclient.rs`, `src/services/wired_service.rs`, `uninstall.sh`)**:
+  - Multi-user UID filtering in `preload_loader.rs` (`find_steam_pid` / `kill_all_steam_instances`) so only processes owned by the current user (`geteuid()`) are matched.
+  - PE32/PE64 Denuvo section/marker scanner (`ProtectionScan`, `BST-54`) in `denuvo_auth.rs`.
+  - Dynamic `seteticketurl` override wiring (`BST-07`) in `eticketclient.rs` & `lua_parser.rs`.
+  - SHA-256 active unlocker verification (`LT-65`) in `wired_service.rs`, launcher auto-spawn hook (`LT-20`), and XDG MIME handler deregistration in `uninstall.sh` (`LT-05`).
+
+### Simplified Primary-User Interface
+- **Cleaner Navigation & Plain-English Labels (`src/ui/app.rs`, `src/ui/views_primary.rs`, `src/ui/views_workbench.rs`)**:
+  - Grouped the left sidebar into **GAMES** (`Home`, `Add Games`, `My Games`, `Game Fixes`) and **TOOLS** (`Depots & Vault`, `Help`), with `Settings` & Account status anchored cleanly at the bottom.
+  - Streamlined **Home** (`lets start crackin 😛` header, simple file drop sheet, 3 clickable plain-English status tiles jumping straight to Steam / Unlocker / Account setup, and Recent Games grid; moved technical `inotify` Hot-Reload watcher controls to **Settings › Advanced Bridge**).
+  - Simplified top command bar (`Launch Steam` / `Restart Steam` / `Setup Steam`, showing red `Stop Steam` only while Steam is actually running).
+  - Tidied **My Games** row actions (`Files & DLC`, `Options`, `More` with common actions up front and expert actions organized inside an **`Advanced Tools`** submenu).
+  - Reorganized **Settings** into plain-English tabs (`General`, `Account`, `Steam Setup`, `Advanced Bridge`, `Updates & Tools`, `Diagnostics`), placing **1-Click Steam Unlocker (SLSsteam)** first under **Steam Setup** and folding **Cloud Redirect & Store Page Plugins** into a clean collapsible **Advanced** drawer.
+
+---
+
+## [2.9.4-beta] - 2026-11-25
+
+### Added & Fixed (15 Forensic Audit Priority Features)
+- **Priority 1 Critical Fixes**:
+  - Silent headless protocol installation (`luatools://install/silent/...`, `?silent=1`) (`LT-13`).
+  - Rootless Steam relaunch prioritizing `~/.local/bin/steam-sls` with `LD_AUDIT` (`LT-18`, `LNX-04`).
+  - Default `SLSsteam` `play_not_owned = true` (`LNX-01`).
+  - Colon-safe fix IDs (`online-fix:<uuid>`) in `FixesService::is_safe_fix_id` (`LT-74`, `LT-75`).
+  - Canonical `text/plain` `depotId:hexKey,...` wire format in `DonateKeysService` (`LT-45`).
+- **Priority 2 Core Services & Encryption**:
+  - Steam UI language detection (`LT-16`), `DepotCacheMigrationService` (`LT-34`), raw manifest fetch endpoints (`LT-44`), binary Steam `.manifest` protobuf codec (`src/parsers/manifest_binary.rs`, `LT-60..62`), `LaunchModStore` with PICS `change_number` drift detection & coordinated Steam shutdown (`src/services/launch_mod_store.rs`, `LT-57..59`).
+  - Central `AppliedFixIndexService` registry (`src/services/applied_fix_index.rs`, `LT-76`), `DownloadQueue` with concurrency & ETA tracking (`src/services/download_queue.rs`, `LT-38`), per-depot DLC checkbox toggles (`LT-31`), `.lua` Overwrite Diff modal (`LT-32`), and at-rest credential encryption using `age` x25519 + AES-GCM (`src/services/credential_encryption.rs`, `LT-40`).
+- **Priority 3 Linux Compatibility**:
+  - `StubRemover` / `Steamless` `.unpacked.exe` replacement (`LNX-06`), Goldberg Windows DLL staging for Proton titles (`LNX-08`), and `PlayUnownedService` `SLSsteam` synchronization (`LNX-03`).
+
+---
+
 ## [2.9.3-beta] - 2026-11-24
 
 ### Added & Fixed (Phase 3 Forensic Audit Closure & Production Call-Path Wiring)

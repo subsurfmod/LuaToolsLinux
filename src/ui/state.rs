@@ -251,6 +251,13 @@ pub enum AppMessage {
         msg: String,
     },
     FilePickedForGameInjectionSo(PathBuf),
+    LaunchOptionsFinished {
+        app_id: u32,
+        ok: bool,
+        entries: Option<Vec<LaunchEntry>>,
+        message: String,
+        warn: bool,
+    },
     ShowWindow,
     HideWindow,
     OpenSettings,
@@ -307,6 +314,8 @@ pub struct LaunchOptionsModal {
     pub entries: Vec<LaunchEntry>,
     pub selected_idx: Option<usize>,
     pub feedback: String,
+    pub steam_running: bool,
+    pub busy: bool,
 }
 
 #[derive(Debug, Clone, Default)]

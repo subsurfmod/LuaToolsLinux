@@ -1,8 +1,8 @@
 %global debug_package %{nil}
 
 Name:           luatools-linux
-Version:        2.9.1
-Release:        0.1.beta%{?dist}
+Version:        3.0.1
+Release:        1%{?dist}
 Summary:        Native Rust workstation for Steam stplug-in lua manifests, depots, and fixes
 License:        MIT
 URL:            https://lua.tools
@@ -48,6 +48,14 @@ install -m 0644 %{_sourcedir}/luatools.desktop %{buildroot}%{_datadir}/applicati
 %{_datadir}/icons/hicolor/scalable/apps/luatools.svg
 
 %changelog
+* Wed Nov 25 2026 LuaTools Linux Contributors <noreply@lua.tools> - 3.0.1-1
+- Release v3.0.1: Aggressive RAM optimization (-59% VmRSS from 220.7 MB to 87.5 MB, -74% RssAnon to 25.6 MB, -64% PSS to 45.4 MB), fixed example.com browser-open bug and hardened /open-url validation, simplified primary-user UI across all screens, async Launch Options & Fix Revert, full forensic audit parity since v2.6.1 (413 passing workspace tests)
+* Wed Nov 25 2026 LuaTools Linux Contributors <noreply@lua.tools> - 2.9.4-0.1.beta
+- Beta v2.9.4-beta: Binary manifest codec, LaunchModStore PICS rebase, AppliedFixIndexService, DownloadQueue, age x25519/AES-GCM credential encryption, silent protocol install, steam-sls LD_AUDIT relaunch, and Proton Goldberg DLL support
+* Tue Nov 24 2026 LuaTools Linux Contributors <noreply@lua.tools> - 2.9.3-0.1.beta
+- Beta v2.9.3-beta: Complete GUI wiring, Overwrite Diff modal, 100-item download history ring, 13 extended LTSP HTTP routes, CDP queue drain, and AceSLS schema alignment
+* Tue Nov 24 2026 LuaTools Linux Contributors <noreply@lua.tools> - 2.9.2-0.1.beta
+- Beta v2.9.2-beta: Single-instance flock, Unix socket IPC, CLI flags, OS login autostart, Steam UI language detection, bst:// URI handler, per-depot DLC toggling, CloudRedirect, and Legacy Unlocker cleaner
 * Tue Nov 24 2026 LuaTools Linux Contributors <noreply@lua.tools> - 2.9.1-0.1.beta
 - Beta v2.9.1-beta: Individual file-by-file audit & improvements across all 78 files changed since v2.6.1 (339/339 tests passing, 0 clippy warnings), installer/uninstaller shared-library staging fixes, and emoji-free Leonida-formatted README.md
 * Tue Nov 24 2026 LuaTools Linux Contributors <noreply@lua.tools> - 2.9.0-0.1.beta

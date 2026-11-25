@@ -204,9 +204,13 @@ fn load_rich_fonts(ctx: &egui::Context) {
             fonts
                 .font_data
                 .insert("rich_body".into(), Arc::new(FontData::from_owned(bytes)));
+            for fam in fonts.families.values_mut() {
+                fam.retain(|name| name != "Ubuntu-Light");
+            }
             if let Some(fam) = fonts.families.get_mut(&FontFamily::Proportional) {
                 fam.insert(0, "rich_body".into());
             }
+            fonts.font_data.remove("Ubuntu-Light");
             body_loaded = true;
             break;
         }
@@ -278,9 +282,13 @@ fn load_rich_fonts(ctx: &egui::Context) {
             fonts
                 .font_data
                 .insert("rich_mono".into(), Arc::new(FontData::from_owned(bytes)));
+            for fam in fonts.families.values_mut() {
+                fam.retain(|name| name != "Hack");
+            }
             if let Some(fam) = fonts.families.get_mut(&FontFamily::Monospace) {
                 fam.insert(0, "rich_mono".into());
             }
+            fonts.font_data.remove("Hack");
             break;
         }
     }

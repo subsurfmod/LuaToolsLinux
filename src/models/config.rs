@@ -141,7 +141,7 @@ pub struct AppSettings {
     pub telemetry_install_id: String,
     #[serde(default)]
     pub autostart: bool,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub close_to_tray: bool,
     #[serde(default)]
     pub minimize_to_tray: bool,
@@ -169,7 +169,7 @@ impl Default for AppSettings {
             telemetry_endpoint_url: String::new(),
             telemetry_install_id: String::new(),
             autostart: false,
-            close_to_tray: true,
+            close_to_tray: false,
             minimize_to_tray: false,
         }
     }

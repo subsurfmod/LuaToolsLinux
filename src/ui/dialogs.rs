@@ -195,9 +195,7 @@ impl LuaToolsApp {
                 .as_ref()
                 .map(|i| i.root.as_path());
             let plugin_svc = crate::services::plugin_installer_service::PluginInstallerService::new(None);
-            let _ = plugin_svc.install_default_luatools_js(
-                steam_root.map(|r| r.join("steamui/LuaTools")).as_deref(),
-            );
+            let _ = plugin_svc.ensure_luatools_js_installed(steam_root);
             let _ = self.slssteam_service.save();
         }
 
@@ -751,7 +749,8 @@ impl LuaToolsApp {
         let mut do_save = false;
         let mut do_restore = false;
 
-        let steam_running = crate::services::launch_mod_store::is_any_steam_running();
+        let steam_running = self.launch_options_modal.steam_running;
+        let is_busy = self.launch_options_modal.busy;
         let app_id = self.launch_options_modal.app_id;
         egui::Window::new(format!(
             "Launch Options — {} (#{})",
@@ -871,17 +870,26 @@ impl LuaToolsApp {
             egui::Sides::new().show(
                 ui,
                 |ui| {
-                    if secondary_button(ui, "Restore Backup").clicked() {
-                        do_restore = true;
-                    }
+                    ui.add_enabled_ui(!is_busy, |ui| {
+                        if secondary_button(ui, "Restore Backup").clicked() {
+                            do_restore = true;
+                        }
+                    });
                 },
                 |ui| {
                     if ghost_button(ui, "Close").clicked() {
                         close = true;
                     }
-                    if primary_button(ui, "Write to appinfo.vdf").clicked() {
-                        do_save = true;
-                    }
+                    ui.add_enabled_ui(!is_busy, |ui| {
+                        let save_lbl = if is_busy {
+                            "Saving…"
+                        } else {
+                            "Save Launch Options"
+                        };
+                        if primary_button(ui, save_lbl).clicked() {
+                            do_save = true;
+                        }
+                    });
                 },
             );
         });
@@ -889,28 +897,41 @@ impl LuaToolsApp {
         if do_save {
             let steam_root = self.steam_service.installation.as_ref().map(|i| i.root.clone());
             if let Some(root) = steam_root {
-                let mut store = crate::services::launch_mod_store::LaunchModStore::new(None);
-                match crate::services::launch_mod_store::save_launch_options_coordinated(
-                    &root,
-                    app_id,
-                    &self.launch_options_modal.entries,
-                    &mut store,
-                ) {
-                    Ok(res) => {
-                        self.launch_options_modal.entries = res.entries;
-                        self.launch_options_modal.feedback = res.message.clone();
-                        let tone = if res.restart_error.is_some() {
-                            ToastKind::Warning
-                        } else {
-                            ToastKind::Success
-                        };
-                        self.notify(res.message, tone);
+                self.launch_options_modal.busy = true;
+                self.launch_options_modal.feedback =
+                    "Updating Steam launch options in background…".into();
+                let entries = self.launch_options_modal.entries.clone();
+                let tx = self.msg_tx.clone();
+                let ctx_c = ctx.clone();
+                thread::spawn(move || {
+                    let mut store = crate::services::launch_mod_store::LaunchModStore::new(None);
+                    match crate::services::launch_mod_store::save_launch_options_coordinated(
+                        &root,
+                        app_id,
+                        &entries,
+                        &mut store,
+                    ) {
+                        Ok(res) => {
+                            let _ = tx.send(AppMessage::LaunchOptionsFinished {
+                                app_id,
+                                ok: true,
+                                entries: Some(res.entries),
+                                message: res.message,
+                                warn: res.restart_error.is_some(),
+                            });
+                        }
+                        Err(m) => {
+                            let _ = tx.send(AppMessage::LaunchOptionsFinished {
+                                app_id,
+                                ok: false,
+                                entries: None,
+                                message: m,
+                                warn: true,
+                            });
+                        }
                     }
-                    Err(m) => {
-                        self.launch_options_modal.feedback = m.clone();
-                        self.notify(m, ToastKind::Warning);
-                    }
-                }
+                    ctx_c.request_repaint();
+                });
             } else {
                 self.launch_options_modal.feedback = "Steam installation not detected.".into();
                 self.notify("Steam installation not detected.", ToastKind::Warning);
@@ -919,29 +940,39 @@ impl LuaToolsApp {
         if do_restore {
             let steam_root = self.steam_service.installation.as_ref().map(|i| i.root.clone());
             if let Some(root) = steam_root {
-                let mut store = crate::services::launch_mod_store::LaunchModStore::new(None);
-                match crate::services::launch_mod_store::restore_launch_backup_coordinated(
-                    &root,
-                    app_id,
-                    &mut store,
-                ) {
-                    Ok(res) => {
-                        self.launch_options_modal.selected_idx =
-                            (!res.entries.is_empty()).then_some(0);
-                        self.launch_options_modal.entries = res.entries;
-                        self.launch_options_modal.feedback = res.message.clone();
-                        let tone = if res.restart_error.is_some() {
-                            ToastKind::Warning
-                        } else {
-                            ToastKind::Success
-                        };
-                        self.notify(res.message, tone);
+                self.launch_options_modal.busy = true;
+                self.launch_options_modal.feedback =
+                    "Restoring backup launch options in background…".into();
+                let tx = self.msg_tx.clone();
+                let ctx_c = ctx.clone();
+                thread::spawn(move || {
+                    let mut store = crate::services::launch_mod_store::LaunchModStore::new(None);
+                    match crate::services::launch_mod_store::restore_launch_backup_coordinated(
+                        &root,
+                        app_id,
+                        &mut store,
+                    ) {
+                        Ok(res) => {
+                            let _ = tx.send(AppMessage::LaunchOptionsFinished {
+                                app_id,
+                                ok: true,
+                                entries: Some(res.entries),
+                                message: res.message,
+                                warn: res.restart_error.is_some(),
+                            });
+                        }
+                        Err(m) => {
+                            let _ = tx.send(AppMessage::LaunchOptionsFinished {
+                                app_id,
+                                ok: false,
+                                entries: None,
+                                message: m,
+                                warn: true,
+                            });
+                        }
                     }
-                    Err(m) => {
-                        self.launch_options_modal.feedback = m.clone();
-                        self.notify(m, ToastKind::Warning);
-                    }
-                }
+                    ctx_c.request_repaint();
+                });
             } else {
                 self.launch_options_modal.feedback = "Steam installation not detected.".into();
                 self.notify("Steam installation not detected.", ToastKind::Warning);

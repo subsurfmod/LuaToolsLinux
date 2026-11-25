@@ -1427,16 +1427,13 @@ impl LuaToolsApp {
 
         ui.add_space(14.0);
 
+        // Use cached library_rows instead of re-reading stplug-in/ from disk every frame
         let my_ids: std::collections::HashSet<String> = self
-            .lua_installer
-            .as_ref()
-            .map(|i| {
-                i.get_installed_games()
-                    .into_iter()
-                    .map(|x| x.to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
+            .library_rows
+            .iter()
+            .filter(|r| r.has_lua)
+            .map(|r| r.app_id.to_string())
+            .collect();
 
         let q = self.fixes_search.trim().to_ascii_lowercase();
         let filtered_games: Vec<_> = self
@@ -1475,10 +1472,14 @@ impl LuaToolsApp {
                                 if filtered_games.is_empty() {
                                     ui.add_space(32.0);
                                     ui.vertical_centered(|ui| {
-                                        ui.label(
-                                            RichText::new("No catalog entries loaded")
-                                                .color(Palette::TEXT_MUTED),
-                                        );
+                                        let msg = if self.fixes_listings.is_empty()
+                                            && self.fixes_requested
+                                        {
+                                            "Loading game fixes catalog…"
+                                        } else {
+                                            "No matching game fixes found"
+                                        };
+                                        ui.label(RichText::new(msg).color(Palette::TEXT_MUTED));
                                     });
                                 }
                                 for g in &filtered_games {
@@ -1657,23 +1658,31 @@ impl LuaToolsApp {
                                 self.apply_fix_files_async(aid, fx, dir, ui.ctx());
                             }
                             if let Some((fid, dir)) = act_rev {
-                                let res = FixesService::unfix_game(&dir, &fid);
-                                if res.ok {
-                                    self.applied_fix_index.remove_fix(aid, &fid);
-                                    self.notify(
+                                self.fixes_busy = true;
+                                self.fixes_progress = 0.25;
+                                self.status_text = format!("Reverting fix {}…", fid);
+                                let tx = self.msg_tx.clone();
+                                let ctx_c = ui.ctx().clone();
+                                thread::spawn(move || {
+                                    let res = FixesService::unfix_game(&dir, &fid);
+                                    let msg = if res.ok {
                                         format!(
                                             "Reverted {} file(s) for AppID {}",
                                             res.applied_files.len(),
                                             aid
-                                        ),
-                                        ToastKind::Success,
-                                    );
-                                } else {
-                                    self.notify(
-                                        res.error.unwrap_or_else(|| "Revert failed".into()),
-                                        ToastKind::Warning,
-                                    );
-                                }
+                                        )
+                                    } else {
+                                        res.error.unwrap_or_else(|| "Revert failed".into())
+                                    };
+                                    let _ = tx.send(AppMessage::FixActionFinished {
+                                        app_id: aid,
+                                        ok: res.ok,
+                                        downloaded_manifest: None,
+                                        fix_id: fid,
+                                        msg,
+                                    });
+                                    ctx_c.request_repaint();
+                                });
                             }
                         } else {
                             ui.vertical_centered(|ui| {
@@ -1768,30 +1777,20 @@ impl LuaToolsApp {
             }
         }
 
-        // Clean Sub-Tab Strip
+        // Clean Sub-Tab Strip (plain-English labels)
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            if chip_button(
-                ui,
-                "General & Steam",
-                self.settings_subtab == SettingsSubTab::General,
-            )
-            .clicked()
+            if chip_button(ui, "General", self.settings_subtab == SettingsSubTab::General).clicked()
             {
                 self.settings_subtab = SettingsSubTab::General;
             }
-            if chip_button(
-                ui,
-                "Account & Providers",
-                self.settings_subtab == SettingsSubTab::Account,
-            )
-            .clicked()
+            if chip_button(ui, "Account", self.settings_subtab == SettingsSubTab::Account).clicked()
             {
                 self.settings_subtab = SettingsSubTab::Account;
             }
             if chip_button(
                 ui,
-                "SLSsteam & Store Bridge",
+                "Steam Setup",
                 self.settings_subtab == SettingsSubTab::Integrations,
             )
             .clicked()
@@ -1800,7 +1799,7 @@ impl LuaToolsApp {
             }
             if chip_button(
                 ui,
-                "Steam Integration",
+                "Advanced Bridge",
                 self.settings_subtab == SettingsSubTab::SteamIntegration,
             )
             .clicked()
@@ -1809,7 +1808,7 @@ impl LuaToolsApp {
             }
             if chip_button(
                 ui,
-                "Updates & Toolchain",
+                "Updates & Tools",
                 self.settings_subtab == SettingsSubTab::UpdatesAndTools,
             )
             .clicked()
@@ -1818,7 +1817,7 @@ impl LuaToolsApp {
             }
             if chip_button(
                 ui,
-                "Telemetry & Logs",
+                "Diagnostics",
                 self.settings_subtab == SettingsSubTab::Telemetry,
             )
             .clicked()
@@ -1883,18 +1882,38 @@ impl LuaToolsApp {
             });
 
             ui.add_space(4.0);
-            ui.checkbox(
-                &mut self.settings_service.settings.auto_update_apps,
-                "Auto-update apps (comment out setManifestid pins on standard installs)",
-            );
-            ui.checkbox(
-                &mut self.settings_service.settings.fast_fetch,
-                "Enable FastFetch (select the first available manifest provider automatically)",
-            );
-            ui.checkbox(
-                &mut self.settings_service.settings.donate_keys,
-                "Contribute newly discovered depot decryption keys from Steam config.vdf",
-            );
+            let mut general_prefs_changed = false;
+            if ui
+                .checkbox(
+                    &mut self.settings_service.settings.auto_update_apps,
+                    "Allow games to auto-update in Steam",
+                )
+                .on_hover_text("Comments out setManifestid pins on standard installs so Steam can download new updates.")
+                .changed()
+            {
+                general_prefs_changed = true;
+            }
+            if ui
+                .checkbox(
+                    &mut self.settings_service.settings.fast_fetch,
+                    "Auto-pick fastest available download source (FastFetch)",
+                )
+                .changed()
+            {
+                general_prefs_changed = true;
+            }
+            if ui
+                .checkbox(
+                    &mut self.settings_service.settings.donate_keys,
+                    "Share newly found decryption keys to help the community",
+                )
+                .changed()
+            {
+                general_prefs_changed = true;
+            }
+            if general_prefs_changed {
+                let _ = self.settings_service.save();
+            }
 
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -2028,6 +2047,11 @@ impl LuaToolsApp {
             }
         }
         if tray_prefs_changed {
+            if self.settings_service.settings.close_to_tray
+                || self.settings_service.settings.minimize_to_tray
+            {
+                self.ensure_tray_initialized();
+            }
             let _ = self.settings_service.save();
         }
     }
@@ -2255,94 +2279,7 @@ impl LuaToolsApp {
     }
 
     fn render_settings_integrations(&mut self, ui: &mut egui::Ui) {
-        let mut sync_play_unowned = false;
-        let plugin_installed = self.play_unowned_service.is_installed();
-
-        paper_card(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = 10.0;
-            egui::Sides::new().show(
-                ui,
-                |ui| {
-                    ui.label(
-                        RichText::new("SLSsteam Unlocker (~/.config/SLSsteam/config.yaml)")
-                            .font(display_font(17.5))
-                            .color(Palette::TEXT_PRIMARY),
-                    );
-                },
-                |ui| {
-                    if plugin_installed {
-                        status_badge(ui, "PlayUnowned .lua Synced", BadgeTone::Ready);
-                    } else {
-                        status_badge(ui, "PlayUnowned .lua Inactive", BadgeTone::Muted);
-                    }
-                },
-            );
-            let cfg = &mut self.slssteam_service.config;
-            ui.label(
-                RichText::new(format!(
-                    "{} AdditionalApps · {} FakeAppIds · {} DepotKeys · {} AppTokens",
-                    cfg.additional_apps.len(),
-                    cfg.fake_app_ids.len(),
-                    cfg.depot_keys.len(),
-                    cfg.app_tokens.len()
-                ))
-                .size(12.5)
-                .color(Palette::TEXT_MUTED),
-            );
-            ui.checkbox(
-                &mut cfg.play_not_owned,
-                "Allow playing unowned games (PlayNotOwnedGames: true + play_unowned_games.lua)",
-            );
-            ui.checkbox(
-                &mut cfg.limit_downloads,
-                "Restrict downloads to Steam Library folders (LimitDownloadsToSteamLibrary)",
-            );
-            ui.horizontal(|ui| {
-                let w = (ui.available_width() - 100.0).max(180.0);
-                ui.add_sized(
-                    [w, 32.0],
-                    TextEdit::singleline(&mut cfg.workshop_path)
-                        .hint_text("Optional custom DepotDownloaderMod executable path…"),
-                );
-                if secondary_button(ui, "Browse…").clicked() {
-                    let tx = self.msg_tx.clone();
-                    let ctx = ui.ctx().clone();
-                    thread::spawn(move || {
-                        let files = pick_files_native("Select DepotDownloaderMod", None);
-                        if let Some(f) = files.into_iter().next() {
-                            let _ = tx.send(AppMessage::FilePickedForWorkshop(f));
-                            ctx.request_repaint();
-                        }
-                    });
-                }
-            });
-            if secondary_button(ui, "Sync PlayUnowned Plugin Now").clicked() {
-                sync_play_unowned = true;
-            }
-        });
-
-        if sync_play_unowned {
-            let enabled = self.slssteam_service.config.play_not_owned;
-            match self
-                .play_unowned_service
-                .set_enabled(enabled, &mut self.slssteam_service)
-            {
-                Ok(()) => self.notify(
-                    if enabled {
-                        "Synced play_unowned_games.lua and SLSsteam config.yaml."
-                    } else {
-                        "Disabled PlayNotOwnedGames and removed play_unowned_games.lua."
-                    },
-                    ToastKind::Success,
-                ),
-                Err(e) => self.notify(e, ToastKind::Warning),
-            }
-        }
-
-        ui.add_space(16.0);
-
-        // Native Wired Suite (ACCELA + SLSsteam) Installer Card
+        // 1. Primary Card: 1-Click Steam Unlocker (SLSsteam + Optional ACCELA)
         let wired_st = self.wired_service.status();
         let mut wired_act: Option<&'static str> = None;
         let mut launch_accela = false;
@@ -2355,7 +2292,7 @@ impl LuaToolsApp {
                 ui,
                 |ui| {
                     ui.label(
-                        RichText::new("Wired Suite (Native ACCELA & SLSsteam Installer)")
+                        RichText::new("1-Click Steam Unlocker (SLSsteam)")
                             .font(display_font(17.5))
                             .color(Palette::TEXT_PRIMARY),
                     );
@@ -2363,20 +2300,18 @@ impl LuaToolsApp {
                 |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     if wired_st.slssteam_installed {
-                        status_badge(ui, "SLSsteam.so Ready", BadgeTone::Ready);
+                        status_badge(ui, "SLSsteam Ready", BadgeTone::Ready);
                     } else {
-                        status_badge(ui, "SLSsteam Missing", BadgeTone::Muted);
+                        status_badge(ui, "Not Installed", BadgeTone::Warn);
                     }
                     if wired_st.accela_installed {
-                        status_badge(ui, "ACCELA Ready", BadgeTone::Ready);
-                    } else {
-                        status_badge(ui, "ACCELA Missing", BadgeTone::Muted);
+                        status_badge(ui, "ACCELA Ready", BadgeTone::Blue);
                     }
                 },
             );
             ui.label(
                 RichText::new(
-                    "Installs ACCELA (~/.local/share/ACCELA) and SLSsteam (~/.local/share/SLSsteam + ~/.local/bin/steam-sls LD_AUDIT launcher) natively in Rust without piping remote shell scripts.",
+                    "Install SLSsteam so Steam can recognize and launch games added with LuaTools. No root password required.",
                 )
                 .size(12.5)
                 .color(Palette::TEXT_MUTED),
@@ -2384,13 +2319,13 @@ impl LuaToolsApp {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 ui.add_enabled_ui(!self.wired_busy, |ui| {
-                    if primary_button(ui, "Install Both (Wired)").clicked() {
-                        wired_act = Some("all");
-                    }
-                    if secondary_button(ui, "Install SLSsteam").clicked() {
+                    if primary_button(ui, "Install Steam Unlocker (SLSsteam)").clicked() {
                         wired_act = Some("slssteam");
                     }
-                    if secondary_button(ui, "Install ACCELA").clicked() {
+                    if secondary_button(ui, "Install Both (SLSsteam + ACCELA)").clicked() {
+                        wired_act = Some("all");
+                    }
+                    if secondary_button(ui, "Install ACCELA Only").clicked() {
                         wired_act = Some("accela");
                     }
                     if wired_st.accela_installed && secondary_button(ui, "Launch ACCELA").clicked()
@@ -2398,7 +2333,7 @@ impl LuaToolsApp {
                         launch_accela = true;
                     }
                     if (wired_st.accela_installed || wired_st.slssteam_installed)
-                        && danger_button(ui, "Uninstall Wired").clicked()
+                        && danger_button(ui, "Uninstall").clicked()
                     {
                         uninstall_wired = true;
                     }
@@ -2433,6 +2368,7 @@ impl LuaToolsApp {
             match self.wired_service.uninstall_all() {
                 Ok(()) => {
                     self.wired_status_text = "Uninstalled ACCELA and SLSsteam.".into();
+                    self.refresh_all_local_state();
                     self.notify("Uninstalled ACCELA and SLSsteam.", ToastKind::Info);
                 }
                 Err(e) => self.notify(e, ToastKind::Warning),
@@ -2441,13 +2377,10 @@ impl LuaToolsApp {
 
         ui.add_space(16.0);
 
-        // Cloud Redirect Revival Card
-        let cr_status = self.cloud_redirect_service.status();
-        let cloud_apps = self.cloud_redirect_service.list_cloud_apps();
-        let mut sync_cloud = false;
-        let mut add_cloud_app: Option<u32> = None;
-        let mut add_cloud_invalid = false;
-        let mut toggle_cloud: Option<(u32, bool)> = None;
+        // 2. SLSsteam Game Play Settings
+        let mut sync_play_unowned = false;
+        let mut sls_toggled = false;
+        let plugin_installed = self.play_unowned_service.is_installed();
 
         paper_card(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -2456,90 +2389,282 @@ impl LuaToolsApp {
                 ui,
                 |ui| {
                     ui.label(
-                        RichText::new("Cloud Redirect (Steam Cloud Revival)")
+                        RichText::new("SLSsteam Options")
                             .font(display_font(17.5))
                             .color(Palette::TEXT_PRIMARY),
                     );
                 },
-                |ui| match &cr_status {
-                    CloudRedirectStatus::Active => {
-                        status_badge(ui, "CloudRedirect Active", BadgeTone::Ready);
-                    }
-                    CloudRedirectStatus::Installed => {
-                        status_badge(ui, "Installed", BadgeTone::Blue);
-                    }
-                    CloudRedirectStatus::NotInstalled => {
-                        status_badge(ui, "Not Installed", BadgeTone::Muted);
-                    }
-                    CloudRedirectStatus::Error(_) => {
-                        status_badge(ui, "Error", BadgeTone::Warn);
+                |ui| {
+                    if plugin_installed {
+                        status_badge(ui, "Synced", BadgeTone::Ready);
+                    } else {
+                        status_badge(ui, "Not Synced", BadgeTone::Muted);
                     }
                 },
             );
+            let cfg = &mut self.slssteam_service.config;
             ui.label(
                 RichText::new(format!(
-                    "Config path: {}  ·  {} cloud-synced app(s)",
-                    self.cloud_redirect_service.redirect_path().display(),
-                    cloud_apps.len()
+                    "{} unlocked game(s) · {} custom AppID(s) · {} depot key(s)",
+                    cfg.additional_apps.len(),
+                    cfg.fake_app_ids.len(),
+                    cfg.depot_keys.len(),
                 ))
-                .size(12.0)
+                .size(12.5)
                 .color(Palette::TEXT_MUTED),
             );
+            if ui
+                .checkbox(
+                    &mut cfg.play_not_owned,
+                    "Allow playing unowned games in Steam (recommended)",
+                )
+                .changed()
+            {
+                sync_play_unowned = true;
+            }
+            if ui
+                .checkbox(
+                    &mut cfg.limit_downloads,
+                    "Keep downloads inside Steam Library folders only",
+                )
+                .changed()
+            {
+                sls_toggled = true;
+            }
             ui.horizontal(|ui| {
-                let cloud_edit = ui.add_sized(
-                    [150.0, 28.0],
-                    TextEdit::singleline(&mut self.cloud_app_input)
-                        .margin(Margin::symmetric(8, 5))
-                        .hint_text("AppID (e.g. 1245620)"),
+                let w = (ui.available_width() - 100.0).max(180.0);
+                ui.add_sized(
+                    [w, 32.0],
+                    TextEdit::singleline(&mut cfg.workshop_path)
+                        .hint_text("Optional custom DepotDownloader executable path…"),
                 );
-                let submit_cloud = (cloud_edit.lost_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                    || secondary_button(ui, "+ Enable Cloud App").clicked();
-                if submit_cloud {
-                    match self.cloud_app_input.trim().parse::<u32>() {
-                        Ok(aid) if aid > 0 => add_cloud_app = Some(aid),
-                        _ => add_cloud_invalid = true,
-                    }
-                }
-                if primary_button(ui, "Sync to CloudRedirect").clicked() {
-                    sync_cloud = true;
+                if secondary_button(ui, "Browse…").clicked() {
+                    let tx = self.msg_tx.clone();
+                    let ctx = ui.ctx().clone();
+                    thread::spawn(move || {
+                        let files = pick_files_native("Select DepotDownloaderMod", None);
+                        if let Some(f) = files.into_iter().next() {
+                            let _ = tx.send(AppMessage::FilePickedForWorkshop(f));
+                            ctx.request_repaint();
+                        }
+                    });
                 }
             });
-
-            // Per-app Cloud toggles across Library + currently enabled Cloud apps
-            let mut candidate_ids: Vec<(u32, String)> = self
-                .library_rows
-                .iter()
-                .map(|r| (r.app_id, r.name.clone()))
-                .collect();
-            for &cid in &cloud_apps {
-                if !candidate_ids.iter().any(|(id, _)| *id == cid) {
-                    candidate_ids.push((cid, self.resolve_game_title(cid)));
-                }
-            }
-            if !candidate_ids.is_empty() {
-                inset_paper_sheet(ui, Margin::symmetric(10, 8), |ui| {
-                    ui.set_width(ui.available_width());
-                    ScrollArea::vertical()
-                        .id_salt("cloud_redirect_apps_scroll")
-                        .max_height(150.0)
-                        .show(ui, |ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing = egui::vec2(14.0, 6.0);
-                                for (aid, name) in &candidate_ids {
-                                    let mut enabled =
-                                        self.cloud_redirect_service.is_cloud_enabled(*aid);
-                                    let lbl = format!("{} (#{})", name, aid);
-                                    if ui.checkbox(&mut enabled, lbl).changed() {
-                                        toggle_cloud = Some((*aid, enabled));
-                                    }
-                                }
-                            });
-                        });
-                });
+            if secondary_button(ui, "Sync Unlocker Settings Now").clicked() {
+                sync_play_unowned = true;
             }
         });
 
+        if sls_toggled {
+            let _ = self.slssteam_service.save();
+        }
+        if sync_play_unowned {
+            let enabled = self.slssteam_service.config.play_not_owned;
+            match self
+                .play_unowned_service
+                .set_enabled(enabled, &mut self.slssteam_service)
+            {
+                Ok(()) => self.notify(
+                    if enabled {
+                        "Synced play_unowned_games.lua and SLSsteam config.yaml."
+                    } else {
+                        "Disabled PlayNotOwnedGames and removed play_unowned_games.lua."
+                    },
+                    ToastKind::Success,
+                ),
+                Err(e) => self.notify(e, ToastKind::Warning),
+            }
+        }
+
+        ui.add_space(16.0);
+
+        // 3. Advanced Optional Bridges (collapsed by default so primary users aren't overwhelmed)
+        let mut sync_cloud = false;
+        let mut add_cloud_app: Option<u32> = None;
+        let mut add_cloud_invalid = false;
+        let mut toggle_cloud: Option<(u32, bool)> = None;
+        let mut cef_toggled = false;
+
+        egui::CollapsingHeader::new(
+            RichText::new("Advanced: Steam Cloud Redirect & Store Page Plugins")
+                .font(semibold_font(13.5))
+                .color(Palette::TEXT_SECONDARY),
+        )
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.add_space(8.0);
+            let cr_status = self.cloud_redirect_service.status();
+            let cloud_apps = self.cloud_redirect_service.list_cloud_apps();
+
+            paper_card(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 10.0;
+                egui::Sides::new().show(
+                    ui,
+                    |ui| {
+                        ui.label(
+                            RichText::new("Cloud Redirect (Steam Cloud Revival)")
+                                .font(display_font(16.5))
+                                .color(Palette::TEXT_PRIMARY),
+                        );
+                    },
+                    |ui| match &cr_status {
+                        CloudRedirectStatus::Active => {
+                            status_badge(ui, "CloudRedirect Active", BadgeTone::Ready);
+                        }
+                        CloudRedirectStatus::Installed => {
+                            status_badge(ui, "Installed", BadgeTone::Blue);
+                        }
+                        CloudRedirectStatus::NotInstalled => {
+                            status_badge(ui, "Not Installed", BadgeTone::Muted);
+                        }
+                        CloudRedirectStatus::Error(_) => {
+                            status_badge(ui, "Error", BadgeTone::Warn);
+                        }
+                    },
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "Config path: {}  ·  {} cloud-synced app(s)",
+                        self.cloud_redirect_service.redirect_path().display(),
+                        cloud_apps.len()
+                    ))
+                    .size(12.0)
+                    .color(Palette::TEXT_MUTED),
+                );
+                ui.horizontal(|ui| {
+                    let cloud_edit = ui.add_sized(
+                        [150.0, 28.0],
+                        TextEdit::singleline(&mut self.cloud_app_input)
+                            .margin(Margin::symmetric(8, 5))
+                            .hint_text("AppID (e.g. 1245620)"),
+                    );
+                    let submit_cloud = (cloud_edit.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                        || secondary_button(ui, "+ Enable Cloud App").clicked();
+                    if submit_cloud {
+                        match self.cloud_app_input.trim().parse::<u32>() {
+                            Ok(aid) if aid > 0 => add_cloud_app = Some(aid),
+                            _ => add_cloud_invalid = true,
+                        }
+                    }
+                    if primary_button(ui, "Sync to CloudRedirect").clicked() {
+                        sync_cloud = true;
+                    }
+                });
+
+                let mut candidate_ids: Vec<(u32, String)> = self
+                    .library_rows
+                    .iter()
+                    .map(|r| (r.app_id, r.name.clone()))
+                    .collect();
+                for &cid in &cloud_apps {
+                    if !candidate_ids.iter().any(|(id, _)| *id == cid) {
+                        candidate_ids.push((cid, self.resolve_game_title(cid)));
+                    }
+                }
+                if !candidate_ids.is_empty() {
+                    inset_paper_sheet(ui, Margin::symmetric(10, 8), |ui| {
+                        ui.set_width(ui.available_width());
+                        ScrollArea::vertical()
+                            .id_salt("cloud_redirect_apps_scroll")
+                            .max_height(140.0)
+                            .show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing = egui::vec2(14.0, 6.0);
+                                    for (aid, name) in &candidate_ids {
+                                        let mut enabled =
+                                            self.cloud_redirect_service.is_cloud_enabled(*aid);
+                                        let lbl = format!("{} (#{})", name, aid);
+                                        if ui.checkbox(&mut enabled, lbl).changed() {
+                                            toggle_cloud = Some((*aid, enabled));
+                                        }
+                                    }
+                                });
+                            });
+                    });
+                }
+            });
+
+            ui.add_space(12.0);
+
+            paper_card(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 10.0;
+                ui.label(
+                    RichText::new("Steam Store Bridge (Millennium, CEF & URI Handler)")
+                        .font(display_font(16.5))
+                        .color(Palette::TEXT_PRIMARY),
+                );
+                ui.label(
+                    RichText::new(&self.settings_millennium_status)
+                        .size(12.5)
+                        .color(if self.millennium_connected {
+                            Palette::GO_TEXT
+                        } else {
+                            Palette::TEXT_MUTED
+                        }),
+                );
+                if ui
+                    .checkbox(
+                        &mut self.settings_service.settings.cef_bridge_enabled,
+                        "Enable CEF DevTools Store Bridge (127.0.0.1:8080 › local RPC :6767)",
+                    )
+                    .changed()
+                {
+                    cef_toggled = true;
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    if secondary_button(ui, "Probe Millennium").clicked() {
+                        self.probe_bridge_async(ui.ctx());
+                    }
+                    if secondary_button(ui, "Enable Steam CEF Debugging").clicked() {
+                        if let Some(inst) = &self.steam_service.installation {
+                            match CefBridgeService::ensure_cef_debugging_enabled(&inst.root) {
+                                Ok(m) => self.notify(m, ToastKind::Success),
+                                Err(m) => self.notify(m, ToastKind::Warning),
+                            }
+                        } else {
+                            self.notify("Steam installation not detected.", ToastKind::Warning);
+                        }
+                    }
+                    if secondary_button(ui, "Register luatools:// Handler").clicked() {
+                        match ProtocolService::register_desktop_handler() {
+                            Ok(m) => self.notify(m, ToastKind::Success),
+                            Err(m) => self.notify(m, ToastKind::Warning),
+                        }
+                    }
+                    if secondary_button(ui, "Install Store Page Plugin (LTSP)").clicked() {
+                        if let Some(inst) = &self.steam_service.installation {
+                            let plugin_svc =
+                                crate::services::plugin_installer_service::PluginInstallerService::new(None);
+                            match plugin_svc.ensure_luatools_js_installed(Some(&inst.root)) {
+                                Ok(path) => self.notify(
+                                    format!("Installed Steam Store Plugin to {}", path.display()),
+                                    ToastKind::Success,
+                                ),
+                                Err(e) => self.notify(
+                                    format!("Failed to install Store Plugin: {}", e),
+                                    ToastKind::Warning,
+                                ),
+                            }
+                        } else {
+                            self.notify("Steam installation not detected.", ToastKind::Warning);
+                        }
+                    }
+                });
+            });
+        });
+
+        if cef_toggled {
+            let _ = self.settings_service.save();
+            if self.settings_service.settings.cef_bridge_enabled {
+                self.cef_bridge.start();
+            } else {
+                self.cef_bridge.stop();
+            }
+        }
         if let Some(aid) = add_cloud_app {
             self.cloud_redirect_service.enable_cloud_for_app(aid);
             self.cloud_app_input.clear();
@@ -2569,70 +2694,6 @@ impl LuaToolsApp {
                 Err(e) => self.notify(e, ToastKind::Warning),
             }
         }
-
-        ui.add_space(16.0);
-
-        paper_card(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = 10.0;
-            ui.label(
-                RichText::new("Steam Store Bridge (Millennium, CEF & URI Handler)")
-                    .font(display_font(17.5))
-                    .color(Palette::TEXT_PRIMARY),
-            );
-            ui.label(
-                RichText::new(&self.settings_millennium_status)
-                    .size(12.5)
-                    .color(if self.millennium_connected {
-                        Palette::GO_TEXT
-                    } else {
-                        Palette::TEXT_MUTED
-                    }),
-            );
-            ui.checkbox(
-                &mut self.settings_service.settings.cef_bridge_enabled,
-                "Enable CEF DevTools Store Bridge (127.0.0.1:8080 › local RPC :6767)",
-            );
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                if secondary_button(ui, "Probe Millennium").clicked() {
-                    self.probe_bridge_async(ui.ctx());
-                }
-                if secondary_button(ui, "Enable Steam CEF Debugging").clicked() {
-                    if let Some(inst) = &self.steam_service.installation {
-                        match CefBridgeService::ensure_cef_debugging_enabled(&inst.root) {
-                            Ok(m) => self.notify(m, ToastKind::Success),
-                            Err(m) => self.notify(m, ToastKind::Warning),
-                        }
-                    } else {
-                        self.notify("Steam installation not detected.", ToastKind::Warning);
-                    }
-                }
-                if secondary_button(ui, "Register luatools:// Handler").clicked() {
-                    match ProtocolService::register_desktop_handler() {
-                        Ok(m) => self.notify(m, ToastKind::Success),
-                        Err(m) => self.notify(m, ToastKind::Warning),
-                    }
-                }
-                if secondary_button(ui, "Install Store Page Plugin (LTSP)").clicked() {
-                    if let Some(inst) = &self.steam_service.installation {
-                        let plugin_svc = crate::services::plugin_installer_service::PluginInstallerService::new(None);
-                        match plugin_svc.ensure_luatools_js_installed(Some(&inst.root)) {
-                            Ok(path) => self.notify(
-                                format!("Installed Steam Store Plugin to {}", path.display()),
-                                ToastKind::Success,
-                            ),
-                            Err(e) => self.notify(
-                                format!("Failed to install Store Plugin: {}", e),
-                                ToastKind::Warning,
-                            ),
-                        }
-                    } else {
-                        self.notify("Steam installation not detected.", ToastKind::Warning);
-                    }
-                }
-            });
-        });
         ui.add_space(24.0);
     }
 
@@ -2651,10 +2712,15 @@ impl LuaToolsApp {
                     .size(12.5)
                     .color(Palette::BLUE_LIGHT),
             );
-            ui.checkbox(
-                &mut self.settings_service.settings.check_updates_on_startup,
-                "Check Git remote once in the background on startup (shows ⬆ Update button in top-right corner)",
-            );
+            if ui
+                .checkbox(
+                    &mut self.settings_service.settings.check_updates_on_startup,
+                    "Check for updates automatically on startup",
+                )
+                .changed()
+            {
+                let _ = self.settings_service.save();
+            }
 
             ui.horizontal(|ui| {
                 ui.label(
@@ -2719,15 +2785,36 @@ impl LuaToolsApp {
         });
 
         ui.add_space(18.0);
-        ui.label(
-            RichText::new("External Toolchain")
-                .font(display_font(17.5))
-                .color(Palette::TEXT_PRIMARY),
+        egui::Sides::new().show(
+            ui,
+            |ui| {
+                ui.label(
+                    RichText::new("External Toolchain")
+                        .font(display_font(17.5))
+                        .color(Palette::TEXT_PRIMARY),
+                );
+            },
+            |ui| {
+                if ghost_button(ui, "Refresh Status").clicked() {
+                    self.cached_tool_statuses.clear();
+                }
+            },
         );
         ui.add_space(8.0);
 
+        if self.cached_tool_statuses.is_empty() {
+            for spec in TOOLS {
+                let info = self.tools_manager.inspect_tool(spec.key);
+                self.cached_tool_statuses.insert(spec.key, info);
+            }
+        }
+
         for spec in TOOLS {
-            let info = self.tools_manager.inspect_tool(spec.key);
+            let info = self
+                .cached_tool_statuses
+                .get(spec.key)
+                .cloned()
+                .unwrap_or_else(|| self.tools_manager.inspect_tool(spec.key));
             let is_busy = self.tool_busy.get(spec.key).copied().unwrap_or(false);
             let pct = self.tool_progress.get(spec.key).copied().unwrap_or(0.0);
 
@@ -2832,7 +2919,12 @@ impl LuaToolsApp {
         let mut open_gh = false;
         let mut test_endpoint = false;
 
-        let ev_count = self.telemetry_service.event_count();
+        if self.telemetry_cache_dirty {
+            self.cached_telemetry_count = self.telemetry_service.event_count();
+            self.cached_telemetry_events = self.telemetry_service.recent_events(35);
+            self.telemetry_cache_dirty = false;
+        }
+        let ev_count = self.cached_telemetry_count;
 
         // 1. Master Telemetry Toggle & Privacy Controls
         paper_card(ui, |ui| {
@@ -2909,6 +3001,7 @@ impl LuaToolsApp {
             }
             let _ = self.settings_service.save();
             self.telemetry_service.set_enabled(enabled);
+            self.telemetry_cache_dirty = true;
             if enabled {
                 self.telemetry_service.record(
                     "info",
@@ -2929,6 +3022,7 @@ impl LuaToolsApp {
         }
         if clear_logs {
             self.telemetry_service.clear_all();
+            self.telemetry_cache_dirty = true;
             self.notify(
                 "Cleared all locally stored telemetry events.",
                 ToastKind::Info,
@@ -3060,15 +3154,25 @@ impl LuaToolsApp {
 
         ui.add_space(16.0);
 
-        // 4. Transparent Local Event Log Viewer
-        let events = self.telemetry_service.recent_events(35);
+        // 4. Transparent Local Event Log Viewer (cached, no per-frame disk reads)
+        let events = self.cached_telemetry_events.clone();
         paper_card(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 8.0;
-            ui.label(
-                RichText::new("Recorded Telemetry Events (Newest First)")
-                    .font(display_font(17.0))
-                    .color(Palette::TEXT_PRIMARY),
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    ui.label(
+                        RichText::new("Recorded Telemetry Events (Newest First)")
+                            .font(display_font(17.0))
+                            .color(Palette::TEXT_PRIMARY),
+                    );
+                },
+                |ui| {
+                    if ghost_button(ui, "Refresh").clicked() {
+                        self.telemetry_cache_dirty = true;
+                    }
+                },
             );
             inset_paper_sheet(ui, Margin::same(10), |ui| {
                 ui.set_width(ui.available_width());

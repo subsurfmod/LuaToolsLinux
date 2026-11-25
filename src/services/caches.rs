@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -200,10 +200,11 @@ impl SteamAppInfoCache {
         if let Ok(raw) = fs::read_to_string(&cache_file) {
             if let Ok(val) = serde_json::from_str::<Value>(&raw) {
                 if let Some(d) = Self::parse_details(app_id, &val) {
-                    self.mem
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(app_id, d.clone());
+                    let mut mem = self.mem.lock().unwrap_or_else(|e| e.into_inner());
+                    if mem.len() >= 32 {
+                        mem.clear();
+                    }
+                    mem.insert(app_id, d.clone());
                     return Some(d);
                 }
             }
@@ -249,10 +250,13 @@ impl SteamAppInfoCache {
             let _ = atomic_write_bytes(&cache_file, serialized.as_bytes());
         }
         let details = Self::parse_details(app_id, data)?;
-        self.mem
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(app_id, details.clone());
+        {
+            let mut mem = self.mem.lock().unwrap_or_else(|e| e.into_inner());
+            if mem.len() >= 32 {
+                mem.clear();
+            }
+            mem.insert(app_id, details.clone());
+        }
         Some(details)
     }
 
@@ -388,10 +392,14 @@ impl SteamAppInfoCache {
     }
 }
 
+const APPLIST_MEM_CAP: usize = 512;
+const APPLIST_MISS_CAP: usize = 1024;
+
 #[derive(Debug, Clone)]
 pub struct SteamAppListCache {
     cache_path: PathBuf,
     map: Arc<Mutex<HashMap<u32, String>>>,
+    misses: Arc<Mutex<HashSet<u32>>>,
     loaded: Arc<Mutex<bool>>,
 }
 
@@ -399,6 +407,134 @@ impl Default for SteamAppListCache {
     fn default() -> Self {
         Self::new(None)
     }
+}
+
+/// Low-memory streaming scanner for the flat `{"<appid>":"<name>",...}` cache file.
+/// Reads in 64 KiB chunks without deserializing the entire 15+ MB JSON into RAM,
+/// and exits early as soon as all requested `wanted` AppIDs have been resolved.
+fn scan_flat_applist_json(path: &Path, wanted: &HashSet<u32>) -> HashMap<u32, String> {
+    let mut found = HashMap::new();
+    if wanted.is_empty() {
+        return found;
+    }
+    let Ok(file) = fs::File::open(path) else {
+        return found;
+    };
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut key_buf: Vec<u8> = Vec::with_capacity(32);
+    let mut val_buf: Vec<u8> = Vec::with_capacity(256);
+
+    #[inline]
+    fn next_byte<R: BufRead>(r: &mut R) -> Option<u8> {
+        loop {
+            let buf = match r.fill_buf() {
+                Ok(b) if b.is_empty() => return None,
+                Ok(b) => b,
+                Err(_) => return None,
+            };
+            let b = buf[0];
+            r.consume(1);
+            return Some(b);
+        }
+    }
+
+    #[inline]
+    fn skip_ws<R: BufRead>(r: &mut R) -> Option<u8> {
+        loop {
+            let b = next_byte(r)?;
+            if !b.is_ascii_whitespace() {
+                return Some(b);
+            }
+        }
+    }
+
+    // Read a JSON string assuming opening `"` was already consumed.
+    // If `capture` is Some, writes the quoted JSON string (including quotes) into `capture`.
+    fn read_json_string<R: BufRead>(r: &mut R, capture: Option<&mut Vec<u8>>) -> bool {
+        let mut out = capture;
+        if let Some(ref mut buf) = out {
+            buf.clear();
+            buf.push(b'"');
+        }
+        let mut escaped = false;
+        while let Some(b) = next_byte(r) {
+            if let Some(ref mut buf) = out {
+                buf.push(b);
+            }
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                return true;
+            }
+        }
+        false
+    }
+
+    // Advance to opening '{'
+    match skip_ws(&mut reader) {
+        Some(b'{') => {}
+        _ => return found,
+    }
+
+    loop {
+        let first = match skip_ws(&mut reader) {
+            Some(b'}') | None => break,
+            Some(b',') => match skip_ws(&mut reader) {
+                Some(b'"') => b'"',
+                _ => break,
+            },
+            Some(b'"') => b'"',
+            _ => break,
+        };
+        if first != b'"' {
+            break;
+        }
+
+        if !read_json_string(&mut reader, Some(&mut key_buf)) {
+            break;
+        }
+        // Parse numeric AppID directly from `"<digits>"`
+        let inner_key = if key_buf.len() >= 2 {
+            &key_buf[1..key_buf.len() - 1]
+        } else {
+            &[]
+        };
+        let aid = std::str::from_utf8(inner_key)
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok());
+
+        match skip_ws(&mut reader) {
+            Some(b':') => {}
+            _ => break,
+        }
+
+        match skip_ws(&mut reader) {
+            Some(b'"') => {
+                let want_this = aid.is_some_and(|id| wanted.contains(&id));
+                if want_this {
+                    if !read_json_string(&mut reader, Some(&mut val_buf)) {
+                        break;
+                    }
+                    if let (Some(id), Ok(name)) = (aid, serde_json::from_slice::<String>(&val_buf))
+                    {
+                        if !name.is_empty() {
+                            found.insert(id, name);
+                            if found.len() == wanted.len() {
+                                break;
+                            }
+                        }
+                    }
+                } else if !read_json_string(&mut reader, None) {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    found
 }
 
 impl SteamAppListCache {
@@ -410,10 +546,13 @@ impl SteamAppListCache {
         Self {
             cache_path: p,
             map: Arc::new(Mutex::new(HashMap::new())),
+            misses: Arc::new(Mutex::new(HashSet::new())),
             loaded: Arc::new(Mutex::new(false)),
         }
     }
 
+    /// Checks on-disk freshness without loading the full 15+ MB app list into RAM.
+    /// Triggers a low-memory background disk refresh only when the cache file is missing or older than 14 days.
     pub fn ensure_loaded(&self) {
         {
             let mut l = self.loaded.lock().unwrap_or_else(|e| e.into_inner());
@@ -423,34 +562,19 @@ impl SteamAppListCache {
             *l = true;
         }
 
-        let mut fresh_enough = false;
-        if let Ok(raw) = fs::read_to_string(&self.cache_path) {
-            if let Ok(parsed) = serde_json::from_str::<HashMap<String, String>>(&raw) {
-                let mut guard = self.map.lock().unwrap_or_else(|e| e.into_inner());
-                for (k, v) in parsed {
-                    if let Ok(aid) = k.parse::<u32>() {
-                        guard.insert(aid, v);
-                    }
-                }
-                if let Ok(meta) = fs::metadata(&self.cache_path) {
-                    if let Ok(mtime) = meta.modified() {
-                        if SystemTime::now()
-                            .duration_since(mtime)
-                            .map(|d| d.as_secs() < TTL_14_DAYS)
-                            .unwrap_or(false)
-                        {
-                            fresh_enough = true;
-                        }
-                    }
-                }
-            }
-        }
+        let fresh_enough = fs::metadata(&self.cache_path)
+            .ok()
+            .filter(|m| m.len() > 2)
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
+            .map(|d| d.as_secs() < TTL_14_DAYS)
+            .unwrap_or(false);
 
-        if fresh_enough {
+        if fresh_enough || cfg!(test) {
             return;
         }
 
-        let map_ref = Arc::clone(&self.map);
+        let misses_ref = Arc::clone(&self.misses);
         let path_clone = self.cache_path.clone();
         thread::spawn(move || {
             let agent = ureq::AgentBuilder::new()
@@ -472,36 +596,129 @@ impl SteamAppListCache {
                 return;
             };
 
-            let mut new_map = HashMap::new();
-            let mut disk_map = HashMap::new();
-            for item in apps {
-                let aid = item
-                    .get("appid")
-                    .and_then(|v| v.as_u64())
-                    .and_then(|n| u32::try_from(n).ok())
-                    .unwrap_or(0);
-                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                if aid > 0 && !name.is_empty() {
-                    new_map.insert(aid, name.to_string());
-                    disk_map.insert(aid.to_string(), name.to_string());
-                }
+            if let Some(parent) = path_clone.parent() {
+                let _ = fs::create_dir_all(parent);
             }
-            if !new_map.is_empty() {
-                *map_ref.lock().unwrap_or_else(|e| e.into_inner()) = new_map;
-                if let Ok(js) = serde_json::to_string(&disk_map) {
-                    let _ = atomic_write_bytes(&path_clone, js.as_bytes());
+            let seq = CACHE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let tmp = path_clone.with_file_name(format!(
+                ".applist.tmp.{}.{}",
+                std::process::id(),
+                seq
+            ));
+            let mut written = 0usize;
+            let write_res = (|| -> std::io::Result<()> {
+                let f = fs::File::create(&tmp)?;
+                let mut w = BufWriter::with_capacity(64 * 1024, f);
+                w.write_all(b"{")?;
+                let mut first = true;
+                for item in apps {
+                    let aid = item
+                        .get("appid")
+                        .and_then(|v| v.as_u64())
+                        .and_then(|n| u32::try_from(n).ok())
+                        .unwrap_or(0);
+                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    if aid > 0 && !name.is_empty() {
+                        if !first {
+                            w.write_all(b",")?;
+                        }
+                        first = false;
+                        write!(w, "\"{}\":", aid)?;
+                        serde_json::to_writer(&mut w, name)
+                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                        written += 1;
+                    }
                 }
+                w.write_all(b"}")?;
+                w.flush()
+            })();
+
+            drop(val);
+            if write_res.is_ok() && written > 0 {
+                if fs::rename(&tmp, &path_clone).is_ok() {
+                    misses_ref
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clear();
+                } else {
+                    let _ = fs::remove_file(&tmp);
+                }
+            } else {
+                let _ = fs::remove_file(&tmp);
+            }
+            #[cfg(target_os = "linux")]
+            unsafe {
+                libc::malloc_trim(0);
             }
         });
     }
 
-    pub fn get_name(&self, app_id: u32) -> Option<String> {
+    /// Resolves a batch of AppIDs in a single 64 KiB streaming pass over `applist.json`,
+    /// caching only the resolved hits (bounded to 512 entries) and misses (bounded to 1024).
+    pub fn resolve_batch(&self, app_ids: &[u32]) -> HashMap<u32, String> {
         self.ensure_loaded();
-        self.map
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&app_id)
-            .cloned()
+        let mut results = HashMap::new();
+        let mut wanted = HashSet::new();
+
+        {
+            let map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+            let misses = self.misses.lock().unwrap_or_else(|e| e.into_inner());
+            for &aid in app_ids {
+                if aid == 0 {
+                    continue;
+                }
+                if let Some(name) = map.get(&aid) {
+                    results.insert(aid, name.clone());
+                } else if !misses.contains(&aid) {
+                    wanted.insert(aid);
+                }
+            }
+        }
+
+        if wanted.is_empty() {
+            return results;
+        }
+
+        let scanned = scan_flat_applist_json(&self.cache_path, &wanted);
+        {
+            let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+            let mut misses = self.misses.lock().unwrap_or_else(|e| e.into_inner());
+            for &aid in &wanted {
+                if let Some(name) = scanned.get(&aid) {
+                    if map.len() >= APPLIST_MEM_CAP {
+                        map.clear();
+                    }
+                    map.insert(aid, name.clone());
+                    results.insert(aid, name.clone());
+                } else {
+                    if misses.len() >= APPLIST_MISS_CAP {
+                        misses.clear();
+                    }
+                    misses.insert(aid);
+                }
+            }
+        }
+
+        results
+    }
+
+    pub fn get_name(&self, app_id: u32) -> Option<String> {
+        if app_id == 0 {
+            return None;
+        }
+        {
+            let map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(hit) = map.get(&app_id) {
+                return Some(hit.clone());
+            }
+        }
+        {
+            let misses = self.misses.lock().unwrap_or_else(|e| e.into_inner());
+            if misses.contains(&app_id) {
+                return None;
+            }
+        }
+        self.resolve_batch(&[app_id]).remove(&app_id)
     }
 }
 
@@ -1021,5 +1238,31 @@ mod metadata_tests {
         assert!(svc.is_hardware(1675200));
         assert!(svc.is_hardware(353370));
         assert!(!svc.is_hardware(1245620));
+    }
+
+    #[test]
+    fn applist_cache_streams_batch_and_unicode_without_full_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("applist.json");
+        fs::write(
+            &cache,
+            r#"{"10":"Counter-Strike","1245620":"ELDEN RING\u2122","1091500":"Cyberpunk \"2077\"","999999":""}"#,
+        )
+        .unwrap();
+
+        let svc = SteamAppListCache::new(Some(cache));
+        let res = svc.resolve_batch(&[1245620, 1091500, 424242, 999999]);
+        assert_eq!(res.get(&1245620).map(String::as_str), Some("ELDEN RING™"));
+        assert_eq!(
+            res.get(&1091500).map(String::as_str),
+            Some("Cyberpunk \"2077\"")
+        );
+        assert!(!res.contains_key(&424242));
+        assert!(!res.contains_key(&999999));
+
+        // Cached hit + cached miss + fresh single lookup
+        assert_eq!(svc.get_name(1245620).as_deref(), Some("ELDEN RING™"));
+        assert_eq!(svc.get_name(424242), None);
+        assert_eq!(svc.get_name(10).as_deref(), Some("Counter-Strike"));
     }
 }

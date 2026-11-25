@@ -33,7 +33,7 @@ use crate::services::cloud_redirect_service::CloudRedirectService;
 use crate::services::depot_downloader::DepotDownloaderService;
 use crate::services::depot_info::{AppDepotInfo, ContentDepot, SteamDepotInfo};
 use crate::services::donate_keys::DonateKeysService;
-use crate::services::external_tools::ExternalToolsManager;
+use crate::services::external_tools::{ExternalToolsManager, ToolStatusInfo};
 use crate::services::fixes_service::FixesService;
 use crate::services::game_process_injection_service::GameProcessInjectionService;
 use crate::services::hot_reload_service::{FileChangeType, HotReloadService};
@@ -50,7 +50,7 @@ use crate::services::steam_bridge_service::SteamBridgeService;
 use crate::services::steam_library_service::SteamLibraryService;
 use crate::services::steam_service::SteamService;
 use crate::services::applied_fix_index::AppliedFixIndexService;
-use crate::services::telemetry_service::TelemetryService;
+use crate::services::telemetry_service::{TelemetryEvent, TelemetryService};
 use crate::services::tray_service::TrayService;
 use crate::services::update_service::UpdateService;
 use crate::services::wired_service::WiredService;
@@ -141,11 +141,19 @@ pub struct LuaToolsApp {
     pub active_toast: Option<ToastNotification>,
     pub millennium_connected: bool,
     pub cover_textures: HashMap<u32, TextureHandle>,
+    pub cover_lru: VecDeque<u32>,
     pub cover_in_flight: HashSet<u32>,
     pub cover_known_urls: HashMap<u32, String>,
     pub cover_retry_urls: HashMap<u32, String>,
     pub cover_failed_at: HashMap<u32, std::time::Instant>,
     pub recent_installed: Vec<(u32, PathBuf)>,
+    pub featured_requested: bool,
+    pub fixes_requested: bool,
+    pub steam_sls_installed: bool,
+    pub cached_tool_statuses: HashMap<&'static str, ToolStatusInfo>,
+    pub cached_telemetry_events: Vec<TelemetryEvent>,
+    pub cached_telemetry_count: usize,
+    pub telemetry_cache_dirty: bool,
 
     // Discover (Acquire) View State
     pub acquire_search_query: String,
@@ -244,6 +252,15 @@ impl LuaToolsApp {
         cc: &eframe::CreationContext<'_>,
         initial_url: Option<String>,
         qa_screenshots_dir: Option<PathBuf>,
+    ) -> Self {
+        Self::new_with_tray_hint(cc, initial_url, qa_screenshots_dir, false)
+    }
+
+    pub fn new_with_tray_hint(
+        cc: &eframe::CreationContext<'_>,
+        initial_url: Option<String>,
+        qa_screenshots_dir: Option<PathBuf>,
+        force_tray: bool,
     ) -> Self {
         apply_papercut_monotone_theme(&cc.egui_ctx);
 
@@ -362,11 +379,19 @@ impl LuaToolsApp {
             active_toast: None,
             millennium_connected: false,
             cover_textures: HashMap::new(),
+            cover_lru: VecDeque::new(),
             cover_in_flight: HashSet::new(),
             cover_known_urls: HashMap::new(),
             cover_retry_urls: HashMap::new(),
             cover_failed_at: HashMap::new(),
             recent_installed: Vec::new(),
+            featured_requested: false,
+            fixes_requested: false,
+            steam_sls_installed: false,
+            cached_tool_statuses: HashMap::new(),
+            cached_telemetry_events: Vec::new(),
+            cached_telemetry_count: 0,
+            telemetry_cache_dirty: true,
             acquire_search_query: String::new(),
             acquire_tab: AcquireTab::TopSellers,
             featured_top: Vec::new(),
@@ -477,14 +502,16 @@ impl LuaToolsApp {
                 // Run depot cache migration (LT-34)
                 crate::services::depot_cache_migration::run_depot_cache_migration(&app.steam_service);
             }
-            // Initialize system tray (LT-07) with live host verification
+            // Wire system tray callbacks; only load GTK3/AppIndicator3 (~25 MB) when tray behavior is enabled
             app.tray_service.set_app_message_sender(app.msg_tx.clone());
             app.tray_service.set_egui_context(cc.egui_ctx.clone());
-            let _ = app.tray_service.initialize();
+            if force_tray
+                || app.settings_service.settings.close_to_tray
+                || app.settings_service.settings.minimize_to_tray
+            {
+                let _ = app.tray_service.initialize();
+            }
 
-            app.probe_bridge_async(&cc.egui_ctx);
-            app.fetch_featured_async(&cc.egui_ctx);
-            app.fetch_fix_listings_async(&cc.egui_ctx);
             if app.settings_service.settings.check_updates_on_startup {
                 app.check_app_update_once_async(&cc.egui_ctx);
             }
@@ -494,6 +521,11 @@ impl LuaToolsApp {
             if let Some(url) = initial_url {
                 app.handle_protocol_url(&url, &cc.egui_ctx);
             }
+        }
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::malloc_trim(0);
         }
 
         app
@@ -603,6 +635,7 @@ impl LuaToolsApp {
             active_toast: None,
             millennium_connected: false,
             cover_textures: HashMap::new(),
+            cover_lru: VecDeque::new(),
             cover_in_flight: HashSet::new(),
             cover_known_urls: HashMap::new(),
             cover_retry_urls: HashMap::new(),
@@ -611,6 +644,13 @@ impl LuaToolsApp {
                 (1245620, PathBuf::from("1245620.lua")),
                 (1091500, PathBuf::from("1091500.lua")),
             ],
+            featured_requested: true,
+            fixes_requested: true,
+            steam_sls_installed: true,
+            cached_tool_statuses: HashMap::new(),
+            cached_telemetry_events: Vec::new(),
+            cached_telemetry_count: 0,
+            telemetry_cache_dirty: true,
             acquire_search_query: String::new(),
             acquire_tab: AcquireTab::TopSellers,
             featured_top: Vec::new(),
@@ -1024,7 +1064,23 @@ impl LuaToolsApp {
         if let Some(installer) = &self.lua_installer {
             self.recent_installed = installer.enumerate_installed();
         }
+        self.steam_sls_installed = dirs::home_dir().is_some_and(|h| {
+            h.join(".local/bin/steam-sls").is_file()
+                || h.join(".local/share/SLSsteam/SLSsteam.so").is_file()
+        });
+        self.cached_tool_statuses.clear();
+        self.telemetry_cache_dirty = true;
         self.refresh_library_rows();
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
+
+    pub fn ensure_tray_initialized(&mut self) {
+        if !self.tray_service.is_tray_available() {
+            let _ = self.tray_service.initialize();
+        }
     }
 
     pub fn refresh_library_rows(&mut self) {
@@ -1038,7 +1094,6 @@ impl LuaToolsApp {
             )
             .run();
         }
-        self.applist_cache.ensure_loaded();
 
         let mut installed_names: HashMap<u32, String> = HashMap::new();
         let mut install_paths: HashMap<u32, PathBuf> = HashMap::new();
@@ -1064,6 +1119,18 @@ impl LuaToolsApp {
         all_ids.sort_unstable();
         all_ids.dedup();
 
+        // Single 64 KiB streaming pass over applist.json for unresolved AppIDs only
+        let unresolved: Vec<u32> = all_ids
+            .iter()
+            .copied()
+            .filter(|aid| !installed_names.contains_key(aid))
+            .collect();
+        let applist_names = if unresolved.is_empty() {
+            HashMap::new()
+        } else {
+            self.applist_cache.resolve_batch(&unresolved)
+        };
+
         let mut rows = Vec::with_capacity(all_ids.len());
         for aid in all_ids {
             let is_inst = installed_names.contains_key(&aid);
@@ -1073,7 +1140,7 @@ impl LuaToolsApp {
             let name = installed_names
                 .get(&aid)
                 .cloned()
-                .or_else(|| self.applist_cache.get_name(aid))
+                .or_else(|| applist_names.get(&aid).cloned())
                 .unwrap_or_else(|| format!("App {}", aid));
             let status_label = match (is_inst, has_lua) {
                 (true, true) => "Installed + Lua",
@@ -1129,6 +1196,7 @@ impl LuaToolsApp {
         if kind == ToastKind::Warning {
             self.telemetry_service
                 .record("warn", "diagnostic", "warning_toast", &text);
+            self.telemetry_cache_dirty = true;
         }
         self.status_text = text.clone();
         self.active_toast = Some(ToastNotification {
@@ -1281,7 +1349,14 @@ impl LuaToolsApp {
             if let Some(path) = cc.ensure(app_id, effective_url.as_deref()) {
                 if let Ok(bytes) = fs::read(&path) {
                     if let Ok(img) = image::load_from_memory(&bytes) {
-                        let rgba = img.to_rgba8();
+                        // Cards render covers at ~222x104; downscale large Steam headers/capsules
+                        // to cut per-cover RGBA GPU/RAM footprint by ~6x.
+                        let resized = if img.width() > 280 || img.height() > 140 {
+                            img.resize(280, 140, image::imageops::FilterType::Triangle)
+                        } else {
+                            img
+                        };
+                        let rgba = resized.to_rgba8();
                         let (w, h) = rgba.dimensions();
                         let _ = tx.send(AppMessage::CoverLoaded {
                             app_id,
@@ -2149,17 +2224,17 @@ impl LuaToolsApp {
     /// which preloads libsteam_integration.so into the Steam client process. No root required.
     pub fn launch_steam_with_bridge(&mut self, ctx: &egui::Context) {
         let bridge_st = self.steam_bridge_service.status();
-        let launcher = dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".local/bin/luatools-steam-launcher");
+        let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let launcher = home.join(".local/bin/luatools-steam-launcher");
+        let steam_sls_exists = home.join(".local/bin/steam-sls").is_file();
 
-        if !launcher.exists() && !bridge_st.system_preload_enabled {
+        if !steam_sls_exists && !launcher.exists() && !bridge_st.system_preload_enabled {
             self.notify(
-                "Bridge launcher not found. Install it first in Settings › Steam Integration.",
+                "Steam unlocker not set up yet. Install SLSsteam in Settings › Steam Setup first.",
                 ToastKind::Warning,
             );
             self.active_view = ActiveView::Settings;
-            self.settings_subtab = SettingsSubTab::SteamIntegration;
+            self.settings_subtab = SettingsSubTab::Integrations;
             return;
         }
 
@@ -2639,6 +2714,13 @@ impl LuaToolsApp {
                             TextureOptions::LINEAR,
                         );
                         self.cover_textures.insert(app_id, tex);
+                        self.cover_lru.retain(|&id| id != app_id);
+                        self.cover_lru.push_back(app_id);
+                        while self.cover_lru.len() > 24 {
+                            if let Some(oldest) = self.cover_lru.pop_front() {
+                                self.cover_textures.remove(&oldest);
+                            }
+                        }
                     } else {
                         self.cover_failed_at
                             .insert(app_id, std::time::Instant::now());
@@ -2730,56 +2812,85 @@ impl LuaToolsApp {
                         if let (Some(dl), Some(installer)) =
                             (downloaded_path, self.lua_installer.clone())
                         {
-                            let res = installer.install_any(
-                                &dl,
-                                Some(app_id),
-                                false,
-                                Some(&source),
-                                Some(&mut self.settings_service),
-                                Some(&mut self.slssteam_service),
-                            );
-                            if let Some(parent) = dl.parent() {
-                                let _ = fs::remove_dir_all(parent);
-                            }
-                            if res.ok {
-                                let msg = format!(
-                                    "Installed AppID {} ({} manifest file(s))",
-                                    app_id, res.manifest_count
+                            if let Some((aid, old_txt, new_txt, added, removed)) =
+                                self.check_lua_overwrite_diff(&dl, Some(app_id))
+                            {
+                                self.overwrite_diff_modal = OverwriteDiffModal {
+                                    open: true,
+                                    app_id: aid,
+                                    source_label: source.clone(),
+                                    old_content: old_txt,
+                                    new_content: new_txt,
+                                    added_lines: added,
+                                    removed_lines: removed,
+                                    pending_package_path: Some(dl),
+                                    cleanup_parent: true,
+                                };
+                                self.acquire_status = format!(
+                                    "Existing {}.lua differs — confirm overwrite to install.",
+                                    aid
                                 );
-                                self.record_download_history(
-                                    app_id,
-                                    game_title,
-                                    &source,
-                                    "Installed",
+                                self.notify(
+                                    format!(
+                                        "Review changes before overwriting existing {}.lua.",
+                                        aid
+                                    ),
+                                    ToastKind::Info,
                                 );
-                                self.acquire_status = msg.clone();
-                                self.notify(msg, ToastKind::Success);
-                                self.refresh_all_local_state();
-                                {
-                                    let consent_seen = self.settings_service.settings.telemetry_consent_seen;
-                                    let telemetry_on = self.settings_service.settings.telemetry_enabled;
-                                    let src_copy = source.clone();
-                                    if consent_seen && telemetry_on {
-                                        thread::spawn(move || {
-                                            let _ = AnalyticsService::new().track_event_gated(
-                                                "acquire_install",
-                                                Some(serde_json::json!({ "source": src_copy })),
-                                                consent_seen,
-                                                telemetry_on,
-                                            );
-                                        });
-                                    }
-                                }
                             } else {
-                                let err = res.error.unwrap_or_else(|| "Install failed".into());
-                                self.record_download_history(
-                                    app_id,
-                                    game_title,
-                                    &source,
-                                    format!("Failed: {}", err),
+                                let res = installer.install_any(
+                                    &dl,
+                                    Some(app_id),
+                                    false,
+                                    Some(&source),
+                                    Some(&mut self.settings_service),
+                                    Some(&mut self.slssteam_service),
                                 );
-                                self.acquire_status = err.clone();
-                                self.notify(err, ToastKind::Warning);
+                                if let Some(parent) = dl.parent() {
+                                    let _ = fs::remove_dir_all(parent);
+                                }
+                                if res.ok {
+                                    let msg = format!(
+                                        "Installed AppID {} ({} manifest file(s))",
+                                        app_id, res.manifest_count
+                                    );
+                                    self.record_download_history(
+                                        app_id,
+                                        game_title,
+                                        &source,
+                                        "Installed",
+                                    );
+                                    self.acquire_status = msg.clone();
+                                    self.notify(msg, ToastKind::Success);
+                                    self.refresh_all_local_state();
+                                    {
+                                        let consent_seen =
+                                            self.settings_service.settings.telemetry_consent_seen;
+                                        let telemetry_on =
+                                            self.settings_service.settings.telemetry_enabled;
+                                        let src_copy = source.clone();
+                                        if consent_seen && telemetry_on {
+                                            thread::spawn(move || {
+                                                let _ = AnalyticsService::new().track_event_gated(
+                                                    "acquire_install",
+                                                    Some(serde_json::json!({ "source": src_copy })),
+                                                    consent_seen,
+                                                    telemetry_on,
+                                                );
+                                            });
+                                        }
+                                    }
+                                } else {
+                                    let err = res.error.unwrap_or_else(|| "Install failed".into());
+                                    self.record_download_history(
+                                        app_id,
+                                        game_title,
+                                        &source,
+                                        format!("Failed: {}", err),
+                                    );
+                                    self.acquire_status = err.clone();
+                                    self.notify(err, ToastKind::Warning);
+                                }
                             }
                         } else {
                             let err =
@@ -2925,6 +3036,9 @@ impl LuaToolsApp {
                             }
                         }
                     }
+                    if ok {
+                        self.applied_fix_index.rebuild_index(&self.steam_service);
+                    }
                     let gtitle = self.resolve_game_title(app_id);
                     self.record_download_history(
                         app_id,
@@ -2947,6 +3061,7 @@ impl LuaToolsApp {
                 }
                 AppMessage::ToolFinished { tool_key, ok, msg } => {
                     self.tool_busy.insert(tool_key, false);
+                    self.cached_tool_statuses.clear();
                     self.notify(
                         msg,
                         if ok {
@@ -3184,6 +3299,33 @@ impl LuaToolsApp {
                 AppMessage::FilePickedForGameInjectionSo(path) => {
                     self.integration_modal.proc_lib_input = path.to_string_lossy().to_string();
                 }
+                AppMessage::LaunchOptionsFinished {
+                    app_id,
+                    ok,
+                    entries,
+                    message,
+                    warn,
+                } => {
+                    if self.launch_options_modal.app_id == app_id {
+                        self.launch_options_modal.busy = false;
+                        self.launch_options_modal.feedback = message.clone();
+                        if let Some(new_entries) = entries {
+                            self.launch_options_modal.selected_idx =
+                                (!new_entries.is_empty()).then_some(0);
+                            self.launch_options_modal.entries = new_entries;
+                        }
+                        self.launch_options_modal.steam_running =
+                            crate::services::launch_mod_store::is_any_steam_running();
+                    }
+                    self.notify(
+                        message,
+                        if ok && !warn {
+                            ToastKind::Success
+                        } else {
+                            ToastKind::Warning
+                        },
+                    );
+                }
                 AppMessage::ShowWindow => {
                     self.restore_from_tray(ctx);
                 }
@@ -3370,6 +3512,30 @@ impl LuaToolsApp {
 
     /// Renders the complete UI shell into `ctx` (callable both from `eframe::App::update` and headless layout tests).
     pub fn render_shell(&mut self, ctx: &egui::Context) {
+        // Release decoded guide screenshot textures as soon as the user leaves Help
+        if self.active_view != ActiveView::Guide
+            && self.guide_zoom_screenshot.is_none()
+            && !self.guide_textures.is_empty()
+        {
+            self.guide_textures.clear();
+        }
+        // Lazy-load remote Steam catalog & Game Fixes catalog on first visit (keeps startup fast & low-RAM)
+        if self.active_view == ActiveView::Acquire
+            && !self.featured_requested
+            && self.featured_top.is_empty()
+            && self.featured_new.is_empty()
+        {
+            self.featured_requested = true;
+            self.fetch_featured_async(ctx);
+        }
+        if self.active_view == ActiveView::Fixes
+            && !self.fixes_requested
+            && self.fixes_listings.is_empty()
+        {
+            self.fixes_requested = true;
+            self.fetch_fix_listings_async(ctx);
+        }
+
         if self.active_view == ActiveView::Depots && self.depots_app_id.is_none() {
             if let Some((first_aid, _)) = self.recent_installed.first().cloned() {
                 self.open_game_in_depots(first_aid, ctx);
@@ -3379,18 +3545,28 @@ impl LuaToolsApp {
         }
 
         // 1. Top Bar — Strict 3-Column StripBuilder (mathematically zero overlap at any width)
-        //    Houses Brand (left), Omnibox (center), and Steam status + corner Git Update button (top-right).
+        //    Houses Brand (left), Search bar (center), and Steam status + corner Git Update button (top-right).
         let mut run_omnibox = false;
         let mut click_rescan = false;
-        let mut click_open_bridge_settings = false;
+        let mut click_open_steam_setup = false;
         let mut click_start_update = false;
         let mut click_launch_bridge = false;
         let mut click_kill_steam = false;
         let mut click_relaunch_exe: Option<PathBuf> = None;
+
+        let bridge_st = self.steam_bridge_service.status();
+        let steam_online = self.steam_service.is_available();
+        let steam_running = bridge_st.steam_pid.is_some();
+        let steam_ready = self.steam_sls_installed
+            || bridge_st.integration_lib_installed
+            || bridge_st.launcher_installed
+            || bridge_st.system_preload_enabled;
+
+        let base_right_w = if steam_running { 276.0 } else { 188.0 };
         let right_col_w = if matches!(self.update_banner, UpdateBannerState::Hidden) {
-            292.0
+            base_right_w
         } else {
-            446.0
+            base_right_w + 132.0
         };
 
         egui::TopBottomPanel::top("top_command_bar")
@@ -3424,7 +3600,7 @@ impl LuaToolsApp {
                             );
                         });
 
-                        // Center: Single Clean Bounded Omnibox + Search Button
+                        // Center: Single Clean Bounded Search Box + Search Button
                         strip.cell(|ui| {
                             let avail = ui.available_width();
                             let input_w = (avail - 78.0).clamp(120.0, 480.0);
@@ -3437,7 +3613,7 @@ impl LuaToolsApp {
                                 [input_w, 32.0],
                                 TextEdit::singleline(&mut self.command_input)
                                     .margin(Margin::symmetric(10, 7))
-                                    .hint_text("Search Store, AppID, or paste Steam URL…  (Ctrl+K)"),
+                                    .hint_text("Search any Steam game or paste a link…  (Ctrl+K)"),
                             );
                             if self.focus_command_next {
                                 resp.request_focus();
@@ -3450,51 +3626,42 @@ impl LuaToolsApp {
                             }
                         });
 
-                        // Right: Steam Launch Pill + Corner Git Update Button (never placed at the bottom!)
+                        // Right: Steam Launch Pill + Optional Stop Steam + Corner Update Button
                         strip.cell(|ui| {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 ui.spacing_mut().item_spacing.x = 8.0;
 
-                                let bridge_st = self.steam_bridge_service.status();
-                                let steam_online = self.steam_service.is_available();
-                                let steam_running = bridge_st.steam_pid.is_some();
-                                let bridge_installed = bridge_st.integration_lib_installed
-                                    || bridge_st.launcher_installed
-                                    || bridge_st.system_preload_enabled;
-
-                                let (lbl, bg, fg, dot_col, tip) = if bridge_installed
-                                    && steam_running
-                                {
+                                let (lbl, bg, fg, dot_col, tip) = if steam_ready && steam_running {
                                     (
-                                        "Restart Steam w/ Bridge",
+                                        "Restart Steam",
                                         Palette::GO_BG,
                                         Palette::GO_TEXT,
                                         Palette::GO_TEXT,
-                                        "Restart Steam with libsteam_integration.so loaded via ~/.local/bin/luatools-steam-launcher (no root required).",
+                                        "Restart Steam so newly added games and changes take effect.",
                                     )
-                                } else if bridge_installed {
+                                } else if steam_ready {
                                     (
-                                        "Launch Steam w/ Bridge",
+                                        "Launch Steam",
                                         Palette::BLUE_PRIMARY,
                                         Palette::TEXT_PRIMARY,
                                         Palette::BLUE_LIGHT,
-                                        "Launch Steam with libsteam_integration.so loaded via ~/.local/bin/luatools-steam-launcher (no root required).",
+                                        "Launch Steam with LuaTools game unlocker active.",
                                     )
                                 } else if steam_online {
                                     (
-                                        "Install Bridge",
+                                        "Setup Steam",
                                         Palette::WARN_BG,
                                         Palette::WARN_TEXT,
                                         Palette::WARN_TEXT,
-                                        "Steam is detected, but the integration bridge is not installed yet. Click to open Settings › Steam Integration.",
+                                        "Steam was found, but the game unlocker isn't installed yet. Click for 1-click setup.",
                                     )
                                 } else {
                                     (
-                                        "No Steam",
+                                        "Rescan Steam",
                                         Palette::WARN_BG,
                                         Palette::WARN_TEXT,
                                         Palette::WARN_TEXT,
-                                        "Steam not detected. Install Steam first, then click here to rescan.",
+                                        "Steam not detected. Click to rescan or set your Steam folder in Settings.",
                                     )
                                 };
 
@@ -3517,7 +3684,7 @@ impl LuaToolsApp {
                                     ui.painter()
                                         .rect_filled(rect, CornerRadius::same(4), bg);
                                     let dot_pos = Pos2::new(rect.left() + 12.0, rect.center().y);
-                                    if bridge_installed && steam_running {
+                                    if steam_ready && steam_running {
                                         ui.painter().circle_filled(dot_pos, 3.6, dot_col);
                                     } else {
                                         ui.painter().circle_stroke(
@@ -3536,33 +3703,35 @@ impl LuaToolsApp {
                                     );
                                 }
                                 if pill_resp.on_hover_text(tip).clicked() {
-                                    if bridge_installed {
+                                    if steam_ready {
                                         click_launch_bridge = true;
                                     } else if steam_online {
-                                        click_open_bridge_settings = true;
+                                        click_open_steam_setup = true;
                                     } else {
                                         click_rescan = true;
                                     }
                                 }
 
-                                // Kill Steam button directly beside Restart/Launch Steam
-                                let kill_btn = egui::Button::new(
-                                    RichText::new("Kill Steam")
-                                        .font(semibold_font(11.5))
-                                        .color(Palette::DANGER_TEXT),
-                                )
-                                .fill(Palette::DANGER_BG)
-                                .stroke(Stroke::new(1.0_f32, Palette::DANGER_BORDER))
-                                .corner_radius(CornerRadius::same(4))
-                                .min_size(Vec2::new(76.0, 28.0));
-                                let kill_resp = ui.add(kill_btn).on_hover_text(
-                                    "Close all running instances of Steam (client, steamwebhelper, overlays, and runtime wrappers).",
-                                );
-                                if kill_resp.hovered() {
-                                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                                }
-                                if kill_resp.clicked() {
-                                    click_kill_steam = true;
+                                // Only show Stop Steam in the top bar while Steam is running
+                                if steam_running {
+                                    let kill_btn = egui::Button::new(
+                                        RichText::new("Stop Steam")
+                                            .font(semibold_font(11.5))
+                                            .color(Palette::DANGER_TEXT),
+                                    )
+                                    .fill(Palette::DANGER_BG)
+                                    .stroke(Stroke::new(1.0_f32, Palette::DANGER_BORDER))
+                                    .corner_radius(CornerRadius::same(4))
+                                    .min_size(Vec2::new(82.0, 28.0));
+                                    let kill_resp = ui.add(kill_btn).on_hover_text(
+                                        "Close all running Steam processes cleanly.",
+                                    );
+                                    if kill_resp.hovered() {
+                                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                    }
+                                    if kill_resp.clicked() {
+                                        click_kill_steam = true;
+                                    }
                                 }
 
                                 match &self.update_banner {
@@ -3632,9 +3801,9 @@ impl LuaToolsApp {
         if click_rescan {
             self.detect_steam_and_sync();
         }
-        if click_open_bridge_settings {
+        if click_open_steam_setup {
             self.active_view = ActiveView::Settings;
-            self.settings_subtab = SettingsSubTab::SteamIntegration;
+            self.settings_subtab = SettingsSubTab::Integrations;
         }
         if click_launch_bridge {
             self.launch_steam_with_bridge(ctx);
@@ -3720,7 +3889,7 @@ impl LuaToolsApp {
                 ui.horizontal(|ui| {
                     ui.add_space(22.0);
                     ui.label(
-                        RichText::new("WORKSPACES")
+                        RichText::new("GAMES")
                             .font(semibold_font(10.5))
                             .color(Palette::TEXT_MUTED),
                     );
@@ -3733,16 +3902,34 @@ impl LuaToolsApp {
                     .filter(|r| r.has_lua)
                     .count()
                     .max(self.recent_installed.len());
-                let items = [
+                let primary_items = [
                     ("Home", None, ActiveView::Overview),
-                    ("Discover", None, ActiveView::Acquire),
-                    ("Library", Some(lua_n), ActiveView::Library),
-                    ("Depots & Vault", None, ActiveView::Depots),
+                    ("Add Games", None, ActiveView::Acquire),
+                    ("My Games", Some(lua_n), ActiveView::Library),
                     ("Game Fixes", None, ActiveView::Fixes),
-                    ("How to Use", None, ActiveView::Guide),
                 ];
+                for (lbl, count, view) in primary_items {
+                    if nav_rail_button(ui, lbl, count, self.active_view == view, 204.0).clicked() {
+                        self.active_view = view;
+                    }
+                }
 
-                for (lbl, count, view) in items {
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(22.0);
+                    ui.label(
+                        RichText::new("TOOLS")
+                            .font(semibold_font(10.5))
+                            .color(Palette::TEXT_MUTED),
+                    );
+                });
+                ui.add_space(6.0);
+
+                let secondary_items = [
+                    ("Depots & Vault", None, ActiveView::Depots),
+                    ("Help", None, ActiveView::Guide),
+                ];
+                for (lbl, count, view) in secondary_items {
                     if nav_rail_button(ui, lbl, count, self.active_view == view, 204.0).clicked() {
                         self.active_view = view;
                     }

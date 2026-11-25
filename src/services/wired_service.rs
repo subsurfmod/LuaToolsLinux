@@ -117,24 +117,54 @@ impl WiredService {
         self.is_accela_installed() && self.is_slssteam_installed()
     }
 
+    /// Cached SHA-256 lookup keyed by `(path, file_size, mtime_secs)` so UI frames never re-hash
+    /// multi-MB `.so` files from disk on every repaint (LT-65).
+    fn cached_sha256(path: &Path, label: &str) -> Option<String> {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        use std::time::UNIX_EPOCH;
+
+        static CACHE: OnceLock<Mutex<HashMap<PathBuf, (u64, u64, String)>>> = OnceLock::new();
+        let meta = fs::metadata(path).ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        let len = meta.len();
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(guard) = cache.lock() {
+            if let Some((c_len, c_mtime, hash)) = guard.get(path) {
+                if *c_len == len && *c_mtime == mtime {
+                    return Some(hash.clone());
+                }
+            }
+        }
+        let computed = FileHash::try_new(path, label).ok()?.sha256;
+        if let Ok(mut guard) = cache.lock() {
+            if guard.len() > 64 {
+                guard.clear();
+            }
+            guard.insert(path.to_path_buf(), (len, mtime, computed.clone()));
+        }
+        Some(computed)
+    }
+
     /// Computes the SHA-256 hash of the installed `SLSsteam.so` unlocker binary (LT-65).
     pub fn slssteam_sha256(&self) -> Option<String> {
         let p = self.slssteam_dir().join("SLSsteam.so");
-        if p.is_file() {
-            FileHash::try_new(&p, "SLSsteam.so").ok().map(|h| h.sha256)
-        } else {
-            None
-        }
+        Self::cached_sha256(&p, "SLSsteam.so")
     }
 
     /// Computes the SHA-256 hash of the installed `library-inject.so` bridge library (LT-65).
     pub fn library_inject_sha256(&self) -> Option<String> {
         let p = self.slssteam_dir().join("library-inject.so");
-        if p.is_file() {
-            FileHash::try_new(&p, "library-inject.so").ok().map(|h| h.sha256)
-        } else {
-            None
-        }
+        Self::cached_sha256(&p, "library-inject.so")
     }
 
     pub fn status(&self) -> WiredStatus {

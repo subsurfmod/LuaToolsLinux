@@ -65,6 +65,44 @@ impl Drop for HttpServerService {
     }
 }
 
+fn allow_external_spawn() -> bool {
+    !cfg!(test) && std::env::var_os("LUATOOLS_NO_EXTERNAL_LAUNCH").is_none()
+}
+
+/// Validates a URL requested via `/open-url` before passing it to `xdg-open`.
+/// Only `http://` and `https://` URLs with real non-reserved hosts are permitted;
+/// RFC 2606 example/test domains (such as `example.com`) and non-HTTP schemes are rejected.
+pub fn validate_external_url(raw: &str) -> Result<String, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 2048 {
+        return Err("Empty or overly long URL");
+    }
+    if trimmed.starts_with('-') || trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("URL contains invalid characters");
+    }
+    let parsed = url::Url::parse(trimmed).map_err(|_| "Malformed URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("Only http:// and https:// URLs are allowed");
+    }
+    let host = parsed
+        .host_str()
+        .map(|h| h.to_ascii_lowercase())
+        .ok_or("URL is missing host")?;
+    let is_reserved_example = host == "example.com"
+        || host.ends_with(".example.com")
+        || host == "example.org"
+        || host.ends_with(".example.org")
+        || host == "example.net"
+        || host.ends_with(".example.net")
+        || host.ends_with(".example")
+        || host.ends_with(".invalid")
+        || host.ends_with(".test");
+    if is_reserved_example {
+        return Err("Reserved example/test domain is not allowed");
+    }
+    Ok(parsed.to_string())
+}
+
 fn send_json(req: Request, status: u16, payload: Value) {
     let body = payload.to_string();
     let resp = Response::from_string(body)
@@ -381,7 +419,9 @@ fn handle_request(
                 send_json(req, 200, json!({ "success": true, "result": "" }));
             }
             "RestartSteam" => {
-                let _ = crate::services::steam_service::SteamService::relaunch_steam_sls(None);
+                if allow_external_spawn() {
+                    let _ = crate::services::steam_service::SteamService::relaunch_steam_sls(None);
+                }
                 send_json(req, 200, json!({ "success": true, "result": "restarted" }));
             }
             "GetThemes" => {
@@ -544,20 +584,30 @@ fn handle_request(
 
     // Route: /open-url
     if parts == ["open-url"] {
-        let target_url = body_json.as_ref()
+        let target_url = body_json
+            .as_ref()
             .and_then(|v| v.get("url"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if !target_url.is_empty() {
-            let _ = std::process::Command::new("xdg-open").arg(target_url).spawn();
+        match validate_external_url(target_url) {
+            Ok(safe_url) => {
+                if allow_external_spawn() {
+                    let _ = std::process::Command::new("xdg-open").arg(&safe_url).spawn();
+                }
+                send_json(req, 200, json!({ "success": true, "url": safe_url }));
+            }
+            Err(reason) => {
+                send_json(req, 400, json!({ "success": false, "error": reason }));
+            }
         }
-        send_json(req, 200, json!({ "success": true }));
         return;
     }
 
     // Route: /restart-steam
     if parts == ["restart-steam"] {
-        let _ = crate::services::steam_service::SteamService::relaunch_steam_sls(None);
+        if allow_external_spawn() {
+            let _ = crate::services::steam_service::SteamService::relaunch_steam_sls(None);
+        }
         send_json(req, 200, json!({ "success": true, "restarted": true }));
         return;
     }
@@ -611,16 +661,18 @@ fn handle_request(
         if aid > 0 {
             let _ = std::fs::remove_file(stplug_dir.join(format!("{}.lua", aid)));
             let _ = std::fs::remove_file(stplug_dir.join(format!("{}.lua.disabled", aid)));
-            let mut sls = crate::services::slssteam_service::SlssteamService::new(None);
-            sls.remove_fake_app_id(aid);
-            sls.remove_token(aid);
-            sls.remove_additional_app(aid);
-            sls.remove_process_mapping(aid);
-            sls.remove_force_denuvo(aid);
-            sls.remove_pinned_app(aid);
-            sls.remove_cd_key(aid);
-            sls.remove_game_title(aid);
-            let _ = sls.save();
+            if allow_external_spawn() {
+                let mut sls = crate::services::slssteam_service::SlssteamService::new(None);
+                sls.remove_fake_app_id(aid);
+                sls.remove_token(aid);
+                sls.remove_additional_app(aid);
+                sls.remove_process_mapping(aid);
+                sls.remove_force_denuvo(aid);
+                sls.remove_pinned_app(aid);
+                sls.remove_cd_key(aid);
+                sls.remove_game_title(aid);
+                let _ = sls.save();
+            }
             let _ = event_tx.send(RpcUiEvent::RemovedApp(aid));
             notify();
         }
@@ -975,8 +1027,20 @@ mod tests {
             .send_json(json!({})).unwrap().into_json().unwrap();
         assert_eq!(cancel["success"], true);
 
+        // Reserved example.com and non-HTTP schemes must be rejected cleanly (never open example.com!)
+        let blocked_example = ureq::post(&format!("http://127.0.0.1:{}/open-url", port))
+            .send_json(json!({ "url": "https://example.com" }));
+        assert!(matches!(blocked_example, Err(ureq::Error::Status(400, _))));
+
+        let blocked_file = ureq::post(&format!("http://127.0.0.1:{}/open-url", port))
+            .send_json(json!({ "url": "file:///etc/passwd" }));
+        assert!(matches!(blocked_file, Err(ureq::Error::Status(400, _))));
+
         let open_url: Value = ureq::post(&format!("http://127.0.0.1:{}/open-url", port))
-            .send_json(json!({ "url": "https://example.com" })).unwrap().into_json().unwrap();
+            .send_json(json!({ "url": "https://store.steampowered.com/app/1245620" }))
+            .unwrap()
+            .into_json()
+            .unwrap();
         assert_eq!(open_url["success"], true);
 
         let r_steam: Value = ureq::post(&format!("http://127.0.0.1:{}/restart-steam", port))
