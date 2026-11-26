@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.3.11] - 2026-11-26
+
+### Fixed
+- **Memory patching (`memory_patch.rs`, `netpacket_core.rs`)**: Removed `Clone` from `MemoryPatch` and moved patches into `NETPACKET_PATCHES` to eliminate use-after-unmap and double-`munmap`; published trampolines before writing JMPs; wrapped FFI hooks in `catch_unwind`; fixed IA-32 32-bit JMP encoding and gated 64-bit `LD_PRELOAD` out of 32-bit Steam.
+- **Lua VM (`lua_parser.rs`)**: Fixed deterministic `Arc::try_unwrap` panic in `execute_lua_script`; materialized `LuaContents.entries`; added 2-arg `addappid`, 2-arg `setStat`, and platform directives; restricted stdlib (`TABLE | STRING | MATH | UTF8`) with 16 MiB memory and 500k instruction limits; added SSRF filtering, timeouts, and `headers_tbl` to `http_get`/`http_post`; wired dynamic scripts into `LuaFileParser::parse_text`.
+- **Valve binary KV1 (`keyvalues1.rs`, `userstats.rs`, `cloud_redirect_service.rs`, `bridge_lib`)**: Fixed bare `0x08`/`0x0B` end markers, `0x04` 4-byte LE `Pointer`, `0x05` NUL-terminated UTF-16LE `WideString`, and `0x0A` `Int64`; added `write_kv1` serializer and real Steam bitmask/schema achievement extraction; wired KV1 across `userstats`, `cloud_redirect_service`, and `bridge_lib`.
+- **Services & CLI**: Added headless `0600` file fallback to `EncryptionService::init_global()` (`credential_encryption.rs`); fixed LTSP repo slug (`madoiscool/LTSP`), `User-Agent`, fallback, and canonical install path (`plugin_installer_service.rs`); fixed `--silent` CLI flag (`main.rs`); fixed `LocalizationService` load order (`localization.rs`); moved `DepotDownloader` stdout reading off the timeout thread (`depot_downloader.rs`); fixed `bst://refreshachievements/<appid>` parsing (`token_bridge.rs`); rejected leading `/` paths in `7z` screening (`wired_service.rs`).
+- **Workspace & Repo**: Synchronized version (`3.3.11`) and license (`GPL-3.0-or-later`) across workspace crates and packaging scripts; purged legacy branches, old tags/releases, and stale build artifacts.
+
+---
+
 ## [3.2.9] - 2026-11-26
 
 ### Automatic Proton/Depot Switching & Platform Compatibility

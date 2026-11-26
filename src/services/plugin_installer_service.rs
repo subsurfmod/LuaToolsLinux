@@ -274,69 +274,111 @@ impl PluginInstallerService {
         &self,
         steam_root: Option<&Path>,
     ) -> Result<PathBuf, String> {
-        // Use GitHub API to get latest release from madoiscool/LuaToolsSteamPlugin
-        let api_url = "https://api.github.com/repos/madoiscool/LuaToolsSteamPlugin/releases/latest";
-        let response = ureq::get(api_url).call().map_err(|e| format!("Failed to fetch release info: {}", e))?;
-        let release: serde_json::Value = response.into_json().map_err(|e| format!("Failed to parse release JSON: {}", e))?;
+        // Try fetching the latest LTSP release from canonical repo madoiscool/LTSP with User-Agent;
+        // on any network/API error, fall back cleanly to the embedded luatools.js bundle.
+        let downloaded_js: Option<String> = (|| -> Result<String, String> {
+            let api_url = "https://api.github.com/repos/madoiscool/LTSP/releases/latest";
+            let ua = format!("LuaToolsLinux/{}", crate::VERSION);
+            let response = ureq::get(api_url)
+                .set("User-Agent", &ua)
+                .set("Accept", "application/vnd.github+json")
+                .timeout(std::time::Duration::from_secs(12))
+                .call()
+                .map_err(|e| format!("Failed to fetch LTSP release info: {}", e))?;
+            let release: serde_json::Value = response
+                .into_json()
+                .map_err(|e| format!("Failed to parse LTSP release JSON: {}", e))?;
 
-        // Find the plugin.zip asset
-        let assets = release.get("assets").and_then(|a| a.as_array()).ok_or("No assets in release")?;
-        let plugin_zip = assets.iter().find(|a| {
-            a.get("name").and_then(|n| n.as_str()).map(|n| n == "plugin.zip").unwrap_or(false)
-        }).ok_or("plugin.zip not found in release")?;
+            let assets = release
+                .get("assets")
+                .and_then(|a| a.as_array())
+                .ok_or("No assets in LTSP release")?;
+            let plugin_zip = assets
+                .iter()
+                .find(|a| {
+                    a.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|n| n.eq_ignore_ascii_case("plugin.zip") || n.ends_with(".zip"))
+                        .unwrap_or(false)
+                })
+                .ok_or("plugin.zip not found in LTSP release")?;
 
-        let download_url = plugin_zip.get("browser_download_url").and_then(|u| u.as_str()).ok_or("No download URL")?;
-        let expected_sha256 = plugin_zip.get("digest").and_then(|d| d.as_str()).map(|d| d.strip_prefix("sha256:").unwrap_or(d));
+            let download_url = plugin_zip
+                .get("browser_download_url")
+                .and_then(|u| u.as_str())
+                .ok_or("No download URL in LTSP asset")?;
+            let expected_sha256 = plugin_zip
+                .get("digest")
+                .and_then(|d| d.as_str())
+                .map(|d| d.strip_prefix("sha256:").unwrap_or(d));
 
-        let downloader = crate::services::proxied_file_downloader::ProxiedFileDownloader::new();
-        let zip_bytes = downloader.download_bytes_sync(download_url).unwrap_or_default();
-
-        if zip_bytes.is_empty() {
-            return Err("Failed to download plugin.zip".into());
-        }
-
-        // Verify SHA-256 if provided
-        if let Some(expected) = expected_sha256 {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(&zip_bytes);
-            let actual = hex::encode(hasher.finalize());
-            if !actual.eq_ignore_ascii_case(expected) {
-                return Err(format!("SHA-256 mismatch: expected {}, got {}", expected, actual));
+            let downloader = crate::services::proxied_file_downloader::ProxiedFileDownloader::new();
+            let zip_bytes = downloader
+                .download_bytes_sync(download_url)
+                .map_err(|e| format!("Failed to download plugin.zip: {}", e))?;
+            if zip_bytes.is_empty() {
+                return Err("Downloaded LTSP plugin.zip was empty".into());
             }
-        }
 
-        if let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)) {
+            if let Some(expected) = expected_sha256 {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(&zip_bytes);
+                let actual = hex::encode(hasher.finalize());
+                if !actual.eq_ignore_ascii_case(expected) {
+                    return Err(format!(
+                        "SHA-256 mismatch: expected {}, got {}",
+                        expected, actual
+                    ));
+                }
+            }
+
+            let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))
+                .map_err(|e| format!("Invalid plugin.zip archive: {}", e))?;
             for i in 0..archive.len() {
                 if let Ok(mut file) = archive.by_index(i) {
                     let name = file.name().to_string();
                     if name.ends_with("luatools.js") {
                         let mut js_content = String::new();
                         if file.read_to_string(&mut js_content).is_ok() && !js_content.is_empty() {
-                            let target = if let Some(sr) = steam_root {
-                                sr.join("steamui/plugins/LuaToolsSteamPlugin/luatools.js")
-                            } else if let Some(h) = dirs::home_dir() {
-                                h.join(".local/share/Steam/steamui/plugins/LuaToolsSteamPlugin/luatools.js")
-                            } else {
-                                self.plugin_dir.join("LuaToolsSteamPlugin").join("luatools.js")
-                            };
-                            if let Some(parent) = target.parent() {
-                                let _ = fs::create_dir_all(parent);
-                            }
-                            if fs::write(&target, &js_content).is_ok() {
-                                // Register plugin in Steam's plugins.json
-                                self.register_steam_plugin(steam_root)?;
-                                return Ok(target);
-                            }
+                            return Ok(js_content);
                         }
                     }
                 }
             }
-        }
+            Err("luatools.js not found inside plugin.zip".into())
+        })()
+        .ok();
 
-        // Fallback to embedded default luatools.js
-        let target = self.ensure_luatools_js_installed(steam_root)?;
-        self.register_steam_plugin(steam_root)?;
+        let target = if let Some(js_content) = downloaded_js {
+            // Write to canonical plugin_dir/luatools.js (read by cef_bridge::find_luatools_js)
+            // AND mirror into steamui/plugins/LuaToolsSteamPlugin/luatools.js if steam_root is known.
+            let primary = self.plugin_dir.join("luatools.js");
+            if let Some(parent) = primary.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            fs::write(&primary, &js_content)
+                .map_err(|e| format!("Failed to write {}: {}", primary.display(), e))?;
+
+            if let Some(sr) = steam_root {
+                let mirror = sr.join("steamui/plugins/LuaToolsSteamPlugin/luatools.js");
+                if let Some(parent) = mirror.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::write(&mirror, &js_content);
+            }
+            primary
+        } else {
+            // Fallback to embedded default luatools.js
+            self.ensure_luatools_js_installed(steam_root)?
+        };
+
+        let _ = self.register_steam_plugin(steam_root);
+        if let Some(sr) = steam_root {
+            let _ = crate::services::millennium_service::MillenniumService::register_luatools_plugin(
+                Some(sr),
+            );
+        }
         Ok(target)
     }
 

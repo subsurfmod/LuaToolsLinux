@@ -1,9 +1,9 @@
 [package]
 name = "steam-auto-patch-linux"
-version = "3.2.9"
+version = "3.3.11"
 edition = "2021"
 description = "Native Linux implementation of SteamAutoPatch (Goldberg Steam emulator deployment)"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [lib]
 name = "steam_auto_patch_linux"

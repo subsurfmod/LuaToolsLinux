@@ -213,7 +213,7 @@ fn main() -> eframe::Result<()> {
                 tray_locked = true;
             }
             "--silent" => {
-                initial_protocol_url = Some("luatools://install/silent/0".to_string());
+                minimized = true;
             }
             "--autostart-enable" | "--enable-autostart" => {
                 let mut settings = SettingsService::default();

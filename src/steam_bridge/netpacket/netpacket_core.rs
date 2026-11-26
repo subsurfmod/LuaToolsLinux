@@ -317,77 +317,117 @@ fn dispatch_netpacket(ctx: &mut NetPacketContext) {
 
 /// Replacement function for BBuildAndAsyncSendFrame (outbound send).
 ///
-/// Signature (inferred from Steam's internal):
-/// void BBuildAndAsyncSendFrame(void* this, void* frame, uint32 frame_size, ...)
+/// Signature:
+/// `bool BBuildAndAsyncSendFrame(void* this, uint32 opcode, uint8* frame, uint32 frame_size)`
 unsafe extern "C" fn bbuild_async_send_frame_replacement(
-    _this: *mut c_void,
+    this_ptr: *mut c_void,
+    opcode: u32,
     frame: *mut u8,
     frame_size: u32,
-    _arg3: *mut c_void,
-    _arg4: *mut c_void,
-    _arg5: *mut c_void,
-) {
-    // Copy frame data to our buffer for processing
-    let frame_slice = std::slice::from_raw_parts(frame, frame_size as usize);
-    let mut frame_buffer = frame_pool().lock().unwrap().acquire_send();
-    frame_buffer.extend_from_slice(frame_slice);
+) -> bool {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !frame.is_null() && frame_size > 0 {
+            let frame_slice = std::slice::from_raw_parts(frame, frame_size as usize);
+            let mut frame_buffer = frame_pool()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .acquire_send();
+            frame_buffer.extend_from_slice(frame_slice);
 
-    let app_id = resolve_app_id();
-    if let Some(mut ctx) = NetPacketContext::new(frame_buffer, NetPacketDirection::Send, app_id) {
-        dispatch_netpacket(&mut ctx);
-        // Copy back modified frame if it changed
-        if ctx.frame_buffer.len() == frame_size as usize {
-            std::ptr::copy_nonoverlapping(ctx.frame_buffer.as_ptr(), frame, frame_size as usize);
-        } else if ctx.frame_buffer.len() < frame_size as usize {
-            // Smaller frame - copy and zero remainder
-            std::ptr::copy_nonoverlapping(ctx.frame_buffer.as_ptr(), frame, ctx.frame_buffer.len());
-            std::ptr::write_bytes(frame.add(ctx.frame_buffer.len()), 0, frame_size as usize - ctx.frame_buffer.len());
+            let app_id = resolve_app_id();
+            if let Some(mut ctx) =
+                NetPacketContext::new(frame_buffer, NetPacketDirection::Send, app_id)
+            {
+                dispatch_netpacket(&mut ctx);
+                if ctx.frame_buffer.len() == frame_size as usize {
+                    std::ptr::copy_nonoverlapping(
+                        ctx.frame_buffer.as_ptr(),
+                        frame,
+                        frame_size as usize,
+                    );
+                } else if ctx.frame_buffer.len() < frame_size as usize {
+                    std::ptr::copy_nonoverlapping(
+                        ctx.frame_buffer.as_ptr(),
+                        frame,
+                        ctx.frame_buffer.len(),
+                    );
+                    std::ptr::write_bytes(
+                        frame.add(ctx.frame_buffer.len()),
+                        0,
+                        frame_size as usize - ctx.frame_buffer.len(),
+                    );
+                }
+            }
         }
-        // Note: If frame grows larger than original, we can't safely expand in-place
-        // This would require the frame pool / ring buffer approach like Windows
-    }
+    }));
 
     // ALWAYS forward to original trampoline to not blackhole Steam traffic
-    if let Some(trampoline) = SEND_PATCH_TRAMPOLINE.get().and_then(|m| m.lock().ok()).and_then(|m| *m) {
-        type SendFn = unsafe extern "C" fn(*mut c_void, *mut u8, u32, *mut c_void, *mut c_void, *mut c_void);
+    if let Some(trampoline) = SEND_PATCH_TRAMPOLINE
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|m| *m)
+    {
+        type SendFn = unsafe extern "C" fn(*mut c_void, u32, *mut u8, u32) -> bool;
         let orig_fn: SendFn = std::mem::transmute(trampoline as *mut u8);
-        orig_fn(_this, frame, frame_size, _arg3, _arg4, _arg5);
+        return orig_fn(this_ptr, opcode, frame, frame_size);
     }
+    true
 }
 
 /// Replacement function for RecvPkt (inbound receive).
 ///
-/// Signature (inferred):
-/// void RecvPkt(void* this, void* frame, uint32 frame_size, ...)
+/// Signature:
+/// `void RecvPkt(void* this, void* pkt)` (or `(this, frame, frame_size)`)
 unsafe extern "C" fn recv_pkt_replacement(
-    _this: *mut c_void,
+    this_ptr: *mut c_void,
     frame: *mut u8,
     frame_size: u32,
-    _arg3: *mut c_void,
-    _arg4: *mut c_void,
-    _arg5: *mut c_void,
 ) {
-    let frame_slice = std::slice::from_raw_parts(frame, frame_size as usize);
-    let mut frame_buffer = frame_pool().lock().unwrap().acquire_recv();
-    frame_buffer.extend_from_slice(frame_slice);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !frame.is_null() && frame_size > 0 && (frame_size as usize) <= 16 * 1024 * 1024 {
+            let frame_slice = std::slice::from_raw_parts(frame, frame_size as usize);
+            let mut frame_buffer = frame_pool()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .acquire_recv();
+            frame_buffer.extend_from_slice(frame_slice);
 
-    let app_id = resolve_app_id();
-    if let Some(mut ctx) = NetPacketContext::new(frame_buffer, NetPacketDirection::Recv, app_id) {
-        dispatch_netpacket(&mut ctx);
-        // Copy back modified frame
-        if ctx.frame_buffer.len() == frame_size as usize {
-            std::ptr::copy_nonoverlapping(ctx.frame_buffer.as_ptr(), frame, frame_size as usize);
-        } else if ctx.frame_buffer.len() < frame_size as usize {
-            std::ptr::copy_nonoverlapping(ctx.frame_buffer.as_ptr(), frame, ctx.frame_buffer.len());
-            std::ptr::write_bytes(frame.add(ctx.frame_buffer.len()), 0, frame_size as usize - ctx.frame_buffer.len());
+            let app_id = resolve_app_id();
+            if let Some(mut ctx) =
+                NetPacketContext::new(frame_buffer, NetPacketDirection::Recv, app_id)
+            {
+                dispatch_netpacket(&mut ctx);
+                if ctx.frame_buffer.len() == frame_size as usize {
+                    std::ptr::copy_nonoverlapping(
+                        ctx.frame_buffer.as_ptr(),
+                        frame,
+                        frame_size as usize,
+                    );
+                } else if ctx.frame_buffer.len() < frame_size as usize {
+                    std::ptr::copy_nonoverlapping(
+                        ctx.frame_buffer.as_ptr(),
+                        frame,
+                        ctx.frame_buffer.len(),
+                    );
+                    std::ptr::write_bytes(
+                        frame.add(ctx.frame_buffer.len()),
+                        0,
+                        frame_size as usize - ctx.frame_buffer.len(),
+                    );
+                }
+            }
         }
-    }
+    }));
 
     // ALWAYS forward to original trampoline to not blackhole Steam traffic
-    if let Some(trampoline) = RECV_PATCH_TRAMPOLINE.get().and_then(|m| m.lock().ok()).and_then(|m| *m) {
-        type RecvFn = unsafe extern "C" fn(*mut c_void, *mut u8, u32, *mut c_void, *mut c_void, *mut c_void);
+    if let Some(trampoline) = RECV_PATCH_TRAMPOLINE
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|m| *m)
+    {
+        type RecvFn = unsafe extern "C" fn(*mut c_void, *mut u8, u32);
         let orig_fn: RecvFn = std::mem::transmute(trampoline as *mut u8);
-        orig_fn(_this, frame, frame_size, _arg3, _arg4, _arg5);
+        orig_fn(this_ptr, frame, frame_size);
     }
 }
 
@@ -453,35 +493,55 @@ pub fn install_netpacket_core(steam_root: &std::path::Path) -> Result<(), String
     // Register all submodule handlers
     register_all_submodule_handlers();
 
-    // Install BBuildAndAsyncSendFrame hook (outbound)
+    // Install BBuildAndAsyncSendFrame hook (outbound), publishing trampoline BEFORE writing JMP
     let send_addr = resolve_netpacket_function(steam_root, "bbuild_async_send_frame")
         .or_else(|_| resolve_netpacket_function(steam_root, "BBuildAndAsyncSendFrame"))
         .or_else(|_| resolve_netpacket_function(steam_root, "build_and_async_send_frame"))?;
     let send_patch = unsafe {
-        memory_patch::patch_by_offset(
+        memory_patch::patch_by_offset_with_callback(
             send_addr,
             0,
             bbuild_async_send_frame_replacement as *const () as *mut u8,
+            |tramp_addr| {
+                *SEND_PATCH_TRAMPOLINE
+                    .get_or_init(|| Mutex::new(None))
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(tramp_addr);
+            },
         )
-    }.map_err(|e| format!("Failed to install BBuildAndAsyncSendFrame hook: {}", e))?;
+    }
+    .map_err(|e| format!("Failed to install BBuildAndAsyncSendFrame hook: {}", e))?;
     log::info!("Installed BBuildAndAsyncSendFrame hook at 0x{:x}", send_addr);
-    netpacket_patches().lock().unwrap().push(send_patch.clone());
-    *SEND_PATCH_TRAMPOLINE.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(send_patch.trampoline as usize);
+    // Move (never clone) send_patch into NETPACKET_PATCHES so Drop does not immediately uninstall it.
+    netpacket_patches()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(send_patch);
 
-    // Install RecvPkt hook (inbound)
+    // Install RecvPkt hook (inbound), publishing trampoline BEFORE writing JMP
     let recv_addr = resolve_netpacket_function(steam_root, "recv_pkt")
         .or_else(|_| resolve_netpacket_function(steam_root, "RecvPkt"))
         .or_else(|_| resolve_netpacket_function(steam_root, "receive_packet"))?;
     let recv_patch = unsafe {
-        memory_patch::patch_by_offset(
+        memory_patch::patch_by_offset_with_callback(
             recv_addr,
             0,
             recv_pkt_replacement as *const () as *mut u8,
+            |tramp_addr| {
+                *RECV_PATCH_TRAMPOLINE
+                    .get_or_init(|| Mutex::new(None))
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(tramp_addr);
+            },
         )
-    }.map_err(|e| format!("Failed to install RecvPkt hook: {}", e))?;
+    }
+    .map_err(|e| format!("Failed to install RecvPkt hook: {}", e))?;
     log::info!("Installed RecvPkt hook at 0x{:x}", recv_addr);
-    netpacket_patches().lock().unwrap().push(recv_patch.clone());
-    *RECV_PATCH_TRAMPOLINE.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(recv_patch.trampoline as usize);
+    // Move (never clone) recv_patch into NETPACKET_PATCHES.
+    netpacket_patches()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(recv_patch);
 
     NETPACKET_CORE_ACTIVE.store(true, Ordering::Release);
     log::info!("NetPacket core dispatcher installed");
@@ -496,10 +556,16 @@ pub fn uninstall_netpacket_core() -> Result<(), String> {
 
     log::info!("Uninstalling NetPacket core dispatcher hooks...");
 
-    // Uninstall patches
+    // Uninstall patches first, then clear trampoline statics so no dangling pointers remain.
     let mut patches = netpacket_patches().lock().unwrap_or_else(|e| e.into_inner());
     for mut patch in patches.drain(..) {
         unsafe { patch.uninstall() }?;
+    }
+    if let Some(m) = SEND_PATCH_TRAMPOLINE.get() {
+        *m.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    if let Some(m) = RECV_PATCH_TRAMPOLINE.get() {
+        *m.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     unregister_netpacket_handlers();

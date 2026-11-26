@@ -501,8 +501,12 @@ pub fn generate_ld_preload_launcher(
          else\n\
            unset LD_PRELOAD\n\
          fi\n\
-         # Export our integration library via LD_PRELOAD\n\
-         export LD_PRELOAD=\"$NEW_LD_PRELOAD\"\n\
+         # Only export libsteam_integration.so via LD_PRELOAD when its ELF class is 32-bit (matching Steam)\n\
+         if [ -f \"{lib}\" ] && command -v file >/dev/null 2>&1; then\n\
+           if file -L \"{lib}\" | grep -q \"ELF 32-bit\"; then\n\
+             export LD_PRELOAD=\"$NEW_LD_PRELOAD\"\n\
+           fi\n\
+         fi\n\
          # LT-20: Auto-launch LuaTools minimized in background if in PATH and not already running\n\
          if command -v luatools >/dev/null 2>&1; then\n\
            if ! pgrep -x luatools >/dev/null 2>&1; then\n\

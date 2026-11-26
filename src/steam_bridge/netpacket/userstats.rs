@@ -16,7 +16,7 @@ use crate::steam_bridge::interop::ipc::{
 use crate::steam_bridge::ost_platform::steam_credential_store;
 // Use new Valve KV1 parser for UserGameStats_*.bin files
 use crate::steam_bridge::ost_platform::keyvalues1::{
-    extract_achievements_kv1, parse_kv1_file,
+    extract_achievements_kv1, parse_kv1_bytes,
 };
 
 const NETPACKET_USERSTATS_GET_USER_STATS_FNHASH: FuncHash = fnv1a_hash("GetUserStats");
@@ -254,8 +254,8 @@ pub fn fill_user_achievements_from_dir(
     };
     if let Ok(data) = std::fs::read(&bin_path) {
         if !data.is_empty() {
-            // Try parsing as Valve KV1 format first
-            if let Ok(kv1) = parse_kv1_file(&bin_path) {
+            // Parse Valve binary KV1 directly from already-read bytes (avoids double disk read)
+            if let Ok(kv1) = parse_kv1_bytes(&data) {
                 let achievements = extract_achievements_kv1(&kv1);
                 let mut ach_data = Vec::new();
                 for (name, ach) in &achievements {

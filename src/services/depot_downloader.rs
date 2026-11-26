@@ -876,16 +876,28 @@ impl DepotDownloaderService {
             })
         });
 
+        // LT-68: Read stdout on a worker thread so the timeout watchdog can interrupt hung processes!
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let stdout_handle = child.stdout.take().map(|stdout| {
+            thread::spawn(move || {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines().map_while(Result::ok) {
+                    let clean = line.trim().to_string();
+                    if !clean.is_empty() && out_tx.send(clean).is_err() {
+                        break;
+                    }
+                }
+            })
+        });
+
         let pct_re = pct_regex();
         let mut last_stdout = String::new();
         let mut recent_stdout = Vec::new();
-        if let Some(stdout) = child.stdout.take() {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines().map_while(Result::ok) {
-                let clean = line.trim().to_string();
-                if clean.is_empty() {
-                    continue;
-                }
+        let timeout = opts.download_timeout();
+        let start = std::time::Instant::now();
+
+        let wait_res = loop {
+            while let Ok(clean) = out_rx.try_recv() {
                 last_stdout = clean.clone();
                 recent_stdout.push(clean.clone());
                 if recent_stdout.len() > 6 {
@@ -898,34 +910,58 @@ impl DepotDownloaderService {
                     .unwrap_or(-1.0);
                 progress_cb(pct, clean);
             }
-        }
 
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {
+                    if start.elapsed() >= timeout {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!("Download timed out after {} seconds", timeout.as_secs()),
+                        ));
+                    }
+                    match out_rx.recv_timeout(Duration::from_millis(100)) {
+                        Ok(clean) => {
+                            last_stdout = clean.clone();
+                            recent_stdout.push(clean.clone());
+                            if recent_stdout.len() > 6 {
+                                recent_stdout.remove(0);
+                            }
+                            let pct = pct_re
+                                .captures(&clean)
+                                .and_then(|c| c.get(1))
+                                .and_then(|m| m.as_str().parse::<f32>().ok())
+                                .unwrap_or(-1.0);
+                            progress_cb(pct, clean);
+                        }
+                        Err(_) => {}
+                    }
+                }
+                Err(e) => break Err(e),
+            }
+        };
+
+        if let Some(h) = stdout_handle {
+            let _ = h.join();
+        }
+        while let Ok(clean) = out_rx.try_recv() {
+            last_stdout = clean.clone();
+            recent_stdout.push(clean.clone());
+            if recent_stdout.len() > 6 {
+                recent_stdout.remove(0);
+            }
+            let pct = pct_re
+                .captures(&clean)
+                .and_then(|c| c.get(1))
+                .and_then(|m| m.as_str().parse::<f32>().ok())
+                .unwrap_or(-1.0);
+            progress_cb(pct, clean);
+        }
         let stderr_lines = stderr_handle
             .and_then(|h| h.join().ok())
             .unwrap_or_default();
-
-        // LT-68: Apply download timeout using manual wait with timeout
-        let timeout = opts.download_timeout();
-        let wait_res = {
-            let start = std::time::Instant::now();
-            loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => break Ok(status),
-                    Ok(None) => {
-                        if start.elapsed() >= timeout {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            break Err(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                format!("Download timed out after {} seconds", timeout.as_secs())
-                            ));
-                        }
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                    Err(e) => break Err(e),
-                }
-            }
-        };
         drop(keys_guard);
 
         match wait_res {

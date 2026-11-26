@@ -110,27 +110,66 @@ impl EncryptionService {
     }
 
     /// Initializes the global encryption service.
-    /// Creates a new identity if one doesn't exist, or loads the existing one.
+    /// Stores/loads the X25519 identity in the OS keyring when available, falling back
+    /// cleanly to a `0600` local key file on headless/non-D-Bus Linux environments.
     pub fn init_global() -> Result<(), EncryptionError> {
         let global = Self::global();
-        let mut guard = global.lock().unwrap();
+        let mut guard = global.lock().unwrap_or_else(|e| e.into_inner());
 
         if guard.is_some() {
             return Ok(());
         }
 
-        // Get or create master key from OS keyring (for auditing/verification)
-        let _master_key = Self::get_or_create_master_key()?;
-
-        // For age, we still need an X25519 identity for encryption
-        // We keep the age identity file for encryption operations but protect the
-        // master key in the keyring
         let key_file = default_luatools_data_dir().join("encryption_key.age");
-        let service = if key_file.exists() {
+
+        // Try OS keyring first for the X25519 identity secret; fall back cleanly on headless systems.
+        let keyring_service = Entry::new("luatools_linux", "age_identity").ok().and_then(|entry| {
+            match entry.get_password() {
+                Ok(secret) => secret.parse::<x25519::Identity>().ok().map(|identity| {
+                    let recipient = identity.to_public();
+                    Self {
+                        identity,
+                        recipient,
+                        key_file: key_file.clone(),
+                    }
+                }),
+                Err(keyring::Error::NoEntry) => {
+                    // Migrate existing file key into keyring if present, else generate fresh identity
+                    let svc = if key_file.exists() {
+                        Self::load_from_key_file(&key_file).ok()
+                    } else {
+                        let identity = x25519::Identity::generate();
+                        let recipient = identity.to_public();
+                        Some(Self {
+                            identity,
+                            recipient,
+                            key_file: key_file.clone(),
+                        })
+                    }?;
+                    use age::secrecy::ExposeSecret;
+                    let secret_str = svc.identity.to_string();
+                    if entry.set_password(secret_str.expose_secret()).is_ok() {
+                        Some(svc)
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => {
+                    log::debug!(
+                        "OS keyring unavailable ({}); falling back to 0600 local age key file",
+                        e
+                    );
+                    None
+                }
+            }
+        });
+
+        let service = if let Some(svc) = keyring_service {
+            svc
+        } else if key_file.exists() {
             Self::load_from_key_file(&key_file)?
         } else {
-            let service = Self::generate_new(&key_file)?;
-            service
+            Self::generate_new(&key_file)?
         };
 
         *guard = Some(service);

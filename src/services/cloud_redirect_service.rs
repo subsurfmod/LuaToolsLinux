@@ -217,18 +217,29 @@ impl CloudRedirectService {
         else {
             return 0;
         };
-        let Ok(bkv) = parse_bkv_file(&stats_file) else {
-            return 0;
-        };
-        let extracted = extract_achievements(&bkv);
-        let blocks: Vec<AchievementBlock> = extracted
-            .into_values()
-            .map(|ach| AchievementBlock {
-                name: ach.name,
-                state: if ach.unlocked { 1 } else { 0 },
-                unlock_time: ach.unlock_time.unwrap_or(0),
-            })
-            .collect();
+        let extracted: Vec<AchievementBlock> =
+            if let Ok(kv1) = crate::steam_bridge::ost_platform::parse_kv1_file(&stats_file) {
+                crate::steam_bridge::ost_platform::extract_achievements_kv1(&kv1)
+                    .into_values()
+                    .map(|ach| AchievementBlock {
+                        name: ach.name,
+                        state: if ach.unlocked { 1 } else { 0 },
+                        unlock_time: ach.unlock_time.unwrap_or(0),
+                    })
+                    .collect()
+            } else if let Ok(bkv) = parse_bkv_file(&stats_file) {
+                extract_achievements(&bkv)
+                    .into_values()
+                    .map(|ach| AchievementBlock {
+                        name: ach.name,
+                        state: if ach.unlocked { 1 } else { 0 },
+                        unlock_time: ach.unlock_time.unwrap_or(0),
+                    })
+                    .collect()
+            } else {
+                return 0;
+            };
+        let blocks = extracted;
         let count = blocks.len();
         self.host.set_achievements(app_id, blocks);
         self.achievement_counts.lock().unwrap().insert(app_id, count);

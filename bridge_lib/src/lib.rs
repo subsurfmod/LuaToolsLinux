@@ -958,19 +958,31 @@ fn sync_cloud_redirect_and_achievements(steam_root: &Path) {
     for aid in apps {
         if account_id != 0 {
             if let Some(stats_path) = find_user_game_stats_file(&config_dir, account_id, aid) {
-                if let Ok(bkv) = parse_bkv_file(&stats_path) {
-                    let extracted = extract_achievements(&bkv);
-                    if !extracted.is_empty() {
-                        let blocks: Vec<AchievementBlock> = extracted
-                            .into_values()
-                            .map(|a| AchievementBlock {
-                                name: a.name,
-                                state: u8::from(a.unlocked),
-                                unlock_time: a.unlock_time.unwrap_or(0),
-                            })
-                            .collect();
-                        host.set_achievements(aid, blocks);
-                    }
+                let blocks: Vec<AchievementBlock> = if let Ok(kv1) =
+                    luatools_linux::steam_bridge::ost_platform::parse_kv1_file(&stats_path)
+                {
+                    luatools_linux::steam_bridge::ost_platform::extract_achievements_kv1(&kv1)
+                        .into_values()
+                        .map(|a| AchievementBlock {
+                            name: a.name,
+                            state: u8::from(a.unlocked),
+                            unlock_time: a.unlock_time.unwrap_or(0),
+                        })
+                        .collect()
+                } else if let Ok(bkv) = parse_bkv_file(&stats_path) {
+                    extract_achievements(&bkv)
+                        .into_values()
+                        .map(|a| AchievementBlock {
+                            name: a.name,
+                            state: u8::from(a.unlocked),
+                            unlock_time: a.unlock_time.unwrap_or(0),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                if !blocks.is_empty() {
+                    host.set_achievements(aid, blocks);
                 }
             }
         }

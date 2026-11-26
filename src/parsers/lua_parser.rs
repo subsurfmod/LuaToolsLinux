@@ -969,7 +969,7 @@ impl LuaFileParser {
 
         let base_app_id = entries.first().map(|e| e.id).unwrap_or(app_id_from_name);
 
-        LuaContents {
+        let mut result = LuaContents {
             base_app_id,
             entries,
             active_pins: manifests,
@@ -987,7 +987,92 @@ impl LuaFileParser {
             key_by_id: BTreeMap::new(),
             sizes: BTreeMap::new(),
             order: Vec::new(),
+        };
+
+        // If the script uses dynamic Lua control flow (loops/conditionals/functions/tables),
+        // run the sandboxed mlua VM and merge any dynamically emitted entries/directives.
+        let has_dynamic_lua = text.lines().any(|l| {
+            let t = l.trim();
+            !t.starts_with("--")
+                && (t.starts_with("for ")
+                    || t.starts_with("while ")
+                    || t.starts_with("repeat")
+                    || t.starts_with("function ")
+                    || t.starts_with("local function ")
+                    || t.starts_with("if "))
+        });
+        if has_dynamic_lua {
+            if let Ok(vm_res) = execute_lua_script(text, app_id_from_name) {
+                for entry in vm_res.entries {
+                    if let Some(existing) = result.entries.iter_mut().find(|e| e.id == entry.id) {
+                        if existing.key.is_none() && entry.key.is_some() {
+                            existing.key = entry.key;
+                        }
+                        if existing.manifest_id.is_none() && entry.manifest_id.is_some() {
+                            existing.manifest_id = entry.manifest_id;
+                        }
+                        if existing.size_on_disk.is_none() && entry.size_on_disk.is_some() {
+                            existing.size_on_disk = entry.size_on_disk;
+                        }
+                        if existing.os.is_none() && entry.os.is_some() {
+                            existing.os = entry.os;
+                        }
+                        if existing.arch.is_none() && entry.arch.is_some() {
+                            existing.arch = entry.arch;
+                        }
+                        if existing.proton.is_none() && entry.proton.is_some() {
+                            existing.proton = entry.proton;
+                        }
+                        if entry.native {
+                            existing.native = true;
+                        }
+                    } else {
+                        result.entries.push(entry);
+                    }
+                }
+                for (k, v) in vm_res.active_pins {
+                    result.active_pins.entry(k).or_insert(v);
+                }
+                for (k, v) in vm_res.tokens {
+                    result.tokens.entry(k).or_insert(v);
+                }
+                for (k, v) in vm_res.process_map {
+                    result.process_map.entry(k).or_insert(v);
+                }
+                for aid in vm_res.force_denuvo {
+                    result.force_denuvo.insert(aid);
+                }
+                for aid in vm_res.pinned_apps {
+                    result.pinned_apps.insert(aid);
+                }
+                for (k, v) in vm_res.legacy_cd_keys {
+                    result.legacy_cd_keys.entry(k).or_insert(v);
+                }
+                for (k, v) in vm_res.app_tickets {
+                    result.app_tickets.entry(k).or_insert(v);
+                }
+                for (k, v) in vm_res.e_tickets {
+                    result.e_tickets.entry(k).or_insert(v);
+                }
+                for url in vm_res.eticket_urls {
+                    if !result.eticket_urls.contains(&url) {
+                        result.eticket_urls.push(url);
+                    }
+                }
+                for (k, v) in vm_res.stats {
+                    result.stats.entry(k).or_insert(v);
+                }
+                if result.base_app_id == 0 {
+                    result.base_app_id = result
+                        .entries
+                        .first()
+                        .map(|e| e.id)
+                        .unwrap_or(app_id_from_name);
+                }
+            }
         }
+
+        result
     }
 
     pub fn comment_out_manifest_pins(lua_text: &str) -> String {
@@ -1189,170 +1274,574 @@ impl LuaFileParser {
     }
 }
 
-/// Execute a dynamic Lua script with mlua VM (BST-01, BST-10, BST-11)
-/// Supports: addappid, setManifestid, addtoken, setAppTicket, setETicket, seteticketurl,
-/// setStat, addprocess, forcedenuvo, pinApp, setlegacycdkey, http_get, http_post, if/else, loops
+/// Validates that a URL is safe for sandboxed Lua HTTP callbacks (http/https only, no loopback/private SSRF).
+fn validate_lua_http_url(raw_url: &str) -> Result<url::Url, String> {
+    let parsed = url::Url::parse(raw_url.trim())
+        .map_err(|e| format!("Invalid URL '{}': {}", raw_url, e))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(format!(
+                "Disallowed URL scheme '{}' (only http/https permitted)",
+                other
+            ));
+        }
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL missing host".to_string())?
+        .to_ascii_lowercase();
+    if host == "localhost"
+        || host.ends_with(".localhost")
+        || host == "0.0.0.0"
+        || host == "::1"
+        || host == "[::1]"
+    {
+        return Err(format!("Disallowed loopback/local host '{}'", host));
+    }
+    if let Ok(ip) = host.trim_matches(|c| c == '[' || c == ']').parse::<std::net::IpAddr>() {
+        let blocked = match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified()
+                    || v4.is_broadcast()
+            }
+            std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+        };
+        if blocked {
+            return Err(format!("Disallowed private/loopback IP '{}'", ip));
+        }
+    }
+    Ok(parsed)
+}
+
+#[derive(Default)]
+struct LuaVmCollected {
+    contents: LuaContents,
+    entry_os: BTreeMap<u32, String>,
+    entry_arch: BTreeMap<u32, String>,
+    entry_proton: BTreeMap<u32, String>,
+    entry_native: BTreeSet<u32>,
+}
+
+/// Execute a dynamic Lua script in a sandboxed mlua VM (BST-01, BST-10, BST-11).
+///
+/// Sandboxing:
+/// - Only safe Lua standard libraries (`TABLE | STRING | MATH | UTF8`) + safe `BASE` functions
+/// - `os`, `io`, `package`, `debug`, `dofile`, `loadfile`, `load`, `collectgarbage` are stripped (`nil`)
+/// - 16 MiB memory cap and 500,000 instruction cap to prevent infinite-loop / OOM DoS
+/// - `http_get` / `http_post` enforce http/https schemes, SSRF host filtering, 10s timeout, and optional `headers_tbl`
 pub fn execute_lua_script(script: &str, app_id: u32) -> Result<LuaContents, String> {
-    let lua = Lua::new();
-    let contents = Arc::new(Mutex::new(LuaContents::default()));
-    contents.lock().unwrap().base_app_id = app_id;
+    let stdlib = mlua::StdLib::TABLE
+        | mlua::StdLib::STRING
+        | mlua::StdLib::MATH
+        | mlua::StdLib::UTF8;
+    let lua = Lua::new_with(stdlib, mlua::LuaOptions::default()).map_err(|e| e.to_string())?;
+    let _ = lua.set_memory_limit(16 * 1024 * 1024);
 
-    // Register addappid(depot_id, flags?, key?) -> flags defaults to 0, key optional
-    let c = contents.clone();
-    let func = lua.create_function(move |_, (depot_id, flags, key): (u32, Option<u32>, Option<String>)| {
-        let mut c = c.lock().unwrap();
-        let flags = flags.unwrap_or(0);
-        if flags & 1 != 0 { // has key
-            if let Some(k) = key {
-                if k.len() == 64 {
-                    c.key_by_id.insert(depot_id, Some(k));
+    // Strip any dangerous globals that might exist in base environment
+    {
+        let globals = lua.globals();
+        for forbidden in [
+            "os",
+            "io",
+            "package",
+            "debug",
+            "dofile",
+            "loadfile",
+            "load",
+            "require",
+            "collectgarbage",
+        ] {
+            let _ = globals.set(forbidden, mlua::Value::Nil);
+        }
+    }
+
+    // Cap total VM instructions to prevent infinite loops
+    let instr_steps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let instr_steps_hook = instr_steps.clone();
+    lua.set_hook(
+        mlua::HookTriggers::new().every_nth_instruction(10_000),
+        move |_, _| {
+            let count = instr_steps_hook.fetch_add(10_000, std::sync::atomic::Ordering::Relaxed);
+            if count >= 500_000 {
+                Err(mlua::Error::RuntimeError(
+                    "Lua script exceeded instruction limit (500,000)".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        },
+    );
+
+    let state = Arc::new(Mutex::new(LuaVmCollected::default()));
+    state.lock().unwrap().contents.base_app_id = app_id;
+
+    // addappid(depot_id) | addappid(depot_id, "64_hex_key") | addappid(depot_id, flags[, "64_hex_key"])
+    {
+        let s = state.clone();
+        let func = lua
+            .create_function(move |_, args: mlua::Variadic<mlua::Value>| {
+                let depot_id = match args.first() {
+                    Some(mlua::Value::Integer(n)) if *n > 0 && *n <= u32::MAX as i64 => *n as u32,
+                    Some(mlua::Value::Number(n)) if *n > 0.0 && *n <= u32::MAX as f64 => *n as u32,
+                    Some(mlua::Value::String(st)) => st
+                        .to_str()
+                        .ok()
+                        .and_then(|t| t.trim().parse::<u32>().ok())
+                        .unwrap_or(0),
+                    _ => 0,
+                };
+                if depot_id == 0 {
+                    return Ok(());
                 }
-            }
-        } else if depot_id != 0 {
-            c.order.push(depot_id);
-            c.key_by_id.insert(depot_id, None);
-        }
-        Ok(())
-    }).map_err(|e| e.to_string())?;
-    lua.globals().set("addappid", func).map_err(|e| e.to_string())?;
 
-    // Register setManifestid(depot_id, manifest_gid, size?) -> size optional
-    let c = contents.clone();
-    let func = lua.create_function(move |_, (depot_id, gid, size): (u32, String, Option<u64>)| {
-        let mut c = c.lock().unwrap();
-        if !gid.is_empty() {
-            c.active_pins.insert(depot_id, gid);
-            if let Some(s) = size {
-                c.sizes.insert(depot_id, s);
-            }
-        }
-        Ok(())
-    }).map_err(|e| e.to_string())?;
-    lua.globals().set("setManifestid", func).map_err(|e| e.to_string())?;
+                // Extract optional 64-char hex key from either arg 2 (2-arg form) or arg 3 (3-arg form)
+                let mut parsed_key: Option<String> = None;
+                for arg in args.iter().skip(1) {
+                    if let mlua::Value::String(st) = arg {
+                        if let Ok(raw) = st.to_str() {
+                            let trimmed = raw.trim();
+                            if trimmed.len() == 64
+                                && trimmed.chars().all(|ch| ch.is_ascii_hexdigit())
+                            {
+                                parsed_key = Some(trimmed.to_ascii_lowercase());
+                                break;
+                            }
+                        }
+                    }
+                }
 
-    // Register addtoken(app_id, token)
-    let c = contents.clone();
-    let func = lua.create_function(move |_, (aid, token): (u32, String)| {
-        let mut c = c.lock().unwrap();
-        if aid > 0 && !token.is_empty() {
-            c.tokens.insert(aid, token);
-        }
-        Ok(())
-    }).map_err(|e| e.to_string())?;
-    lua.globals().set("addtoken", func).map_err(|e| e.to_string())?;
+                let mut guard = s.lock().unwrap();
+                if !guard.contents.order.contains(&depot_id) {
+                    guard.contents.order.push(depot_id);
+                }
+                match guard.contents.key_by_id.get_mut(&depot_id) {
+                    Some(existing) => {
+                        if existing.is_none() && parsed_key.is_some() {
+                            *existing = parsed_key;
+                        }
+                    }
+                    None => {
+                        guard.contents.key_by_id.insert(depot_id, parsed_key);
+                    }
+                }
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("addappid", func.clone())
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("addAppId", func)
+            .map_err(|e| e.to_string())?;
+    }
 
-    // Register setAppTicket(app_id, ticket)
-    let c = contents.clone();
-    let func = lua.create_function(move |_, (aid, ticket): (u32, String)| {
-        let mut c = c.lock().unwrap();
-        if aid > 0 && !ticket.is_empty() {
-            c.app_tickets.insert(aid, ticket);
-        }
-        Ok(())
-    }).map_err(|e| e.to_string())?;
-    lua.globals().set("setAppTicket", func).map_err(|e| e.to_string())?;
+    // setManifestid(depot_id, manifest_gid[, size])
+    {
+        let s = state.clone();
+        let func = lua
+            .create_function(move |_, (depot_id, gid, size): (u32, String, Option<u64>)| {
+                let mut guard = s.lock().unwrap();
+                let gid_t = gid.trim().to_string();
+                if depot_id > 0 && !gid_t.is_empty() {
+                    guard.contents.active_pins.insert(depot_id, gid_t);
+                    if let Some(sz) = size {
+                        guard.contents.sizes.insert(depot_id, sz);
+                    }
+                }
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("setManifestid", func.clone())
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("setmanifestid", func)
+            .map_err(|e| e.to_string())?;
+    }
 
-    // Register setETicket(app_id, ticket)
-    let c = contents.clone();
-    let func = lua.create_function(move |_, (aid, ticket): (u32, String)| {
-        let mut c = c.lock().unwrap();
-        if aid > 0 && !ticket.is_empty() {
-            c.e_tickets.insert(aid, ticket);
-        }
-        Ok(())
-    }).map_err(|e| e.to_string())?;
-    lua.globals().set("setETicket", func).map_err(|e| e.to_string())?;
+    // addtoken(app_id, token)
+    {
+        let s = state.clone();
+        let func = lua
+            .create_function(move |_, (aid, token): (u32, String)| {
+                let mut guard = s.lock().unwrap();
+                if aid > 0 && !token.is_empty() {
+                    guard.contents.tokens.insert(aid, token);
+                }
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("addtoken", func.clone())
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("addToken", func)
+            .map_err(|e| e.to_string())?;
+    }
 
-    // Register seteticketurl(url)
-    let c = contents.clone();
-    let func = lua.create_function(move |_, url: String| {
-        let mut c = c.lock().unwrap();
-        if !url.is_empty() {
-            c.eticket_urls.push(url);
-        }
-        Ok(())
-    }).map_err(|e| e.to_string())?;
-    lua.globals().set("seteticketurl", func).map_err(|e| e.to_string())?;
+    // setAppTicket(app_id, ticket)
+    {
+        let s = state.clone();
+        let func = lua
+            .create_function(move |_, (aid, ticket): (u32, String)| {
+                let mut guard = s.lock().unwrap();
+                if aid > 0 && !ticket.is_empty() {
+                    guard.contents.app_tickets.insert(aid, ticket);
+                }
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("setAppTicket", func.clone())
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("setappticket", func)
+            .map_err(|e| e.to_string())?;
+    }
 
-    // Register setStat(app_id, stat_name, stat_value)
-    let c = contents.clone();
-    let func = lua.create_function(move |_, (aid, name, value): (u32, String, String)| {
-        let mut c = c.lock().unwrap();
-        if aid > 0 && !name.is_empty() {
-            c.stats.insert(aid, format!("{}={}", name, value));
-        }
-        Ok(())
-    }).map_err(|e| e.to_string())?;
-    lua.globals().set("setStat", func).map_err(|e| e.to_string())?;
+    // setETicket(app_id, ticket)
+    {
+        let s = state.clone();
+        let func = lua
+            .create_function(move |_, (aid, ticket): (u32, String)| {
+                let mut guard = s.lock().unwrap();
+                if aid > 0 && !ticket.is_empty() {
+                    guard.contents.e_tickets.insert(aid, ticket);
+                }
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("setETicket", func.clone())
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("seteticket", func)
+            .map_err(|e| e.to_string())?;
+    }
 
-    // Register addprocess(app_id, process_name)
-    let c = contents.clone();
-    let func = lua.create_function(move |_, (aid, process): (u32, String)| {
-        let mut c = c.lock().unwrap();
-        if aid > 0 && !process.is_empty() {
-            c.process_map.insert(aid, process);
-        }
-        Ok(())
-    }).map_err(|e| e.to_string())?;
-    lua.globals().set("addprocess", func).map_err(|e| e.to_string())?;
+    // seteticketurl(url)
+    {
+        let s = state.clone();
+        let func = lua
+            .create_function(move |_, url: String| {
+                let mut guard = s.lock().unwrap();
+                if !url.trim().is_empty() {
+                    guard.contents.eticket_urls.push(url.trim().to_string());
+                }
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("seteticketurl", func.clone())
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("setETicketUrl", func)
+            .map_err(|e| e.to_string())?;
+    }
 
-    // Register forcedenuvo(app_id)
-    let c = contents.clone();
-    let func = lua.create_function(move |_, aid: u32| {
-        let mut c = c.lock().unwrap();
-        if aid > 0 {
-            c.force_denuvo.insert(aid);
-        }
-        Ok(())
-    }).map_err(|e| e.to_string())?;
-    lua.globals().set("forcedenuvo", func).map_err(|e| e.to_string())?;
+    // setStat(app_id, steam_id) OR setStat(app_id, stat_name, stat_value)
+    {
+        let s = state.clone();
+        let func = lua
+            .create_function(move |_, args: mlua::Variadic<mlua::Value>| {
+                let aid = match args.first() {
+                    Some(mlua::Value::Integer(n)) if *n > 0 => *n as u32,
+                    Some(mlua::Value::Number(n)) if *n > 0.0 => *n as u32,
+                    _ => 0,
+                };
+                if aid == 0 || args.len() < 2 {
+                    return Ok(());
+                }
+                let val_to_string = |v: &mlua::Value| -> String {
+                    match v {
+                        mlua::Value::String(st) => st.to_str().unwrap_or("").to_string(),
+                        mlua::Value::Integer(n) => n.to_string(),
+                        mlua::Value::Number(n) => n.to_string(),
+                        mlua::Value::Boolean(b) => b.to_string(),
+                        _ => String::new(),
+                    }
+                };
+                let mut guard = s.lock().unwrap();
+                if args.len() == 2 {
+                    let steam_id = val_to_string(&args[1]);
+                    if !steam_id.is_empty() {
+                        guard.contents.stats.insert(aid, steam_id);
+                    }
+                } else {
+                    let name = val_to_string(&args[1]);
+                    let value = val_to_string(&args[2]);
+                    if !name.is_empty() {
+                        guard
+                            .contents
+                            .stats
+                            .insert(aid, format!("{}={}", name, value));
+                    }
+                }
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("setStat", func.clone())
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("setstat", func)
+            .map_err(|e| e.to_string())?;
+    }
 
-    // Register pinApp(app_id)
-    let c = contents.clone();
-    let func = lua.create_function(move |_, aid: u32| {
-        let mut c = c.lock().unwrap();
-        if aid > 0 {
-            c.pinned_apps.insert(aid);
-        }
-        Ok(())
-    }).map_err(|e| e.to_string())?;
-    lua.globals().set("pinApp", func).map_err(|e| e.to_string())?;
+    // addprocess(app_id, process_name)
+    {
+        let s = state.clone();
+        let func = lua
+            .create_function(move |_, (aid, process): (u32, String)| {
+                let mut guard = s.lock().unwrap();
+                if aid > 0 && !process.is_empty() {
+                    guard.contents.process_map.insert(aid, process);
+                }
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("addprocess", func.clone())
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("addProcess", func)
+            .map_err(|e| e.to_string())?;
+    }
 
-    // Register setlegacycdkey(app_id, key)
-    let c = contents.clone();
-    let func = lua.create_function(move |_, (aid, key): (u32, String)| {
-        let mut c = c.lock().unwrap();
-        if aid > 0 && !key.is_empty() {
-            c.legacy_cd_keys.insert(aid, key);
-        }
-        Ok(())
-    }).map_err(|e| e.to_string())?;
-    lua.globals().set("setlegacycdkey", func).map_err(|e| e.to_string())?;
+    // forcedenuvo(app_id)
+    {
+        let s = state.clone();
+        let func = lua
+            .create_function(move |_, aid: u32| {
+                let mut guard = s.lock().unwrap();
+                if aid > 0 {
+                    guard.contents.force_denuvo.insert(aid);
+                }
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("forcedenuvo", func.clone())
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("forceDenuvo", func)
+            .map_err(|e| e.to_string())?;
+    }
 
-    // Register http_get(url) -> string
-    let c = contents.clone();
-    let func = lua.create_function(move |_, url: String| {
-        match ureq::get(&url).call() {
-            Ok(resp) => resp.into_string().map_err(|e| mlua::Error::RuntimeError(e.to_string())),
-            Err(e) => Err(mlua::Error::RuntimeError(e.to_string())),
-        }
-    }).map_err(|e| e.to_string())?;
-    lua.globals().set("http_get", func).map_err(|e| e.to_string())?;
+    // pinApp(app_id)
+    {
+        let s = state.clone();
+        let func = lua
+            .create_function(move |_, aid: u32| {
+                let mut guard = s.lock().unwrap();
+                if aid > 0 {
+                    guard.contents.pinned_apps.insert(aid);
+                }
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("pinApp", func.clone())
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("pinapp", func)
+            .map_err(|e| e.to_string())?;
+    }
 
-    // Register http_post(url, body) -> string
-    let func = lua.create_function(move |_, (url, body): (String, String)| {
-        match ureq::post(&url).send_string(&body) {
-            Ok(resp) => resp.into_string().map_err(|e| mlua::Error::RuntimeError(e.to_string())),
-            Err(e) => Err(mlua::Error::RuntimeError(e.to_string())),
-        }
-    }).map_err(|e| e.to_string())?;
-    lua.globals().set("http_post", func).map_err(|e| e.to_string())?;
+    // setlegacycdkey(app_id, key)
+    {
+        let s = state.clone();
+        let func = lua
+            .create_function(move |_, (aid, key): (u32, String)| {
+                let mut guard = s.lock().unwrap();
+                if aid > 0 && !key.is_empty() {
+                    guard.contents.legacy_cd_keys.insert(aid, key);
+                }
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("setlegacycdkey", func.clone())
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("setLegacyCdKey", func)
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Platform directives: setOS, setArch, setProton, setNative
+    {
+        let s = state.clone();
+        let func = lua
+            .create_function(move |_, (id, os): (u32, String)| {
+                if id > 0 && !os.trim().is_empty() {
+                    s.lock()
+                        .unwrap()
+                        .entry_os
+                        .insert(id, os.trim().to_ascii_lowercase());
+                }
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("setOS", func.clone())
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("setos", func)
+            .map_err(|e| e.to_string())?;
+    }
+    {
+        let s = state.clone();
+        let func = lua
+            .create_function(move |_, (id, arch): (u32, String)| {
+                if id > 0 && !arch.trim().is_empty() {
+                    s.lock()
+                        .unwrap()
+                        .entry_arch
+                        .insert(id, arch.trim().to_ascii_lowercase());
+                }
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("setArch", func.clone())
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("setarch", func)
+            .map_err(|e| e.to_string())?;
+    }
+    {
+        let s = state.clone();
+        let func = lua
+            .create_function(move |_, (id, proton): (u32, String)| {
+                if id > 0 && !proton.trim().is_empty() {
+                    s.lock()
+                        .unwrap()
+                        .entry_proton
+                        .insert(id, proton.trim().to_string());
+                }
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("setProton", func.clone())
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("setproton", func)
+            .map_err(|e| e.to_string())?;
+    }
+    {
+        let s = state.clone();
+        let func = lua
+            .create_function(move |_, id: u32| {
+                if id > 0 {
+                    s.lock().unwrap().entry_native.insert(id);
+                }
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("setNative", func.clone())
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("setnative", func)
+            .map_err(|e| e.to_string())?;
+    }
+
+    // http_get(url [, headers_tbl]) -> string
+    {
+        let func = lua
+            .create_function(
+                move |_, (url, headers_tbl): (String, Option<mlua::Table>)| {
+                    validate_lua_http_url(&url).map_err(mlua::Error::RuntimeError)?;
+                    let agent = ureq::AgentBuilder::new()
+                        .timeout(std::time::Duration::from_secs(10))
+                        .build();
+                    let mut req = agent.get(&url);
+                    if let Some(tbl) = headers_tbl {
+                        for pair in tbl.pairs::<String, String>().flatten() {
+                            req = req.set(&pair.0, &pair.1);
+                        }
+                    }
+                    match req.call() {
+                        Ok(resp) => resp
+                            .into_string()
+                            .map_err(|e| mlua::Error::RuntimeError(e.to_string())),
+                        Err(e) => Err(mlua::Error::RuntimeError(e.to_string())),
+                    }
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("http_get", func)
+            .map_err(|e| e.to_string())?;
+    }
+
+    // http_post(url, body [, headers_tbl]) -> string
+    {
+        let func = lua
+            .create_function(
+                move |_, (url, body, headers_tbl): (String, String, Option<mlua::Table>)| {
+                    validate_lua_http_url(&url).map_err(mlua::Error::RuntimeError)?;
+                    let agent = ureq::AgentBuilder::new()
+                        .timeout(std::time::Duration::from_secs(10))
+                        .build();
+                    let mut req = agent.post(&url);
+                    if let Some(tbl) = headers_tbl {
+                        for pair in tbl.pairs::<String, String>().flatten() {
+                            req = req.set(&pair.0, &pair.1);
+                        }
+                    }
+                    match req.send_string(&body) {
+                        Ok(resp) => resp
+                            .into_string()
+                            .map_err(|e| mlua::Error::RuntimeError(e.to_string())),
+                        Err(e) => Err(mlua::Error::RuntimeError(e.to_string())),
+                    }
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        lua.globals()
+            .set("http_post", func)
+            .map_err(|e| e.to_string())?;
+    }
 
     // Execute the script
     lua.load(script).exec().map_err(|e| e.to_string())?;
 
-    // Return the parsed contents
-    Ok(Arc::try_unwrap(contents).unwrap().into_inner().unwrap())
+    // Drop the Lua VM BEFORE unwrapping `state` so all closure Arcs are released cleanly!
+    drop(lua);
+
+    let collected = Arc::try_unwrap(state)
+        .map_err(|_| "Internal error: Lua VM state still referenced".to_string())?
+        .into_inner()
+        .map_err(|_| "Internal error: Lua VM state mutex poisoned".to_string())?;
+
+    let mut out = collected.contents;
+    out.entries = out
+        .order
+        .iter()
+        .map(|&id| LuaEntry {
+            id,
+            key: out.key_by_id.get(&id).cloned().flatten(),
+            manifest_id: out.active_pins.get(&id).cloned(),
+            commented_manifest_id: None,
+            comment: None,
+            size_on_disk: out.sizes.get(&id).copied(),
+            os: collected.entry_os.get(&id).cloned(),
+            arch: collected.entry_arch.get(&id).cloned(),
+            proton: collected.entry_proton.get(&id).cloned(),
+            native: collected.entry_native.contains(&id),
+        })
+        .collect();
+    if out.base_app_id == 0 {
+        out.base_app_id = out.entries.first().map(|e| e.id).unwrap_or(app_id);
+    }
+
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1541,5 +2030,80 @@ mod tests {
         );
         assert!(parsed.force_denuvo.contains(&1245620));
         assert!(parsed.pinned_apps.contains(&1245620));
+    }
+
+    #[test]
+    fn execute_lua_script_materializes_entries_supports_2arg_and_platform_directives() {
+        let script = r#"
+            addappid(1245620)
+            local key1 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            local key2 = "FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210"
+            addappid(1245621, 1, key1)
+            addappid(1245622, key2)
+            setManifestid(1245621, "8888777766665555444", 4096)
+            setOS(1245621, "linux")
+            setArch(1245621, "x86_64")
+            setProton(1245622, "GE-Proton9-20")
+            setNative(1245621)
+            setStat(1245620, "76561198000000001")
+            for i = 1, 2 do
+                addappid(2778580 + i)
+            end
+        "#;
+        let res = execute_lua_script(script, 1245620).expect("execute_lua_script should succeed");
+        assert_eq!(res.base_app_id, 1245620);
+        assert_eq!(res.entries.len(), 5);
+        assert_eq!(res.depot_count(), 2);
+        assert_eq!(res.dlc_count(), 2);
+        assert_eq!(
+            res.entries[1].key.as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            res.entries[2].key.as_deref(),
+            Some("fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210")
+        );
+        assert_eq!(res.entries[1].os.as_deref(), Some("linux"));
+        assert_eq!(res.entries[1].arch.as_deref(), Some("x86_64"));
+        assert!(res.entries[1].native);
+        assert_eq!(res.entries[2].proton.as_deref(), Some("GE-Proton9-20"));
+        assert_eq!(
+            res.stats.get(&1245620).map(String::as_str),
+            Some("76561198000000001")
+        );
+    }
+
+    #[test]
+    fn execute_lua_script_sandbox_blocks_os_io_debug_and_infinite_loops_and_ssrf() {
+        // os/io/package/debug/dofile/loadfile must be nil
+        let sandbox_check = r#"
+            assert(os == nil, "os must be stripped")
+            assert(io == nil, "io must be stripped")
+            assert(package == nil, "package must be stripped")
+            assert(debug == nil, "debug must be stripped")
+            assert(dofile == nil, "dofile must be stripped")
+            assert(loadfile == nil, "loadfile must be stripped")
+            addappid(480)
+        "#;
+        let res = execute_lua_script(sandbox_check, 480).expect("sandbox assertions should pass");
+        assert_eq!(res.entries.len(), 1);
+
+        // Infinite loop must terminate with error via instruction hook
+        let inf_loop = "while true do local x = 1 + 1 end";
+        let err = execute_lua_script(inf_loop, 480).unwrap_err();
+        assert!(err.contains("instruction limit"), "unexpected error: {}", err);
+
+        // SSRF URL validation
+        let ssrf = r#"http_get("http://127.0.0.1:6767/status")"#;
+        let ssrf_err = execute_lua_script(ssrf, 480).unwrap_err();
+        assert!(
+            ssrf_err.contains("Disallowed") || ssrf_err.contains("loopback"),
+            "expected SSRF rejection, got: {}",
+            ssrf_err
+        );
+
+        let file_scheme = r#"http_post("file:///etc/passwd", "x")"#;
+        let scheme_err = execute_lua_script(file_scheme, 480).unwrap_err();
+        assert!(scheme_err.contains("Disallowed URL scheme"), "got: {}", scheme_err);
     }
 }

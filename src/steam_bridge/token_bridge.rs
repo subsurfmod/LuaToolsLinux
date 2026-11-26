@@ -68,14 +68,36 @@ impl BstUri {
             return None;
         }
 
-        let app_id = parts
+        let mut app_id = parts
             .first()
             .and_then(|p| p.parse::<u32>().ok())
             .unwrap_or(0);
         let mut token = String::new();
         let mut params = HashMap::new();
 
-        if parts.len() > 1 {
+        if app_id == 0 && parts.len() > 1 {
+            // Support action-first URI grammar such as `bst://refreshachievements/480`
+            if let Ok(parsed_id) = parts[1].parse::<u32>() {
+                token = percent_decode(parts[0]);
+                app_id = parsed_id;
+                for part in parts.iter().skip(2) {
+                    if let Some((k, v)) = part.split_once('=') {
+                        if !k.is_empty() {
+                            params.insert(percent_decode(k), percent_decode(v));
+                        }
+                    }
+                }
+            } else {
+                token = percent_decode(parts[1]);
+                for part in parts.iter().skip(2) {
+                    if let Some((k, v)) = part.split_once('=') {
+                        if !k.is_empty() {
+                            params.insert(percent_decode(k), percent_decode(v));
+                        }
+                    }
+                }
+            }
+        } else if parts.len() > 1 {
             token = percent_decode(parts[1]);
             for part in parts.iter().skip(2) {
                 if let Some((k, v)) = part.split_once('=') {

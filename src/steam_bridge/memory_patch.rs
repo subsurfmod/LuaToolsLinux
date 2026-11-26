@@ -19,6 +19,11 @@ use std::ptr;
 
 use crate::steam_bridge::ost_platform::memory::{get_module_image, is_readable};
 
+#[cfg(target_arch = "x86_64")]
+pub const JMP_ABS64_LEN: usize = 14;
+#[cfg(target_arch = "x86")]
+pub const JMP_ABS64_LEN: usize = 6;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
 pub const JMP_ABS64_LEN: usize = 14;
 const TRAMPOLINE_SIZE: usize = 64;
 const MIN_VALID_USER_ADDR: usize = 0x10000;
@@ -130,7 +135,8 @@ fn page_bounds(addr: usize, len: usize, page_size: usize) -> Result<(usize, usiz
 }
 
 /// Represents an installed inline memory patch.
-#[derive(Debug, Clone)]
+/// Intentionally NOT `Clone` because it owns an `mmap`ed trampoline and restores bytes on `Drop`.
+#[derive(Debug)]
 pub struct MemoryPatch {
     pub target: *mut u8,
     pub trampoline: *mut u8,
@@ -154,23 +160,56 @@ impl MemoryPatch {
         }
     }
 
-    /// Writes a 14-byte x86-64 absolute jump (`FF 25 00 00 00 00` + 8-byte address) at `dst`.
+    /// Writes an absolute jump at `dst`:
+    /// - x86_64: 14-byte `FF 25 00 00 00 00 <u64>` (`jmp qword ptr [rip + 0]`)
+    /// - x86 (IA-32): 6-byte `68 <u32> C3` (`push imm32; ret`), safe at any distance without over-read UB
     ///
     /// # Safety
-    /// `dst` must point to at least 14 bytes of writable memory.
+    /// `dst` must point to at least `JMP_ABS64_LEN` bytes of writable memory.
     unsafe fn write_abs_jmp64(dst: *mut u8, target_addr: usize) {
-        let stub: [u8; 6] = [0xFF, 0x25, 0x00, 0x00, 0x00, 0x00];
-        ptr::copy_nonoverlapping(stub.as_ptr(), dst, stub.len());
-        ptr::copy_nonoverlapping(target_addr.to_le_bytes().as_ptr(), dst.add(stub.len()), 8);
+        #[cfg(target_arch = "x86_64")]
+        {
+            let stub: [u8; 6] = [0xFF, 0x25, 0x00, 0x00, 0x00, 0x00];
+            ptr::copy_nonoverlapping(stub.as_ptr(), dst, stub.len());
+            let addr64 = target_addr as u64;
+            ptr::copy_nonoverlapping(addr64.to_le_bytes().as_ptr(), dst.add(stub.len()), 8);
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            dst.write(0x68); // push imm32
+            let addr32 = target_addr as u32;
+            ptr::copy_nonoverlapping(addr32.to_le_bytes().as_ptr(), dst.add(1), 4);
+            dst.add(5).write(0xC3); // ret
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+        {
+            let _ = (dst, target_addr);
+        }
     }
 
     /// Installs the trampoline and overwrites `target` with a jump to `replacement`.
     ///
     /// # Safety
     /// `self.target` must point to valid mapped executable instructions of at least
-    /// `min_orig_bytes.max(14)` bytes on an instruction boundary, and `self.replacement`
+    /// `min_orig_bytes.max(JMP_ABS64_LEN)` bytes on an instruction boundary, and `self.replacement`
     /// must be a valid function pointer with a compatible ABI.
     pub unsafe fn install(&mut self, min_orig_bytes: usize) -> Result<(), String> {
+        self.install_with_callback(min_orig_bytes, |_| {})
+    }
+
+    /// Installs the trampoline, invokes `on_trampoline_ready(trampoline_addr)` BEFORE writing
+    /// the hook JMP at `self.target` (eliminating install-time races), then activates the patch.
+    ///
+    /// # Safety
+    /// Same requirements as [`Self::install`].
+    pub unsafe fn install_with_callback<F>(
+        &mut self,
+        min_orig_bytes: usize,
+        on_trampoline_ready: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(usize),
+    {
         if self.active {
             return Err("patch already installed".into());
         }
@@ -254,6 +293,9 @@ impl MemoryPatch {
             eprintln!("[memory_patch] {}", msg);
             return Err(msg);
         }
+
+        // Publish trampoline pointer to caller BEFORE overwriting target bytes to avoid install-time race.
+        on_trampoline_ready(trampoline as usize);
 
         Self::write_abs_jmp64(self.target, self.replacement as usize);
         for i in JMP_ABS64_LEN..overwrite_len {
@@ -426,12 +468,29 @@ pub unsafe fn patch_by_offset(
     offset: u64,
     replacement: *mut u8,
 ) -> Result<MemoryPatch, String> {
+    patch_by_offset_with_callback(base, offset, replacement, |_| {})
+}
+
+/// Creates and installs an inline patch at `base + offset`, invoking `on_trampoline_ready`
+/// before writing the JMP so hook statics are populated race-free.
+///
+/// # Safety
+/// Same requirements as [`patch_by_offset`].
+pub unsafe fn patch_by_offset_with_callback<F>(
+    base: u64,
+    offset: u64,
+    replacement: *mut u8,
+    on_trampoline_ready: F,
+) -> Result<MemoryPatch, String>
+where
+    F: FnOnce(usize),
+{
     let addr = base
         .checked_add(offset)
         .ok_or_else(|| "patch_by_offset address overflow".to_string())?;
     let target = addr as usize as *mut u8;
     let mut patch = MemoryPatch::new(target, replacement);
-    patch.install(JMP_ABS64_LEN)?;
+    patch.install_with_callback(JMP_ABS64_LEN, on_trampoline_ready)?;
     Ok(patch)
 }
 

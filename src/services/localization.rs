@@ -65,7 +65,9 @@ impl LocalizationService {
         let mut translations = HashMap::new();
         let fallback_lang = "en".to_string();
 
-        // Scan for available translation files
+        let mut lang_maps: HashMap<String, HashMap<String, String>> = HashMap::new();
+
+        // Scan for available translation files (deterministic load order: English fallback first, then requested language)
         if let Ok(entries) = fs::read_dir(&assets_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -88,22 +90,31 @@ impl LocalizationService {
                                     native_name,
                                 });
 
-                                // Load translations for this language
-                                if stem == lang_code || (lang_code != "en" && stem == "en") {
+                                if stem == lang_code || stem == "en" {
                                     if let Some(obj) = json.as_object() {
+                                        let mut m = HashMap::new();
                                         for (k, v) in obj {
                                             if let Some(s) = v.as_str() {
-                                                if translations.get(k).is_none() {
-                                                    translations.insert(k.clone(), s.to_string());
-                                                }
+                                                m.insert(k.clone(), s.to_string());
                                             }
                                         }
+                                        lang_maps.insert(stem.to_string(), m);
                                     }
                                 }
                             }
                         }
                     }
                 }
+            }
+        }
+
+        // Apply English fallback first, then overlay requested language so it always takes precedence
+        if let Some(en_map) = lang_maps.remove("en") {
+            translations.extend(en_map);
+        }
+        if lang_code != "en" {
+            if let Some(req_map) = lang_maps.remove(lang_code) {
+                translations.extend(req_map);
             }
         }
 

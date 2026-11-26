@@ -512,10 +512,12 @@ impl WiredService {
              # Set target platform for LuaTools depot filtering (auto-detect or override via env)\n\
              export LUATOOLS_TARGET_OS=\"${{LUATOOLS_TARGET_OS:-linux}}\"\n\
              export LUATOOLS_TARGET_ARCH=\"${{LUATOOLS_TARGET_ARCH:-x86_64}}\"\n\
-             # Include LuaTools integration library via LD_PRELOAD (only if 64-bit or matching arch)\n\
-             # Note: On 32-bit Steam, we use LD_AUDIT instead of LD_PRELOAD to avoid ELFCLASS64 mismatch\n\
-             if [ -f \"{integration_lib}\" ]; then\n\
-                 export LD_PRELOAD=\"{integration_lib}${{LD_PRELOAD:+:$LD_PRELOAD}}\"\n\
+             # Include LuaTools integration library via LD_PRELOAD ONLY if it is a 32-bit ELF matching Steam\n\
+             # (Never inject 64-bit ELFCLASS64 libsteam_integration.so into 32-bit ubuntu12_32/steam)\n\
+             if [ -f \"{integration_lib}\" ] && command -v file >/dev/null 2>&1; then\n\
+                 if file -L \"{integration_lib}\" | grep -q \"ELF 32-bit\"; then\n\
+                     export LD_PRELOAD=\"{integration_lib}${{LD_PRELOAD:+:$LD_PRELOAD}}\"\n\
+                 fi\n\
              fi\n\
              # SLSsteam via LD_AUDIT (always use for SLSsteam hooks)\n\
              export LD_AUDIT=\"{audit}\"\n\
@@ -686,7 +688,9 @@ pub fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
                 if trimmed.starts_with("Path = ") {
                     let file_path = &trimmed[7..];
                     // Check for actual path traversal patterns
-                    let is_traversal = file_path.starts_with("../")
+                    let is_traversal = file_path.starts_with('/')
+                        || file_path.starts_with('\\')
+                        || file_path.starts_with("../")
                         || file_path.starts_with("..\\")
                         || file_path.contains("/../")
                         || file_path.contains("\\..\\")
