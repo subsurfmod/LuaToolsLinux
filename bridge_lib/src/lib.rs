@@ -788,10 +788,16 @@ fn load_persisted_state(steam_root: &Path) {
                 .unwrap_or(0);
             if let Ok(txt) = fs::read_to_string(&p) {
                 let parsed = LuaFileParser::parse_text(&txt, base_id);
-                let mut lua_depot_ids = Vec::new();
+                let mut lua_cached_entries = Vec::new();
                 if base_id > 0 {
                     write_lock(spoofed_apps()).insert(base_id);
-                    lua_depot_ids.push(base_id);
+                    lua_cached_entries.push(CachedLuaEntry {
+                        depot_id: base_id,
+                        os: None,
+                        arch: None,
+                        proton: None,
+                        native: false,
+                    });
                 }
                 for item in parsed.entries {
                     if item.has_key() {
@@ -801,9 +807,15 @@ fn load_persisted_state(steam_root: &Path) {
                     } else if item.id > 0 {
                         write_lock(spoofed_apps()).insert(item.id);
                     }
-                    // Collect all depot IDs from Lua entries
+                    // Collect all depot IDs from Lua entries with platform info
                     if item.id > 0 {
-                        lua_depot_ids.push(item.id);
+                        lua_cached_entries.push(CachedLuaEntry {
+                            depot_id: item.id,
+                            os: item.os.clone(),
+                            arch: item.arch.clone(),
+                            proton: item.proton.clone(),
+                            native: item.native,
+                        });
                     }
                     if let Some(mid) = item.manifest_id {
                         if base_id > 0 {
@@ -812,8 +824,8 @@ fn load_persisted_state(steam_root: &Path) {
                     }
                 }
                 // Update cached Lua entries for get_all_depot_ids
-                if !lua_depot_ids.is_empty() {
-                    update_cached_lua_entries(lua_depot_ids);
+                if !lua_cached_entries.is_empty() {
+                    update_cached_lua_entries(lua_cached_entries);
                 }
                 for (aid, tok) in parsed.tokens {
                     write_lock(cached_tickets()).entry(aid).or_insert_with(|| AppTicketData {
@@ -1165,6 +1177,19 @@ fn run_integration() -> Result<(), String> {
         let prefix = exe_sha.get(..12).unwrap_or(&exe_sha);
         eprintln!("[steam_integration] attached to host exe sha256={}...", prefix);
     }
+
+    // Set target platform from environment variables (set by steam-sls wrapper)
+    if let (Ok(os), Ok(arch)) = (
+        std::env::var("LUATOOLS_TARGET_OS"),
+        std::env::var("LUATOOLS_TARGET_ARCH"),
+    ) {
+        set_target_platform(os, arch);
+        eprintln!("[steam_integration] target platform set to {}/{}",
+            std::env::var("LUATOOLS_TARGET_OS").unwrap_or_default(),
+            std::env::var("LUATOOLS_TARGET_ARCH").unwrap_or_default()
+        );
+    }
+
     load_persisted_state(&steam_root);
 
     // Start the IPC server first so the LuaTools GUI sees a live connection immediately,
@@ -1689,6 +1714,11 @@ pub fn get_depot_key(depot_id: u32) -> Option<String> {
     read_lock(depot_keys()).get(&depot_id).cloned()
 }
 
+/// Alias for compatibility with interop_decryption
+pub fn read_depot_key(depot_id: u32) -> Option<String> {
+    get_depot_key(depot_id)
+}
+
 /// Exported C reader for depot decryption keys
 /// Returns a pointer to a C string (caller does not need to free - memory is leaked)
 #[no_mangle]
@@ -1724,9 +1754,25 @@ pub extern "C" fn get_additional_apps_c(out: *mut u32, max_len: u32) -> u32 {
     len as u32
 }
 
-/// Get all depot IDs from Lua config (additional apps + depot keys + Lua entries)
+/// Target platform for depot filtering
+static TARGET_PLATFORM: OnceLock<(String, String)> = OnceLock::new();
+
+/// Set target platform for depot filtering (called from wired_service or launcher)
+pub fn set_target_platform(os: String, arch: String) {
+    let _ = TARGET_PLATFORM.set((os, arch));
+}
+
+/// Get target platform (os, arch)
+fn get_target_platform() -> (String, String) {
+    TARGET_PLATFORM
+        .get_or_init(|| ("linux".to_string(), "x86_64".to_string()))
+        .clone()
+}
+
+/// Get all depot IDs from Lua config filtered by target platform
 /// This collects all depot IDs that should be injected into Package 0 to make them appear owned.
 pub fn get_all_depot_ids() -> Vec<u32> {
+    let (target_os, target_arch) = get_target_platform();
     let mut depots = Vec::new();
 
     // Add depot IDs from depot_keys (depots with decryption keys)
@@ -1746,9 +1792,12 @@ pub fn get_all_depot_ids() -> Vec<u32> {
     // Add depot IDs from cached Lua config entries (stplug-in/*.lua files parsed at load time)
     // These are depots that have keys or are entitlements in the Lua manifests
     if let Ok(cached_entries) = read_cached_lua_entries() {
-        for &did in &cached_entries {
-            if !depots.contains(&did) {
-                depots.push(did);
+        for entry in &cached_entries {
+            // Filter by platform compatibility
+            if entry.matches_platform(&target_os, &target_arch) {
+                if !depots.contains(&entry.depot_id) {
+                    depots.push(entry.depot_id);
+                }
             }
         }
     }
@@ -1756,22 +1805,49 @@ pub fn get_all_depot_ids() -> Vec<u32> {
     depots
 }
 
-/// Cached depot IDs from Lua config entries (stplug-in/*.lua files)
-static CACHED_LUA_ENTRIES: OnceLock<RwLock<Vec<u32>>> = OnceLock::new();
+impl CachedLuaEntry {
+    /// Check if this entry matches the target platform
+    pub fn matches_platform(&self, target_os: &str, target_arch: &str) -> bool {
+        if let Some(ref os) = self.os {
+            if os != target_os {
+                return false;
+            }
+        }
+        if let Some(ref arch) = self.arch {
+            if arch != target_arch {
+                return false;
+            }
+        }
+        true
+    }
+}
 
-fn cached_lua_entries() -> &'static RwLock<Vec<u32>> {
+/// Cached Lua entry with platform compatibility info
+#[derive(Debug, Clone, Default)]
+pub struct CachedLuaEntry {
+    pub depot_id: u32,
+    pub os: Option<String>,
+    pub arch: Option<String>,
+    pub proton: Option<String>,
+    pub native: bool,
+}
+
+/// Cached depot entries from Lua config entries (stplug-in/*.lua files)
+static CACHED_LUA_ENTRIES: OnceLock<RwLock<Vec<CachedLuaEntry>>> = OnceLock::new();
+
+fn cached_lua_entries() -> &'static RwLock<Vec<CachedLuaEntry>> {
     CACHED_LUA_ENTRIES.get_or_init(|| RwLock::new(Vec::new()))
 }
 
-fn read_cached_lua_entries() -> Result<Vec<u32>, String> {
+fn read_cached_lua_entries() -> Result<Vec<CachedLuaEntry>, String> {
     Ok(read_lock(cached_lua_entries()).clone())
 }
 
 /// Update cached Lua entries from parsed stplug-in Lua files
 /// Called during load_persisted_state to sync all depot IDs from Lua configs
-fn update_cached_lua_entries(depot_ids: Vec<u32>) {
-    let mut entries = write_lock(cached_lua_entries());
-    *entries = depot_ids;
+fn update_cached_lua_entries(entries: Vec<CachedLuaEntry>) {
+    let mut cached = write_lock(cached_lua_entries());
+    *cached = entries;
 }
 
 /// Take pending depot additions from Lua config hot-reload
@@ -1836,6 +1912,17 @@ pub extern "C" fn take_pending_additions_c(out: *mut u32, max_len: u32) -> u32 {
         }
     }
     len as u32
+}
+
+/// Exported C function to set target platform for depot filtering
+#[no_mangle]
+pub extern "C" fn set_target_platform_c(os: *const libc::c_char, arch: *const libc::c_char) {
+    if os.is_null() || arch.is_null() {
+        return;
+    }
+    let os_str = unsafe { std::ffi::CStr::from_ptr(os).to_string_lossy().into_owned() };
+    let arch_str = unsafe { std::ffi::CStr::from_ptr(arch).to_string_lossy().into_owned() };
+    set_target_platform(os_str, arch_str);
 }
 
 /// Exported C function to take pending removals

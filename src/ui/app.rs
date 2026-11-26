@@ -1694,6 +1694,7 @@ impl LuaToolsApp {
                 dlc_app_id: None,
                 is_shared: false,
                 os: None,
+                arch: None,
                 language: None,
                 public_manifest_id: None,
                 from_app_id: None,

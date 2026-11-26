@@ -23,6 +23,8 @@ pub struct ContentDepot {
     #[serde(default)]
     pub os: Option<String>,
     #[serde(default)]
+    pub arch: Option<String>,
+    #[serde(default)]
     pub language: Option<String>,
     #[serde(default)]
     pub public_manifest_id: Option<String>,
@@ -231,6 +233,7 @@ impl SteamDepotInfo {
                     dlc_app_id,
                     is_shared,
                     os,
+                    arch: None,
                     language,
                     public_manifest_id,
                     from_app_id,
@@ -277,6 +280,7 @@ mod tests {
                 dlc_app_id: None,
                 is_shared: false,
                 os: Some("windows".into()),
+                arch: None,
                 language: Some("english".into()),
                 public_manifest_id: Some("998877".into()),
                 from_app_id: None,

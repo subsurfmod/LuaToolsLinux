@@ -1413,6 +1413,7 @@ impl LuaToolsApp {
                 from_app_id: p.depot.from_app_id,
                 language: p.depot.language.clone(),
                 os: p.depot.os.clone(),
+                arch: p.depot.arch.clone(),
                 is_shared: p.depot.is_shared,
                 is_dlc: p.depot.is_dlc(),
             })

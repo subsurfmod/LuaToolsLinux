@@ -507,6 +507,9 @@ impl WiredService {
              elif [ -x \"$HOME/.local/bin/luatools\" ]; then\n\
                  \"$HOME/.local/bin/luatools\" --minimized --tray-locked &\n\
              fi\n\
+             # Set target platform for LuaTools depot filtering (auto-detect or override via env)\n\
+             export LUATOOLS_TARGET_OS=\"${{LUATOOLS_TARGET_OS:-linux}}\"\n\
+             export LUATOOLS_TARGET_ARCH=\"${{LUATOOLS_TARGET_ARCH:-x86_64}}\"\n\
              # Include LuaTools integration library via LD_PRELOAD\n\
              export LD_PRELOAD=\"{integration_lib}${{LD_PRELOAD:+:$LD_PRELOAD}}\"\n\
              # SLSsteam via LD_AUDIT (only library-inject.so to avoid 32-bit crashes with SLSsteam.so)\n\

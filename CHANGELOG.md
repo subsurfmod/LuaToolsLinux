@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.2.9] - 2026-11-26
+
+### Automatic Proton/Depot Switching & Platform Compatibility
+- **Lua Platform Compatibility Fields** (`src/parsers/lua_parser.rs`): Added `os`, `arch`, `proton`, and `native` fields to `LuaEntry` struct with `matches_platform()`, `get_proton_version()`, and `is_native_linux()` helper methods.
+- **New Lua Directives** (`src/parsers/lua_parser.rs`): Implemented `setOS(appid, "linux|windows|macos")`, `setArch(appid, "x86_64|arm64")`, `setProton(appid, "GE-Proton-9-25|Proton-Experimental|Proton-Stable")`, and `setNative(appid)` directives for Lua configs.
+- **Platform-Filtered Depot Injection** (`bridge_lib/src/lib.rs`): Modified `get_all_depot_ids()` to filter cached Lua entries by target platform (`LUATOOLS_TARGET_OS`/`LUATOOLS_TARGET_ARCH` env vars set by `steam-sls` wrapper). Added `CachedLuaEntry` struct with platform metadata.
+- **Steam Launcher Platform Env Vars** (`src/services/wired_service.rs`): Updated `steam-sls` wrapper to export `LUATOOLS_TARGET_OS` and `LUATOOLS_TARGET_ARCH` environment variables.
+- **Bridge Lib Platform Initialization** (`bridge_lib/src/lib.rs`): Added `set_target_platform()` called from `run_integration()` to read env vars and set target platform for depot filtering.
+- **DepotDownloader OS/Arch Support** (`src/services/depot_downloader.rs`): Added `arch` field to `DepotSelection` and `-os`/`-arch` flags to download arguments.
+- **Depot Info Arch Field** (`src/services/depot_info.rs`, `src/ui/app.rs`, `src/ui/views_workbench.rs`): Added `arch` field to `ContentDepot` struct and updated all initializers.
+- **C Export for Platform Setting** (`bridge_lib/src/lib.rs`): Added `set_target_platform_c()` C export for external callers.
+- **Version Bump**: Updated to v3.2.9 to avoid updater breakage.
+
+---
+
 ## [3.2.8] - 2026-11-26
 
 ### Package 0 License Synthesis & Depot Download Fixes

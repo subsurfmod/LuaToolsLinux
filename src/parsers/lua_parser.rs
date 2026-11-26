@@ -17,6 +17,11 @@ pub struct LuaEntry {
     pub commented_manifest_id: Option<String>,
     pub comment: Option<String>,
     pub size_on_disk: Option<u64>,
+    // Platform compatibility fields
+    pub os: Option<String>,           // "linux", "windows", "macos"
+    pub arch: Option<String>,         // "x86_64", "arm64"
+    pub proton: Option<String>,       // Proton version hint: "GE-Proton", "Proton-Experimental", "Proton-Stable", "Proton-GE-9-25", etc.
+    pub native: bool,                 // true if native Linux build exists
 }
 
 impl LuaEntry {
@@ -26,6 +31,31 @@ impl LuaEntry {
 
     pub fn is_dlc(&self) -> bool {
         !self.has_key() && self.id != 0
+    }
+
+    /// Check if this entry matches the target platform
+    pub fn matches_platform(&self, target_os: &str, target_arch: &str) -> bool {
+        if let Some(ref os) = self.os {
+            if os != target_os {
+                return false;
+            }
+        }
+        if let Some(ref arch) = self.arch {
+            if arch != target_arch {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Get the recommended Proton version for this entry
+    pub fn get_proton_version(&self) -> Option<String> {
+        self.proton.clone()
+    }
+
+    /// Check if this is a native Linux depot
+    pub fn is_native_linux(&self) -> bool {
+        self.native || self.os.as_deref() == Some("linux")
     }
 }
 
@@ -149,6 +179,34 @@ fn set_stat_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r#"(?i)^setStat\s*\(\s*(\d+)\s*,\s*["']?([^"')\s]+)["']?\s*\)"#).unwrap()
+    })
+}
+
+fn set_os_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?i)^setOS\s*\(\s*(\d+)\s*,\s*["']([^"']+)["']\s*\)"#).unwrap()
+    })
+}
+
+fn set_arch_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?i)^setArch\s*\(\s*(\d+)\s*,\s*["']([^"']+)["']\s*\)"#).unwrap()
+    })
+}
+
+fn set_proton_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?i)^setProton\s*\(\s*(\d+)\s*,\s*["']([^"']+)["']\s*\)"#).unwrap()
+    })
+}
+
+fn set_native_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?i)^setNative\s*\(\s*(\d+)\s*\)"#).unwrap()
     })
 }
 
@@ -342,6 +400,10 @@ fn is_supported_directive_name(name: &str) -> bool {
             | "addprocess"
             | "forcedenuvo"
             | "pinapp"
+            | "setos"
+            | "setarch"
+            | "setproton"
+            | "setnative"
     )
 }
 
@@ -673,6 +735,12 @@ impl LuaFileParser {
         let mut eticket_urls: Vec<String> = Vec::new();
         let mut stats: BTreeMap<u32, String> = BTreeMap::new();
 
+        // Platform compatibility tracking (collected during parse, applied when building entries)
+        let mut entry_os: BTreeMap<u32, String> = BTreeMap::new();
+        let mut entry_arch: BTreeMap<u32, String> = BTreeMap::new();
+        let mut entry_proton: BTreeMap<u32, String> = BTreeMap::new();
+        let mut entry_native: BTreeSet<u32> = BTreeSet::new();
+
         for raw_line in text.lines() {
             let line = raw_line.trim();
             if line.is_empty() {
@@ -752,6 +820,38 @@ impl LuaFileParser {
                     if let (Some(id_m), Some(s_m)) = (cap.get(1), cap.get(2)) {
                         if let Some(aid) = Self::parse_app_or_depot_id(id_m.as_str()) {
                             stats.insert(aid, s_m.as_str().to_string());
+                        }
+                    }
+                }
+
+                if let Some(cap) = set_os_re().captures(line_to_match) {
+                    if let (Some(id_m), Some(os_m)) = (cap.get(1), cap.get(2)) {
+                        if let Some(aid) = Self::parse_app_or_depot_id(id_m.as_str()) {
+                            entry_os.insert(aid, os_m.as_str().to_string());
+                        }
+                    }
+                }
+
+                if let Some(cap) = set_arch_re().captures(line_to_match) {
+                    if let (Some(id_m), Some(arch_m)) = (cap.get(1), cap.get(2)) {
+                        if let Some(aid) = Self::parse_app_or_depot_id(id_m.as_str()) {
+                            entry_arch.insert(aid, arch_m.as_str().to_string());
+                        }
+                    }
+                }
+
+                if let Some(cap) = set_proton_re().captures(line_to_match) {
+                    if let (Some(id_m), Some(proton_m)) = (cap.get(1), cap.get(2)) {
+                        if let Some(aid) = Self::parse_app_or_depot_id(id_m.as_str()) {
+                            entry_proton.insert(aid, proton_m.as_str().to_string());
+                        }
+                    }
+                }
+
+                if let Some(cap) = set_native_re().captures(line_to_match) {
+                    if let Some(id_m) = cap.get(1) {
+                        if let Some(aid) = Self::parse_app_or_depot_id(id_m.as_str()) {
+                            entry_native.insert(aid);
                         }
                     }
                 }
@@ -838,6 +938,10 @@ impl LuaFileParser {
                 commented_manifest_id: commented_manifests.get(&id).cloned(),
                 comment: comment_by_id.get(&id).cloned(),
                 size_on_disk: sizes.get(&id).copied(),
+                os: entry_os.get(&id).cloned(),
+                arch: entry_arch.get(&id).cloned(),
+                proton: entry_proton.get(&id).cloned(),
+                native: entry_native.contains(&id),
             })
             .collect();
 
@@ -851,6 +955,10 @@ impl LuaFileParser {
                 commented_manifest_id: commented_manifests.get(&id).cloned(),
                 comment: comment_by_id.get(&id).cloned(),
                 size_on_disk: sizes.get(&id).copied(),
+                os: entry_os.get(&id).cloned(),
+                arch: entry_arch.get(&id).cloned(),
+                proton: entry_proton.get(&id).cloned(),
+                native: entry_native.contains(&id),
             })
             .collect();
 

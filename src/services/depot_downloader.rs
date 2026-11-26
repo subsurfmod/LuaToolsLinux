@@ -54,6 +54,7 @@ pub struct DepotSelection {
     pub from_app_id: Option<u32>,
     pub language: Option<String>,
     pub os: Option<String>,
+    pub arch: Option<String>,
     pub is_shared: bool,
     pub is_dlc: bool,
 }
@@ -307,6 +308,17 @@ impl DepotDownloaderService {
             "-depot".to_string(),
             selection.depot_id.to_string(),
         ];
+
+        // Add -os and -arch flags if specified in selection
+        if let Some(ref os) = selection.os {
+            args.push("-os".to_string());
+            args.push(os.clone());
+        }
+        if let Some(ref arch) = selection.arch {
+            args.push("-arch".to_string());
+            args.push(arch.clone());
+        }
+
         if let Some(gid) = selection
             .manifest_id
             .as_deref()
@@ -1016,6 +1028,7 @@ mod tests {
             from_app_id: None,
             language: None,
             os: None,
+            arch: None,
             is_shared: false,
             is_dlc: false,
         };
@@ -1062,6 +1075,7 @@ mod tests {
             from_app_id: Some(730),
             language: None,
             os: None,
+            arch: None,
             is_shared: false,
             is_dlc: false,
         };
