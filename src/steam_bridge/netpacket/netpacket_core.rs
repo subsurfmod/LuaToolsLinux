@@ -268,6 +268,14 @@ static NETPACKET_CORE_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Installed memory patches for BBuildAndAsyncSendFrame and RecvPkt.
 static NETPACKET_PATCHES: OnceLock<Mutex<Vec<MemoryPatch>>> = OnceLock::new();
 
+/// Stored send patch trampoline for trampoline access
+/// Use usize to avoid Send/Sync issues with raw pointers
+static SEND_PATCH_TRAMPOLINE: OnceLock<Mutex<Option<usize>>> = OnceLock::new();
+
+/// Stored recv patch trampoline for trampoline access
+/// Use usize to avoid Send/Sync issues with raw pointers
+static RECV_PATCH_TRAMPOLINE: OnceLock<Mutex<Option<usize>>> = OnceLock::new();
+
 fn netpacket_patches() -> &'static Mutex<Vec<MemoryPatch>> {
     NETPACKET_PATCHES.get_or_init(|| Mutex::new(Vec::new()))
 }
@@ -338,6 +346,13 @@ unsafe extern "C" fn bbuild_async_send_frame_replacement(
         // Note: If frame grows larger than original, we can't safely expand in-place
         // This would require the frame pool / ring buffer approach like Windows
     }
+
+    // ALWAYS forward to original trampoline to not blackhole Steam traffic
+    if let Some(trampoline) = SEND_PATCH_TRAMPOLINE.get().and_then(|m| m.lock().ok()).and_then(|m| *m) {
+        type SendFn = unsafe extern "C" fn(*mut c_void, *mut u8, u32, *mut c_void, *mut c_void, *mut c_void);
+        let orig_fn: SendFn = std::mem::transmute(trampoline as *mut u8);
+        orig_fn(_this, frame, frame_size, _arg3, _arg4, _arg5);
+    }
 }
 
 /// Replacement function for RecvPkt (inbound receive).
@@ -366,6 +381,13 @@ unsafe extern "C" fn recv_pkt_replacement(
             std::ptr::copy_nonoverlapping(ctx.frame_buffer.as_ptr(), frame, ctx.frame_buffer.len());
             std::ptr::write_bytes(frame.add(ctx.frame_buffer.len()), 0, frame_size as usize - ctx.frame_buffer.len());
         }
+    }
+
+    // ALWAYS forward to original trampoline to not blackhole Steam traffic
+    if let Some(trampoline) = RECV_PATCH_TRAMPOLINE.get().and_then(|m| m.lock().ok()).and_then(|m| *m) {
+        type RecvFn = unsafe extern "C" fn(*mut c_void, *mut u8, u32, *mut c_void, *mut c_void, *mut c_void);
+        let orig_fn: RecvFn = std::mem::transmute(trampoline as *mut u8);
+        orig_fn(_this, frame, frame_size, _arg3, _arg4, _arg5);
     }
 }
 
@@ -443,7 +465,8 @@ pub fn install_netpacket_core(steam_root: &std::path::Path) -> Result<(), String
         )
     }.map_err(|e| format!("Failed to install BBuildAndAsyncSendFrame hook: {}", e))?;
     log::info!("Installed BBuildAndAsyncSendFrame hook at 0x{:x}", send_addr);
-    netpacket_patches().lock().unwrap().push(send_patch);
+    netpacket_patches().lock().unwrap().push(send_patch.clone());
+    *SEND_PATCH_TRAMPOLINE.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(send_patch.trampoline as usize);
 
     // Install RecvPkt hook (inbound)
     let recv_addr = resolve_netpacket_function(steam_root, "recv_pkt")
@@ -457,7 +480,8 @@ pub fn install_netpacket_core(steam_root: &std::path::Path) -> Result<(), String
         )
     }.map_err(|e| format!("Failed to install RecvPkt hook: {}", e))?;
     log::info!("Installed RecvPkt hook at 0x{:x}", recv_addr);
-    netpacket_patches().lock().unwrap().push(recv_patch);
+    netpacket_patches().lock().unwrap().push(recv_patch.clone());
+    *RECV_PATCH_TRAMPOLINE.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(recv_patch.trampoline as usize);
 
     NETPACKET_CORE_ACTIVE.store(true, Ordering::Release);
     log::info!("NetPacket core dispatcher installed");

@@ -274,32 +274,59 @@ impl PluginInstallerService {
         &self,
         steam_root: Option<&Path>,
     ) -> Result<PathBuf, String> {
-        let zip_url = "https://github.com/madoiscool/LTSP/releases/latest/download/plugin.zip";
-        let downloader = crate::services::proxied_file_downloader::ProxiedFileDownloader::new();
-        let zip_bytes = downloader.download_bytes_sync(zip_url).unwrap_or_default();
+        // Use GitHub API to get latest release from madoiscool/LuaToolsSteamPlugin
+        let api_url = "https://api.github.com/repos/madoiscool/LuaToolsSteamPlugin/releases/latest";
+        let response = ureq::get(api_url).call().map_err(|e| format!("Failed to fetch release info: {}", e))?;
+        let release: serde_json::Value = response.into_json().map_err(|e| format!("Failed to parse release JSON: {}", e))?;
 
-        if !zip_bytes.is_empty() {
-            if let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)) {
-                for i in 0..archive.len() {
-                    if let Ok(mut file) = archive.by_index(i) {
-                        let name = file.name().to_string();
-                        if name.ends_with("luatools.js") {
-                            let mut js_content = String::new();
-                            if file.read_to_string(&mut js_content).is_ok() && !js_content.is_empty() {
-                                let target = if let Some(sr) = steam_root {
-                                    sr.join("steamui/LuaTools/luatools.js")
-                                } else if let Some(h) = dirs::home_dir() {
-                                    h.join(".local/share/Steam/steamui/LuaTools/luatools.js")
-                                } else {
-                                    self.plugin_dir.join("luatools").join("luatools.js")
-                                };
-                                if let Some(parent) = target.parent() {
-                                    let _ = fs::create_dir_all(parent);
-                                }
-                                if fs::write(&target, &js_content).is_ok() {
-                                    let _ = crate::services::millennium_service::MillenniumService::register_luatools_plugin(steam_root);
-                                    return Ok(target);
-                                }
+        // Find the plugin.zip asset
+        let assets = release.get("assets").and_then(|a| a.as_array()).ok_or("No assets in release")?;
+        let plugin_zip = assets.iter().find(|a| {
+            a.get("name").and_then(|n| n.as_str()).map(|n| n == "plugin.zip").unwrap_or(false)
+        }).ok_or("plugin.zip not found in release")?;
+
+        let download_url = plugin_zip.get("browser_download_url").and_then(|u| u.as_str()).ok_or("No download URL")?;
+        let expected_sha256 = plugin_zip.get("digest").and_then(|d| d.as_str()).map(|d| d.strip_prefix("sha256:").unwrap_or(d));
+
+        let downloader = crate::services::proxied_file_downloader::ProxiedFileDownloader::new();
+        let zip_bytes = downloader.download_bytes_sync(download_url).unwrap_or_default();
+
+        if zip_bytes.is_empty() {
+            return Err("Failed to download plugin.zip".into());
+        }
+
+        // Verify SHA-256 if provided
+        if let Some(expected) = expected_sha256 {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(&zip_bytes);
+            let actual = hex::encode(hasher.finalize());
+            if !actual.eq_ignore_ascii_case(expected) {
+                return Err(format!("SHA-256 mismatch: expected {}, got {}", expected, actual));
+            }
+        }
+
+        if let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)) {
+            for i in 0..archive.len() {
+                if let Ok(mut file) = archive.by_index(i) {
+                    let name = file.name().to_string();
+                    if name.ends_with("luatools.js") {
+                        let mut js_content = String::new();
+                        if file.read_to_string(&mut js_content).is_ok() && !js_content.is_empty() {
+                            let target = if let Some(sr) = steam_root {
+                                sr.join("steamui/plugins/LuaToolsSteamPlugin/luatools.js")
+                            } else if let Some(h) = dirs::home_dir() {
+                                h.join(".local/share/Steam/steamui/plugins/LuaToolsSteamPlugin/luatools.js")
+                            } else {
+                                self.plugin_dir.join("LuaToolsSteamPlugin").join("luatools.js")
+                            };
+                            if let Some(parent) = target.parent() {
+                                let _ = fs::create_dir_all(parent);
+                            }
+                            if fs::write(&target, &js_content).is_ok() {
+                                // Register plugin in Steam's plugins.json
+                                self.register_steam_plugin(steam_root)?;
+                                return Ok(target);
                             }
                         }
                     }
@@ -309,8 +336,51 @@ impl PluginInstallerService {
 
         // Fallback to embedded default luatools.js
         let target = self.ensure_luatools_js_installed(steam_root)?;
-        let _ = crate::services::millennium_service::MillenniumService::register_luatools_plugin(steam_root);
+        self.register_steam_plugin(steam_root)?;
         Ok(target)
+    }
+
+    fn register_steam_plugin(&self, steam_root: Option<&Path>) -> Result<(), String> {
+        let plugins_dir = if let Some(sr) = steam_root {
+            sr.join("steamui/plugins")
+        } else if let Some(h) = dirs::home_dir() {
+            h.join(".local/share/Steam/steamui/plugins")
+        } else {
+            return Ok(());
+        };
+
+        let plugins_json = plugins_dir.join("plugins.json");
+        let plugin_entry = serde_json::json!({
+            "name": "LuaToolsSteamPlugin",
+            "path": "LuaToolsSteamPlugin",
+            "enabled": true
+        });
+
+        let mut plugins = if plugins_json.exists() {
+            fs::read_to_string(&plugins_json)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .unwrap_or(serde_json::json!([]))
+        } else {
+            serde_json::json!([])
+        };
+
+        if let Some(arr) = plugins.as_array_mut() {
+            // Remove existing entry if present
+            arr.retain(|p| p.get("name").and_then(|n| n.as_str()) != Some("LuaToolsSteamPlugin"));
+            arr.push(plugin_entry);
+        }
+
+        if let Some(parent) = plugins_json.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let tmp = plugins_json.with_extension("json.tmp");
+        if let Ok(content) = serde_json::to_string_pretty(&plugins) {
+            if fs::write(&tmp, content).is_ok() && fs::rename(&tmp, &plugins_json).is_ok() {
+                return Ok(());
+            }
+        }
+        Err("Failed to register plugin in plugins.json".into())
     }
 
     pub fn ensure_luatools_js_installed(&self, steam_root: Option<&Path>) -> Result<PathBuf, String> {

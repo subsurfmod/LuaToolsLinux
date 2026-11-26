@@ -54,10 +54,19 @@ impl CefBridgeService {
 
     pub fn ensure_cef_debugging_enabled(steam_root: &Path) -> Result<String, String> {
         let marker = steam_root.join(".cef-enable-remote-debugging");
-        fs::write(&marker, b"").map_err(|e| e.to_string())?;
+        // LT-22: Create symlink instead of empty file - Millennium/CEF expects a symlink
+        // pointing to a marker file or just create the symlink itself
+        let target = steam_root.join("cef_debug_enabled");
+        if !target.exists() {
+            fs::write(&target, b"1").map_err(|e| e.to_string())?;
+        }
+        // Remove existing file/symlink if present
+        let _ = fs::remove_file(&marker);
+        std::os::unix::fs::symlink(&target, &marker).map_err(|e| e.to_string())?;
         Ok(format!(
-            "Created {} (restart Steam to open CDP on :8080)",
-            marker.display()
+            "Created symlink {} -> {} (restart Steam to open CDP on :8080)",
+            marker.display(),
+            target.display()
         ))
     }
 
@@ -235,6 +244,12 @@ fn build_polyfill_js(http_port: u16) -> String {
   if (!window.Millennium.findElement) {{
     window.Millennium.findElement = function() {{ return null; }};
   }}
+
+  // LT-23: CEF Protocol Configuration for LuaTools Store Plugin
+  window.PluginConfig = {{
+    backendPort: {http_port},
+    pollInterval: 500
+  }};
 }})();"#
     )
 }

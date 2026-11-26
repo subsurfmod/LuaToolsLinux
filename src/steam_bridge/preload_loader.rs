@@ -522,9 +522,10 @@ pub fn generate_ld_preload_launcher(
            if [ -f \"$SLS_DIR/SLSsteam.so\" ]; then\n\
              AUDIT_LIBS=\"${{AUDIT_LIBS:+$AUDIT_LIBS:}}$SLS_DIR/SLSsteam.so\"\n\
            fi\n\
-           # Only use LD_AUDIT if we're NOT using LD_PRELOAD for our integration\n\
-           # (LD_AUDIT with SLSsteam.so causes crashes when 32-bit Steam wrapper loads it)\n\
-           if [ -n \"$AUDIT_LIBS\" ] && [ -z \"${{LD_PRELOAD:-}}\" ]; then\n\
+           # Use LD_AUDIT for SLSsteam (always, regardless of LD_PRELOAD)\n\
+           # LD_PRELOAD is for our integration library (64-bit only)\n\
+           # LD_AUDIT is for SLSsteam hooks (works with both 32-bit and 64-bit)\n\
+           if [ -n \"$AUDIT_LIBS\" ]; then\n\
              export LD_AUDIT=\"$AUDIT_LIBS\"\n\
            fi\n\
          fi\n\

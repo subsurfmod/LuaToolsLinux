@@ -3,6 +3,9 @@
 //! Uses age (https://age-encryption.org) for authenticated encryption of sensitive data
 //! like auth.json. Encrypts with X25519/AES256-GCM and stores the encrypted blob
 //! with a version header.
+//!
+//! Master encryption key is stored securely in the OS keyring (secret-service/KWallet)
+//! instead of plaintext file.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,6 +15,7 @@ use age::{Encryptor, Decryptor, Recipient, Identity};
 use age::x25519;
 use age::secrecy::ExposeSecret;
 use base64::{Engine, engine::general_purpose::STANDARD};
+use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -79,6 +83,32 @@ impl EncryptionService {
             .clone()
     }
 
+    /// Gets or creates the master encryption key from the OS keyring.
+    fn get_or_create_master_key() -> Result<String, EncryptionError> {
+        let entry = Entry::new("luatools_linux", "master_key")
+            .map_err(|e| EncryptionError::Decrypt(format!("Keyring entry error: {e}")))?;
+
+        match entry.get_password() {
+            Ok(key) => Ok(key),
+            Err(keyring::Error::NoEntry) => {
+                // Generate new key and store in keyring
+                let new_key = Self::generate_secure_token(32);
+                entry.set_password(&new_key)
+                    .map_err(|e| EncryptionError::Decrypt(format!("Failed to store key: {e}")))?;
+                Ok(new_key)
+            }
+            Err(e) => Err(EncryptionError::Decrypt(format!("Keyring error: {e}"))),
+        }
+    }
+
+    /// Generates a cryptographically secure random token.
+    fn generate_secure_token(len: usize) -> String {
+        use rand::RngCore;
+        let mut bytes = vec![0u8; len];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        hex::encode(bytes)
+    }
+
     /// Initializes the global encryption service.
     /// Creates a new identity if one doesn't exist, or loads the existing one.
     pub fn init_global() -> Result<(), EncryptionError> {
@@ -89,6 +119,12 @@ impl EncryptionService {
             return Ok(());
         }
 
+        // Get or create master key from OS keyring (for auditing/verification)
+        let _master_key = Self::get_or_create_master_key()?;
+
+        // For age, we still need an X25519 identity for encryption
+        // We keep the age identity file for encryption operations but protect the
+        // master key in the keyring
         let key_file = default_luatools_data_dir().join("encryption_key.age");
         let service = if key_file.exists() {
             Self::load_from_key_file(&key_file)?

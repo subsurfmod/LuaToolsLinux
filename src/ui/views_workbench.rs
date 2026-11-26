@@ -505,6 +505,7 @@ impl LuaToolsApp {
                                 );
                             },
                             |ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
                                 if table_button(ui, "+ Save Preset", false).clicked() {
                                     self.text_prompt_modal.open = true;
                                     self.text_prompt_modal.kind = "preset".into();
@@ -512,6 +513,54 @@ impl LuaToolsApp {
                                     self.text_prompt_modal.prompt =
                                         "Name this .lua build/preset:".into();
                                     self.text_prompt_modal.value.clear();
+                                }
+                                if ghost_button(ui, "Collapse Defaults").clicked() {
+                                    let removed = self.lua_vault.collapse_defaults(app_id);
+                                    self.depots_variants = self.lua_vault.get_variants(app_id);
+                                    self.notify(
+                                        format!("Collapsed {} duplicate default variant(s)", removed),
+                                        ToastKind::Info,
+                                    );
+                                }
+                                if ghost_button(ui, "Stamp Now").clicked() {
+                                    let label = if self.depots_selected_variant_hash.is_some() {
+                                        self.depots_variants
+                                            .iter()
+                                            .find(|v| self.depots_selected_variant_hash.as_deref() == Some(v.hash.as_str()))
+                                            .and_then(|v| v.label.clone())
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(v) = self.lua_vault.stamp_now(app_id, label.as_deref()) {
+                                        self.depots_variants = self.lua_vault.get_variants(app_id);
+                                        self.notify(
+                                            format!("Stamped live .lua as build variant: {}", v.display_label()),
+                                            ToastKind::Success,
+                                        );
+                                    } else {
+                                        self.notify("No live .lua to stamp", ToastKind::Warning);
+                                    }
+                                }
+                                if ghost_button(ui, "Apply Build If Live Empty").clicked() {
+                                    if let Some(v) = self.lua_vault.apply_build_if_nothing_live(app_id) {
+                                        let live_txt = self.lua_vault.read_live_text(app_id);
+                                        if !live_txt.trim().is_empty() {
+                                            let parsed = LuaFileParser::parse_text(&live_txt, app_id);
+                                            crate::services::lua_installer::LuaInstaller::sync_with_slssteam(
+                                                &mut self.slssteam_service,
+                                                app_id,
+                                                &parsed,
+                                            );
+                                        }
+                                        self.reload_depots_local(app_id);
+                                        self.refresh_all_local_state();
+                                        self.notify(
+                                            format!("Applied build variant (was empty): {}", v.display_label()),
+                                            ToastKind::Success,
+                                        );
+                                    } else {
+                                        self.notify("Already have live .lua or no build variants exist", ToastKind::Info);
+                                    }
                                 }
                             },
                         );
@@ -1428,6 +1477,8 @@ impl LuaToolsApp {
             steam_username: self.settings_service.settings.steam_username.clone(),
             hubcap_api_key: (!self.settings_service.settings.hubcap_api_key.trim().is_empty())
                 .then(|| self.settings_service.settings.hubcap_api_key.trim().to_string()),
+            max_concurrent_downloads: Some(3),
+            download_timeout_secs: Some(600),
         };
         let mut dd = self.depot_downloader.clone();
         dd.steam_installation = self.steam_service.installation.clone();
@@ -2758,9 +2809,9 @@ impl LuaToolsApp {
             }
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-                if primary_button(ui, "Install Store Page Plugin")
+                if primary_button(ui, "Install Store Page Plugin (LTSP)")
                     .on_hover_text(
-                        "Stage the LuaTools JavaScript plugin into Steam so store pages show LuaTools buttons",
+                        "Download and install the full LuaTools Steam Plugin (LTSP) from madoiscool/LuaToolsSteamPlugin GitHub releases - includes luatools.js with full store integration",
                     )
                     .clicked()
                 {
@@ -2769,13 +2820,13 @@ impl LuaToolsApp {
                             crate::services::plugin_installer_service::PluginInstallerService::new(
                                 None,
                             );
-                        match plugin_svc.ensure_luatools_js_installed(Some(&inst.root)) {
+                        match plugin_svc.download_and_install_ltsp(Some(&inst.root)) {
                             Ok(path) => self.notify(
-                                format!("Installed Steam Store Plugin to {}", path.display()),
+                                format!("Installed LTSP Steam Store Plugin to {}", path.display()),
                                 ToastKind::Success,
                             ),
                             Err(e) => self.notify(
-                                format!("Failed to install Store Plugin: {}", e),
+                                format!("Failed to install LTSP Store Plugin: {}", e),
                                 ToastKind::Warning,
                             ),
                         }
@@ -3350,7 +3401,67 @@ impl LuaToolsApp {
 
         ui.add_space(16.0);
 
-        // 4. Transparent Local Event Log Viewer (cached, no per-frame disk reads)
+        // 4. DNS-over-HTTPS (DoH) Resolver (LT-47)
+        paper_card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 10.0;
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    ui.label(
+                        RichText::new("DNS-over-HTTPS (DoH) Resolver")
+                            .font(display_font(17.5))
+                            .color(Palette::TEXT_PRIMARY),
+                    );
+                },
+                |ui| {
+                    if self.settings_service.settings.doh_enabled {
+                        status_badge(ui, "Enabled", BadgeTone::Ready);
+                    } else {
+                        status_badge(ui, "Disabled (using system DNS)", BadgeTone::Muted);
+                    }
+                },
+            );
+            ui.label(
+                RichText::new(
+                    "When enabled, Steam domain names (store.steampowered.com, api.steampowered.com, etc.) are resolved via encrypted DNS-over-HTTPS instead of plaintext DNS. Uses Cloudflare (1.1.1.1) by default; custom endpoint can be specified below.",
+                )
+                .size(12.5)
+                .color(Palette::TEXT_MUTED),
+            );
+
+            ui.checkbox(
+                &mut self.settings_service.settings.doh_enabled,
+                "Enable DNS-over-HTTPS for Steam domain resolution",
+            )
+            .on_hover_text("Encrypts DNS queries for Steam API and CDN domains");
+
+            ui.horizontal(|ui| {
+                let w = (ui.available_width() - 140.0).max(180.0);
+                ui.add_sized(
+                    [w, 30.0],
+                    TextEdit::singleline(
+                        &mut self.settings_service.settings.doh_endpoint,
+                    )
+                    .margin(Margin::symmetric(10, 6))
+                    .hint_text("https://1.1.1.1/dns-query (optional, defaults to Cloudflare)"),
+                );
+                if secondary_button(ui, "Test Resolution").clicked() {
+                    // Test DNS resolution
+                }
+            });
+            if !self.settings_service.settings.doh_endpoint.trim().is_empty() {
+                ui.label(
+                    RichText::new(format!("Custom endpoint: {}", self.settings_service.settings.doh_endpoint))
+                        .size(11.5)
+                        .color(Palette::TEXT_SECONDARY),
+                );
+            }
+        });
+
+        ui.add_space(16.0);
+
+        // 5. Transparent Local Event Log Viewer (cached, no per-frame disk reads)
         let events = self.cached_telemetry_events.clone();
         paper_card(ui, |ui| {
             ui.set_width(ui.available_width());

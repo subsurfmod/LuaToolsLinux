@@ -133,11 +133,55 @@ impl Default for TokenBridge {
 }
 
 impl TokenBridge {
-    /// Create a new TokenBridge instance.
+    /// Create a new TokenBridge instance with default handlers.
     pub fn new() -> Self {
-        TokenBridge {
+        let mut bridge = TokenBridge {
             handlers: Arc::new(RwLock::new(Vec::new())),
-        }
+        };
+        bridge.register_default_handlers();
+        bridge
+    }
+
+    /// Register default handlers for common bst:// actions.
+    fn register_default_handlers(&mut self) {
+        // bst://refreshachievements/<appid> - Trigger Steam achievement refresh
+        self.register_handler(Box::new(|uri: &BstUri| {
+            if uri.app_id > 0 && (uri.token.eq_ignore_ascii_case("refreshachievements")
+                || uri.params.get("action").map(|s| s.as_str()) == Some("refreshachievements")) {
+                Some(uri.clone())
+            } else {
+                None
+            }
+        }));
+
+        // bst://fix/<appid> - Open fix for app
+        self.register_handler(Box::new(|uri: &BstUri| {
+            if uri.app_id > 0 && (uri.token.eq_ignore_ascii_case("fix")
+                || uri.params.get("action").map(|s| s.as_str()) == Some("fix")) {
+                Some(uri.clone())
+            } else {
+                None
+            }
+        }));
+
+        // bst://install/<appid> - Install app via LuaTools
+        self.register_handler(Box::new(|uri: &BstUri| {
+            if uri.app_id > 0 && (uri.token.eq_ignore_ascii_case("install")
+                || uri.params.get("action").map(|s| s.as_str()) == Some("install")) {
+                Some(uri.clone())
+            } else {
+                None
+            }
+        }));
+
+        // Generic fallback handler
+        self.register_handler(Box::new(|uri: &BstUri| {
+            if uri.is_valid() || !uri.token.is_empty() || uri.app_id > 0 {
+                Some(uri.clone())
+            } else {
+                None
+            }
+        }));
     }
 
     /// Register a handler for `bst://` URIs.
@@ -232,9 +276,13 @@ mod tests {
     #[test]
     fn test_token_bridge_dispatch_fallback_and_clear() {
         let mut bridge = TokenBridge::new();
+        // TokenBridge::new() now registers 4 default handlers
+        let initial_count = bridge.handler_count();
+        assert!(initial_count >= 4);
+
         bridge.register_handler(Box::new(|_| None));
         bridge.register_handler(Box::new(|u| Some(u.clone())));
-        assert_eq!(bridge.handler_count(), 2);
+        assert_eq!(bridge.handler_count(), initial_count + 2);
 
         let out = bridge.handle_uri("bst://730/sessiontok").unwrap();
         assert_eq!(out.app_id, 730);

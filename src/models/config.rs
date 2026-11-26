@@ -199,6 +199,10 @@ pub struct AppSettings {
     pub close_to_tray: bool,
     #[serde(default)]
     pub minimize_to_tray: bool,
+    #[serde(default)]
+    pub doh_enabled: bool,
+    #[serde(default)]
+    pub doh_endpoint: String,
 }
 
 impl Default for AppSettings {
@@ -225,6 +229,8 @@ impl Default for AppSettings {
             autostart: false,
             close_to_tray: false,
             minimize_to_tray: false,
+            doh_enabled: false,
+            doh_endpoint: String::new(),
         }
     }
 }

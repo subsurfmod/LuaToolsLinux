@@ -1067,6 +1067,13 @@ impl LuaFileParser {
             return (text.to_string(), false);
         };
 
+        // Also find companion setManifestid lines for this depot
+        let manifest_pattern = format!(
+            r"(?i)^(\s*)((?:--+\s*)+)?(setManifestid\s*\(\s*{}\s*,.*)$",
+            depot_id
+        );
+        let manifest_re = Regex::new(&manifest_pattern).ok();
+
         let mut changed = false;
         let mut new_lines: Vec<String> = Vec::new();
         for line in text.lines() {
@@ -1086,6 +1093,30 @@ impl LuaFileParser {
                 } else if !should_enable && !is_commented {
                     new_lines.push(format!("{}-- {}", indent, body));
                     changed = true;
+                } else {
+                    new_lines.push(line.to_string());
+                }
+            } else if let Some(ref mre) = manifest_re {
+                // Also comment/uncomment companion setManifestid lines
+                if let Some(cap) = mre.captures(line) {
+                    let indent = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+                    let is_commented = cap.get(2).is_some();
+                    let body = cap.get(3).map(|m| m.as_str()).unwrap_or("");
+
+                    let should_enable = match enabled {
+                        Some(e) => e,
+                        None => is_commented,
+                    };
+
+                    if should_enable && is_commented {
+                        new_lines.push(format!("{}{}", indent, body));
+                        changed = true;
+                    } else if !should_enable && !is_commented {
+                        new_lines.push(format!("{}-- {}", indent, body));
+                        changed = true;
+                    } else {
+                        new_lines.push(line.to_string());
+                    }
                 } else {
                     new_lines.push(line.to_string());
                 }

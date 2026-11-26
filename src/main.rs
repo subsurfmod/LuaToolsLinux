@@ -212,6 +212,9 @@ fn main() -> eframe::Result<()> {
             "--tray-locked" => {
                 tray_locked = true;
             }
+            "--silent" => {
+                initial_protocol_url = Some("luatools://install/silent/0".to_string());
+            }
             "--autostart-enable" | "--enable-autostart" => {
                 let mut settings = SettingsService::default();
                 match settings.set_autostart(true) {
@@ -245,6 +248,7 @@ fn main() -> eframe::Result<()> {
                        --update              Pull latest source from Git and rebuild/install native binary\n  \
                        --minimized           Launch minimized\n  \
                        --tray-locked         Keep running in background/tray on close\n  \
+                       --silent              Start completely hidden (background install via protocol)\n  \
                        --autostart-enable    Enable login autostart (~/.config/autostart/luatools.desktop)\n  \
                        --autostart-disable   Disable login autostart\n  \
                        -v,--version          Print version\n  \

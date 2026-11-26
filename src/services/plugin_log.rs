@@ -136,7 +136,13 @@ impl PluginLog {
 
 impl Default for PluginLog {
     fn default() -> Self {
-        Self::new(1000, None)
+        let log_dir = dirs::data_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("luatools")
+            .join("logs");
+        let log_file = log_dir.join("plugin.log");
+        std::fs::create_dir_all(&log_dir).ok();
+        Self::new(1000, Some(&log_file))
     }
 }
 

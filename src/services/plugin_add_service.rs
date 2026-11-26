@@ -1,5 +1,6 @@
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::thread;
 
@@ -106,6 +107,7 @@ pub fn start_headless_add(app_id: u64, game_name: Option<String>, stplug_dir: &P
         let aid = u32::try_from(app_id).unwrap_or(0);
         if aid > 0 {
             let manifest_res = crate::services::api_client::HubcapService::fetch_raw_manifest(aid, 0, None);
+            let mut lua_content = String::new();
             if let Ok(bytes) = manifest_res {
                 let cache_dir = dirs::home_dir()
                     .unwrap_or_else(|| PathBuf::from("."))
@@ -113,12 +115,32 @@ pub fn start_headless_add(app_id: u64, game_name: Option<String>, stplug_dir: &P
                 let _ = fs::create_dir_all(&cache_dir);
                 let manifest_file = cache_dir.join(format!("{}.manifest", aid));
                 let _ = fs::write(&manifest_file, &bytes);
+
+                // Parse manifest to extract depot info
+                let manifest_file = cache_dir.join(format!("{}.manifest", aid));
+                if let Ok(metadata) = crate::parsers::manifest_binary::read_manifest_file(&manifest_file) {
+                    // Build Lua content with depot info from manifest
+                    lua_content.push_str(&format!("addappid({})\n", aid));
+                    // Note: ManifestMetadata only has single depot info
+                    // For full depot list we'd need deeper manifest parsing
+                    if metadata.depot_id != aid {
+                        let mut entry = format!("addappid({})", metadata.depot_id);
+                        if metadata.filenames_encrypted {
+                            // Key would need to be provided separately
+                            entry.push_str(&format!(", 1, \"NEED_KEY_{}\"", metadata.depot_id));
+                        }
+                        lua_content.push_str(&format!("{}\n", entry));
+                    }
+                }
+            }
+
+            // If no manifest was fetched/parsed, fall back to basic addappid
+            if lua_content.is_empty() {
+                lua_content = format!("addappid({})\n", aid);
             }
 
             // Install .lua entry in stplug-in
             let lua_file = stplug_dir.join(format!("{}.lua", aid));
-            let lua_content = format!("addappid({})
-", aid);
             let _ = fs::create_dir_all(&stplug_dir);
             let _ = fs::write(&lua_file, lua_content);
 
@@ -159,7 +181,7 @@ pub fn pick_source_and_download(app_id: u64, source_name: &str, stplug_dir: &Pat
 // including validation, dependency checking, and installation.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 

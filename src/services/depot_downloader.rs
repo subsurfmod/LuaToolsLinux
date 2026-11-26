@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
@@ -71,6 +72,21 @@ pub struct DepotDownloadOptions {
     pub custom_tool_path: String,
     pub steam_username: String,
     pub hubcap_api_key: Option<String>,
+    // LT-67, LT-68: DepotDownloaderMod defaults with concurrency/timeout
+    pub max_concurrent_downloads: Option<usize>,
+    pub download_timeout_secs: Option<u64>,
+}
+
+impl DepotDownloadOptions {
+    /// Returns the effective max concurrent downloads (default: 3)
+    pub fn max_concurrent(&self) -> usize {
+        self.max_concurrent_downloads.unwrap_or(3)
+    }
+
+    /// Returns the effective download timeout (default: 10 minutes = 600s)
+    pub fn download_timeout(&self) -> Duration {
+        Duration::from_secs(self.download_timeout_secs.unwrap_or(600))
+    }
 }
 
 const DEPOTDOWNLOADER_REPO: &str = "SteamRE/DepotDownloader";
@@ -888,7 +904,28 @@ impl DepotDownloaderService {
             .and_then(|h| h.join().ok())
             .unwrap_or_default();
 
-        let wait_res = child.wait();
+        // LT-68: Apply download timeout using manual wait with timeout
+        let timeout = opts.download_timeout();
+        let wait_res = {
+            let start = std::time::Instant::now();
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break Ok(status),
+                    Ok(None) => {
+                        if start.elapsed() >= timeout {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            break Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                format!("Download timed out after {} seconds", timeout.as_secs())
+                            ));
+                        }
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(e) => break Err(e),
+                }
+            }
+        };
         drop(keys_guard);
 
         match wait_res {

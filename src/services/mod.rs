@@ -19,6 +19,7 @@ pub mod game_process_injection_service;
 pub mod github_proxy;
 pub mod hot_reload_service;
 pub mod http_server;
+pub mod localization;
 pub mod lua_installer;
 pub mod manifest_binding_service;
 pub mod millennium_service;

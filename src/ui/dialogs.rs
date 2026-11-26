@@ -255,6 +255,13 @@ impl LuaToolsApp {
         let mut do_overwrite = false;
         let mut do_cancel = false;
 
+        // Compute semantic diff (LT-32)
+        let semantic_diff = compute_semantic_lua_diff(
+            &self.overwrite_diff_modal.old_content,
+            &self.overwrite_diff_modal.new_content,
+            app_id,
+        );
+
         egui::Window::new(format!(
             "Confirm Overwrite — {} ({}.lua)",
             gname, app_id
@@ -262,12 +269,12 @@ impl LuaToolsApp {
         .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(true)
-        .default_size([560.0, 380.0])
+        .default_size([600.0, 420.0])
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             ui.label(
                 RichText::new(format!(
-                    "An existing stplug-in/{}.lua was found with different contents. Review the changes below before overwriting:",
+                    "An existing stplug-in/{}.lua was found with different contents. Review the semantic changes below before overwriting:",
                     app_id
                 ))
                 .size(12.5)
@@ -279,21 +286,145 @@ impl LuaToolsApp {
                 ui.set_width(ui.available_width());
                 ScrollArea::vertical()
                     .id_salt("overwrite_diff_scroll")
-                    .max_height(220.0)
+                    .max_height(260.0)
                     .show(ui, |ui| {
-                        for rem in &self.overwrite_diff_modal.removed_lines {
-                            ui.label(
-                                RichText::new(rem)
-                                    .font(egui::FontId::new(11.5, egui::FontFamily::Monospace))
-                                    .color(Palette::DANGER_TEXT),
-                            );
+                        ui.spacing_mut().item_spacing.y = 4.0;
+
+                        // Summary badges
+                        let mut summary_parts = Vec::new();
+                        if !semantic_diff.added_depots.is_empty() {
+                            summary_parts.push(format!("+{} depots", semantic_diff.added_depots.len()));
                         }
-                        for add in &self.overwrite_diff_modal.added_lines {
-                            ui.label(
-                                RichText::new(add)
-                                    .font(egui::FontId::new(11.5, egui::FontFamily::Monospace))
-                                    .color(Palette::GO_TEXT),
-                            );
+                        if !semantic_diff.removed_depots.is_empty() {
+                            summary_parts.push(format!("-{} depots", semantic_diff.removed_depots.len()));
+                        }
+                        if !semantic_diff.added_manifest_pins.is_empty() {
+                            summary_parts.push(format!("+{} manifest pins", semantic_diff.added_manifest_pins.len()));
+                        }
+                        if !semantic_diff.removed_manifest_pins.is_empty() {
+                            summary_parts.push(format!("-{} manifest pins", semantic_diff.removed_manifest_pins.len()));
+                        }
+                        if !semantic_diff.added_depot_keys.is_empty() {
+                            summary_parts.push(format!("+{} depot keys", semantic_diff.added_depot_keys.len()));
+                        }
+                        if !semantic_diff.changed_depot_keys.is_empty() {
+                            summary_parts.push(format!("~{} depot keys", semantic_diff.changed_depot_keys.len()));
+                        }
+                        if !summary_parts.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                for part in summary_parts {
+                                    let badge_color = if part.starts_with('+') { Palette::GO_TEXT }
+                                        else if part.starts_with('-') { Palette::DANGER_TEXT }
+                                        else { Palette::WARN_TEXT };
+                                    ui.label(
+                                        RichText::new(part)
+                                            .size(11.0)
+                                            .color(badge_color)
+                                            .strong(),
+                                    );
+                                }
+                            });
+                            ui.add_space(8.0);
+                        }
+
+                        // Added depots
+                        if !semantic_diff.added_depots.is_empty() {
+                            ui.label(RichText::new("➕ Added Depots / DLCs:").size(12.0).color(Palette::GO_TEXT).strong());
+                            for (depot_id, entry) in &semantic_diff.added_depots {
+                                let comment = entry.comment.as_deref().unwrap_or("");
+                                let key_str = entry.key.as_deref().map(|k| format!(" (key: {})", format_key_preview(k))).unwrap_or_default();
+                                ui.label(
+                                    RichText::new(format!("  addappid({}){} -- {}", depot_id, key_str, comment))
+                                        .font(egui::FontId::new(11.0, egui::FontFamily::Monospace))
+                                        .color(Palette::GO_TEXT),
+                                );
+                            }
+                            ui.add_space(4.0);
+                        }
+
+                        // Removed depots
+                        if !semantic_diff.removed_depots.is_empty() {
+                            ui.label(RichText::new("➖ Removed Depots / DLCs:").size(12.0).color(Palette::DANGER_TEXT).strong());
+                            for depot_id in &semantic_diff.removed_depots {
+                                ui.label(
+                                    RichText::new(format!("  -- addappid({})", depot_id))
+                                        .font(egui::FontId::new(11.0, egui::FontFamily::Monospace))
+                                        .color(Palette::DANGER_TEXT),
+                                );
+                            }
+                            ui.add_space(4.0);
+                        }
+
+                        // Added manifest pins
+                        if !semantic_diff.added_manifest_pins.is_empty() {
+                            ui.label(RichText::new("📌 Added Manifest Pins:").size(12.0).color(Palette::BLUE_LIGHT).strong());
+                            for (depot_id, gid) in &semantic_diff.added_manifest_pins {
+                                ui.label(
+                                    RichText::new(format!("  setManifestid({}, \"{}\")", depot_id, gid))
+                                        .font(egui::FontId::new(11.0, egui::FontFamily::Monospace))
+                                        .color(Palette::BLUE_LIGHT),
+                                );
+                            }
+                            ui.add_space(4.0);
+                        }
+
+                        // Removed manifest pins
+                        if !semantic_diff.removed_manifest_pins.is_empty() {
+                            ui.label(RichText::new("📍 Removed Manifest Pins:").size(12.0).color(Palette::WARN_TEXT).strong());
+                            for depot_id in &semantic_diff.removed_manifest_pins {
+                                ui.label(
+                                    RichText::new(format!("  -- setManifestid({}, ...)", depot_id))
+                                        .font(egui::FontId::new(11.0, egui::FontFamily::Monospace))
+                                        .color(Palette::WARN_TEXT),
+                                );
+                            }
+                            ui.add_space(4.0);
+                        }
+
+                        // Changed depot keys
+                        if !semantic_diff.changed_depot_keys.is_empty() {
+                            ui.label(RichText::new("🔑 Changed Depot Keys:").size(12.0).color(Palette::WARN_TEXT).strong());
+                            for (depot_id, (old_key, new_key)) in &semantic_diff.changed_depot_keys {
+                                ui.label(
+                                    RichText::new(format!("  ~ depot {}: {} → {}", depot_id, format_key_preview(old_key), format_key_preview(new_key)))
+                                        .font(egui::FontId::new(11.0, egui::FontFamily::Monospace))
+                                        .color(Palette::WARN_TEXT),
+                                );
+                            }
+                            ui.add_space(4.0);
+                        }
+
+                        // Added depot keys
+                        if !semantic_diff.added_depot_keys.is_empty() {
+                            ui.label(RichText::new("🔑 Added Depot Keys:").size(12.0).color(Palette::GO_TEXT).strong());
+                            for (depot_id, key) in &semantic_diff.added_depot_keys {
+                                ui.label(
+                                    RichText::new(format!("  + depot {}: {}", depot_id, format_key_preview(key)))
+                                        .font(egui::FontId::new(11.0, egui::FontFamily::Monospace))
+                                        .color(Palette::GO_TEXT),
+                                );
+                            }
+                            ui.add_space(4.0);
+                        }
+
+                        // Fallback: show raw line diff if no semantic changes detected
+                        if semantic_diff.is_empty() && (!self.overwrite_diff_modal.removed_lines.is_empty() || !self.overwrite_diff_modal.added_lines.is_empty()) {
+                            ui.label(RichText::new("Raw Line Diff (no semantic changes detected):").size(12.0).color(Palette::TEXT_MUTED));
+                            for rem in &self.overwrite_diff_modal.removed_lines {
+                                ui.label(
+                                    RichText::new(rem)
+                                        .font(egui::FontId::new(11.5, egui::FontFamily::Monospace))
+                                        .color(Palette::DANGER_TEXT),
+                                );
+                            }
+                            for add in &self.overwrite_diff_modal.added_lines {
+                                ui.label(
+                                    RichText::new(add)
+                                        .font(egui::FontId::new(11.5, egui::FontFamily::Monospace))
+                                        .color(Palette::GO_TEXT),
+                                );
+                            }
                         }
                     });
             });
@@ -2017,6 +2148,94 @@ impl LuaToolsApp {
         if close {
             self.integration_modal.open = false;
         }
+    }
+}
+
+/// Semantic diff between two .lua files (LT-32)
+#[derive(Debug, Default)]
+struct SemanticLuaDiff {
+    added_depots: Vec<(u32, crate::parsers::lua_parser::LuaEntry)>,
+    removed_depots: Vec<u32>,
+    added_manifest_pins: Vec<(u32, String)>,
+    removed_manifest_pins: Vec<u32>,
+    added_depot_keys: Vec<(u32, String)>,
+    changed_depot_keys: Vec<(u32, (String, String))>,
+}
+
+impl SemanticLuaDiff {
+    fn is_empty(&self) -> bool {
+        self.added_depots.is_empty()
+            && self.removed_depots.is_empty()
+            && self.added_manifest_pins.is_empty()
+            && self.removed_manifest_pins.is_empty()
+            && self.added_depot_keys.is_empty()
+            && self.changed_depot_keys.is_empty()
+    }
+}
+
+/// Compute semantic diff between two .lua files (LT-32)
+fn compute_semantic_lua_diff(old: &str, new: &str, app_id: u32) -> SemanticLuaDiff {
+    use crate::parsers::lua_parser::LuaFileParser;
+    let old_parsed = LuaFileParser::parse_text(old, app_id);
+    let new_parsed = LuaFileParser::parse_text(new, app_id);
+
+    let old_depots: std::collections::HashMap<u32, &crate::parsers::lua_parser::LuaEntry> = old_parsed.entries.iter()
+        .chain(old_parsed.disabled_entries.iter())
+        .map(|e| (e.id, e))
+        .collect();
+    let new_depots: std::collections::HashMap<u32, &crate::parsers::lua_parser::LuaEntry> = new_parsed.entries.iter()
+        .chain(new_parsed.disabled_entries.iter())
+        .map(|e| (e.id, e))
+        .collect();
+
+    let mut added_depots = Vec::new();
+    let mut removed_depots = Vec::new();
+    let mut added_manifest_pins = Vec::new();
+    let mut removed_manifest_pins = Vec::new();
+    let mut added_depot_keys = Vec::new();
+    let mut changed_depot_keys = Vec::new();
+
+    for (id, new_entry) in &new_depots {
+        if let Some(old_entry) = old_depots.get(id) {
+            // Check for changed keys
+            if let (Some(old_k), Some(new_k)) = (&old_entry.key, &new_entry.key) {
+                if old_k != new_k {
+                    changed_depot_keys.push((*id, (old_k.clone(), new_k.clone())));
+                }
+            }
+            // Check for manifest pins
+            if let Some(new_gid) = &new_entry.manifest_id {
+                if old_entry.manifest_id.as_deref() != Some(new_gid.as_str()) {
+                    added_manifest_pins.push((*id, new_gid.clone()));
+                }
+            }
+            // Check for new keys
+            if new_entry.key.is_some() && old_entry.key.is_none() {
+                added_depot_keys.push((*id, new_entry.key.clone().unwrap()));
+            }
+        } else {
+            // New depot
+            added_depots.push((*id, (*new_entry).clone()));
+        }
+    }
+
+    for (id, old_entry) in &old_depots {
+        if !new_depots.contains_key(id) {
+            removed_depots.push(*id);
+        } else if let Some(old_gid) = &old_entry.manifest_id {
+            if new_depots.get(id).and_then(|e| e.manifest_id.as_deref()) != Some(old_gid.as_str()) {
+                removed_manifest_pins.push(*id);
+            }
+        }
+    }
+
+    SemanticLuaDiff {
+        added_depots,
+        removed_depots,
+        added_manifest_pins,
+        removed_manifest_pins,
+        added_depot_keys,
+        changed_depot_keys,
     }
 }
 

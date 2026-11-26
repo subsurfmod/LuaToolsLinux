@@ -480,6 +480,95 @@ impl LuaVault {
             }
         }
     }
+
+    // LT-36: Collapse duplicate default variants (same hash, different labels)
+    pub fn collapse_defaults(&self, app_id: u32) -> usize {
+        let mut index = self.load_index(app_id);
+        let mut seen_hashes = std::collections::HashSet::new();
+        let mut to_remove = Vec::new();
+
+        for (i, v) in index.variants.iter().enumerate() {
+            if v.kind == KIND_DEFAULT {
+                if seen_hashes.contains(&v.hash) {
+                    to_remove.push(i);
+                } else {
+                    seen_hashes.insert(v.hash.clone());
+                }
+            }
+        }
+
+        let removed = to_remove.len();
+        for i in to_remove.iter().rev() {
+            let v = &index.variants[*i];
+            if !index.variants.iter().any(|x| x.hash == v.hash && x.kind != KIND_DEFAULT) {
+                let _ = fs::remove_file(self.variant_path(app_id, &v.hash));
+            }
+            index.variants.remove(*i);
+        }
+
+        if removed > 0 {
+            self.save_index(app_id, &index);
+        }
+        removed
+    }
+
+    // LT-36: Stamp current live .lua as a build variant
+    pub fn stamp_now(&self, app_id: u32, label: Option<&str>) -> Option<LuaVariant> {
+        let Some(live_path) = self.live_path(app_id) else {
+            return None;
+        };
+        let Ok(bytes) = fs::read(&live_path) else {
+            return None;
+        };
+        if bytes.is_empty() {
+            return None;
+        }
+        let hash_str = Self::hash_bytes(&bytes);
+        let text = String::from_utf8_lossy(&bytes).to_string();
+
+        let mut index = self.load_index(app_id);
+        // If this hash already exists as a build/preset, just update label
+        let already_exists = index.variants.iter().any(|v| v.hash == hash_str);
+        if already_exists {
+            if let Some(existing) = index.variants.iter_mut().find(|v| v.hash == hash_str) {
+                if let Some(lbl) = label {
+                    existing.label = Some(lbl.to_string());
+                }
+                existing.kind = KIND_BUILD.to_string();
+            }
+            self.save_index(app_id, &index);
+            return index.variants.iter().find(|v| v.hash == hash_str).cloned();
+        }
+
+        // Otherwise create new build variant
+        let _ = fs::create_dir_all(self.app_dir(app_id));
+        if fs::write(self.variant_path(app_id, &hash_str), &bytes).is_err() {
+            return None;
+        }
+
+        let mut var = Self::describe_variant(app_id, &text, hash_str, KIND_BUILD, None, None);
+        var.label = label.map(str::to_string);
+        index.variants.push(var.clone());
+        self.save_index(app_id, &index);
+        Some(var)
+    }
+
+    // LT-36: Apply a build variant if nothing is currently live
+    pub fn apply_build_if_nothing_live(&self, app_id: u32) -> Option<LuaVariant> {
+        let active = self.get_active_hash(app_id);
+        if active.is_some() {
+            return None; // Something already live
+        }
+
+        let variants = self.get_variants(app_id);
+        // Find the most recent build variant
+        let build_var = variants.iter().find(|v| v.kind == KIND_BUILD)?;
+        if self.apply(app_id, &build_var.hash) {
+            Some(build_var.clone())
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]

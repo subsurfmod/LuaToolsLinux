@@ -114,12 +114,14 @@ impl ManifestFile {
 
     /// Verifies candidate 32-byte key against encrypted filenames in manifest (LT-62).
     /// If filenames are not encrypted, returns true.
+    /// Returns false for corrupted/unreadable manifests.
     pub fn key_looks_valid(path: &Path, key_bytes: &[u8]) -> bool {
         if key_bytes.len() != 32 {
             return false;
         }
         let Some(meta) = Self::try_read(path) else {
-            return true;
+            // Corrupted manifest - reject
+            return false;
         };
         if !meta.filenames_encrypted {
             return true;
@@ -453,10 +455,12 @@ fn read_length_delimited(cursor: &mut Cursor<&[u8]>) -> Result<Vec<u8>, Manifest
 
 /// Validates an AES key against encrypted manifest filenames (LT-62)
 /// Returns true if the key can successfully decrypt at least one filename
+/// Returns true for unencrypted manifests (no key required)
 pub fn validate_aes_key(manifest_path: &Path, candidate_key: &[u8; 32]) -> Result<bool, ManifestError> {
     let metadata = read_manifest_file(manifest_path)?;
     if !metadata.filenames_encrypted {
-        return Ok(false);
+        // No encryption = no key needed = valid
+        return Ok(true);
     }
 
     // Re-read the file to get encrypted names

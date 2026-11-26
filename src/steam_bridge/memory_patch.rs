@@ -127,7 +127,7 @@ fn page_bounds(addr: usize, len: usize, page_size: usize) -> Result<(usize, usiz
 }
 
 /// Represents an installed inline memory patch.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MemoryPatch {
     pub target: *mut u8,
     pub trampoline: *mut u8,

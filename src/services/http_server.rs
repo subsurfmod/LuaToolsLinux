@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use base64::{engine::general_purpose, Engine as _};
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server};
 
@@ -689,6 +690,42 @@ fn handle_request(
 
     // Route: /icon
     if parts == ["icon"] {
+        // LT-28: Serve game icon from Steam CDN
+        if aid > 0 {
+            // Try to fetch icon from Steam CDN
+            let agent = ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(10))
+                .build();
+            let icon_url = format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{}/capsule_184x69.jpg", aid);
+            match agent.get(&icon_url).call() {
+                Ok(resp) => {
+                    if resp.status() == 200 {
+                        let mut bytes = Vec::new();
+                        if resp.into_reader().read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
+                            let b64 = general_purpose::STANDARD.encode(&bytes);
+                            send_json(req, 200, json!({ "success": true, "dataUrl": format!("data:image/jpeg;base64,{}", b64) }));
+                            return;
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+            // Fallback: try header image
+            let header_url = format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{}/header.jpg", aid);
+            match agent.get(&header_url).call() {
+                Ok(resp) => {
+                    if resp.status() == 200 {
+                        let mut bytes = Vec::new();
+                        if resp.into_reader().read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
+                            let b64 = general_purpose::STANDARD.encode(&bytes);
+                            send_json(req, 200, json!({ "success": true, "dataUrl": format!("data:image/jpeg;base64,{}", b64) }));
+                            return;
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
         send_json(req, 200, json!({ "success": false, "dataUrl": "" }));
         return;
     }

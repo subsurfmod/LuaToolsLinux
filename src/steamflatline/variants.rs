@@ -88,7 +88,13 @@ impl Unpacker for StubVariant30x64 {
 
         // Check for .bind section - need to parse sections
         // For quick check, look for .bind in the file
-        data.windows(5).any(|w| w == b".bind")
+        if !data.windows(5).any(|w| w == b".bind") {
+            return false;
+        }
+
+        // Check for v3.0 signature 0xC0DEC0DE at entry point - 4
+        // We need to find entry point first - for a quick check, look for the signature in the file
+        data.windows(4).any(|w| w == &[0xDE, 0xC0, 0xDE, 0xC0])
     }
 
     fn process(&self, data: &[u8], output_path: &Path) -> Result<()> {
@@ -216,7 +222,7 @@ impl Unpacker for StubVariant30x64 {
         const DRM_FLAG_NO_ENCRYPTION: u32 = 0x1;
         let is_encrypted = (flags & DRM_FLAG_NO_ENCRYPTION) == 0;
 
-        let mut code_data = if is_encrypted {
+        let code_data = if is_encrypted {
             // Read encrypted section data
             let encrypted_size = code_section_raw_size;
             let mut encrypted_data = vec![0u8; (encrypted_size + 16) as usize];
@@ -239,7 +245,16 @@ impl Unpacker for StubVariant30x64 {
         };
 
         // Compute new entry point RVA before mutating pe
-        let new_entry_rva = pe.va_to_rva(original_entry_point as u64) as u32;
+        // original_entry_point in SteamStub header is already an RVA, not a VA
+        let image_base = match &pe.optional_header {
+            crate::steamflatline::pe::OptionalHeader::Pe64(h) => h.image_base,
+            _ => return Err(SteamFlatlineError::UnsupportedArchitecture),
+        };
+        let new_entry_rva = if (original_entry_point as u64) >= image_base {
+            (original_entry_point as u64 - image_base) as u32
+        } else {
+            original_entry_point
+        };
 
         // Update entry point to original BEFORE removing .bind section (indices stay stable)
         match &mut pe.optional_header {
@@ -250,10 +265,12 @@ impl Unpacker for StubVariant30x64 {
             _ => return Err(SteamFlatlineError::UnsupportedArchitecture),
         }
 
-        // Update code section data
+        // Update code section data - use full code_data without truncation
         if code_section_idx < pe.section_data.len() {
-            let new_size = code_data.len().min(pe.section_data[code_section_idx].len());
-            pe.section_data[code_section_idx][..new_size].copy_from_slice(&code_data[..new_size]);
+            pe.section_data[code_section_idx] = code_data.clone();
+            // Update section header sizes
+            pe.sections[code_section_idx].size_of_raw_data = code_data.len() as u32;
+            pe.sections[code_section_idx].virtual_size = code_data.len() as u32;
         }
 
         // Remove .bind section if present (after updating entry point and code data)
@@ -263,6 +280,23 @@ impl Unpacker for StubVariant30x64 {
             pe.sections.remove(bind_idx);
             pe.section_data.remove(bind_idx);
             pe.file_header.number_of_sections -= 1;
+
+            // Recalculate size_of_image after removing .bind section
+            let section_alignment = match &pe.optional_header {
+                crate::steamflatline::pe::OptionalHeader::Pe64(h) => h.section_alignment,
+                _ => return Err(SteamFlatlineError::UnsupportedArchitecture),
+            };
+            let max_va_end = pe.sections.iter()
+                .map(|s| s.virtual_address + s.virtual_size.max(s.size_of_raw_data))
+                .max()
+                .unwrap_or(0);
+            let aligned_size_of_image = ((max_va_end + section_alignment - 1) / section_alignment) * section_alignment;
+            match &mut pe.optional_header {
+                crate::steamflatline::pe::OptionalHeader::Pe64(h) => {
+                    h.size_of_image = aligned_size_of_image;
+                }
+                _ => return Err(SteamFlatlineError::UnsupportedArchitecture),
+            };
         }
 
         // Write unpacked file
@@ -444,7 +478,7 @@ impl Unpacker for StubVariant30x86 {
         const DRM_FLAG_NO_ENCRYPTION: u32 = 0x1;
         let is_encrypted = (flags & DRM_FLAG_NO_ENCRYPTION) == 0;
 
-        let mut code_data = if is_encrypted {
+        let code_data = if is_encrypted {
             // Read encrypted section data
             let encrypted_size = code_section_raw_size;
             let mut encrypted_data = vec![0u8; (encrypted_size + 16) as usize];
@@ -467,7 +501,16 @@ impl Unpacker for StubVariant30x86 {
         };
 
         // Compute new entry point RVA before mutating pe
-        let new_entry_rva = pe.va_to_rva(original_entry_point as u64) as u32;
+        // original_entry_point in SteamStub header is already an RVA, not a VA
+        let image_base = match &pe.optional_header {
+            crate::steamflatline::pe::OptionalHeader::Pe32(h) => h.image_base as u64,
+            _ => return Err(SteamFlatlineError::UnsupportedArchitecture),
+        };
+        let new_entry_rva = if (original_entry_point as u64) >= image_base {
+            (original_entry_point as u64 - image_base) as u32
+        } else {
+            original_entry_point
+        };
 
         // Update entry point to original BEFORE removing .bind section (indices stay stable)
         match &mut pe.optional_header {
@@ -478,10 +521,12 @@ impl Unpacker for StubVariant30x86 {
             _ => return Err(SteamFlatlineError::UnsupportedArchitecture),
         }
 
-        // Update code section data
+        // Update code section data - use full code_data without truncation
         if code_section_idx < pe.section_data.len() {
-            let new_size = code_data.len().min(pe.section_data[code_section_idx].len());
-            pe.section_data[code_section_idx][..new_size].copy_from_slice(&code_data[..new_size]);
+            pe.section_data[code_section_idx] = code_data.clone();
+            // Update section header sizes
+            pe.sections[code_section_idx].size_of_raw_data = code_data.len() as u32;
+            pe.sections[code_section_idx].virtual_size = code_data.len() as u32;
         }
 
         // Remove .bind section if present (after updating entry point and code data)
@@ -491,6 +536,23 @@ impl Unpacker for StubVariant30x86 {
             pe.sections.remove(bind_idx);
             pe.section_data.remove(bind_idx);
             pe.file_header.number_of_sections -= 1;
+
+            // Recalculate size_of_image after removing .bind section
+            let section_alignment = match &pe.optional_header {
+                crate::steamflatline::pe::OptionalHeader::Pe32(h) => h.section_alignment,
+                _ => return Err(SteamFlatlineError::UnsupportedArchitecture),
+            };
+            let max_va_end = pe.sections.iter()
+                .map(|s| s.virtual_address + s.virtual_size.max(s.size_of_raw_data))
+                .max()
+                .unwrap_or(0);
+            let aligned_size_of_image = ((max_va_end + section_alignment - 1) / section_alignment) * section_alignment;
+            match &mut pe.optional_header {
+                crate::steamflatline::pe::OptionalHeader::Pe32(h) => {
+                    h.size_of_image = aligned_size_of_image;
+                }
+                _ => return Err(SteamFlatlineError::UnsupportedArchitecture),
+            };
         }
 
         // Write unpacked file
@@ -522,7 +584,7 @@ impl Unpacker for StubVariant31x64 {
     }
 
     fn can_process(&self, data: &[u8]) -> bool {
-        // Similar to v3.0 x64 but with different header
+        // Similar to v3.0 x64 but with different header - v3.1 signature is 0xC0DEC0D1
         if data.len() < 100 {
             return false;
         }
@@ -553,7 +615,13 @@ impl Unpacker for StubVariant31x64 {
         }
 
         // Check for .bind section
-        data.windows(5).any(|w| w == b".bind")
+        if !data.windows(5).any(|w| w == b".bind") {
+            return false;
+        }
+
+        // Check for v3.1 signature 0xC0DEC0D1
+        // Look for the signature in the file
+        data.windows(4).any(|w| w == &[0xD1, 0xC0, 0xDE, 0xC0])
     }
 
     fn process(&self, data: &[u8], output_path: &Path) -> Result<()> {
@@ -703,7 +771,7 @@ impl Unpacker for StubVariant31x64 {
         const DRM_FLAG_NO_ENCRYPTION: u32 = 0x1;
         let is_encrypted = (flags & DRM_FLAG_NO_ENCRYPTION) == 0;
 
-        let mut code_data = if is_encrypted {
+        let code_data = if is_encrypted {
             // Read encrypted section data
             let encrypted_size = code_section_raw_size;
             let mut encrypted_data = vec![0u8; (encrypted_size + 16) as usize];
@@ -726,7 +794,16 @@ impl Unpacker for StubVariant31x64 {
         };
 
         // Compute new entry point RVA before mutating pe
-        let new_entry_rva = pe.va_to_rva(original_entry_point as u64) as u32;
+        // original_entry_point in SteamStub header is already an RVA, not a VA
+        let image_base = match &pe.optional_header {
+            crate::steamflatline::pe::OptionalHeader::Pe64(h) => h.image_base,
+            _ => return Err(SteamFlatlineError::UnsupportedArchitecture),
+        };
+        let new_entry_rva = if (original_entry_point as u64) >= image_base {
+            (original_entry_point as u64 - image_base) as u32
+        } else {
+            original_entry_point
+        };
 
         // Update entry point to original BEFORE removing .bind section (indices stay stable)
         match &mut pe.optional_header {
@@ -737,10 +814,12 @@ impl Unpacker for StubVariant31x64 {
             _ => return Err(SteamFlatlineError::UnsupportedArchitecture),
         }
 
-        // Update code section data
+        // Update code section data - use full code_data without truncation
         if code_section_idx < pe.section_data.len() {
-            let new_size = code_data.len().min(pe.section_data[code_section_idx].len());
-            pe.section_data[code_section_idx][..new_size].copy_from_slice(&code_data[..new_size]);
+            pe.section_data[code_section_idx] = code_data.clone();
+            // Update section header sizes
+            pe.sections[code_section_idx].size_of_raw_data = code_data.len() as u32;
+            pe.sections[code_section_idx].virtual_size = code_data.len() as u32;
         }
 
         // Remove .bind section if present (after updating entry point and code data)
@@ -750,6 +829,23 @@ impl Unpacker for StubVariant31x64 {
             pe.sections.remove(bind_idx);
             pe.section_data.remove(bind_idx);
             pe.file_header.number_of_sections -= 1;
+
+            // Recalculate size_of_image after removing .bind section
+            let section_alignment = match &pe.optional_header {
+                crate::steamflatline::pe::OptionalHeader::Pe64(h) => h.section_alignment,
+                _ => return Err(SteamFlatlineError::UnsupportedArchitecture),
+            };
+            let max_va_end = pe.sections.iter()
+                .map(|s| s.virtual_address + s.virtual_size.max(s.size_of_raw_data))
+                .max()
+                .unwrap_or(0);
+            let aligned_size_of_image = ((max_va_end + section_alignment - 1) / section_alignment) * section_alignment;
+            match &mut pe.optional_header {
+                crate::steamflatline::pe::OptionalHeader::Pe64(h) => {
+                    h.size_of_image = aligned_size_of_image;
+                }
+                _ => return Err(SteamFlatlineError::UnsupportedArchitecture),
+            };
         }
 
         // Write unpacked file
@@ -951,7 +1047,7 @@ impl Unpacker for StubVariant31x86 {
         const DRM_FLAG_NO_ENCRYPTION: u32 = 0x1;
         let is_encrypted = (flags & DRM_FLAG_NO_ENCRYPTION) == 0;
 
-        let mut code_data = if is_encrypted {
+        let code_data = if is_encrypted {
             // Read encrypted section data
             let encrypted_size = code_section_raw_size;
             let mut encrypted_data = vec![0u8; (encrypted_size + 16) as usize];
@@ -974,7 +1070,16 @@ impl Unpacker for StubVariant31x86 {
         };
 
         // Compute new entry point RVA before mutating pe
-        let new_entry_rva = pe.va_to_rva(original_entry_point as u64) as u32;
+        // original_entry_point in SteamStub header is already an RVA, not a VA
+        let image_base = match &pe.optional_header {
+            crate::steamflatline::pe::OptionalHeader::Pe32(h) => h.image_base as u64,
+            _ => return Err(SteamFlatlineError::UnsupportedArchitecture),
+        };
+        let new_entry_rva = if (original_entry_point as u64) >= image_base {
+            (original_entry_point as u64 - image_base) as u32
+        } else {
+            original_entry_point
+        };
 
         // Update entry point to original BEFORE removing .bind section (indices stay stable)
         match &mut pe.optional_header {
@@ -985,10 +1090,12 @@ impl Unpacker for StubVariant31x86 {
             _ => return Err(SteamFlatlineError::UnsupportedArchitecture),
         }
 
-        // Update code section data
+        // Update code section data - use full code_data without truncation
         if code_section_idx < pe.section_data.len() {
-            let new_size = code_data.len().min(pe.section_data[code_section_idx].len());
-            pe.section_data[code_section_idx][..new_size].copy_from_slice(&code_data[..new_size]);
+            pe.section_data[code_section_idx] = code_data.clone();
+            // Update section header sizes
+            pe.sections[code_section_idx].size_of_raw_data = code_data.len() as u32;
+            pe.sections[code_section_idx].virtual_size = code_data.len() as u32;
         }
 
         // Remove .bind section if present (after updating entry point and code data)
@@ -998,6 +1105,23 @@ impl Unpacker for StubVariant31x86 {
             pe.sections.remove(bind_idx);
             pe.section_data.remove(bind_idx);
             pe.file_header.number_of_sections -= 1;
+
+            // Recalculate size_of_image after removing .bind section
+            let section_alignment = match &pe.optional_header {
+                crate::steamflatline::pe::OptionalHeader::Pe32(h) => h.section_alignment,
+                _ => return Err(SteamFlatlineError::UnsupportedArchitecture),
+            };
+            let max_va_end = pe.sections.iter()
+                .map(|s| s.virtual_address + s.virtual_size.max(s.size_of_raw_data))
+                .max()
+                .unwrap_or(0);
+            let aligned_size_of_image = ((max_va_end + section_alignment - 1) / section_alignment) * section_alignment;
+            match &mut pe.optional_header {
+                crate::steamflatline::pe::OptionalHeader::Pe32(h) => {
+                    h.size_of_image = aligned_size_of_image;
+                }
+                _ => return Err(SteamFlatlineError::UnsupportedArchitecture),
+            };
         }
 
         // Write unpacked file
@@ -1192,7 +1316,7 @@ impl Unpacker for StubVariant21x86 {
         const DRM_FLAG_NO_ENCRYPTION: u32 = 0x1;
         let is_encrypted = (flags & DRM_FLAG_NO_ENCRYPTION) == 0;
 
-        let mut code_data = if is_encrypted {
+        let code_data = if is_encrypted {
             // Read encrypted section data
             let encrypted_size = code_section_raw_size;
             let mut encrypted_data = vec![0u8; (encrypted_size + 16) as usize];
@@ -1215,7 +1339,16 @@ impl Unpacker for StubVariant21x86 {
         };
 
         // Compute new entry point RVA before mutating pe
-        let new_entry_rva = pe.va_to_rva(original_entry_point as u64) as u32;
+        // original_entry_point in SteamStub header is already an RVA, not a VA
+        let image_base = match &pe.optional_header {
+            crate::steamflatline::pe::OptionalHeader::Pe32(h) => h.image_base as u64,
+            _ => return Err(SteamFlatlineError::UnsupportedArchitecture),
+        };
+        let new_entry_rva = if (original_entry_point as u64) >= image_base {
+            (original_entry_point as u64 - image_base) as u32
+        } else {
+            original_entry_point
+        };
 
         // Update entry point to original BEFORE removing .bind section (indices stay stable)
         match &mut pe.optional_header {
@@ -1226,10 +1359,12 @@ impl Unpacker for StubVariant21x86 {
             _ => return Err(SteamFlatlineError::UnsupportedArchitecture),
         }
 
-        // Update code section data
+        // Update code section data - use full code_data without truncation
         if code_section_idx < pe.section_data.len() {
-            let new_size = code_data.len().min(pe.section_data[code_section_idx].len());
-            pe.section_data[code_section_idx][..new_size].copy_from_slice(&code_data[..new_size]);
+            pe.section_data[code_section_idx] = code_data.clone();
+            // Update section header sizes
+            pe.sections[code_section_idx].size_of_raw_data = code_data.len() as u32;
+            pe.sections[code_section_idx].virtual_size = code_data.len() as u32;
         }
 
         // Remove .bind section if present (after updating entry point and code data)
@@ -1239,6 +1374,23 @@ impl Unpacker for StubVariant21x86 {
             pe.sections.remove(bind_idx);
             pe.section_data.remove(bind_idx);
             pe.file_header.number_of_sections -= 1;
+
+            // Recalculate size_of_image after removing .bind section
+            let section_alignment = match &pe.optional_header {
+                crate::steamflatline::pe::OptionalHeader::Pe32(h) => h.section_alignment,
+                _ => return Err(SteamFlatlineError::UnsupportedArchitecture),
+            };
+            let max_va_end = pe.sections.iter()
+                .map(|s| s.virtual_address + s.virtual_size.max(s.size_of_raw_data))
+                .max()
+                .unwrap_or(0);
+            let aligned_size_of_image = ((max_va_end + section_alignment - 1) / section_alignment) * section_alignment;
+            match &mut pe.optional_header {
+                crate::steamflatline::pe::OptionalHeader::Pe32(h) => {
+                    h.size_of_image = aligned_size_of_image;
+                }
+                _ => return Err(SteamFlatlineError::UnsupportedArchitecture),
+            };
         }
 
         // Write unpacked file
@@ -1270,11 +1422,44 @@ impl Unpacker for StubVariant20x86 {
     }
 
     fn can_process(&self, data: &[u8]) -> bool {
-        StubVariant21x86::new().can_process(data)
+        // v2.0 uses signature 0xDEADFACE in the .bind section header
+        if data.len() < 100 {
+            return false;
+        }
+
+        if data[0..2] != [0x4D, 0x5A] {
+            return false;
+        }
+
+        let pe_offset = u32::from_le_bytes([data[60], data[61], data[62], data[63]]) as usize;
+        if pe_offset + 4 > data.len() {
+            return false;
+        }
+
+        if &data[pe_offset..pe_offset+4] != b"PE\0\0" {
+            return false;
+        }
+
+        if pe_offset + 6 > data.len() {
+            return false;
+        }
+        let machine = u16::from_le_bytes([data[pe_offset+4], data[pe_offset+5]]);
+        if machine != 0x014c {
+            return false;
+        }
+
+        // Check for .bind section
+        if !data.windows(5).any(|w| w == b".bind") {
+            return false;
+        }
+
+        // Check for v2.0 signature 0xDEADFACE
+        data.windows(4).any(|w| w == &[0xCE, 0xFA, 0xAD, 0xDE])
     }
 
-    fn process(&self, _data: &[u8], _output_path: &Path) -> Result<()> {
-        Err(SteamFlatlineError::UnsupportedFormat)
+    fn process(&self, data: &[u8], output_path: &Path) -> Result<()> {
+        // Delegate to v2.1 unpacker as they share the same structure
+        StubVariant21x86::new().process(data, output_path)
     }
 }
 

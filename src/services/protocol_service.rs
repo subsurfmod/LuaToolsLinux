@@ -12,17 +12,7 @@ use crate::steam_bridge::token_bridge::{BstUri, TokenBridge};
 
 fn shared_token_bridge() -> &'static TokenBridge {
     static BRIDGE: OnceLock<TokenBridge> = OnceLock::new();
-    BRIDGE.get_or_init(|| {
-        let mut bridge = TokenBridge::new();
-        bridge.register_handler(Box::new(|uri: &BstUri| {
-            if uri.is_valid() || !uri.token.is_empty() || uri.app_id > 0 {
-                Some(uri.clone())
-            } else {
-                None
-            }
-        }));
-        bridge
-    })
+    BRIDGE.get_or_init(TokenBridge::new)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

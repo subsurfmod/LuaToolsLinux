@@ -3,10 +3,10 @@ members = [".", "bridge_lib", "steam_auto_patch_linux"]
 
 [package]
 name = "luatools-linux"
-version = "3.2.9"
+version = "3.3.9"
 edition = "2021"
 description = "Native lightweight Rust workstation for Steam stplug-in lua manifests, LuaVault variants, depot downloads, and game fixes"
-license = "MIT"
+license = "GPL-3.0-or-later"
 authors = ["LuaTools Linux Contributors"]
 
 [[bin]]
@@ -58,6 +58,7 @@ zip = { version = "2.2", default-features = false, features = ["deflate"] }
 flate2 = "1.0"
 tar = "0.4"
 age = { version = "0.12", default-features = false, features = ["aes-gcm", "curve25519-dalek"] }
+keyring = "2.1"
 steam-auto-patch-linux = { path = "steam_auto_patch_linux" }
 # tray-icon = { version = "0.11", default-features = false, features = ["common-controls-v6"] }  -- temporarily disabled due to system deps
 # rdev = "0.5"

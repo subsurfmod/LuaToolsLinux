@@ -485,8 +485,9 @@ impl WiredService {
             .map_err(|e| format!("Failed to create bin dir: {}", e))?;
         let wrapper = self.bin_dir.join("steam-sls");
 
-        // Build LD_PRELOAD with our integration library
-        let integration_lib = "/home/tejas/.local/lib/luatools/libsteam_integration.so";
+        // Build integration library path dynamically based on user's home directory
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let integration_lib = home.join(".local/lib/luatools/libsteam_integration.so");
 
         // Build LD_AUDIT for SLSsteam (only library-inject.so to avoid 32-bit crashes with SLSsteam.so)
         let audit = if sls_dir.join("library-inject.so").is_file() {
@@ -499,6 +500,7 @@ impl WiredService {
             target_so.display().to_string()
         };
 
+        let integration_lib_str = integration_lib.display().to_string();
         let script = format!(
             "#!/usr/bin/env bash\n\
              # Auto-start LuaTools companion in background minimized to tray if available (LT-20)\n\
@@ -510,12 +512,15 @@ impl WiredService {
              # Set target platform for LuaTools depot filtering (auto-detect or override via env)\n\
              export LUATOOLS_TARGET_OS=\"${{LUATOOLS_TARGET_OS:-linux}}\"\n\
              export LUATOOLS_TARGET_ARCH=\"${{LUATOOLS_TARGET_ARCH:-x86_64}}\"\n\
-             # Include LuaTools integration library via LD_PRELOAD\n\
-             export LD_PRELOAD=\"{integration_lib}${{LD_PRELOAD:+:$LD_PRELOAD}}\"\n\
-             # SLSsteam via LD_AUDIT (only library-inject.so to avoid 32-bit crashes with SLSsteam.so)\n\
+             # Include LuaTools integration library via LD_PRELOAD (only if 64-bit or matching arch)\n\
+             # Note: On 32-bit Steam, we use LD_AUDIT instead of LD_PRELOAD to avoid ELFCLASS64 mismatch\n\
+             if [ -f \"{integration_lib}\" ]; then\n\
+                 export LD_PRELOAD=\"{integration_lib}${{LD_PRELOAD:+:$LD_PRELOAD}}\"\n\
+             fi\n\
+             # SLSsteam via LD_AUDIT (always use for SLSsteam hooks)\n\
              export LD_AUDIT=\"{audit}\"\n\
              exec steam \"$@\"\n",
-            integration_lib = integration_lib,
+            integration_lib = integration_lib_str,
             audit = audit
         );
         fs::write(&wrapper, script)
@@ -666,29 +671,33 @@ pub fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
                 .to_string()
         })?;
         // Pre-screen 7z file listing for path traversal entries
+        // Use 7z l -slt for structured output that includes full paths
         let list_out = Command::new(&bin)
             .arg("l")
-            .arg("-ba")
+            .arg("-slt")
             .arg(archive)
             .output()
             .map_err(|e| format!("Failed to inspect 7z archive: {}", e))?;
         if list_out.status.success() {
             let listing = String::from_utf8_lossy(&list_out.stdout);
+            // Parse 7z -slt output which has "Path = filename" lines
             for line in listing.lines() {
-                // Check for actual path traversal patterns (../ or ..\ as path components)
-                // Not just ".." anywhere in the filename (e.g., "docs/LICENSE" contains ".." in "LICENSE")
-                // Only flag if it's a path component: starts with ../ or ..\, or contains /../ or \..\ or ends with /.. or \..
-                let is_traversal = line.starts_with("../")
-                    || line.starts_with("..\\")
-                    || line.contains("/../")
-                    || line.contains("\\..\\")
-                    || line.ends_with("/..")
-                    || line.ends_with("\\..")
-                    || line == ".."
-                    || line == "../"
-                    || line == "..\\";
-                if is_traversal {
-                    return Err(format!("Rejected unsafe path-traversal entry in 7z: {}", line.trim()));
+                let trimmed = line.trim();
+                if trimmed.starts_with("Path = ") {
+                    let file_path = &trimmed[7..];
+                    // Check for actual path traversal patterns
+                    let is_traversal = file_path.starts_with("../")
+                        || file_path.starts_with("..\\")
+                        || file_path.contains("/../")
+                        || file_path.contains("\\..\\")
+                        || file_path.ends_with("/..")
+                        || file_path.ends_with("\\..")
+                        || file_path == ".."
+                        || file_path == "../"
+                        || file_path == "..\\";
+                    if is_traversal {
+                        return Err(format!("Rejected unsafe path-traversal entry in 7z: {}", file_path));
+                    }
                 }
             }
         }

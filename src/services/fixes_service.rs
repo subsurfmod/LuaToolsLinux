@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
 use crate::services::api_client::{DRMFixFixItem, LuaToolsApiClient};
+use crate::services::applied_fix_index::{AppliedFixIndexService as FixIndexService, AppliedFixRecord as IndexAppliedFixRecord, AppliedFixFileEntry};
 use crate::services::lua_installer::LuaInstaller;
 use crate::services::settings_service::SettingsService;
 use crate::services::slssteam_service::SlssteamService;
@@ -483,12 +484,22 @@ impl FixesService {
         }
 
         if !cfg!(test) && !game_dir.starts_with(std::env::temp_dir()) {
-            let _ = AppliedFixIndexService::default().record_fix_applied(
+            let mut idx = FixIndexService::default();
+            let record = IndexAppliedFixRecord {
                 app_id,
-                fix_id,
-                game_dir,
-                applied.len(),
-            );
+                fix_id: fix_id.to_string(),
+                applied_at: chrono::Utc::now().to_rfc3339(),
+                game_dir: Some(game_dir.to_path_buf()),
+                files: applied.iter().map(|f| AppliedFixFileEntry {
+                    relative_path: f.clone(),
+                    action: "modified".to_string(),
+                    backup_path: None,
+                    hash_before: None,
+                    hash_after: String::new(),
+                }).collect(),
+                wine_dll_overrides: None,
+            };
+            idx.add_fix(record);
         }
 
         FixApplicationResult {
@@ -603,7 +614,8 @@ impl FixesService {
         let _ = fs::remove_file(&record_file);
         let _ = fs::remove_dir_all(fix_meta_dir.join("backups").join(fix_id));
         if !cfg!(test) && !game_dir.starts_with(std::env::temp_dir()) {
-            let _ = AppliedFixIndexService::default().record_fix_reverted(record.app_id, fix_id);
+            let mut idx = FixIndexService::default();
+            idx.remove_fix(record.app_id, fix_id);
         }
         FixApplicationResult {
             ok: true,

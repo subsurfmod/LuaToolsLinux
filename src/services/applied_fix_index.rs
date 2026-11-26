@@ -16,7 +16,7 @@ where
     Ok(opt.map(PathBuf::from))
 }
 
-const APPLIED_FIXES_FILENAME: &str = "applied_fixes.json";
+const APPLIED_FIXES_FILENAME: &str = "applied-fixes.json";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -123,6 +123,12 @@ impl SteamLibraryService {
     }
 
     fn add_to_library_folders(&self, library: &SteamLibrary, app_id: u32) -> Result<(), String> {
+        // LNX-05: Check if Steam is running before modifying libraryfolders.vdf
+        // Skip check during tests (CI environment may have false positives)
+        if !cfg!(test) && crate::steam_bridge::preload_loader::find_steam_pid().is_some() {
+            return Err("Steam is running. Please close Steam before modifying library folders.".to_string());
+        }
+
         let vdf_path = library.steamapps().join("libraryfolders.vdf");
         let app_entry_re = Regex::new(&format!(r#"(?m)^\s*"{}"\s+"[0-9]+""#, app_id)).unwrap();
 
@@ -175,6 +181,12 @@ impl SteamLibraryService {
         app_id: u32,
         sls: &mut SlssteamService,
     ) -> Result<(), String> {
+        // LNX-05: Check if Steam is running before modifying libraryfolders.vdf
+        // Skip check during tests (CI environment may have false positives)
+        if !cfg!(test) && crate::steam_bridge::preload_loader::find_steam_pid().is_some() {
+            return Err("Steam is running. Please close Steam before modifying library folders.".to_string());
+        }
+
         let Some(inst) = &self.steam_installation else {
             return Err("No Steam installation detected.".into());
         };
