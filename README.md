@@ -4,7 +4,7 @@
   <p><strong>Add Steam games, set up SLSsteam, manage DLC &amp; depots, and apply game fixes on Linux.</strong></p>
   <p>
     <a href="https://github.com/subsurfmod/LuaToolsLinux/releases/latest">
-      <img src="https://img.shields.io/badge/DOWNLOAD%20v3.2.7-1A3A6B?style=for-the-badge&logo=github&logoColor=white" alt="Download v3.2.7">
+      <img src="https://img.shields.io/badge/DOWNLOAD%20v3.3.9-1A3A6B?style=for-the-badge&logo=github&logoColor=white" alt="Download v3.2.7">
     </a>
   </p>
 </div>
@@ -50,10 +50,10 @@ Build packages locally with `./packaging/build-packages.sh`, or install a releas
 
 ```bash
 # Ubuntu / Debian / Pop!_OS
-sudo apt install ./dist/luatools-linux_3.2.3_amd64.deb
+sudo apt install ./dist/luatools-linux_3.3.9_amd64.deb
 
 # Fedora / RHEL / openSUSE
-sudo dnf install ./dist/luatools-linux-3.2.3-1.*.rpm
+sudo dnf install ./dist/luatools-linux-3.3.9-1.*.rpm
 ```
 
 ### Update & Uninstall
@@ -120,4 +120,49 @@ Install **SLSsteam**, sync unowned-game settings, and configure store plugins in
 
 ## License
 
-Licensed under the **MIT License** — see [LICENSE](LICENSE) for details.
+Licensed under the **GNU General Public License v3.0 or later (GPL-3.0-or-later)** — see [LICENSE](LICENSE) for details.
+
+## Credits & Acknowledgments
+
+LuaTools Linux is built on the shoulders of giants. This project incorporates code, ideas, and inspiration from the following open-source repositories and projects. We are deeply grateful to their authors and maintainers.
+
+### Core Upstream Projects
+
+- **BetterSteamTools (BST)** — Original Windows LuaTools implementation
+  - Repository: https://github.com/madoiscool/BetterSteamTools
+  - Used for: Core Lua file format, addappid/setManifestid semantics, protocol definitions
+
+- **LuaToolsSteamPlugin (LTSP)** — Steam Store page integration
+  - Repository: https://github.com/madoiscool/LuaToolsSteamPlugin
+  - Used for: Store page plugin, browser protocol handlers
+
+- **SLSsteam / AceSLS** — Steam client hooking framework for Linux
+  - Repository: https://github.com/acedio/slssteam
+  - Used for: Steam client integration, app_id spoofing, plugin loading
+
+- **Steamless / steamflatline** — SteamStub unpacker
+  - Repository: https://github.com/atom0s/Steamless
+  - Used for: SteamStub DRM removal (variants v1.0, v2.0, v3.0, v3.1)
+
+- **DepotDownloaderMod** — High-performance depot downloader
+  - Repository: https://github.com/SteamAutoCracks/DepotDownloaderMod
+  - Used for: Depot downloading with manifestfile/depotkey support
+
+- **SteamAutoPatch** — Automated Goldberg emulator configuration
+  - Repository: https://github.com/SteamAutoCracks/Steam-auto-crack
+  - Used for: Automated Steam emulator configuration
+
+- **Goldberg Emulator** — Steamworks API replacement
+  - Repository: https://github.com/Detanup01/gbe_fork
+  - Used for: Native Linux Steam API replacement (libsteam_api.so)
+
+- **SteamRE/DepotDownloader** — Original depot downloader
+  - Repository: https://github.com/SteamRE/DepotDownloader
+  - Used for: Manifest binary format reference
+
+### Rust Ecosystem
+
+Special thanks to the maintainers of all Rust crates used in this project:
+`eframe`, `egui`, `ureq`, `tiny_http`, `tungstenite`, `serde`, `serde_json`, `aes`, `keyring`, `image`, and many others listed in [Cargo.toml](Cargo.toml).
+
+For the complete list of credits and third-party dependencies, see [CREDITS.md](CREDITS.md).
