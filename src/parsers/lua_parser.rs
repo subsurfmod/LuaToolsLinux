@@ -3,8 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
+use mlua::{Lua};
 use regex::Regex;
 
 use crate::steam_bridge::ost_platform::numbers::{parse_uint32, parse_uint64};
@@ -75,6 +76,10 @@ pub struct LuaContents {
     pub e_tickets: BTreeMap<u32, String>,
     pub eticket_urls: Vec<String>,
     pub stats: BTreeMap<u32, String>,
+    // Internal fields for dynamic Lua execution
+    pub(crate) key_by_id: BTreeMap<u32, Option<String>>,
+    pub(crate) sizes: BTreeMap<u32, u64>,
+    pub(crate) order: Vec<u32>,
 }
 
 impl LuaContents {
@@ -979,6 +984,9 @@ impl LuaFileParser {
             e_tickets,
             eticket_urls,
             stats,
+            key_by_id: BTreeMap::new(),
+            sizes: BTreeMap::new(),
+            order: Vec::new(),
         }
     }
 
@@ -1179,6 +1187,172 @@ impl LuaFileParser {
             header = header
         )
     }
+}
+
+/// Execute a dynamic Lua script with mlua VM (BST-01, BST-10, BST-11)
+/// Supports: addappid, setManifestid, addtoken, setAppTicket, setETicket, seteticketurl,
+/// setStat, addprocess, forcedenuvo, pinApp, setlegacycdkey, http_get, http_post, if/else, loops
+pub fn execute_lua_script(script: &str, app_id: u32) -> Result<LuaContents, String> {
+    let lua = Lua::new();
+    let contents = Arc::new(Mutex::new(LuaContents::default()));
+    contents.lock().unwrap().base_app_id = app_id;
+
+    // Register addappid(depot_id, flags?, key?) -> flags defaults to 0, key optional
+    let c = contents.clone();
+    let func = lua.create_function(move |_, (depot_id, flags, key): (u32, Option<u32>, Option<String>)| {
+        let mut c = c.lock().unwrap();
+        let flags = flags.unwrap_or(0);
+        if flags & 1 != 0 { // has key
+            if let Some(k) = key {
+                if k.len() == 64 {
+                    c.key_by_id.insert(depot_id, Some(k));
+                }
+            }
+        } else if depot_id != 0 {
+            c.order.push(depot_id);
+            c.key_by_id.insert(depot_id, None);
+        }
+        Ok(())
+    }).map_err(|e| e.to_string())?;
+    lua.globals().set("addappid", func).map_err(|e| e.to_string())?;
+
+    // Register setManifestid(depot_id, manifest_gid, size?) -> size optional
+    let c = contents.clone();
+    let func = lua.create_function(move |_, (depot_id, gid, size): (u32, String, Option<u64>)| {
+        let mut c = c.lock().unwrap();
+        if !gid.is_empty() {
+            c.active_pins.insert(depot_id, gid);
+            if let Some(s) = size {
+                c.sizes.insert(depot_id, s);
+            }
+        }
+        Ok(())
+    }).map_err(|e| e.to_string())?;
+    lua.globals().set("setManifestid", func).map_err(|e| e.to_string())?;
+
+    // Register addtoken(app_id, token)
+    let c = contents.clone();
+    let func = lua.create_function(move |_, (aid, token): (u32, String)| {
+        let mut c = c.lock().unwrap();
+        if aid > 0 && !token.is_empty() {
+            c.tokens.insert(aid, token);
+        }
+        Ok(())
+    }).map_err(|e| e.to_string())?;
+    lua.globals().set("addtoken", func).map_err(|e| e.to_string())?;
+
+    // Register setAppTicket(app_id, ticket)
+    let c = contents.clone();
+    let func = lua.create_function(move |_, (aid, ticket): (u32, String)| {
+        let mut c = c.lock().unwrap();
+        if aid > 0 && !ticket.is_empty() {
+            c.app_tickets.insert(aid, ticket);
+        }
+        Ok(())
+    }).map_err(|e| e.to_string())?;
+    lua.globals().set("setAppTicket", func).map_err(|e| e.to_string())?;
+
+    // Register setETicket(app_id, ticket)
+    let c = contents.clone();
+    let func = lua.create_function(move |_, (aid, ticket): (u32, String)| {
+        let mut c = c.lock().unwrap();
+        if aid > 0 && !ticket.is_empty() {
+            c.e_tickets.insert(aid, ticket);
+        }
+        Ok(())
+    }).map_err(|e| e.to_string())?;
+    lua.globals().set("setETicket", func).map_err(|e| e.to_string())?;
+
+    // Register seteticketurl(url)
+    let c = contents.clone();
+    let func = lua.create_function(move |_, url: String| {
+        let mut c = c.lock().unwrap();
+        if !url.is_empty() {
+            c.eticket_urls.push(url);
+        }
+        Ok(())
+    }).map_err(|e| e.to_string())?;
+    lua.globals().set("seteticketurl", func).map_err(|e| e.to_string())?;
+
+    // Register setStat(app_id, stat_name, stat_value)
+    let c = contents.clone();
+    let func = lua.create_function(move |_, (aid, name, value): (u32, String, String)| {
+        let mut c = c.lock().unwrap();
+        if aid > 0 && !name.is_empty() {
+            c.stats.insert(aid, format!("{}={}", name, value));
+        }
+        Ok(())
+    }).map_err(|e| e.to_string())?;
+    lua.globals().set("setStat", func).map_err(|e| e.to_string())?;
+
+    // Register addprocess(app_id, process_name)
+    let c = contents.clone();
+    let func = lua.create_function(move |_, (aid, process): (u32, String)| {
+        let mut c = c.lock().unwrap();
+        if aid > 0 && !process.is_empty() {
+            c.process_map.insert(aid, process);
+        }
+        Ok(())
+    }).map_err(|e| e.to_string())?;
+    lua.globals().set("addprocess", func).map_err(|e| e.to_string())?;
+
+    // Register forcedenuvo(app_id)
+    let c = contents.clone();
+    let func = lua.create_function(move |_, aid: u32| {
+        let mut c = c.lock().unwrap();
+        if aid > 0 {
+            c.force_denuvo.insert(aid);
+        }
+        Ok(())
+    }).map_err(|e| e.to_string())?;
+    lua.globals().set("forcedenuvo", func).map_err(|e| e.to_string())?;
+
+    // Register pinApp(app_id)
+    let c = contents.clone();
+    let func = lua.create_function(move |_, aid: u32| {
+        let mut c = c.lock().unwrap();
+        if aid > 0 {
+            c.pinned_apps.insert(aid);
+        }
+        Ok(())
+    }).map_err(|e| e.to_string())?;
+    lua.globals().set("pinApp", func).map_err(|e| e.to_string())?;
+
+    // Register setlegacycdkey(app_id, key)
+    let c = contents.clone();
+    let func = lua.create_function(move |_, (aid, key): (u32, String)| {
+        let mut c = c.lock().unwrap();
+        if aid > 0 && !key.is_empty() {
+            c.legacy_cd_keys.insert(aid, key);
+        }
+        Ok(())
+    }).map_err(|e| e.to_string())?;
+    lua.globals().set("setlegacycdkey", func).map_err(|e| e.to_string())?;
+
+    // Register http_get(url) -> string
+    let c = contents.clone();
+    let func = lua.create_function(move |_, url: String| {
+        match ureq::get(&url).call() {
+            Ok(resp) => resp.into_string().map_err(|e| mlua::Error::RuntimeError(e.to_string())),
+            Err(e) => Err(mlua::Error::RuntimeError(e.to_string())),
+        }
+    }).map_err(|e| e.to_string())?;
+    lua.globals().set("http_get", func).map_err(|e| e.to_string())?;
+
+    // Register http_post(url, body) -> string
+    let func = lua.create_function(move |_, (url, body): (String, String)| {
+        match ureq::post(&url).send_string(&body) {
+            Ok(resp) => resp.into_string().map_err(|e| mlua::Error::RuntimeError(e.to_string())),
+            Err(e) => Err(mlua::Error::RuntimeError(e.to_string())),
+        }
+    }).map_err(|e| e.to_string())?;
+    lua.globals().set("http_post", func).map_err(|e| e.to_string())?;
+
+    // Execute the script
+    lua.load(script).exec().map_err(|e| e.to_string())?;
+
+    // Return the parsed contents
+    Ok(Arc::try_unwrap(contents).unwrap().into_inner().unwrap())
 }
 
 #[cfg(test)]

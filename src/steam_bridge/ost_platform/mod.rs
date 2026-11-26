@@ -5,6 +5,7 @@
 
 pub mod bkv_parser;
 pub mod byte_search;
+pub mod keyvalues1;
 pub mod dialog;
 pub mod directory_watch;
 pub mod dynamic_library;
@@ -42,6 +43,12 @@ pub use remote_process::{get_architecture, inject_library, Architecture, InjectS
 pub use bkv_parser::{
     extract_achievements, find_user_game_stats_file, parse_bkv_file, AchievementData, BkvError,
     BkvReader, BkvValue,
+};
+
+// New Valve KV1 parser (replaces custom BKV format for UserGameStats_*.bin)
+pub use keyvalues1::{
+    extract_achievements_kv1, find_user_game_stats_file as find_user_game_stats_file_kv1,
+    parse_kv1_file, AchievementData as Kv1AchievementData, Kv1Error, Kv1Reader, Kv1Value,
 };
 pub use byte_search::{find, find_in_file, find_in_file_range, find_with_mask};
 pub use directory_watch::{wait_any, Change, ChangeAction, WaitResult, WaitStatus, Watch};

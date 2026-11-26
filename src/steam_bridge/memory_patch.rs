@@ -10,7 +10,10 @@
 //! logs `errno` on any `mmap`/`mprotect` error, restores `PROT_READ | PROT_EXEC` after
 //! patching (preserving W^X), and releases trampoline pages cleanly on failure or drop.
 
+#[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::_mm_mfence;
+#[cfg(target_arch = "x86")]
+use std::arch::x86::_mm_mfence;
 use std::io;
 use std::ptr;
 

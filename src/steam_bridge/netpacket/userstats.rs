@@ -14,6 +14,10 @@ use crate::steam_bridge::interop::ipc::{
     self, fnv1a_hash, FuncHash, HandlerFn, IpcContext, IpcInterface,
 };
 use crate::steam_bridge::ost_platform::steam_credential_store;
+// Use new Valve KV1 parser for UserGameStats_*.bin files
+use crate::steam_bridge::ost_platform::keyvalues1::{
+    extract_achievements_kv1, parse_kv1_file,
+};
 
 const NETPACKET_USERSTATS_GET_USER_STATS_FNHASH: FuncHash = fnv1a_hash("GetUserStats");
 const NETPACKET_USERSTATS_CLIENT_GET_USER_STATS_FNHASH: FuncHash = fnv1a_hash("ClientGetUserStats");
@@ -234,6 +238,7 @@ fn find_local_stats_bin(base_dir: &Path, app_id: u32) -> Option<std::path::PathB
 }
 
 /// Rebuild `GetUserAchievements` from a local `UserGameStats_<app_id>.bin` file inside `base_dir`.
+/// Uses Valve's binary KeyValues (KV1) format parser.
 pub fn fill_user_achievements_from_dir(
     base_dir: &Path,
     app_id: u32,
@@ -249,8 +254,46 @@ pub fn fill_user_achievements_from_dir(
     };
     if let Ok(data) = std::fs::read(&bin_path) {
         if !data.is_empty() {
-            // Count non-zero unlock bitmask entries if the binary payload is a packed 4-byte record
-            // table, or report at least 1 payload block if non-empty binary VDF stats exist.
+            // Try parsing as Valve KV1 format first
+            if let Ok(kv1) = parse_kv1_file(&bin_path) {
+                let achievements = extract_achievements_kv1(&kv1);
+                let mut ach_data = Vec::new();
+                for (name, ach) in &achievements {
+                    if ach.unlocked {
+                        *n_unlocked += 1;
+                    }
+                    // Serialize achievement data for response
+                    ach_data.extend_from_slice(name.as_bytes());
+                    ach_data.push(0);
+                    ach_data.extend_from_slice(&(ach.unlocked as u32).to_le_bytes());
+                    if let Some(t) = ach.unlock_time {
+                        ach_data.extend_from_slice(&t.to_le_bytes());
+                    } else {
+                        ach_data.extend_from_slice(&0u32.to_le_bytes());
+                    }
+                    if let Some(p) = ach.progress {
+                        ach_data.extend_from_slice(&p.to_le_bytes());
+                    } else {
+                        ach_data.extend_from_slice(&0i32.to_le_bytes());
+                    }
+                    if let Some(mp) = ach.max_progress {
+                        ach_data.extend_from_slice(&mp.to_le_bytes());
+                    } else {
+                        ach_data.extend_from_slice(&0i32.to_le_bytes());
+                    }
+                }
+                resp.extend_from_slice(&ach_data);
+                log::debug!(
+                    "FillUserAchievements: AppId={} - loaded {} achievements ({} unlocked) from {}",
+                    app_id,
+                    achievements.len(),
+                    *n_unlocked,
+                    bin_path.display()
+                );
+                return;
+            }
+
+            // Fallback: old heuristic scan for "unlocked" strings
             resp.extend_from_slice(&data);
             let unlocked_estimate = data
                 .windows(b"unlocked".len())
@@ -258,7 +301,7 @@ pub fn fill_user_achievements_from_dir(
                 .count();
             *n_unlocked = u32::try_from(unlocked_estimate).unwrap_or(u32::MAX);
             log::debug!(
-                "FillUserAchievements: AppId={} - loaded {} bytes ({} unlocked marker(s)) from {}",
+                "FillUserAchievements: AppId={} - loaded {} bytes ({} unlocked marker(s)) from {} (fallback scan)",
                 app_id,
                 data.len(),
                 *n_unlocked,

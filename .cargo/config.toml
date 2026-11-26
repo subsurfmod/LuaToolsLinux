@@ -1,0 +1,18 @@
+[target.i686-unknown-linux-gnu]
+linker = "clang"
+rustflags = [
+  "-C", "link-arg=-m32",
+  "-C", "link-arg=-target", "-C", "link-arg=i686-unknown-linux-gnu",
+]
+
+[build]
+# Enable 32-bit build dependencies
+rustflags = [
+  "-C", "target-feature=+sse2",
+]
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
