@@ -333,6 +333,7 @@ pub struct LuaToolsApp {
     pub status_text: String,
     pub active_toast: Option<ToastNotification>,
     pub millennium_connected: bool,
+    pub native_millennium_plugin_installed: bool,
     pub cover_textures: HashMap<u32, TextureHandle>,
     pub cover_lru: VecDeque<u32>,
     pub cover_in_flight: HashSet<u32>,
@@ -423,6 +424,7 @@ pub struct LuaToolsApp {
     pub live_steam_pid: Option<u32>,
     pub last_steam_poll: std::time::Instant,
     pub steam_poll_in_flight: bool,
+    pub steam_poll_completed: bool,
     pub is_headless_demo: bool,
     pub guide_topic: GuideTopic,
     pub guide_textures: HashMap<&'static str, TextureHandle>,
@@ -627,6 +629,7 @@ impl LuaToolsApp {
             status_text: "Ready — drop .lua, .manifest, or .zip files anywhere to install".into(),
             active_toast: None,
             millennium_connected: false,
+            native_millennium_plugin_installed: false,
             cover_textures: HashMap::new(),
             cover_lru: VecDeque::new(),
             cover_in_flight: HashSet::new(),
@@ -713,6 +716,7 @@ impl LuaToolsApp {
             },
             last_steam_poll: std::time::Instant::now(),
             steam_poll_in_flight: false,
+            steam_poll_completed: false,
             is_headless_demo: is_qa,
             guide_topic: GuideTopic::QuickStart,
             guide_textures: HashMap::new(),
@@ -812,6 +816,7 @@ impl LuaToolsApp {
             if app.settings_service.settings.check_updates_on_startup {
                 app.check_app_update_once_async(&cc.egui_ctx);
             }
+            app.probe_bridge_async(&cc.egui_ctx);
             if app.auth_service.is_signed_in() {
                 app.fetch_usage_async(&cc.egui_ctx);
             }
@@ -942,6 +947,7 @@ impl LuaToolsApp {
             status_text: "Ready — drop .lua, .manifest, or .zip files anywhere to install".into(),
             active_toast: None,
             millennium_connected: false,
+            native_millennium_plugin_installed: false,
             cover_textures: HashMap::new(),
             cover_lru: VecDeque::new(),
             cover_in_flight: HashSet::new(),
@@ -1027,6 +1033,7 @@ impl LuaToolsApp {
             live_steam_pid: None,
             last_steam_poll: std::time::Instant::now(),
             steam_poll_in_flight: false,
+            steam_poll_completed: false,
             is_headless_demo: true,
             guide_topic: GuideTopic::QuickStart,
             guide_textures: HashMap::new(),
@@ -1274,6 +1281,7 @@ impl LuaToolsApp {
             self.hot_reload_service
                 .update_watch_dir(&inst.stplug_in_path);
             self.wired_service.steam_root = Some(inst.root.clone());
+            self.millennium_service.steam_root = Some(inst.root.clone());
             self.api_client.set_steam_root(Some(inst.root.clone()));
             self.app_info_cache.set_steam_root(Some(inst.root.clone()));
             self.cover_cache.set_steam_root(Some(inst.root.clone()));
@@ -1356,6 +1364,7 @@ impl LuaToolsApp {
             self.steam_library_service.steam_installation = None;
             self.steam_bridge_service.set_steam_installation(None);
             self.wired_service.steam_root = None;
+            self.millennium_service.steam_root = None;
             self.api_client.set_steam_root(None);
             self.app_info_cache.set_steam_root(None);
             self.cover_cache.set_steam_root(None);
@@ -1424,6 +1433,7 @@ impl LuaToolsApp {
             h.join(".local/bin/steam-sls").is_file()
                 || h.join(".local/share/SLSsteam/SLSsteam.so").is_file()
         });
+        self.native_millennium_plugin_installed = self.detect_native_millennium_plugin_installed();
         self.cached_tool_statuses.clear();
         self.telemetry_cache_dirty = true;
         self.refresh_library_rows();
@@ -1431,6 +1441,40 @@ impl LuaToolsApp {
         unsafe {
             libc::malloc_trim(0);
         }
+    }
+
+    pub fn detect_native_millennium_plugin_installed(&self) -> bool {
+        if self.is_headless_demo {
+            return false;
+        }
+        let steam_root = self
+            .steam_service
+            .installation
+            .as_ref()
+            .map(|i| i.root.as_path());
+        MillenniumService::data_dirs(steam_root)
+            .into_iter()
+            .any(|dir| dir.join("plugins/LuaToolsLinux/plugin.json").is_file())
+    }
+
+    pub fn is_any_modal_open(&self) -> bool {
+        let show_first_run = (!self.settings_service.settings.telemetry_consent_seen
+            && !self.started_hidden_or_silent)
+            || self.telemetry_modal_open;
+        show_first_run
+            || self.emblem_overlay_open
+            || self.confirm_modal.open
+            || self.updater_feed.modal_open
+            || self.action_modal.open
+            || self.add_appid_modal.open
+            || self.game_detail_modal.open
+            || self.integration_modal.open
+            || self.launch_options_modal.open
+            || self.depot_detail_modal.open
+            || self.text_prompt_modal.open
+            || self.about_modal_open
+            || self.overwrite_diff_modal.open
+            || self.guide_zoom_screenshot.is_some()
     }
 
     pub fn ensure_tray_initialized(&mut self) {
@@ -3962,6 +4006,9 @@ impl LuaToolsApp {
                     );
                 }
                 UiInternalMsg::FirstRunLtspFinished { ok, msg } => {
+                    self.native_millennium_plugin_installed =
+                        self.detect_native_millennium_plugin_installed();
+                    self.probe_bridge_async(ctx);
                     self.finish_action_modal("ltsp", ok, msg.clone());
                     self.notify(
                         msg,
@@ -3973,6 +4020,9 @@ impl LuaToolsApp {
                     );
                 }
                 UiInternalMsg::LtspInstallFinished { ok, msg } => {
+                    self.native_millennium_plugin_installed =
+                        self.detect_native_millennium_plugin_installed();
+                    self.probe_bridge_async(ctx);
                     self.finish_action_modal("ltsp", ok, msg.clone());
                     self.notify(
                         msg,
@@ -4020,6 +4070,10 @@ impl LuaToolsApp {
                 UiInternalMsg::LiveSteamPidPolled(pid) => {
                     self.steam_poll_in_flight = false;
                     self.live_steam_pid = pid;
+                    self.steam_poll_completed = true;
+                    if let Ok(mut st) = self.steam_bridge_service.status.lock() {
+                        st.steam_pid = pid;
+                    }
                 }
             }
         }
@@ -4065,6 +4119,8 @@ impl LuaToolsApp {
                     steam_path,
                 } => {
                     self.millennium_connected = available;
+                    self.native_millennium_plugin_installed =
+                        self.detect_native_millennium_plugin_installed();
                     let status = if available {
                         format!(
                             "Connected · Millennium v{} · Steam={}",
@@ -4677,7 +4733,9 @@ impl LuaToolsApp {
                     }
                     if chk.available {
                         let badge = match (&chk.remote_version, chk.commits_behind) {
-                            (Some(v), _) if v != VERSION => format!("⬆ Update v{}", v),
+                            (Some(v), _) if UpdateService::is_newer_semver(v, VERSION) => {
+                                format!("⬆ Update v{}", v)
+                            }
                             (_, b) if b > 0 => format!("⬆ Update (+{})", b),
                             _ => "⬆ Update".into(),
                         };
@@ -4801,6 +4859,7 @@ impl LuaToolsApp {
                     self.wired_busy = false;
                     self.wired_status_text = msg.clone();
                     self.refresh_all_local_state();
+                    self.probe_bridge_async(ctx);
                     self.finish_action_modal("wired", ok, msg.clone());
                     self.notify(
                         msg,
@@ -4814,6 +4873,8 @@ impl LuaToolsApp {
                 AppMessage::BridgeActionFinished { ok, msg } => {
                     self.bridge_busy = false;
                     self.bridge_status_msg = msg.clone();
+                    self.bridge_system_preload =
+                        self.steam_bridge_service.status().system_preload_enabled;
                     self.poll_live_steam_pid_async(ctx, true);
                     self.finish_action_modal("bridge", ok, msg.clone());
                     self.notify(
@@ -5149,6 +5210,7 @@ impl LuaToolsApp {
 
     /// Renders the complete UI shell into `ctx` (callable both from `eframe::App::update` and headless layout tests).
     pub fn render_shell(&mut self, ctx: &egui::Context) {
+        crate::ui::theme::set_modal_layer_active(ctx, self.is_any_modal_open());
         // Release decoded guide screenshot textures as soon as the user leaves Help
         if self.active_view != ActiveView::Guide
             && self.guide_zoom_screenshot.is_none()
@@ -5196,7 +5258,11 @@ impl LuaToolsApp {
 
         let bridge_st = self.steam_bridge_service.status();
         let steam_online = self.steam_service.is_available();
-        let steam_running = self.live_steam_pid.is_some() || bridge_st.steam_pid.is_some();
+        let steam_running = if self.steam_poll_completed {
+            self.live_steam_pid.is_some()
+        } else {
+            self.live_steam_pid.is_some() || bridge_st.steam_pid.is_some()
+        };
         let steam_ready = self.steam_sls_installed
             || bridge_st.integration_lib_installed
             || bridge_st.launcher_installed

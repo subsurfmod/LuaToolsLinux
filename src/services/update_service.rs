@@ -1585,6 +1585,103 @@ impl UpdateService {
         Ok(())
     }
 
+    #[cfg(unix)]
+    fn atomic_symlink(target: &str, link_path: &Path) -> Result<(), String> {
+        if let Some(parent) = link_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+        }
+        if let Ok(meta) = fs::symlink_metadata(link_path) {
+            if meta.file_type().is_dir() {
+                fs::remove_dir_all(link_path).map_err(|e| {
+                    format!(
+                        "Failed to remove existing directory {}: {}",
+                        link_path.display(),
+                        e
+                    )
+                })?;
+            }
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_name = format!(
+            ".{}.tmp.{}.{}",
+            link_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("link"),
+            std::process::id(),
+            stamp
+        );
+        let tmp_link = link_path.with_file_name(tmp_name);
+        let _ = fs::remove_file(&tmp_link);
+        std::os::unix::fs::symlink(target, &tmp_link)
+            .map_err(|e| format!("Failed to create symlink {}: {}", tmp_link.display(), e))?;
+        fs::rename(&tmp_link, link_path).map_err(|e| {
+            let _ = fs::remove_file(&tmp_link);
+            format!(
+                "Failed to atomically install symlink {} -> {}: {}",
+                link_path.display(),
+                target,
+                e
+            )
+        })?;
+        Ok(())
+    }
+
+    fn sync_bridge_lib_layout(
+        base_dir: &Path,
+        bridge_32: Option<&Path>,
+        bridge_64: Option<&Path>,
+    ) -> Vec<PathBuf> {
+        let mut installed = Vec::new();
+        if let Some(b32) = bridge_32 {
+            for rel in [
+                "libsteam_integration.so",
+                "libsteam_integration32.so",
+                "32/libsteam_integration.so",
+                "lib/libsteam_integration.so",
+            ] {
+                let dst = base_dir.join(rel);
+                if Self::atomic_replace_executable(b32, &dst).is_ok() {
+                    installed.push(dst);
+                }
+            }
+            #[cfg(unix)]
+            {
+                let _ = Self::atomic_symlink("lib", &base_dir.join("lib32"));
+                let _ = Self::atomic_symlink("lib", &base_dir.join("i386-linux-gnu"));
+                let _ = Self::atomic_symlink("../32", &base_dir.join("lib/i386-linux-gnu"));
+            }
+        } else if let Some(b64) = bridge_64 {
+            let dst = base_dir.join("libsteam_integration.so");
+            if Self::atomic_replace_executable(b64, &dst).is_ok() {
+                installed.push(dst);
+            }
+        }
+
+        if let Some(b64) = bridge_64 {
+            for rel in [
+                "libsteam_integration64.so",
+                "64/libsteam_integration.so",
+                "lib64/libsteam_integration.so",
+            ] {
+                let dst = base_dir.join(rel);
+                if Self::atomic_replace_executable(b64, &dst).is_ok() {
+                    installed.push(dst);
+                }
+            }
+            #[cfg(unix)]
+            {
+                let _ = Self::atomic_symlink("lib64", &base_dir.join("x86_64-linux-gnu"));
+                let _ = Self::atomic_symlink("../lib64", &base_dir.join("lib/x86_64-linux-gnu"));
+            }
+        }
+        installed
+    }
+
     fn find_git_bin() -> Option<PathBuf> {
         let path_var = std::env::var_os("PATH")?;
         std::env::split_paths(&path_var)
@@ -1716,14 +1813,14 @@ impl UpdateService {
             .unwrap_or(VERSION);
         let new_version = release_tag.trim_start_matches('v').to_string();
 
-        if Self::is_newer_semver(VERSION, &new_version) {
+        if !Self::is_newer_semver(&new_version, VERSION) {
             emit(
                 &mut progress_cb,
                 0.10,
                 "Checking latest GitHub Release",
                 "",
                 format!(
-                    "No prebuilt Linux binary available (latest GitHub Release v{} is older than running v{}); falling back to Git + Cargo source build...",
+                    "No newer prebuilt Linux release available (latest GitHub Release v{} is not newer than running v{}); falling back to Git + Cargo source build...",
                     new_version, VERSION
                 ),
             );
@@ -2236,38 +2333,54 @@ impl UpdateService {
                 progress_cb(ev);
             });
 
-            let built_so = {
-                let i686_so = crate_dir.join("target/i686-unknown-linux-gnu/release/libsteam_integration.so");
+            let bridge_32_path =
+                crate_dir.join("target/i686-unknown-linux-gnu/release/libsteam_integration.so");
+            let bridge_64_path = {
+                let rel_so = crate_dir.join("target/release/libsteam_integration.so");
                 let dbg_so = crate_dir.join("target/debug-debug/libsteam_integration.so");
-                if i686_so.is_file() {
-                    i686_so
+                if rel_so.is_file() {
+                    Some(rel_so)
                 } else if dbg_so.is_file() {
-                    dbg_so
+                    Some(dbg_so)
                 } else {
-                    crate_dir.join("target/release/libsteam_integration.so")
+                    None
                 }
             };
-            if built_so.is_file() {
-                let dist_so = crate_dir.join("dist/libsteam_integration.so");
-                let _ = Self::atomic_replace_executable(&built_so, &dist_so);
-                progress_cb(UpdateProgressEvent {
-                    fraction: 0.93,
-                    stage_label: "3/3 Installing binaries".into(),
-                    current_crate: "libsteam_integration.so".into(),
-                    compiled_crates: tracker.compiled_crates,
-                    total_crates: tracker.total_crates,
-                    log_line: Some(format!("Installed {}", dist_so.display())),
-                });
+            let bridge_32 = bridge_32_path.is_file().then_some(bridge_32_path.as_path());
+            let bridge_64 = bridge_64_path.as_deref();
+
+            if bridge_32.is_some() || bridge_64.is_some() {
+                let dist_dir = crate_dir.join("dist");
+                let synced_dist = Self::sync_bridge_lib_layout(&dist_dir, bridge_32, bridge_64);
+                if !synced_dist.is_empty() {
+                    progress_cb(UpdateProgressEvent {
+                        fraction: 0.93,
+                        stage_label: "3/3 Installing binaries".into(),
+                        current_crate: "libsteam_integration.so".into(),
+                        compiled_crates: tracker.compiled_crates,
+                        total_crates: tracker.total_crates,
+                        log_line: Some(format!(
+                            "Synced {} multilib bridge file(s) in {}",
+                            synced_dist.len(),
+                            dist_dir.display()
+                        )),
+                    });
+                }
                 if let Some(home) = dirs::home_dir() {
-                    let lib_dst = home.join(".local/lib/luatools/libsteam_integration.so");
-                    if Self::atomic_replace_executable(&built_so, &lib_dst).is_ok() {
+                    let lib_dir = home.join(".local/lib/luatools");
+                    let synced_local = Self::sync_bridge_lib_layout(&lib_dir, bridge_32, bridge_64);
+                    if !synced_local.is_empty() {
                         progress_cb(UpdateProgressEvent {
                             fraction: 0.94,
                             stage_label: "3/3 Installing binaries".into(),
                             current_crate: "libsteam_integration.so".into(),
                             compiled_crates: tracker.compiled_crates,
                             total_crates: tracker.total_crates,
-                            log_line: Some(format!("Installed {}", lib_dst.display())),
+                            log_line: Some(format!(
+                                "Synced {} multilib bridge file(s) in {}",
+                                synced_local.len(),
+                                lib_dir.display()
+                            )),
                         });
                     }
                 }

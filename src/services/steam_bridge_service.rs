@@ -5,9 +5,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+static OVERRIDES_TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 use serde::{Deserialize, Serialize};
 
@@ -306,14 +310,38 @@ impl SteamBridgeService {
             let _ = fs::create_dir_all(parent);
         }
         if let Ok(js) = serde_json::to_string_pretty(ov) {
+            let cnt = OVERRIDES_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
             let tmp = self
                 .overrides_path
-                .with_extension(format!("json.tmp.{}", std::process::id()));
-            if fs::write(&tmp, &js).is_ok() && fs::rename(&tmp, &self.overrides_path).is_err() {
+                .with_extension(format!("json.tmp.{}.{}", std::process::id(), cnt));
+            if let Err(e) = fs::write(&tmp, &js) {
+                log::error!(
+                    "Failed to write temporary bridge overrides {}: {}",
+                    tmp.display(),
+                    e
+                );
+                let _ = fs::remove_file(&tmp);
+                return;
+            }
+            if fs::rename(&tmp, &self.overrides_path).is_err() {
                 let _ = fs::remove_file(&tmp);
                 let _ = fs::write(&self.overrides_path, &js);
             }
         }
+    }
+
+    /// Mutates `self.overrides` under lock, clones a snapshot, drops the mutex, and persists
+    /// outside the critical section so disk I/O never blocks other lock holders.
+    fn mutate_and_save_overrides<F>(&self, mutate: F)
+    where
+        F: FnOnce(&mut BridgeOverrides),
+    {
+        let snapshot = {
+            let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
+            mutate(&mut ov);
+            ov.clone()
+        };
+        self.save_overrides(&snapshot);
     }
 
     pub fn snapshot_overrides(&self) -> BridgeOverrides {
@@ -460,57 +488,18 @@ impl SteamBridgeService {
         candidates.push(PathBuf::from("/usr/lib/luatools/libsteam_integration.so"));
 
         if let Some(src) = candidates.into_iter().find(|p| p.is_file()) {
-            let needs_copy = if !self.lib_target_path.is_file() {
-                true
-            } else {
-                let same_file = fs::canonicalize(&src)
-                    .ok()
-                    .zip(fs::canonicalize(&self.lib_target_path).ok())
-                    .is_some_and(|(a, b)| a == b);
-                if same_file {
-                    false
+            let src64 = UpdateService::discover_repo_dir("").and_then(|repo| {
+                let rel64 = repo.join("target/release/libsteam_integration.so");
+                let dbg64 = repo.join("target/debug-debug/libsteam_integration.so");
+                if rel64.is_file() {
+                    Some(rel64)
+                } else if dbg64.is_file() {
+                    Some(dbg64)
                 } else {
-                    match (fs::metadata(&src), fs::metadata(&self.lib_target_path)) {
-                        (Ok(sm), Ok(dm)) => {
-                            let newer = sm
-                                .modified()
-                                .ok()
-                                .zip(dm.modified().ok())
-                                .is_some_and(|(s, d)| s > d);
-                            newer || sm.len() != dm.len()
-                        }
-                        _ => true,
-                    }
+                    None
                 }
-            };
-            if needs_copy {
-                UpdateService::atomic_replace_executable(&src, &self.lib_target_path)?;
-                if let Some(parent) = self.lib_target_path.parent() {
-                    let _ = fs::create_dir_all(parent.join("32"));
-                    let _ = fs::create_dir_all(parent.join("lib"));
-                    let _ = fs::copy(&src, parent.join("32/libsteam_integration.so"));
-                    let _ = fs::copy(&src, parent.join("lib/libsteam_integration.so"));
-                    let _ = fs::copy(&src, parent.join("libsteam_integration32.so"));
-                    if let Some(repo) = UpdateService::discover_repo_dir("") {
-                        let rel64 = repo.join("target/release/libsteam_integration.so");
-                        let dbg64 = repo.join("target/debug-debug/libsteam_integration.so");
-                        let src64 = if rel64.is_file() {
-                            Some(rel64)
-                        } else if dbg64.is_file() {
-                            Some(dbg64)
-                        } else {
-                            None
-                        };
-                        if let Some(s64) = src64 {
-                            let _ = fs::create_dir_all(parent.join("64"));
-                            let _ = fs::create_dir_all(parent.join("lib64"));
-                            let _ = fs::copy(&s64, parent.join("64/libsteam_integration.so"));
-                            let _ = fs::copy(&s64, parent.join("lib64/libsteam_integration.so"));
-                            let _ = fs::copy(&s64, parent.join("libsteam_integration64.so"));
-                        }
-                    }
-                }
-            }
+            });
+            stage_multilib_libraries(&self.lib_target_path, &src, src64.as_deref())?;
             return Ok(self.lib_target_path.clone());
         }
 
@@ -542,14 +531,20 @@ impl SteamBridgeService {
                 let built_i686 = repo.join("target/i686-unknown-linux-gnu/release/libsteam_integration.so");
                 if let Ok(ref out) = out_i686 {
                     if out.status.success() && built_i686.is_file() {
-                        UpdateService::atomic_replace_executable(&built_i686, &self.lib_target_path)?;
-                        if let Some(parent) = self.lib_target_path.parent() {
-                            let _ = fs::create_dir_all(parent.join("32"));
-                            let _ = fs::create_dir_all(parent.join("lib"));
-                            let _ = fs::copy(&built_i686, parent.join("32/libsteam_integration.so"));
-                            let _ = fs::copy(&built_i686, parent.join("lib/libsteam_integration.so"));
-                            let _ = fs::copy(&built_i686, parent.join("libsteam_integration32.so"));
-                        }
+                        let rel64 = repo.join("target/release/libsteam_integration.so");
+                        let dbg64 = repo.join("target/debug-debug/libsteam_integration.so");
+                        let src64 = if rel64.is_file() {
+                            Some(rel64)
+                        } else if dbg64.is_file() {
+                            Some(dbg64)
+                        } else {
+                            None
+                        };
+                        stage_multilib_libraries(
+                            &self.lib_target_path,
+                            &built_i686,
+                            src64.as_deref(),
+                        )?;
                         return Ok(self.lib_target_path.clone());
                     }
                 }
@@ -569,7 +564,7 @@ impl SteamBridgeService {
                     .map_err(|e| format!("Failed to invoke cargo to build bridge_lib: {}", e))?;
                 let built_dbg = repo.join("target/debug-debug/libsteam_integration.so");
                 if out.status.success() && built_dbg.is_file() {
-                    UpdateService::atomic_replace_executable(&built_dbg, &self.lib_target_path)?;
+                    atomic_stage_so_if_stale(&built_dbg, &self.lib_target_path)?;
                     return Ok(self.lib_target_path.clone());
                 }
 
@@ -580,7 +575,7 @@ impl SteamBridgeService {
                     .map_err(|e| format!("Failed to invoke cargo to build bridge_lib: {}", e))?;
                 let built_rel = repo.join("target/release/libsteam_integration.so");
                 if out_rel.status.success() && built_rel.is_file() {
-                    UpdateService::atomic_replace_executable(&built_rel, &self.lib_target_path)?;
+                    atomic_stage_so_if_stale(&built_rel, &self.lib_target_path)?;
                     return Ok(self.lib_target_path.clone());
                 }
             }
@@ -708,13 +703,41 @@ impl SteamBridgeService {
             preload_loader::disable_system_preload(&self.lib_target_path)
                 .map_err(|e| format!("Failed to clean /etc/ld.so.preload (needs root): {}", e))?;
         }
-        if self.launcher_path.exists() {
+        if fs::symlink_metadata(&self.launcher_path).is_ok() {
             fs::remove_file(&self.launcher_path)
                 .map_err(|e| format!("Failed to remove launcher: {}", e))?;
         }
-        if self.lib_target_path.exists() {
+        if fs::symlink_metadata(&self.lib_target_path).is_ok() {
             fs::remove_file(&self.lib_target_path)
                 .map_err(|e| format!("Failed to remove integration library: {}", e))?;
+        }
+        if let Some(parent) = self.lib_target_path.parent() {
+            for staged_file in ["libsteam_integration32.so", "libsteam_integration64.so"] {
+                let path = parent.join(staged_file);
+                if fs::symlink_metadata(&path).is_ok() {
+                    fs::remove_file(&path).map_err(|e| {
+                        format!("Failed to remove staged library {}: {}", path.display(), e)
+                    })?;
+                }
+            }
+            for staged_dir in ["lib", "32", "lib64", "64"] {
+                let path = parent.join(staged_dir);
+                if let Ok(meta) = fs::symlink_metadata(&path) {
+                    if meta.file_type().is_dir() {
+                        fs::remove_dir_all(&path).map_err(|e| {
+                            format!(
+                                "Failed to remove staged directory {}: {}",
+                                path.display(),
+                                e
+                            )
+                        })?;
+                    } else {
+                        fs::remove_file(&path).map_err(|e| {
+                            format!("Failed to remove staged entry {}: {}", path.display(), e)
+                        })?;
+                    }
+                }
+            }
         }
         let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
         status.integration_active = false;
@@ -731,20 +754,16 @@ impl SteamBridgeService {
     // ===== Per-Game & Per-Depot Integration Actions (Local Persistence + Live IPC) =====
 
     pub fn add_redirect_app(&self, app_id: u32) {
-        {
-            let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
+        self.mutate_and_save_overrides(|ov| {
             ov.redirect_apps.insert(app_id);
-            self.save_overrides(&ov);
-        }
+        });
         let _ = self.send_ipc_message(IpcMessage::AddPlayUnownedApp { app_id });
     }
 
     pub fn remove_redirect_app(&self, app_id: u32) {
-        {
-            let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
+        self.mutate_and_save_overrides(|ov| {
             ov.redirect_apps.remove(&app_id);
-            self.save_overrides(&ov);
-        }
+        });
         let _ = self.send_ipc_message(IpcMessage::RemovePlayUnownedApp { app_id });
     }
 
@@ -757,20 +776,16 @@ impl SteamBridgeService {
     }
 
     pub fn set_app_id_spoof(&self, app_id: u32, spoof_id: u32) {
-        {
-            let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
+        self.mutate_and_save_overrides(|ov| {
             ov.app_id_spoofs.insert(app_id, spoof_id);
-            self.save_overrides(&ov);
-        }
+        });
         let _ = self.send_ipc_message(IpcMessage::SetAppIdSpoof { app_id, spoof_id });
     }
 
     pub fn remove_app_id_spoof(&self, app_id: u32) {
-        {
-            let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
+        self.mutate_and_save_overrides(|ov| {
             ov.app_id_spoofs.remove(&app_id);
-            self.save_overrides(&ov);
-        }
+        });
         let _ = self.send_ipc_message(IpcMessage::RemoveAppIdSpoof { app_id });
     }
 
@@ -789,11 +804,9 @@ impl SteamBridgeService {
             self.remove_legacy_cd_key(app_id);
             return;
         }
-        {
-            let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
+        self.mutate_and_save_overrides(|ov| {
             ov.legacy_cd_keys.insert(app_id, key.clone());
-            self.save_overrides(&ov);
-        }
+        });
         let _ = self
             .legacy_cd_key_store
             .lock()
@@ -803,11 +816,9 @@ impl SteamBridgeService {
     }
 
     pub fn remove_legacy_cd_key(&self, app_id: u32) {
-        {
-            let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
+        self.mutate_and_save_overrides(|ov| {
             ov.legacy_cd_keys.remove(&app_id);
-            self.save_overrides(&ov);
-        }
+        });
         let _ = self
             .legacy_cd_key_store
             .lock()
@@ -932,20 +943,16 @@ impl SteamBridgeService {
             self.remove_depot_key(depot_id);
             return;
         }
-        {
-            let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
+        self.mutate_and_save_overrides(|ov| {
             ov.depot_keys.insert(depot_id, key.clone());
-            self.save_overrides(&ov);
-        }
+        });
         let _ = self.send_ipc_message(IpcMessage::SetDepotKey { depot_id, key });
     }
 
     pub fn remove_depot_key(&self, depot_id: u32) {
-        {
-            let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
+        self.mutate_and_save_overrides(|ov| {
             ov.depot_keys.remove(&depot_id);
-            self.save_overrides(&ov);
-        }
+        });
         let _ = self.send_ipc_message(IpcMessage::RemoveDepotKey { depot_id });
     }
 
@@ -963,14 +970,12 @@ impl SteamBridgeService {
         if stat_name.is_empty() {
             return;
         }
-        {
-            let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
+        self.mutate_and_save_overrides(|ov| {
             ov.stats
                 .entry(app_id)
                 .or_default()
                 .insert(stat_name.clone(), stat_value.clone());
-            self.save_overrides(&ov);
-        }
+        });
         let _ = self.send_ipc_message(IpcMessage::SetStat {
             app_id,
             stat_name,
@@ -980,16 +985,14 @@ impl SteamBridgeService {
 
     pub fn remove_stat(&self, app_id: u32, stat_name: &str) {
         let stat_name = stat_name.trim();
-        {
-            let mut ov = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
+        self.mutate_and_save_overrides(|ov| {
             if let Some(map) = ov.stats.get_mut(&app_id) {
                 map.remove(stat_name);
                 if map.is_empty() {
                     ov.stats.remove(&app_id);
                 }
             }
-            self.save_overrides(&ov);
-        }
+        });
         let _ = self.send_ipc_message(IpcMessage::RemoveStat {
             app_id,
             stat_name: stat_name.to_string(),
@@ -1078,6 +1081,140 @@ impl SteamBridgeService {
         let client = IpcClient::new();
         client.send(&msg)
     }
+}
+
+fn file_needs_refresh(src: &Path, dst: &Path) -> bool {
+    if !dst.is_file() {
+        return true;
+    }
+    let same_file = fs::canonicalize(src)
+        .ok()
+        .zip(fs::canonicalize(dst).ok())
+        .is_some_and(|(a, b)| a == b);
+    if same_file {
+        return false;
+    }
+    match (fs::metadata(src), fs::metadata(dst)) {
+        (Ok(sm), Ok(dm)) => {
+            let newer = sm
+                .modified()
+                .ok()
+                .zip(dm.modified().ok())
+                .is_some_and(|(s, d)| s > d);
+            newer || sm.len() != dm.len()
+        }
+        _ => true,
+    }
+}
+
+/// Atomically stages a shared library via a sibling temp file (`<name>.tmp.<pid>`) + `fs::rename`
+/// so a live process with `dst` `mmap`-ed never suffers `SIGBUS` from in-place truncation.
+fn atomic_stage_so_if_stale(src: &Path, dst: &Path) -> Result<(), String> {
+    if !file_needs_refresh(src, dst) {
+        return Ok(());
+    }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create directory {}: {}", parent.display(), e))?;
+    }
+    let file_name = dst
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("libsteam_integration.so");
+    let tmp = dst.with_file_name(format!("{}.tmp.{}", file_name, std::process::id()));
+    if let Err(e) = fs::copy(src, &tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!(
+            "Failed to copy {} to temporary file {}: {}",
+            src.display(),
+            tmp.display(),
+            e
+        ));
+    }
+    let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755));
+    if let Err(e) = fs::rename(&tmp, dst) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!(
+            "Failed to atomically replace {} from {}: {}",
+            dst.display(),
+            tmp.display(),
+            e
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_relative_symlink(link_path: &Path, target: &Path) -> Result<(), String> {
+    if let Some(parent) = link_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "Failed to create symlink parent directory {}: {}",
+                parent.display(),
+                e
+            )
+        })?;
+    }
+    if let Ok(existing) = fs::read_link(link_path) {
+        if existing == target {
+            return Ok(());
+        }
+    }
+    if let Ok(meta) = fs::symlink_metadata(link_path) {
+        if meta.file_type().is_dir() {
+            fs::remove_dir_all(link_path).map_err(|e| {
+                format!(
+                    "Failed to remove directory blocking symlink {}: {}",
+                    link_path.display(),
+                    e
+                )
+            })?;
+        }
+    }
+    let file_name = link_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("symlink");
+    let tmp_link = link_path.with_file_name(format!("{}.tmp.{}", file_name, std::process::id()));
+    let _ = fs::remove_file(&tmp_link);
+    std::os::unix::fs::symlink(target, &tmp_link).map_err(|e| {
+        format!(
+            "Failed to create temp symlink {} -> {}: {}",
+            tmp_link.display(),
+            target.display(),
+            e
+        )
+    })?;
+    if let Err(e) = fs::rename(&tmp_link, link_path) {
+        let _ = fs::remove_file(&tmp_link);
+        return Err(format!(
+            "Failed to atomically install symlink {} -> {}: {}",
+            link_path.display(),
+            target.display(),
+            e
+        ));
+    }
+    Ok(())
+}
+
+fn stage_multilib_libraries(
+    lib_target_path: &Path,
+    src32: &Path,
+    src64: Option<&Path>,
+) -> Result<(), String> {
+    atomic_stage_so_if_stale(src32, lib_target_path)?;
+    if let Some(parent) = lib_target_path.parent() {
+        atomic_stage_so_if_stale(src32, &parent.join("32/libsteam_integration.so"))?;
+        atomic_stage_so_if_stale(src32, &parent.join("lib/libsteam_integration.so"))?;
+        atomic_stage_so_if_stale(src32, &parent.join("libsteam_integration32.so"))?;
+        if let Some(s64) = src64 {
+            atomic_stage_so_if_stale(s64, &parent.join("64/libsteam_integration.so"))?;
+            atomic_stage_so_if_stale(s64, &parent.join("lib64/libsteam_integration.so"))?;
+            atomic_stage_so_if_stale(s64, &parent.join("libsteam_integration64.so"))?;
+        }
+        ensure_relative_symlink(&parent.join("lib/i386-linux-gnu"), Path::new("../32"))?;
+        ensure_relative_symlink(&parent.join("lib/x86_64-linux-gnu"), Path::new("../lib64"))?;
+    }
+    Ok(())
 }
 
 fn is_in_ld_so_preload(lib_path: &Path) -> bool {
@@ -1210,5 +1347,70 @@ mod tests {
         svc.register_denuvo_app(1245620);
         assert!(svc.is_denuvo_app(1245620));
         svc.unregister_denuvo_app(1245620);
+    }
+
+    #[test]
+    fn stages_multilib_atomically_creates_debian_symlinks_and_uninstall_cleans_all() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut svc = SteamBridgeService::with_paths(None, Some(tmp.path().join("sandbox")));
+
+        let src_dir = tmp.path().join("src_libs");
+        fs::create_dir_all(&src_dir).unwrap();
+        let src32 = src_dir.join("lib32.so");
+        let src64 = src_dir.join("lib64.so");
+        fs::write(&src32, b"\x7fELF32_INITIAL").unwrap();
+        fs::write(&src64, b"\x7fELF64_INITIAL").unwrap();
+
+        stage_multilib_libraries(&svc.lib_target_path, &src32, Some(&src64)).unwrap();
+
+        let parent = svc.lib_target_path.parent().unwrap().to_path_buf();
+        assert!(svc.lib_target_path.is_file());
+        assert!(parent.join("32/libsteam_integration.so").is_file());
+        assert!(parent.join("lib/libsteam_integration.so").is_file());
+        assert!(parent.join("libsteam_integration32.so").is_file());
+        assert!(parent.join("64/libsteam_integration.so").is_file());
+        assert!(parent.join("lib64/libsteam_integration.so").is_file());
+        assert!(parent.join("libsteam_integration64.so").is_file());
+        assert_eq!(
+            fs::read_link(parent.join("lib/i386-linux-gnu")).unwrap(),
+            Path::new("../32")
+        );
+        assert_eq!(
+            fs::read_link(parent.join("lib/x86_64-linux-gnu")).unwrap(),
+            Path::new("../lib64")
+        );
+
+        // Independent freshness check + atomic rename (new inode, prevents SIGBUS on mapped .so)
+        let orig_32_ino = fs::metadata(&svc.lib_target_path).unwrap().ino();
+        let orig_64_ino = fs::metadata(parent.join("lib64/libsteam_integration.so"))
+            .unwrap()
+            .ino();
+        fs::write(&src64, b"\x7fELF64_UPDATED_LONGER_PAYLOAD").unwrap();
+
+        stage_multilib_libraries(&svc.lib_target_path, &src32, Some(&src64)).unwrap();
+
+        assert_eq!(fs::metadata(&svc.lib_target_path).unwrap().ino(), orig_32_ino);
+        assert_ne!(
+            fs::metadata(parent.join("lib64/libsteam_integration.so"))
+                .unwrap()
+                .ino(),
+            orig_64_ino
+        );
+        assert_eq!(
+            fs::read(parent.join("lib64/libsteam_integration.so")).unwrap(),
+            b"\x7fELF64_UPDATED_LONGER_PAYLOAD"
+        );
+
+        // Uninstall must clean all staged files and subdirectories
+        svc.uninstall_integration().unwrap();
+        assert!(!svc.lib_target_path.exists());
+        assert!(!parent.join("libsteam_integration32.so").exists());
+        assert!(!parent.join("libsteam_integration64.so").exists());
+        assert!(!parent.join("lib").exists());
+        assert!(!parent.join("32").exists());
+        assert!(!parent.join("lib64").exists());
+        assert!(!parent.join("64").exists());
     }
 }

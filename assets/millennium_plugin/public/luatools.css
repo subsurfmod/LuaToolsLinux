@@ -50,6 +50,12 @@
   border: 1px solid #5c7e10;
 }
 
+.luatools-badge-disabled {
+  background: rgba(184, 134, 11, 0.25);
+  color: #f0c05a;
+  border: 1px solid #9e7319;
+}
+
 .luatools-badge-available {
   background: rgba(42, 71, 94, 0.4);
   color: #66c0f4;
@@ -93,13 +99,18 @@
   text-decoration: none;
 }
 
+.luatools-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 .luatools-btn-primary {
   background: linear-gradient(90deg, #799905 0%, #536f06 100%);
   color: #ffffff;
   text-shadow: 0 1px 2px rgba(0,0,0,0.5);
 }
 
-.luatools-btn-primary:hover {
+.luatools-btn-primary:hover:not(:disabled) {
   background: linear-gradient(90deg, #8cb006 0%, #5e7f07 100%);
   box-shadow: 0 0 10px rgba(164, 208, 7, 0.4);
 }
@@ -109,7 +120,7 @@
   color: #c6d4df;
 }
 
-.luatools-btn-secondary:hover {
+.luatools-btn-secondary:hover:not(:disabled) {
   background: #3a6282;
   color: #ffffff;
 }
@@ -119,7 +130,7 @@
   color: #ffccd0;
 }
 
-.luatools-btn-danger:hover {
+.luatools-btn-danger:hover:not(:disabled) {
   background: #a32b37;
   color: #ffffff;
 }
@@ -140,6 +151,7 @@
   padding: 8px 10px;
   background: #476005;
   color: #ffffff;
+  border: none;
   border-left: 1px solid rgba(0,0,0,0.2);
   cursor: pointer;
 }
@@ -174,9 +186,15 @@
   transition: background 0.15s ease;
 }
 
-.luatools-dropdown-item:hover {
+.luatools-dropdown-item:hover:not(.disabled) {
   background: #2a475e;
   color: #ffffff;
+}
+
+.luatools-dropdown-item.disabled {
+  opacity: 0.45;
+  color: #7c8b99;
+  cursor: not-allowed;
 }
 
 /* Progress bar */

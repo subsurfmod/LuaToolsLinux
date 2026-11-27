@@ -16,6 +16,7 @@ for arg in "$@"; do
 done
 
 # Helper function to remove registered MIME scheme handlers for luatools.desktop
+# atomically while preserving file ownership/permissions and sibling handlers.
 clean_mime_handlers() {
     local target_home="$1"
     local mimeapps_paths=(
@@ -24,13 +25,59 @@ clean_mime_handlers() {
     )
     for mime_file in "${mimeapps_paths[@]}"; do
         if [ -f "$mime_file" ]; then
-            sed -i \
-                -e '/^x-scheme-handler\/luatools=.*luatools\.desktop/d' \
-                -e '/^x-scheme-handler\/bst=.*luatools\.desktop/d' \
-                -e 's/luatools\.desktop;//g' \
-                -e 's/;luatools\.desktop//g' \
-                -e 's/luatools\.desktop//g' \
-                "$mime_file" 2>/dev/null || true
+            local mime_tmp="${mime_file}.tmp.$$"
+            if command -v python3 >/dev/null 2>&1 && python3 -c "
+import os, sys
+src, tmp = sys.argv[1], sys.argv[2]
+try:
+    st = os.stat(src)
+    with open(src, 'r', encoding='utf-8', errors='replace') as f:
+        lines = f.readlines()
+    out = []
+    changed = False
+    for line in lines:
+        if 'luatools.desktop' not in line or '=' not in line or line.lstrip().startswith('['):
+            out.append(line)
+            continue
+        key, rest = line.split('=', 1)
+        eol = '\r\n' if rest.endswith('\r\n') else ('\n' if rest.endswith('\n') else '')
+        val = rest[:-len(eol)] if eol else rest
+        had_trailing_semi = val.endswith(';')
+        tokens = [t for t in val.split(';') if t]
+        filtered = [t for t in tokens if t != 'luatools.desktop']
+        if len(filtered) != len(tokens):
+            changed = True
+            if filtered:
+                joined = ';'.join(filtered) + (';' if had_trailing_semi else '')
+                out.append(f'{key}={joined}{eol}')
+            # If no handlers remain on this key, omit the line cleanly.
+        else:
+            out.append(line)
+    if changed:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.writelines(out)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp, st.st_mode & 0o7777)
+            if os.geteuid() == 0:
+                os.chown(tmp, st.st_uid, st.st_gid)
+        except OSError:
+            pass
+except Exception:
+    try:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    except OSError:
+        pass
+    sys.exit(1)
+" "$mime_file" "$mime_tmp" 2>/dev/null; then
+                if [ -f "$mime_tmp" ]; then
+                    mv -f "$mime_tmp" "$mime_file"
+                fi
+            else
+                rm -f "$mime_tmp" 2>/dev/null || true
+            fi
         fi
     done
 }
@@ -50,7 +97,8 @@ try:
     st = os.stat(src)
     with open(src, 'r', encoding='utf-8') as f:
         d = json.load(f)
-    enabled = d.get('plugins', {}).get('enabledPlugins', [])
+    plugins = d.get('plugins') if isinstance(d, dict) else None
+    enabled = plugins.get('enabledPlugins') if isinstance(plugins, dict) else None
     if isinstance(enabled, list) and 'LuaToolsLinux' in enabled:
         enabled.remove('LuaToolsLinux')
         with open(tmp, 'w', encoding='utf-8') as f:
@@ -80,6 +128,14 @@ except Exception:
     fi
 }
 
+SUDO_HOME=""
+if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
+    SUDO_HOME="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
+    if [ -z "$SUDO_HOME" ]; then
+        SUDO_HOME="/home/${SUDO_USER}"
+    fi
+fi
+
 if [ "$SYSTEM_WIDE" -eq 1 ]; then
     if [ "$(id -u)" -eq 0 ]; then
         rm -f /usr/local/bin/luatools \
@@ -93,16 +149,12 @@ if [ "$SYSTEM_WIDE" -eq 1 ]; then
               "${HOME}/.config/autostart/luatools.desktop"
         clean_mime_handlers "${HOME}"
         clean_millennium_plugin "${HOME}"
-        if [ -n "${SUDO_USER:-}" ]; then
-            sudo_home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
-            if [ -z "$sudo_home" ]; then
-                sudo_home="/home/${SUDO_USER}"
-            fi
-            rm -f "${sudo_home}/.config/autostart/luatools.desktop"
-            clean_mime_handlers "${sudo_home}"
-            clean_millennium_plugin "${sudo_home}"
+        if [ -n "$SUDO_HOME" ]; then
+            rm -f "${SUDO_HOME}/.config/autostart/luatools.desktop"
+            clean_mime_handlers "${SUDO_HOME}"
+            clean_millennium_plugin "${SUDO_HOME}"
             if command -v update-desktop-database >/dev/null 2>&1; then
-                sudo -u "$SUDO_USER" update-desktop-database "${sudo_home}/.local/share/applications" 2>/dev/null || true
+                sudo -u "$SUDO_USER" update-desktop-database "${SUDO_HOME}/.local/share/applications" 2>/dev/null || true
             fi
         fi
         rm -rf /usr/local/lib/luatools/32 \
@@ -143,27 +195,32 @@ if [ "$SYSTEM_WIDE" -eq 1 ]; then
     fi
     echo "[OK] Removed system-wide LuaTools Linux files, autostart entries, and xdg-mime associations."
 else
-    rm -f "${HOME}/.local/bin/luatools" \
-          "${HOME}/.local/bin/luatools-steam-launcher" \
-          "${HOME}/.local/lib/luatools/libsteam_integration.so" \
-          "${HOME}/.local/lib/luatools/libsteam_integration32.so" \
-          "${HOME}/.local/lib/luatools/libsteam_integration64.so" \
-          "${HOME}/.local/lib/luatools/libsteam_auto_patch_linux.so" \
-          "${HOME}/.local/share/applications/luatools.desktop" \
-          "${HOME}/.local/share/icons/hicolor/scalable/apps/luatools.svg" \
-          "${HOME}/.config/autostart/luatools.desktop"
-    clean_mime_handlers "${HOME}"
-    clean_millennium_plugin "${HOME}"
-    rm -rf "${HOME}/.local/lib/luatools/32" \
-           "${HOME}/.local/lib/luatools/64" \
-           "${HOME}/.local/lib/luatools/lib" \
-           "${HOME}/.local/lib/luatools/lib64" \
-           "${HOME}/.local/lib/luatools/lib32" \
-           "${HOME}/.local/lib/luatools/i386-linux-gnu" \
-           "${HOME}/.local/lib/luatools/x86_64-linux-gnu"
-    rmdir "${HOME}/.local/lib/luatools" 2>/dev/null || true
+    TARGET_HOME="${SUDO_HOME:-$HOME}"
+    rm -f "${TARGET_HOME}/.local/bin/luatools" \
+          "${TARGET_HOME}/.local/bin/luatools-steam-launcher" \
+          "${TARGET_HOME}/.local/lib/luatools/libsteam_integration.so" \
+          "${TARGET_HOME}/.local/lib/luatools/libsteam_integration32.so" \
+          "${TARGET_HOME}/.local/lib/luatools/libsteam_integration64.so" \
+          "${TARGET_HOME}/.local/lib/luatools/libsteam_auto_patch_linux.so" \
+          "${TARGET_HOME}/.local/share/applications/luatools.desktop" \
+          "${TARGET_HOME}/.local/share/icons/hicolor/scalable/apps/luatools.svg" \
+          "${TARGET_HOME}/.config/autostart/luatools.desktop"
+    clean_mime_handlers "${TARGET_HOME}"
+    clean_millennium_plugin "${TARGET_HOME}"
+    rm -rf "${TARGET_HOME}/.local/lib/luatools/32" \
+           "${TARGET_HOME}/.local/lib/luatools/64" \
+           "${TARGET_HOME}/.local/lib/luatools/lib" \
+           "${TARGET_HOME}/.local/lib/luatools/lib64" \
+           "${TARGET_HOME}/.local/lib/luatools/lib32" \
+           "${TARGET_HOME}/.local/lib/luatools/i386-linux-gnu" \
+           "${TARGET_HOME}/.local/lib/luatools/x86_64-linux-gnu"
+    rmdir "${TARGET_HOME}/.local/lib/luatools" 2>/dev/null || true
     if command -v update-desktop-database >/dev/null 2>&1; then
-        update-desktop-database "${HOME}/.local/share/applications" 2>/dev/null || true
+        if [ -n "$SUDO_HOME" ] && [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+            sudo -u "$SUDO_USER" update-desktop-database "${TARGET_HOME}/.local/share/applications" 2>/dev/null || true
+        else
+            update-desktop-database "${TARGET_HOME}/.local/share/applications" 2>/dev/null || true
+        fi
     fi
     echo "[OK] Removed user-local LuaTools Linux binary, integration libraries, launcher, autostart entry, xdg-mime associations, and icon."
 fi
@@ -172,6 +229,12 @@ if [ "$PURGE_DATA" -eq 1 ]; then
     rm -rf "${HOME}/.config/luatools" \
            "${HOME}/.local/share/luatools" \
            "${HOME}/.cache/luatools"
+    if [ -n "$SUDO_HOME" ] && [ "$SUDO_HOME" != "$HOME" ]; then
+        rm -rf "${SUDO_HOME}/.config/luatools" \
+               "${SUDO_HOME}/.local/share/luatools" \
+               "${SUDO_HOME}/.cache/luatools"
+        echo "[OK] Purged ${SUDO_HOME}/.config/luatools, ${SUDO_HOME}/.local/share/luatools, and ${SUDO_HOME}/.cache/luatools."
+    fi
     echo "[OK] Purged ~/.config/luatools, ~/.local/share/luatools, and ~/.cache/luatools."
 else
     echo "[INFO] Preserved user vaults & settings (pass --purge to remove them)."

@@ -382,10 +382,31 @@ pub fn is_any_steam_process(comm: &str, exe_path: Option<&Path>, cmdline: &str) 
     false
 }
 
+fn collect_ancestor_pids(start_pid: u32) -> HashSet<u32> {
+    let mut set = HashSet::new();
+    let mut cur = start_pid;
+    for _ in 0..64 {
+        if cur <= 1 || !set.insert(cur) {
+            break;
+        }
+        let next_ppid = fs::read_to_string(format!("/proc/{}/stat", cur))
+            .ok()
+            .and_then(|s| {
+                let rparen = s.rfind(')')?;
+                let mut parts = s[rparen + 1..].split_whitespace();
+                let _state = parts.next()?;
+                parts.next()?.parse::<u32>().ok()
+            })
+            .unwrap_or(0);
+        cur = next_ppid;
+    }
+    set
+}
+
 /// Finds all running Steam client, webhelper, overlay, and Steam Runtime PIDs.
 pub fn find_all_steam_pids() -> Vec<u32> {
     let my_pid = std::process::id();
-    let my_ppid = unsafe { libc::getppid() }.max(0) as u32;
+    let ancestors = collect_ancestor_pids(my_pid);
     let my_uid = unsafe { libc::geteuid() };
     let mut pids = Vec::new();
 
@@ -395,7 +416,7 @@ pub fn find_all_steam_pids() -> Vec<u32> {
             let Ok(pid): Result<u32, _> = pid_str.parse() else {
                 continue;
             };
-            if pid == my_pid || pid == my_ppid || pid <= 1 {
+            if pid <= 1 || ancestors.contains(&pid) {
                 continue;
             }
             if my_uid != 0 {

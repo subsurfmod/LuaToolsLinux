@@ -23,6 +23,52 @@ case "${1:-}" in
     ;;
 esac
 
+# Strip any pre-existing libsteam_integration*.so from LD_PRELOAD cleanly,
+# handling both colon- and whitespace-separated glibc LD_PRELOAD lists without globbing.
+strip_bridge_preload() {
+  (
+    set -f
+    local raw="${1:-}"
+    local out=""
+    local tok=""
+    local IFS=$': \t\n'
+    for tok in $raw; do
+      case "$tok" in
+        ""|*libsteam_integration.so|*libsteam_integration32.so|*libsteam_integration64.so)
+          continue
+          ;;
+      esac
+      out="${out:+${out}:}${tok}"
+    done
+    printf '%s' "$out"
+  )
+}
+
+check_elf_arch() {
+  local path="$1"
+  local expected="$2"
+  [ -f "$path" ] || return 1
+  if command -v file >/dev/null 2>&1; then
+    file -L "$path" 2>/dev/null | grep -q "$expected" || return 1
+  fi
+  return 0
+}
+
+is_valid_multilib_base() {
+  local base="$1"
+  check_elf_arch "${base}/lib/libsteam_integration.so" "ELF 32-bit" || return 1
+  check_elf_arch "${base}/lib64/libsteam_integration.so" "ELF 64-bit" || return 1
+  # On Debian/Ubuntu multiarch systems, glibc $LIB expands to lib/i386-linux-gnu & lib/x86_64-linux-gnu
+  # (or i386-linux-gnu & x86_64-linux-gnu). Verify those paths resolve cleanly before exporting $LIB.
+  if [ -d "/usr/lib/x86_64-linux-gnu" ] || [ -f "/etc/debian_version" ]; then
+    check_elf_arch "${base}/lib/i386-linux-gnu/libsteam_integration.so" "ELF 32-bit" || return 1
+    check_elf_arch "${base}/lib/x86_64-linux-gnu/libsteam_integration.so" "ELF 64-bit" || return 1
+    check_elf_arch "${base}/i386-linux-gnu/libsteam_integration.so" "ELF 32-bit" || return 1
+    check_elf_arch "${base}/x86_64-linux-gnu/libsteam_integration.so" "ELF 64-bit" || return 1
+  fi
+  return 0
+}
+
 # LT-20: Auto-launch LuaTools minimized in background unless user opted out
 # Opt out via LUATOOLS_NO_AUTOLAUNCH=1 or creating ~/.config/luatools/no-autolaunch
 if [ "${LUATOOLS_NO_AUTOLAUNCH:-0}" != "1" ] && [ ! -f "${XDG_CONFIG_HOME:-$HOME/.config}/luatools/no-autolaunch" ]; then
@@ -39,11 +85,15 @@ fi
 
 # Strip any pre-existing libsteam_integration.so from LD_PRELOAD to avoid duplicates
 if [ -n "${LD_PRELOAD:-}" ]; then
-  CLEANED_PRELOAD="$(echo "$LD_PRELOAD" | tr ':' '\n' | grep -v 'libsteam_integration.so' | tr '\n' ':' | sed 's/:$//')"
-  export LD_PRELOAD="$CLEANED_PRELOAD"
+  CLEANED_PRELOAD="$(strip_bridge_preload "$LD_PRELOAD")"
+  if [ -n "$CLEANED_PRELOAD" ]; then
+    export LD_PRELOAD="$CLEANED_PRELOAD"
+  else
+    unset LD_PRELOAD
+  fi
 fi
 
-# Locate integration library: prefer multilib $LIB if both 32-bit and 64-bit are available
+# Locate integration library: prefer multilib $LIB if both 32-bit and 64-bit layout is verified
 INTEGRATION_LIB=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
 
@@ -52,7 +102,7 @@ for base in \
   "/usr/local/lib/luatools" \
   "/usr/lib/luatools" \
   "${SCRIPT_DIR}/../dist"; do
-  if [ -f "${base}/lib/libsteam_integration.so" ] && [ -f "${base}/lib64/libsteam_integration.so" ]; then
+  if is_valid_multilib_base "$base"; then
     INTEGRATION_LIB="${base}/\$LIB/libsteam_integration.so"
     break
   fi
@@ -77,16 +127,9 @@ if [ -z "$INTEGRATION_LIB" ]; then
     "${SCRIPT_DIR}/../dist/libsteam_integration32.so" \
     "${SCRIPT_DIR}/../dist/libsteam_integration.so" \
     "${SCRIPT_DIR}/../target/i686-unknown-linux-gnu/release/libsteam_integration.so"; do
-    if [ -f "$cand" ]; then
-      if command -v file >/dev/null 2>&1; then
-        if file -L "$cand" | grep -q "ELF 32-bit"; then
-          INTEGRATION_LIB="$cand"
-          break
-        fi
-      else
-        INTEGRATION_LIB="$cand"
-        break
-      fi
+    if check_elf_arch "$cand" "ELF 32-bit"; then
+      INTEGRATION_LIB="$cand"
+      break
     fi
   done
 fi
@@ -116,11 +159,15 @@ if [ -n "$INTEGRATION_LIB" ]; then
   fi
 fi
 
-# Fallback path: when 32-bit bridge_lib is absent, strip 64-bit lib from LD_PRELOAD
+# Fallback path: when 32-bit bridge_lib is absent, strip bridge libs from LD_PRELOAD
 # and delegate to external 32-bit SLSsteam.so via steam-sls or LD_AUDIT
 if [ -n "${LD_PRELOAD:-}" ]; then
-  CLEANED_PRELOAD="$(echo "$LD_PRELOAD" | tr ':' '\n' | grep -v 'libsteam_integration.so' | tr '\n' ':' | sed 's/:$//')"
-  export LD_PRELOAD="$CLEANED_PRELOAD"
+  CLEANED_PRELOAD="$(strip_bridge_preload "$LD_PRELOAD")"
+  if [ -n "$CLEANED_PRELOAD" ]; then
+    export LD_PRELOAD="$CLEANED_PRELOAD"
+  else
+    unset LD_PRELOAD
+  fi
 fi
 
 STEAM_SLS="${HOME}/.local/bin/steam-sls"

@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           luatools-linux
-Version:        4.1.2
+Version:        4.1.3
 Release:        1%{?dist}
 Summary:        Native Rust workstation for Steam stplug-in lua manifests, depots, and fixes
 License:        GPL-3.0-or-later
@@ -13,11 +13,16 @@ Requires:       mesa-libGL
 Requires:       libwayland-client
 Requires:       libxkbcommon
 Requires:       libX11
+Requires:       libXcursor
+Requires:       libXi
+Requires:       libXrandr
+Requires:       fontconfig
 Requires:       xdg-utils
 Recommends:     zenity
 Recommends:     zstd
 Recommends:     bzip2
 Recommends:     p7zip
+Recommends:     libnotify
 
 %description
 LuaTools Linux is a lightweight, zero-Python native Rust rewrite of LuaTools
@@ -26,45 +31,49 @@ acquisition, content-addressed LuaVault variant switching, DepotDownloaderMod
 integration, SHA-256 backed game fixes, SLSsteam YAML sync, and binary appinfo.vdf editing.
 
 %install
-mkdir -p %{buildroot}%{_bindir}
-mkdir -p %{buildroot}/usr/lib/luatools
-mkdir -p %{buildroot}%{_datadir}/luatools
-mkdir -p %{buildroot}%{_datadir}/applications
-mkdir -p %{buildroot}%{_datadir}/icons/hicolor/scalable/apps
+mkdir -p "%{buildroot}%{_bindir}"
+mkdir -p "%{buildroot}/usr/lib/luatools"
+mkdir -p "%{buildroot}%{_datadir}/luatools"
+mkdir -p "%{buildroot}%{_datadir}/applications"
+mkdir -p "%{buildroot}%{_datadir}/icons/hicolor/scalable/apps"
+mkdir -p "%{buildroot}%{_datadir}/licenses/%{name}"
 
-install -m 0755 %{_sourcedir}/luatools %{buildroot}%{_bindir}/luatools
-if [ -f %{_sourcedir}/luatools-steam-launcher ]; then
-    install -m 0755 %{_sourcedir}/luatools-steam-launcher %{buildroot}%{_bindir}/luatools-steam-launcher
+install -m 0755 "%{_sourcedir}/luatools" "%{buildroot}%{_bindir}/luatools"
+if [ -f "%{_sourcedir}/luatools-steam-launcher" ]; then
+    install -m 0755 "%{_sourcedir}/luatools-steam-launcher" "%{buildroot}%{_bindir}/luatools-steam-launcher"
 fi
-if [ -f %{_sourcedir}/libsteam_integration.so ]; then
-    install -m 0755 %{_sourcedir}/libsteam_integration.so %{buildroot}/usr/lib/luatools/libsteam_integration.so
+if [ -f "%{_sourcedir}/libsteam_integration.so" ]; then
+    install -m 0755 "%{_sourcedir}/libsteam_integration.so" "%{buildroot}/usr/lib/luatools/libsteam_integration.so"
 fi
-if [ -f %{_sourcedir}/libsteam_integration32.so ]; then
-    mkdir -p %{buildroot}/usr/lib/luatools/32 %{buildroot}/usr/lib/luatools/lib
-    install -m 0755 %{_sourcedir}/libsteam_integration32.so %{buildroot}/usr/lib/luatools/libsteam_integration32.so
-    install -m 0755 %{_sourcedir}/libsteam_integration32.so %{buildroot}/usr/lib/luatools/32/libsteam_integration.so
-    install -m 0755 %{_sourcedir}/libsteam_integration32.so %{buildroot}/usr/lib/luatools/lib/libsteam_integration.so
-    ln -sfn lib %{buildroot}/usr/lib/luatools/lib32
-    ln -sfn lib %{buildroot}/usr/lib/luatools/i386-linux-gnu
-    ln -sfn . %{buildroot}/usr/lib/luatools/lib/i386-linux-gnu
+if [ -f "%{_sourcedir}/libsteam_integration32.so" ]; then
+    mkdir -p "%{buildroot}/usr/lib/luatools/32" "%{buildroot}/usr/lib/luatools/lib"
+    install -m 0755 "%{_sourcedir}/libsteam_integration32.so" "%{buildroot}/usr/lib/luatools/libsteam_integration32.so"
+    install -m 0755 "%{_sourcedir}/libsteam_integration32.so" "%{buildroot}/usr/lib/luatools/32/libsteam_integration.so"
+    install -m 0755 "%{_sourcedir}/libsteam_integration32.so" "%{buildroot}/usr/lib/luatools/lib/libsteam_integration.so"
+    ln -sfn lib "%{buildroot}/usr/lib/luatools/lib32"
+    ln -sfn lib "%{buildroot}/usr/lib/luatools/i386-linux-gnu"
+    ln -sfn ../32 "%{buildroot}/usr/lib/luatools/lib/i386-linux-gnu"
 fi
-if [ -f %{_sourcedir}/libsteam_integration64.so ]; then
-    mkdir -p %{buildroot}/usr/lib/luatools/64 %{buildroot}/usr/lib/luatools/lib64 %{buildroot}/usr/lib/luatools/lib
-    install -m 0755 %{_sourcedir}/libsteam_integration64.so %{buildroot}/usr/lib/luatools/libsteam_integration64.so
-    install -m 0755 %{_sourcedir}/libsteam_integration64.so %{buildroot}/usr/lib/luatools/64/libsteam_integration.so
-    install -m 0755 %{_sourcedir}/libsteam_integration64.so %{buildroot}/usr/lib/luatools/lib64/libsteam_integration.so
-    ln -sfn lib64 %{buildroot}/usr/lib/luatools/x86_64-linux-gnu
-    ln -sfn ../lib64 %{buildroot}/usr/lib/luatools/lib/x86_64-linux-gnu
+if [ -f "%{_sourcedir}/libsteam_integration64.so" ]; then
+    mkdir -p "%{buildroot}/usr/lib/luatools/64" "%{buildroot}/usr/lib/luatools/lib64" "%{buildroot}/usr/lib/luatools/lib"
+    install -m 0755 "%{_sourcedir}/libsteam_integration64.so" "%{buildroot}/usr/lib/luatools/libsteam_integration64.so"
+    install -m 0755 "%{_sourcedir}/libsteam_integration64.so" "%{buildroot}/usr/lib/luatools/64/libsteam_integration.so"
+    install -m 0755 "%{_sourcedir}/libsteam_integration64.so" "%{buildroot}/usr/lib/luatools/lib64/libsteam_integration.so"
+    ln -sfn lib64 "%{buildroot}/usr/lib/luatools/x86_64-linux-gnu"
+    ln -sfn ../lib64 "%{buildroot}/usr/lib/luatools/lib/x86_64-linux-gnu"
 fi
-if [ -f %{_sourcedir}/libsteam_auto_patch_linux.so ]; then
-    install -m 0755 %{_sourcedir}/libsteam_auto_patch_linux.so %{buildroot}/usr/lib/luatools/libsteam_auto_patch_linux.so
+if [ -f "%{_sourcedir}/libsteam_auto_patch_linux.so" ]; then
+    install -m 0755 "%{_sourcedir}/libsteam_auto_patch_linux.so" "%{buildroot}/usr/lib/luatools/libsteam_auto_patch_linux.so"
 fi
-if [ -d %{_sourcedir}/millennium_plugin ]; then
-    mkdir -p %{buildroot}%{_datadir}/luatools/millennium_plugin
-    cp -a %{_sourcedir}/millennium_plugin/. %{buildroot}%{_datadir}/luatools/millennium_plugin/
+if [ -d "%{_sourcedir}/millennium_plugin" ]; then
+    mkdir -p "%{buildroot}%{_datadir}/luatools/millennium_plugin"
+    cp -a "%{_sourcedir}/millennium_plugin/." "%{buildroot}%{_datadir}/luatools/millennium_plugin/"
 fi
-install -m 0644 %{_sourcedir}/luatools.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/luatools.svg
-install -m 0644 %{_sourcedir}/luatools.desktop %{buildroot}%{_datadir}/applications/luatools.desktop
+if [ -f "%{_sourcedir}/LICENSE" ]; then
+    install -m 0644 "%{_sourcedir}/LICENSE" "%{buildroot}%{_datadir}/licenses/%{name}/LICENSE"
+fi
+install -m 0644 "%{_sourcedir}/luatools.svg" "%{buildroot}%{_datadir}/icons/hicolor/scalable/apps/luatools.svg"
+install -m 0644 "%{_sourcedir}/luatools.desktop" "%{buildroot}%{_datadir}/applications/luatools.desktop"
 
 %files
 %{_bindir}/luatools
@@ -73,8 +82,11 @@ install -m 0644 %{_sourcedir}/luatools.desktop %{buildroot}%{_datadir}/applicati
 %{_datadir}/luatools
 %{_datadir}/applications/luatools.desktop
 %{_datadir}/icons/hicolor/scalable/apps/luatools.svg
+%{_datadir}/licenses/%{name}/LICENSE
 
 %changelog
+* Fri Nov 27 2026 LuaTools Linux Contributors <noreply@lua.tools> - 4.1.3-1
+- Release v4.1.3: Millennium v3.6.3 native plugin runtime compatibility (require("json"), logger:info, positional/table RPC args, table returns, native .millennium/Dist/webkit.js), HTTP/CEF/bridge hardening, self-updater semver/multilib fixes, Home Hub & ? tooltip fixes, and cyclic symlink / packaging fixes
 * Fri Nov 27 2026 LuaTools Linux Contributors <noreply@lua.tools> - 4.1.2-1
 - Release v4.1.2: Native Millennium v3.6+ LuaToolsLinux plugin (Lua backend + Steam Store/SharedJSContext UI), multi-arch $LIB preload routing, multi-user /tmp/millennium-mep-{uid}.sock isolation, V_strncpy/Plat_IsInDebugSession bridge guards, and extended companion RPC handlers
 * Fri Nov 27 2026 LuaTools Linux Contributors <noreply@lua.tools> - 4.0.0-1

@@ -7,7 +7,7 @@
 set -euo pipefail
 
 APP_NAME="luatools"
-APP_VERSION="4.1.2"
+APP_VERSION="4.1.3"
 REPO_URL="https://github.com/subsurfmod/LuaToolsLinux.git"
 SCRIPT_DIR=""
 if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
@@ -55,6 +55,18 @@ ok()    { printf "\033[1;36m[   OK   ]\033[0m %s\n" "$*"; }
 warn()  { printf "\033[1;33m[  WARN  ]\033[0m %s\n" "$*"; }
 err()   { printf "\033[1;31m[ ERROR  ]\033[0m %s\n" "$*" >&2; }
 
+# Resolve the target non-root user & home so `sudo ./install.sh` (without --system)
+# never silently installs into /root/.local instead of the invoking user's ~/.local.
+TARGET_USER=""
+TARGET_HOME="${HOME}"
+if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
+    resolved_home="$(getent passwd "${SUDO_USER}" 2>/dev/null | cut -d: -f6 || true)"
+    if [ -n "$resolved_home" ] && [ -d "$resolved_home" ]; then
+        TARGET_USER="${SUDO_USER}"
+        TARGET_HOME="$resolved_home"
+    fi
+fi
+
 run_privileged() {
     if [ "$(id -u)" -eq 0 ]; then
         "$@"
@@ -63,6 +75,51 @@ run_privileged() {
     else
         err "Root privileges required for: $*"
         return 1
+    fi
+}
+
+run_as_target_user() {
+    if [ "$(id -u)" -eq 0 ] && [ -n "$TARGET_USER" ]; then
+        sudo -u "$TARGET_USER" -H "$@"
+    else
+        "$@"
+    fi
+}
+
+# Remove any pre-existing directory/file at link destination before creating symlink
+# so `ln -sfn` never nests a symlink inside an existing real directory.
+safe_symlink() {
+    local target="$1"
+    local link_path="$2"
+    rm -rf "$link_path"
+    ln -sfn "$target" "$link_path"
+}
+
+safe_symlink_privileged() {
+    local target="$1"
+    local link_path="$2"
+    run_privileged rm -rf "$link_path"
+    run_privileged ln -sfn "$target" "$link_path"
+}
+
+# Render .desktop template safely without fragile sed delimiter/escape issues on paths.
+render_desktop_file() {
+    local tmpl="$1"
+    local exec_path="$2"
+    local out_path="$3"
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c "
+import sys
+tmpl, exec_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(tmpl, 'r', encoding='utf-8') as f:
+    text = f.read()
+with open(out_path, 'w', encoding='utf-8') as f:
+    f.write(text.replace('@EXEC_PATH@', exec_path))
+" "$tmpl" "$exec_path" "$out_path"
+    else
+        local content
+        content="$(cat "$tmpl")"
+        printf '%s\n' "${content//@EXEC_PATH@/$exec_path}" > "$out_path"
     fi
 }
 
@@ -177,15 +234,15 @@ ensure_source_checkout() {
         return 0
     fi
 
-    local clone_dir="${HOME}/.local/share/luatools/repo"
-    mkdir -p "$(dirname "$clone_dir")"
+    local clone_dir="${TARGET_HOME}/.local/share/luatools/repo"
+    run_as_target_user mkdir -p "$(dirname "$clone_dir")"
     if [ -d "${clone_dir}/.git" ]; then
         info "Updating existing repository checkout in ${clone_dir}..."
-        git -C "$clone_dir" pull --ff-only || git -C "$clone_dir" pull --rebase --autostash
+        run_as_target_user git -C "$clone_dir" pull --ff-only || run_as_target_user git -C "$clone_dir" pull --rebase --autostash
     else
         rm -rf "$clone_dir"
         info "Cloning ${REPO_URL} into ${clone_dir}..."
-        git clone --depth 1 "$REPO_URL" "$clone_dir"
+        run_as_target_user git clone --depth 1 "$REPO_URL" "$clone_dir"
     fi
     SCRIPT_DIR="$clone_dir"
 }
@@ -202,19 +259,13 @@ ensure_binary() {
             "${SCRIPT_DIR}/bridge_lib"
             "${SCRIPT_DIR}/steam_auto_patch_linux"
         )
-        if [ -d "${SCRIPT_DIR}/assets/guide" ]; then
-            check_paths+=("${SCRIPT_DIR}/assets/guide")
-        fi
-        if [ -d "${SCRIPT_DIR}/assets/millennium_plugin" ]; then
-            check_paths+=("${SCRIPT_DIR}/assets/millennium_plugin")
-        fi
-        if [ -e "${SCRIPT_DIR}/.git/HEAD" ]; then
-            check_paths+=("${SCRIPT_DIR}/.git/HEAD")
-        fi
-        if [ -e "${SCRIPT_DIR}/.git/refs/heads/main" ]; then
-            check_paths+=("${SCRIPT_DIR}/.git/refs/heads/main")
-        fi
-        if [ -n "$(find "${check_paths[@]}" -newer "${SCRIPT_DIR}/dist/${APP_NAME}" 2>/dev/null | head -n 1)" ]; then
+        [ -f "${SCRIPT_DIR}/build.rs" ] && check_paths+=("${SCRIPT_DIR}/build.rs")
+        [ -f "${SCRIPT_DIR}/Cargo.lock" ] && check_paths+=("${SCRIPT_DIR}/Cargo.lock")
+        [ -d "${SCRIPT_DIR}/assets" ] && check_paths+=("${SCRIPT_DIR}/assets")
+        [ -e "${SCRIPT_DIR}/.git/HEAD" ] && check_paths+=("${SCRIPT_DIR}/.git/HEAD")
+        [ -e "${SCRIPT_DIR}/.git/logs/HEAD" ] && check_paths+=("${SCRIPT_DIR}/.git/logs/HEAD")
+        [ -e "${SCRIPT_DIR}/.git/refs/heads/main" ] && check_paths+=("${SCRIPT_DIR}/.git/refs/heads/main")
+        if [ -n "$(find "${check_paths[@]}" -newer "${SCRIPT_DIR}/dist/${APP_NAME}" -print -quit 2>/dev/null)" ]; then
             has_newer_src=1
         fi
     fi
@@ -232,12 +283,17 @@ ensure_binary() {
         fi
     fi
 
-    export PATH="${HOME}/.cargo/bin:${PATH}"
+    export PATH="${TARGET_HOME}/.cargo/bin:${HOME}/.cargo/bin:${PATH}"
     if ! command -v cargo >/dev/null 2>&1; then
         info "Rust toolchain (cargo) not found — bootstrapping user-local rustup..."
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-        # shellcheck disable=SC1091
-        [ -f "${HOME}/.cargo/env" ] && source "${HOME}/.cargo/env"
+        if [ "$(id -u)" -eq 0 ] && [ -n "$TARGET_USER" ]; then
+            run_as_target_user sh -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable'
+        else
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+            # shellcheck disable=SC1091
+            [ -f "${HOME}/.cargo/env" ] && source "${HOME}/.cargo/env"
+        fi
+        export PATH="${TARGET_HOME}/.cargo/bin:${HOME}/.cargo/bin:${PATH}"
     fi
 
     ok "Rust toolchain ready: $(rustc --version)"
@@ -268,9 +324,9 @@ ensure_binary() {
         install -m 0755 "$bridge_32" "${SCRIPT_DIR}/dist/libsteam_integration32.so"
         install -m 0755 "$bridge_32" "${SCRIPT_DIR}/dist/32/libsteam_integration.so"
         install -m 0755 "$bridge_32" "${SCRIPT_DIR}/dist/lib/libsteam_integration.so"
-        mkdir -p "${SCRIPT_DIR}/dist/lib32" "${SCRIPT_DIR}/dist/i386-linux-gnu"
-        install -m 0755 "$bridge_32" "${SCRIPT_DIR}/dist/lib32/libsteam_integration.so"
-        install -m 0755 "$bridge_32" "${SCRIPT_DIR}/dist/i386-linux-gnu/libsteam_integration.so"
+        safe_symlink lib "${SCRIPT_DIR}/dist/lib32"
+        safe_symlink lib "${SCRIPT_DIR}/dist/i386-linux-gnu"
+        safe_symlink ../32 "${SCRIPT_DIR}/dist/lib/i386-linux-gnu"
         ok "Staged 32-bit i686 Steam integration library -> dist/libsteam_integration.so, dist/lib/ & dist/32/"
     elif [ -f "$bridge_64" ]; then
         install -m 0755 "$bridge_64" "${SCRIPT_DIR}/dist/libsteam_integration.so"
@@ -280,8 +336,8 @@ ensure_binary() {
         install -m 0755 "$bridge_64" "${SCRIPT_DIR}/dist/libsteam_integration64.so"
         install -m 0755 "$bridge_64" "${SCRIPT_DIR}/dist/64/libsteam_integration.so"
         install -m 0755 "$bridge_64" "${SCRIPT_DIR}/dist/lib64/libsteam_integration.so"
-        mkdir -p "${SCRIPT_DIR}/dist/x86_64-linux-gnu"
-        install -m 0755 "$bridge_64" "${SCRIPT_DIR}/dist/x86_64-linux-gnu/libsteam_integration.so"
+        safe_symlink lib64 "${SCRIPT_DIR}/dist/x86_64-linux-gnu"
+        safe_symlink ../lib64 "${SCRIPT_DIR}/dist/lib/x86_64-linux-gnu"
         ok "Staged 64-bit x86_64 Steam integration library -> dist/libsteam_integration64.so, dist/lib64/ & dist/64/"
     fi
 
@@ -364,9 +420,9 @@ install_files() {
             run_privileged install -m 0755 "$bridge_32" "${lib_dir}/libsteam_integration32.so"
             run_privileged install -m 0755 "$bridge_32" "${lib_dir}/32/libsteam_integration.so"
             run_privileged install -m 0755 "$bridge_32" "${lib_dir}/lib/libsteam_integration.so"
-            run_privileged ln -sfn lib "${lib_dir}/lib32" 2>/dev/null || true
-            run_privileged ln -sfn lib "${lib_dir}/i386-linux-gnu" 2>/dev/null || true
-            run_privileged ln -sfn . "${lib_dir}/lib/i386-linux-gnu" 2>/dev/null || true
+            safe_symlink_privileged lib "${lib_dir}/lib32" 2>/dev/null || true
+            safe_symlink_privileged lib "${lib_dir}/i386-linux-gnu" 2>/dev/null || true
+            safe_symlink_privileged ../32 "${lib_dir}/lib/i386-linux-gnu" 2>/dev/null || true
         elif [ -n "$bridge_64" ]; then
             run_privileged install -m 0755 "$bridge_64" "${lib_dir}/libsteam_integration.so"
         fi
@@ -375,8 +431,8 @@ install_files() {
             run_privileged install -m 0755 "$bridge_64" "${lib_dir}/libsteam_integration64.so"
             run_privileged install -m 0755 "$bridge_64" "${lib_dir}/64/libsteam_integration.so"
             run_privileged install -m 0755 "$bridge_64" "${lib_dir}/lib64/libsteam_integration.so"
-            run_privileged ln -sfn lib64 "${lib_dir}/x86_64-linux-gnu" 2>/dev/null || true
-            run_privileged ln -sfn ../lib64 "${lib_dir}/lib/x86_64-linux-gnu" 2>/dev/null || true
+            safe_symlink_privileged lib64 "${lib_dir}/x86_64-linux-gnu" 2>/dev/null || true
+            safe_symlink_privileged ../lib64 "${lib_dir}/lib/x86_64-linux-gnu" 2>/dev/null || true
         fi
 
         [ -n "$patch_src" ] && run_privileged install -m 0755 "$patch_src" "${lib_dir}/libsteam_auto_patch_linux.so"
@@ -384,14 +440,14 @@ install_files() {
 
         local tmp_desktop
         tmp_desktop="$(mktemp)"
-        sed "s|@EXEC_PATH@|${bin_dir}/${APP_NAME}|g" "${SCRIPT_DIR}/assets/luatools.desktop.in" > "$tmp_desktop"
+        render_desktop_file "${SCRIPT_DIR}/assets/luatools.desktop.in" "${bin_dir}/${APP_NAME}" "$tmp_desktop"
         run_privileged install -m 0644 "$tmp_desktop" "${apps_dir}/luatools.desktop"
         rm -f "$tmp_desktop"
         command -v update-desktop-database >/dev/null 2>&1 && run_privileged update-desktop-database "$apps_dir" || true
         if command -v xdg-mime >/dev/null 2>&1; then
-            if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
-                sudo -u "$SUDO_USER" xdg-mime default luatools.desktop x-scheme-handler/luatools || true
-                sudo -u "$SUDO_USER" xdg-mime default luatools.desktop x-scheme-handler/bst || true
+            if [ "$(id -u)" -eq 0 ] && [ -n "$TARGET_USER" ]; then
+                sudo -u "$TARGET_USER" -H xdg-mime default luatools.desktop x-scheme-handler/luatools || true
+                sudo -u "$TARGET_USER" -H xdg-mime default luatools.desktop x-scheme-handler/bst || true
             elif [ "$(id -u)" -ne 0 ]; then
                 xdg-mime default luatools.desktop x-scheme-handler/luatools || true
                 xdg-mime default luatools.desktop x-scheme-handler/bst || true
@@ -399,16 +455,20 @@ install_files() {
         fi
         INSTALLED_BIN="${bin_dir}/${APP_NAME}"
     else
-        local bin_dir="${HOME}/.local/bin"
-        local lib_dir="${HOME}/.local/lib/luatools"
-        local apps_dir="${HOME}/.local/share/applications"
-        local icon_dir="${HOME}/.local/share/icons/hicolor/scalable/apps"
-        info "Installing for current user into ~/.local..."
+        if [ "$(id -u)" -eq 0 ] && [ -n "$TARGET_USER" ]; then
+            warn "User-local install invoked via sudo without --system; installing into ${TARGET_HOME}/.local for ${TARGET_USER} instead of /root/.local."
+        fi
+        local user_home="${TARGET_HOME}"
+        local bin_dir="${user_home}/.local/bin"
+        local lib_dir="${user_home}/.local/lib/luatools"
+        local apps_dir="${user_home}/.local/share/applications"
+        local icon_dir="${user_home}/.local/share/icons/hicolor/scalable/apps"
+        info "Installing for user into ${user_home}/.local..."
         mkdir -p "$bin_dir" "$lib_dir" "$apps_dir" "$icon_dir" \
-                 "${HOME}/.config/luatools" \
-                 "${HOME}/.local/share/luatools/luavault" \
-                 "${HOME}/.local/share/luatools/tools" \
-                 "${HOME}/.cache/luatools"
+                 "${user_home}/.config/luatools" \
+                 "${user_home}/.local/share/luatools/luavault" \
+                 "${user_home}/.local/share/luatools/tools" \
+                 "${user_home}/.cache/luatools"
 
         install -m 0755 "$BIN_SOURCE" "${bin_dir}/${APP_NAME}"
         local launcher_src="${SCRIPT_DIR}/assets/luatools-steam-launcher"
@@ -421,9 +481,9 @@ install_files() {
             install -m 0755 "$bridge_32" "${lib_dir}/libsteam_integration32.so"
             install -m 0755 "$bridge_32" "${lib_dir}/32/libsteam_integration.so"
             install -m 0755 "$bridge_32" "${lib_dir}/lib/libsteam_integration.so"
-            ln -sfn lib "${lib_dir}/lib32" 2>/dev/null || true
-            ln -sfn lib "${lib_dir}/i386-linux-gnu" 2>/dev/null || true
-            ln -sfn . "${lib_dir}/lib/i386-linux-gnu" 2>/dev/null || true
+            safe_symlink lib "${lib_dir}/lib32" 2>/dev/null || true
+            safe_symlink lib "${lib_dir}/i386-linux-gnu" 2>/dev/null || true
+            safe_symlink ../32 "${lib_dir}/lib/i386-linux-gnu" 2>/dev/null || true
         elif [ -n "$bridge_64" ]; then
             install -m 0755 "$bridge_64" "${lib_dir}/libsteam_integration.so"
         fi
@@ -432,54 +492,66 @@ install_files() {
             install -m 0755 "$bridge_64" "${lib_dir}/libsteam_integration64.so"
             install -m 0755 "$bridge_64" "${lib_dir}/64/libsteam_integration.so"
             install -m 0755 "$bridge_64" "${lib_dir}/lib64/libsteam_integration.so"
-            ln -sfn lib64 "${lib_dir}/x86_64-linux-gnu" 2>/dev/null || true
-            ln -sfn ../lib64 "${lib_dir}/lib/x86_64-linux-gnu" 2>/dev/null || true
+            safe_symlink lib64 "${lib_dir}/x86_64-linux-gnu" 2>/dev/null || true
+            safe_symlink ../lib64 "${lib_dir}/lib/x86_64-linux-gnu" 2>/dev/null || true
         fi
 
         [ -n "$patch_src" ] && install -m 0755 "$patch_src" "${lib_dir}/libsteam_auto_patch_linux.so"
         install -m 0644 "${SCRIPT_DIR}/assets/luatools.svg" "${icon_dir}/luatools.svg"
-        sed "s|@EXEC_PATH@|${bin_dir}/${APP_NAME}|g" "${SCRIPT_DIR}/assets/luatools.desktop.in" > "${apps_dir}/luatools.desktop"
+        render_desktop_file "${SCRIPT_DIR}/assets/luatools.desktop.in" "${bin_dir}/${APP_NAME}" "${apps_dir}/luatools.desktop"
         chmod 0644 "${apps_dir}/luatools.desktop"
 
+        if [ "$(id -u)" -eq 0 ] && [ -n "$TARGET_USER" ]; then
+            local target_grp
+            target_grp="$(id -gn "$TARGET_USER")"
+            chown -R "${TARGET_USER}:${target_grp}" \
+                "${bin_dir}/${APP_NAME}" \
+                "$lib_dir" \
+                "${apps_dir}/luatools.desktop" \
+                "${icon_dir}/luatools.svg" \
+                "${user_home}/.config/luatools" \
+                "${user_home}/.local/share/luatools" \
+                "${user_home}/.cache/luatools" 2>/dev/null || true
+            [ -f "${bin_dir}/luatools-steam-launcher" ] && chown "${TARGET_USER}:${target_grp}" "${bin_dir}/luatools-steam-launcher" 2>/dev/null || true
+        fi
+
         if command -v xdg-mime >/dev/null 2>&1; then
-            if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
-                sudo -u "$SUDO_USER" xdg-mime default luatools.desktop x-scheme-handler/luatools || true
-                sudo -u "$SUDO_USER" xdg-mime default luatools.desktop x-scheme-handler/bst || true
+            if [ "$(id -u)" -eq 0 ] && [ -n "$TARGET_USER" ]; then
+                sudo -u "$TARGET_USER" -H xdg-mime default luatools.desktop x-scheme-handler/luatools || true
+                sudo -u "$TARGET_USER" -H xdg-mime default luatools.desktop x-scheme-handler/bst || true
             else
                 xdg-mime default luatools.desktop x-scheme-handler/luatools || true
                 xdg-mime default luatools.desktop x-scheme-handler/bst || true
             fi
         fi
         if command -v update-desktop-database >/dev/null 2>&1; then
-            update-desktop-database "$apps_dir" >/dev/null 2>&1 || true
+            run_as_target_user update-desktop-database "$apps_dir" >/dev/null 2>&1 || true
         fi
         INSTALLED_BIN="${bin_dir}/${APP_NAME}"
+    fi
+
+    # Resolve non-root user home for Millennium plugin & source_repo.json metadata
+    local target_home=""
+    local target_user=""
+    if [ "$(id -u)" -ne 0 ]; then
+        target_home="${HOME}"
+    elif [ -n "$TARGET_USER" ]; then
+        target_home="${TARGET_HOME}"
+        target_user="${TARGET_USER}"
     fi
 
     # Install native Millennium plugin (LuaToolsLinux by subsurfmod) only for a non-root user
     # when Millennium is actually installed on the system.
     if [ -d "${SCRIPT_DIR}/assets/millennium_plugin" ]; then
-        local target_home=""
-        local target_user=""
-        if [ "$SYSTEM_WIDE" -eq 1 ]; then
-            if [ "$(id -u)" -ne 0 ]; then
-                target_home="${HOME}"
-            elif [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
-                target_home="$(getent passwd "${SUDO_USER}" 2>/dev/null | cut -d: -f6 || true)"
-                target_user="${SUDO_USER}"
-            fi
-        elif [ "$(id -u)" -ne 0 ]; then
-            target_home="${HOME}"
-        elif [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
-            target_home="$(getent passwd "${SUDO_USER}" 2>/dev/null | cut -d: -f6 || true)"
-            target_user="${SUDO_USER}"
-        fi
-
         if [ -z "$target_home" ] || [ "$target_home" = "/root" ] || [ ! -d "$target_home" ]; then
             info "Skipping user Millennium plugin deployment (no non-root target home)."
         elif [ ! -d "/usr/lib/millennium" ] \
+            && [ ! -d "/usr/lib64/millennium" ] \
+            && [ ! -d "/usr/share/millennium" ] \
             && [ ! -d "${target_home}/.local/share/millennium" ] \
-            && [ ! -d "${target_home}/.config/millennium" ]; then
+            && [ ! -d "${target_home}/.config/millennium" ] \
+            && [ ! -f "${target_home}/.local/share/Steam/ubuntu12_32/libmillennium_x86.so" ] \
+            && [ ! -f "${target_home}/.steam/steam/ubuntu12_32/libmillennium_x86.so" ]; then
             info "Millennium not detected; skipping LuaToolsLinux Millennium plugin deployment."
         else
             local millennium_plugins_dir="${target_home}/.local/share/millennium/plugins/LuaToolsLinux"
@@ -491,37 +563,64 @@ install_files() {
             install -m 0644 "${SCRIPT_DIR}/assets/millennium_plugin/public/luatools.css" "${millennium_plugins_dir}/public/luatools.css"
             install -m 0644 "${SCRIPT_DIR}/assets/millennium_plugin/dist/index.js" "${millennium_plugins_dir}/dist/index.js"
             install -m 0644 "${SCRIPT_DIR}/assets/millennium_plugin/dist/index.js" "${millennium_plugins_dir}/.millennium/Dist/index.js"
+            if [ -f "${SCRIPT_DIR}/assets/millennium_plugin/.millennium/Dist/webkit.js" ]; then
+                install -m 0644 "${SCRIPT_DIR}/assets/millennium_plugin/.millennium/Dist/webkit.js" "${millennium_plugins_dir}/.millennium/Dist/webkit.js"
+            elif [ -f "${SCRIPT_DIR}/assets/millennium_plugin/dist/webkit.js" ]; then
+                install -m 0644 "${SCRIPT_DIR}/assets/millennium_plugin/dist/webkit.js" "${millennium_plugins_dir}/.millennium/Dist/webkit.js"
+            fi
             if [ -n "$target_user" ] && [ "$(id -u)" -eq 0 ]; then
                 chown -R "${target_user}:$(id -gn "$target_user")" "${target_home}/.local/share/millennium" 2>/dev/null || true
             fi
 
             local millennium_cfg="${target_home}/.config/millennium/config.json"
-            if [ -f "$millennium_cfg" ]; then
+            local millennium_state="${target_home}/.config/luatools/millennium_plugin_state.json"
+            if [ -f "$millennium_cfg" ] && command -v python3 >/dev/null 2>&1; then
                 local millennium_cfg_tmp="${millennium_cfg}.tmp.$$"
                 if python3 -c "
 import json, os, sys
-src, tmp = sys.argv[1], sys.argv[2]
+src, tmp, state_path = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    if state_path and os.path.isfile(state_path):
+        with open(state_path, 'r', encoding='utf-8') as sf:
+            st = json.load(sf)
+        if isinstance(st, dict) and st.get('user_opted_out') is True:
+            sys.exit(0)
+except Exception:
+    pass
 try:
     with open(src, 'r', encoding='utf-8') as f:
         d = json.load(f)
 except Exception:
     d = {}
-plugins = d.setdefault('plugins', {})
-enabled = plugins.setdefault('enabledPlugins', [])
+if not isinstance(d, dict):
+    d = {}
+plugins = d.get('plugins')
+if not isinstance(plugins, dict):
+    plugins = {}
+    d['plugins'] = plugins
+enabled = plugins.get('enabledPlugins')
+if not isinstance(enabled, list):
+    enabled = []
+    plugins['enabledPlugins'] = enabled
 if 'LuaToolsLinux' not in enabled:
     enabled.append('LuaToolsLinux')
-gen = d.setdefault('general', {})
+gen = d.get('general')
+if not isinstance(gen, dict):
+    gen = {}
+    d['general'] = gen
 gen['injectJavascript'] = True
 gen['injectCSS'] = True
 with open(tmp, 'w', encoding='utf-8') as f:
     json.dump(d, f, indent=2)
     f.flush()
     os.fsync(f.fileno())
-" "$millennium_cfg" "$millennium_cfg_tmp" 2>/dev/null; then
-                    if [ -n "$target_user" ] && [ "$(id -u)" -eq 0 ]; then
-                        chown "${target_user}:$(id -gn "$target_user")" "$millennium_cfg_tmp" 2>/dev/null || true
+" "$millennium_cfg" "$millennium_cfg_tmp" "$millennium_state" 2>/dev/null; then
+                    if [ -f "$millennium_cfg_tmp" ]; then
+                        if [ -n "$target_user" ] && [ "$(id -u)" -eq 0 ]; then
+                            chown "${target_user}:$(id -gn "$target_user")" "$millennium_cfg_tmp" 2>/dev/null || true
+                        fi
+                        mv -f "$millennium_cfg_tmp" "$millennium_cfg"
                     fi
-                    mv -f "$millennium_cfg_tmp" "$millennium_cfg"
                 else
                     rm -f "$millennium_cfg_tmp"
                 fi
@@ -530,21 +629,37 @@ with open(tmp, 'w', encoding='utf-8') as f:
         fi
     fi
 
-    # Record source repository location for one-click in-app Git updates
-    if [ "$(id -u)" -ne 0 ]; then
-        local meta_dir="${HOME}/.local/share/luatools"
+    # Record source repository location for one-click in-app Git updates (safely JSON-escaped,
+    # and written for $SUDO_USER under --system as well).
+    if [ -n "$target_home" ] && [ "$target_home" != "/root" ] && [ -d "$target_home" ] && [ -f "${SCRIPT_DIR}/Cargo.toml" ]; then
+        local meta_dir="${target_home}/.local/share/luatools"
         mkdir -p "$meta_dir"
         local git_origin=""
-        if command -v git >/dev/null 2>&1 && [ -d "${SCRIPT_DIR}/.git" ]; then
+        if command -v git >/dev/null 2>&1 && { [ -d "${SCRIPT_DIR}/.git" ] || [ -f "${SCRIPT_DIR}/.git" ]; }; then
             git_origin="$(git -C "${SCRIPT_DIR}" remote get-url origin 2>/dev/null || true)"
         fi
-        if [ -f "${SCRIPT_DIR}/Cargo.toml" ]; then
-            cat > "${meta_dir}/source_repo.json" <<EOF
-{
-  "repo_dir": "${SCRIPT_DIR}",
-  "remote_url": "${git_origin}"
-}
-EOF
+        local meta_file="${meta_dir}/source_repo.json"
+        local meta_tmp="${meta_file}.tmp.$$"
+        if command -v python3 >/dev/null 2>&1; then
+            python3 -c "
+import json, os, sys
+tmp, repo_dir, remote_url = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(tmp, 'w', encoding='utf-8') as f:
+    json.dump({'repo_dir': repo_dir, 'remote_url': remote_url}, f, indent=2)
+    f.write('\n')
+    f.flush()
+    os.fsync(f.fileno())
+" "$meta_tmp" "$SCRIPT_DIR" "$git_origin"
+            mv -f "$meta_tmp" "$meta_file"
+        else
+            local esc_dir="${SCRIPT_DIR//\\/\\\\}"
+            esc_dir="${esc_dir//\"/\\\"}"
+            local esc_origin="${git_origin//\\/\\\\}"
+            esc_origin="${esc_origin//\"/\\\"}"
+            printf '{\n  "repo_dir": "%s",\n  "remote_url": "%s"\n}\n' "$esc_dir" "$esc_origin" > "$meta_file"
+        fi
+        if [ -n "$target_user" ] && [ "$(id -u)" -eq 0 ]; then
+            chown -R "${target_user}:$(id -gn "$target_user")" "$meta_dir" 2>/dev/null || true
         fi
     fi
 

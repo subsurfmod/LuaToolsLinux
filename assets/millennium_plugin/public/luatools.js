@@ -7,8 +7,16 @@
   window.__luatoolsStorePluginInjected = true;
 
   const PLUGIN_NAME = 'LuaToolsLinux';
+  const DEFAULT_RPC_PORT = 6767;
   let currentAppId = null;
   let statusPollTimer = null;
+
+  function clearStatusPoll() {
+    if (statusPollTimer) {
+      clearInterval(statusPollTimer);
+      statusPollTimer = null;
+    }
+  }
 
   function getAppIdFromUrl() {
     const match = window.location.pathname.match(/\/app\/(\d+)/);
@@ -20,7 +28,17 @@
     return el ? el.textContent.trim() : 'Game';
   }
 
-  const DEFAULT_RPC_PORT = 6767;
+  function parseRpcResponse(res) {
+    let parsed = res;
+    for (let i = 0; i < 2 && typeof parsed === 'string'; i++) {
+      try {
+        parsed = JSON.parse(parsed);
+      } catch (e) {
+        return i === 0 ? { raw: parsed } : parsed;
+      }
+    }
+    return parsed;
+  }
 
   async function callHttpFallback(method, args) {
     const rawPort =
@@ -53,7 +71,7 @@
       });
       const text = await resp.text();
       try {
-        return JSON.parse(text);
+        return parseRpcResponse(text);
       } catch (e) {
         return { success: resp.ok, raw: text };
       }
@@ -68,21 +86,8 @@
       return callHttpFallback(method, args);
     }
     try {
-      let res;
-      try {
-        res = await window.Millennium.callServerMethod(PLUGIN_NAME, method, args || {});
-      } catch (e) {
-        // Fallback to lowercase name if registered as luatools
-        res = await window.Millennium.callServerMethod('luatools', method, args || {});
-      }
-      if (typeof res === 'string') {
-        try {
-          return JSON.parse(res);
-        } catch (e) {
-          return { raw: res };
-        }
-      }
-      return res;
+      const res = await window.Millennium.callServerMethod(PLUGIN_NAME, method, [args || {}]);
+      return parseRpcResponse(res);
     } catch (err) {
       console.error('[LuaToolsLinux] Call failed:', method, err);
       return null;
@@ -104,9 +109,14 @@
     const container = document.createElement('div');
     container.id = 'luatools-store-container';
 
-    const isInstalled = state && (state.exists || state.has);
-    const badgeClass = isInstalled ? 'luatools-badge-installed' : 'luatools-badge-available';
-    const badgeText = isInstalled ? '✓ In LuaToolsLinux' : 'Ready to Unlock';
+    const isInstalled = Boolean(state && (state.exists || state.has));
+    const isDisabled = Boolean(!isInstalled && state && state.disabled);
+    const badgeClass = isInstalled
+      ? 'luatools-badge-installed'
+      : (isDisabled ? 'luatools-badge-disabled' : 'luatools-badge-available');
+    const badgeText = isInstalled
+      ? '✓ In LuaToolsLinux'
+      : (isDisabled ? '⏸ Disabled in LuaToolsLinux' : 'Ready to Unlock');
 
     container.innerHTML = `
       <div id="luatools-store-header">
@@ -131,10 +141,13 @@
     if (!root) return;
 
     root.innerHTML = '';
-    const isInstalled = state && (state.exists || state.has);
+    const isInstalled = Boolean(state && (state.exists || state.has));
+    const isDisabled = Boolean(!isInstalled && state && state.disabled);
 
     if (isInstalled) {
-      detail.textContent = `Unlocked via LuaToolsLinux (Depots: ${state.depotCount || 0}, DLCs: ${state.dlcCount || 0})`;
+      if (detail) {
+        detail.textContent = `Unlocked via LuaToolsLinux (Depots: ${state.depotCount || 0}, DLCs: ${state.dlcCount || 0})`;
+      }
 
       // Restart Steam Button
       const btnRestart = document.createElement('button');
@@ -143,7 +156,14 @@
       btnRestart.onclick = async () => {
         btnRestart.disabled = true;
         btnRestart.textContent = 'Restarting Steam...';
-        await callPlugin('RestartSteam', {});
+        const res = await callPlugin('RestartSteam', {});
+        if (!res || res.success === false) {
+          btnRestart.textContent = '⚠ Restart Failed';
+          setTimeout(() => {
+            btnRestart.disabled = false;
+            btnRestart.innerHTML = '⟳ Restart Steam to Play';
+          }, 2500);
+        }
       };
       root.appendChild(btnRestart);
 
@@ -163,9 +183,16 @@
       btnDlc.onclick = async () => {
         btnDlc.disabled = true;
         btnDlc.textContent = 'Syncing...';
-        await callPlugin('SyncDlcForApp', { appid: appId });
-        btnDlc.textContent = '✓ DLC Synced';
-        setTimeout(() => { btnDlc.disabled = false; btnDlc.innerHTML = '⤓ Sync DLC'; }, 2000);
+        const res = await callPlugin('SyncDlcForApp', { appid: appId });
+        if (res && res.success) {
+          btnDlc.textContent = '✓ DLC Synced';
+        } else {
+          btnDlc.textContent = '⚠ Sync Failed';
+        }
+        setTimeout(() => {
+          btnDlc.disabled = false;
+          btnDlc.innerHTML = '⤓ Sync DLC';
+        }, 2000);
       };
       root.appendChild(btnDlc);
 
@@ -182,8 +209,46 @@
       };
       root.appendChild(btnRemove);
 
+    } else if (isDisabled) {
+      if (detail) {
+        detail.textContent = `Currently disabled in LuaToolsLinux (Depots: ${state.depotCount || 0}, DLCs: ${state.dlcCount || 0}). Re-enable to activate.`;
+      }
+
+      const btnEnable = document.createElement('button');
+      btnEnable.className = 'luatools-btn luatools-btn-primary';
+      btnEnable.innerHTML = '▶ Enable in LuaToolsLinux';
+      btnEnable.onclick = async () => {
+        btnEnable.disabled = true;
+        btnEnable.textContent = 'Enabling...';
+        const res = await callPlugin('ToggleAppEnabled', { appid: appId, enabled: true });
+        if (res && res.success) {
+          initAppWidget(appId);
+        } else {
+          btnEnable.textContent = '⚠ Enable Failed';
+          setTimeout(() => {
+            btnEnable.disabled = false;
+            btnEnable.innerHTML = '▶ Enable in LuaToolsLinux';
+          }, 2500);
+        }
+      };
+      root.appendChild(btnEnable);
+
+      const btnRemove = document.createElement('button');
+      btnRemove.className = 'luatools-btn luatools-btn-danger';
+      btnRemove.innerHTML = '✕ Remove';
+      btnRemove.onclick = async () => {
+        if (!confirm('Remove this disabled game from LuaToolsLinux stplug-in and SLSsteam?')) return;
+        btnRemove.disabled = true;
+        btnRemove.textContent = 'Removing...';
+        await callPlugin('DeleteLuaToolsForApp', { appid: appId });
+        initAppWidget(appId);
+      };
+      root.appendChild(btnRemove);
+
     } else {
-      detail.textContent = 'Download manifest, depot decryption keys, and sync SLSsteam with one click.';
+      if (detail) {
+        detail.textContent = 'Download manifest, depot decryption keys, and sync SLSsteam with one click.';
+      }
 
       // Main Add Button Group
       const btnGroup = document.createElement('div');
@@ -225,12 +290,22 @@
         res.sources.forEach((src) => {
           const item = document.createElement('div');
           item.className = 'luatools-dropdown-item';
-          item.textContent = `${src.name} (${src.available ? 'Available' : 'Unavailable'})`;
-          item.onclick = (e) => {
-            e.stopPropagation();
-            menu.classList.remove('active');
-            startAdd(appId, src.name);
-          };
+          const label = src.displayName || src.name || 'Mirror';
+          const isAvailable = src.available !== false;
+          item.textContent = `${label} (${isAvailable ? 'Available' : 'Unavailable'})`;
+          if (!isAvailable) {
+            item.classList.add('disabled');
+            item.setAttribute('aria-disabled', 'true');
+            item.onclick = (e) => {
+              e.stopPropagation();
+            };
+          } else {
+            item.onclick = (e) => {
+              e.stopPropagation();
+              menu.classList.remove('active');
+              startAdd(appId, src.name);
+            };
+          }
           menu.appendChild(item);
         });
       } else {
@@ -250,6 +325,7 @@
     const progArea = document.getElementById('luatools-progress-area');
     if (!root || !progArea) return;
 
+    clearStatusPoll();
     root.style.display = 'none';
     progArea.style.display = 'block';
     progArea.innerHTML = `
@@ -266,17 +342,40 @@
 
     const appName = getAppName();
     const cleanSource = (source && source !== 'auto' && source !== 'Auto (Default Mirror)') ? source : null;
-    await callPlugin('StartAddViaLuaTools', {
+    const res = await callPlugin('StartAddViaLuaTools', {
       appid: appId,
       name: appName,
       source: cleanSource
     });
 
-    if (statusPollTimer) clearInterval(statusPollTimer);
+    if (!res || !res.success) {
+      const desc = document.getElementById('luatools-step-desc');
+      const pct = document.getElementById('luatools-step-pct');
+      const bar = document.getElementById('luatools-bar');
+      const errMsg = (res && res.error) ? res.error : 'Companion daemon unreachable';
+      if (desc) desc.textContent = 'Failed: ' + errMsg;
+      if (pct) pct.textContent = 'Error';
+      if (bar) {
+        bar.style.width = '100%';
+        bar.style.background = '#80222b';
+      }
+      setTimeout(() => {
+        if (currentAppId === appId) {
+          initAppWidget(appId);
+        }
+      }, 2500);
+      return;
+    }
+
+    clearStatusPoll();
     statusPollTimer = setInterval(() => pollAddStatus(appId), 600);
   }
 
   async function pollAddStatus(appId) {
+    if (currentAppId !== appId) {
+      clearStatusPoll();
+      return;
+    }
     const res = await callPlugin('GetAddViaLuaToolsStatus', { appid: appId });
     if (!res) return;
     const state = res.state || res.result || res;
@@ -301,22 +400,25 @@
     const isFailed = statusLower === 'failed' || state.installFailed === true || (state.error && !isDone);
 
     if (isDone) {
-      clearInterval(statusPollTimer);
-      statusPollTimer = null;
+      clearStatusPoll();
       if (desc) desc.textContent = '✓ Unlocked successfully!';
       if (bar) bar.style.width = '100%';
-      setTimeout(() => initAppWidget(appId), 800);
+      setTimeout(() => {
+        if (currentAppId === appId) initAppWidget(appId);
+      }, 800);
     } else if (isCancelled) {
-      clearInterval(statusPollTimer);
-      statusPollTimer = null;
+      clearStatusPoll();
       if (desc) desc.textContent = 'Add cancelled';
-      setTimeout(() => initAppWidget(appId), 1000);
+      setTimeout(() => {
+        if (currentAppId === appId) initAppWidget(appId);
+      }, 1000);
     } else if (isFailed) {
-      clearInterval(statusPollTimer);
-      statusPollTimer = null;
+      clearStatusPoll();
       if (desc) desc.textContent = 'Failed: ' + (state.error || 'Download failed');
       if (bar) bar.style.background = '#80222b';
-      setTimeout(() => initAppWidget(appId), 3000);
+      setTimeout(() => {
+        if (currentAppId === appId) initAppWidget(appId);
+      }, 3000);
     }
   }
 
@@ -324,13 +426,18 @@
     if (!appId) return;
     currentAppId = appId;
     const state = await callPlugin('HasLuaToolsForApp', { appid: appId });
+    if (currentAppId !== appId) return;
     createWidget(appId, state);
   }
 
   function onRouteChange() {
     const newAppId = getAppIdFromUrl();
-    if (newAppId && newAppId !== currentAppId) {
-      initAppWidget(newAppId);
+    if (newAppId !== currentAppId) {
+      clearStatusPoll();
+      currentAppId = newAppId;
+      if (newAppId) {
+        initAppWidget(newAppId);
+      }
     }
   }
 

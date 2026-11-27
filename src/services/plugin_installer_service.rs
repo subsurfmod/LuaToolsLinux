@@ -345,9 +345,32 @@ impl PluginInstallerService {
             candidates.push(sr.join("steamui/LuaTools/luatools.js"));
         }
         candidates.push(self.plugin_dir.join("luatools").join("luatools.js"));
+        candidates.push(
+            self.plugin_dir
+                .join("LuaToolsLinux/.millennium/Dist/webkit.js"),
+        );
+        candidates.push(self.plugin_dir.join("LuaToolsLinux/public/luatools.js"));
+
+        let millennium_plugins =
+            crate::services::millennium_service::MillenniumService::resolve_plugins_dir();
+        candidates.push(millennium_plugins.join("LuaToolsLinux/.millennium/Dist/webkit.js"));
+        candidates.push(millennium_plugins.join("LuaToolsLinux/public/luatools.js"));
+
         if let Some(h) = dirs::home_dir() {
             candidates.push(h.join(".local/share/luatools/plugins/luatools/luatools.js"));
             candidates.push(h.join(".local/share/Steam/steamui/LuaTools/luatools.js"));
+            candidates.push(
+                h.join(".local/share/millennium/plugins/LuaToolsLinux/.millennium/Dist/webkit.js"),
+            );
+            candidates.push(
+                h.join(".local/share/millennium/plugins/LuaToolsLinux/public/luatools.js"),
+            );
+            candidates.push(h.join(
+                ".var/app/com.valvesoftware.Steam/.local/share/millennium/plugins/LuaToolsLinux/.millennium/Dist/webkit.js",
+            ));
+            candidates.push(h.join(
+                ".var/app/com.valvesoftware.Steam/.local/share/millennium/plugins/LuaToolsLinux/public/luatools.js",
+            ));
             candidates.push(h.join(".local/share/millennium/plugins/luatools/public/luatools.js"));
         }
         candidates.into_iter().find(|p| p.is_file())
@@ -476,52 +499,23 @@ impl PluginInstallerService {
         let target = if let Some(js_content) = downloaded_js {
             self.install_ltsp_js_payload(&js_content, steam_root)?
         } else {
-            self.install_ltsp_js_payload(DEFAULT_LUATOOLS_JS, steam_root)?
+            self.install_ltsp_js_payload(MILLENNIUM_PUBLIC_LUATOOLS_JS, steam_root)?
         };
 
-        let _ = self.register_steam_plugin(steam_root);
+        // Reconcile any conflicting legacy Millennium plugins and deploy the native
+        // LuaToolsLinux Millennium plugin cleanly (never registering conflicting
+        // "LuaToolsSteamPlugin").
         let _ = crate::services::millennium_service::MillenniumService::register_luatools_plugin(
             steam_root,
         );
-        Ok(target)
-    }
-
-    fn register_steam_plugin(&self, steam_root: Option<&Path>) -> Result<(), String> {
-        let plugins_dir = if let Some(sr) = steam_root {
-            sr.join("steamui/plugins")
-        } else if let Some(h) = dirs::home_dir() {
-            h.join(".local/share/Steam/steamui/plugins")
-        } else {
-            return Ok(());
-        };
-
-        let plugins_json = plugins_dir.join("plugins.json");
-        let plugin_entry = serde_json::json!({
-            "name": "LuaToolsSteamPlugin",
-            "path": "../LuaTools/luatools.js",
-            "enabled": true
-        });
-
-        let mut plugins = if plugins_json.exists() {
-            fs::read_to_string(&plugins_json)
-                .ok()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                .unwrap_or(serde_json::json!([]))
-        } else {
-            serde_json::json!([])
-        };
-
-        if let Some(arr) = plugins.as_array_mut() {
-            arr.retain(|p| {
-                p.get("name").and_then(|n| n.as_str()) != Some("LuaToolsSteamPlugin")
-            });
-            arr.push(plugin_entry);
+        if let Ok(plugin_dir) =
+            crate::services::millennium_service::MillenniumService::ensure_luatoolslinux_plugin_installed(
+                steam_root,
+            )
+        {
+            return Ok(plugin_dir);
         }
-
-        let content = serde_json::to_string_pretty(&plugins)
-            .map_err(|e| format!("Failed to serialize plugins.json: {}", e))?;
-        write_file_atomic(&plugins_json, content.as_bytes())
-            .map_err(|_| "Failed to register plugin in plugins.json".to_string())
+        Ok(target)
     }
 
     pub fn ensure_luatools_js_installed(
@@ -535,16 +529,15 @@ impl PluginInstallerService {
     }
 
     /// Atomically deploys the embedded LuaToolsLinux Millennium v3.6+ plugin payload
-    /// into `~/.local/share/millennium/plugins/LuaToolsLinux/` (or target path).
+    /// into the resolved Millennium plugins directory (or `base_dir`), skipping any
+    /// files whose on-disk bytes already match the embedded payload.
     pub fn install_embedded_millennium_plugin(
         &self,
         base_dir: Option<&Path>,
     ) -> Result<PathBuf, String> {
-        let root = base_dir.map(PathBuf::from).unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".local/share/millennium/plugins")
-        });
+        let root = base_dir
+            .map(PathBuf::from)
+            .unwrap_or_else(crate::services::millennium_service::MillenniumService::resolve_plugins_dir);
         let target_dir = root.join("LuaToolsLinux");
         let backend_dir = target_dir.join("backend");
         let public_dir = target_dir.join("public");
@@ -560,23 +553,63 @@ impl PluginInstallerService {
         fs::create_dir_all(&dot_dist_dir)
             .map_err(|e| format!("Failed to create plugin .millennium/Dist dir: {}", e))?;
 
-        write_file_atomic(&target_dir.join("plugin.json"), MILLENNIUM_PLUGIN_JSON.as_bytes())
-            .map_err(|e| format!("Failed to write plugin.json: {}", e))?;
-        write_file_atomic(&backend_dir.join("main.lua"), MILLENNIUM_BACKEND_MAIN_LUA.as_bytes())
-            .map_err(|e| format!("Failed to write backend/main.lua: {}", e))?;
-        write_file_atomic(&public_dir.join("luatools.js"), MILLENNIUM_PUBLIC_LUATOOLS_JS.as_bytes())
-            .map_err(|e| format!("Failed to write public/luatools.js: {}", e))?;
-        write_file_atomic(&public_dir.join("luatools.css"), MILLENNIUM_PUBLIC_LUATOOLS_CSS.as_bytes())
-            .map_err(|e| format!("Failed to write public/luatools.css: {}", e))?;
-        write_file_atomic(&dist_dir.join("index.js"), MILLENNIUM_DIST_INDEX_JS.as_bytes())
-            .map_err(|e| format!("Failed to write dist/index.js: {}", e))?;
-        write_file_atomic(&dot_dist_dir.join("index.js"), MILLENNIUM_DIST_INDEX_JS.as_bytes())
-            .map_err(|e| format!("Failed to write .millennium/Dist/index.js: {}", e))?;
+        let files = [
+            (
+                target_dir.join("plugin.json"),
+                "plugin.json",
+                MILLENNIUM_PLUGIN_JSON.as_bytes(),
+            ),
+            (
+                backend_dir.join("main.lua"),
+                "backend/main.lua",
+                MILLENNIUM_BACKEND_MAIN_LUA.as_bytes(),
+            ),
+            (
+                public_dir.join("luatools.js"),
+                "public/luatools.js",
+                MILLENNIUM_PUBLIC_LUATOOLS_JS.as_bytes(),
+            ),
+            (
+                public_dir.join("luatools.css"),
+                "public/luatools.css",
+                MILLENNIUM_PUBLIC_LUATOOLS_CSS.as_bytes(),
+            ),
+            (
+                dist_dir.join("index.js"),
+                "dist/index.js",
+                MILLENNIUM_DIST_INDEX_JS.as_bytes(),
+            ),
+            (
+                dot_dist_dir.join("index.js"),
+                ".millennium/Dist/index.js",
+                MILLENNIUM_DIST_INDEX_JS.as_bytes(),
+            ),
+            (
+                dot_dist_dir.join("webkit.js"),
+                ".millennium/Dist/webkit.js",
+                MILLENNIUM_WEBKIT_JS.as_bytes(),
+            ),
+        ];
 
-        PluginLog::global().info(
-            Some("PluginInstaller"),
-            &format!("Installed LuaToolsLinux Millennium plugin to {}", target_dir.display()),
-        );
+        let mut updated_count = 0usize;
+        for (path, label, bytes) in &files {
+            if write_file_atomic_if_changed(path, bytes)
+                .map_err(|e| format!("Failed to write {}: {}", label, e))?
+            {
+                updated_count += 1;
+            }
+        }
+
+        if updated_count > 0 {
+            PluginLog::global().info(
+                Some("PluginInstaller"),
+                &format!(
+                    "Installed/updated {} LuaToolsLinux Millennium plugin file(s) in {}",
+                    updated_count,
+                    target_dir.display()
+                ),
+            );
+        }
 
         Ok(target_dir)
     }
@@ -587,14 +620,30 @@ pub const MILLENNIUM_BACKEND_MAIN_LUA: &str = include_str!("../../assets/millenn
 pub const MILLENNIUM_PUBLIC_LUATOOLS_JS: &str = include_str!("../../assets/millennium_plugin/public/luatools.js");
 pub const MILLENNIUM_PUBLIC_LUATOOLS_CSS: &str = include_str!("../../assets/millennium_plugin/public/luatools.css");
 pub const MILLENNIUM_DIST_INDEX_JS: &str = include_str!("../../assets/millennium_plugin/dist/index.js");
+pub const MILLENNIUM_WEBKIT_JS: &str = include_str!("../../assets/millennium_plugin/.millennium/Dist/webkit.js");
 
 fn write_file_atomic(target: &Path, data: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = target.with_extension("tmp");
+    let mut tmp_name = target
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("file"));
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    let tmp = target.with_file_name(tmp_name);
     fs::write(&tmp, data)?;
     fs::rename(&tmp, target)
+}
+
+fn write_file_atomic_if_changed(target: &Path, data: &[u8]) -> std::io::Result<bool> {
+    if let Ok(existing) = fs::read(target) {
+        if existing == data {
+            return Ok(false);
+        }
+    }
+    write_file_atomic(target, data)?;
+    Ok(true)
 }
 
 pub const DEFAULT_LUATOOLS_JS: &str = r##"// LuaTools Store Plugin (LTSP) - Injected into Steam Store
@@ -791,7 +840,13 @@ mod tests {
         assert_eq!(fs::read_to_string(&path_plugin).unwrap(), payload);
         assert_eq!(fs::read_to_string(&path_steamui).unwrap(), payload);
         assert_eq!(
-            crate::services::cef_bridge::find_luatools_js(Some(&steam_root)),
+            crate::services::cef_bridge::find_luatools_js_with_env(
+                Some(&steam_root),
+                Some(dir.path()),
+                None,
+                None,
+                None,
+            ),
             Some(path_steamui.clone())
         );
 
@@ -823,14 +878,56 @@ mod tests {
         assert!(installed.join("public/luatools.css").is_file());
         assert!(installed.join("dist/index.js").is_file());
         assert!(installed.join(".millennium/Dist/index.js").is_file());
+        assert!(installed.join(".millennium/Dist/webkit.js").is_file());
 
         let manifest = fs::read_to_string(installed.join("plugin.json")).unwrap();
         assert!(manifest.contains(r#""name": "LuaToolsLinux""#));
         assert!(manifest.contains(r#""author": "subsurfmod""#));
+        assert!(manifest.contains(r#""version": "4.1.3""#));
         assert!(manifest.contains(r#""backendType": "lua""#));
 
         let lua = fs::read_to_string(installed.join("backend/main.lua")).unwrap();
         assert!(lua.contains("subsurfmod"));
-        assert!(lua.contains("millennium"));
+        assert!(lua.contains("logger:info"));
+
+        assert_eq!(
+            fs::read(installed.join("dist/index.js")).unwrap(),
+            fs::read(installed.join(".millennium/Dist/index.js")).unwrap()
+        );
+
+        let webkit = fs::read_to_string(installed.join(".millennium/Dist/webkit.js")).unwrap();
+        assert!(webkit.contains("luatools-store-css"));
+        assert!(webkit.contains("store.steampowered.com"));
+
+        // Re-running with identical bytes skips writes cleanly
+        assert!(!write_file_atomic_if_changed(
+            &installed.join("plugin.json"),
+            MILLENNIUM_PLUGIN_JSON.as_bytes()
+        )
+        .unwrap());
+        assert!(service
+            .install_embedded_millennium_plugin(Some(dir.path()))
+            .is_ok());
+
+        // find_installed_luatools_js discovers LuaToolsLinux webkit.js / public/luatools.js
+        let found = service.find_installed_luatools_js(None).unwrap();
+        assert_eq!(found, installed.join(".millennium/Dist/webkit.js"));
+        fs::remove_file(installed.join(".millennium/Dist/webkit.js")).unwrap();
+        let found_public = service.find_installed_luatools_js(None).unwrap();
+        assert_eq!(found_public, installed.join("public/luatools.js"));
+    }
+
+    #[test]
+    fn test_write_file_atomic_if_changed_sibling_files() {
+        let dir = tempdir().unwrap();
+        let js_path = dir.path().join("luatools.js");
+        let css_path = dir.path().join("luatools.css");
+
+        assert!(write_file_atomic_if_changed(&js_path, b"console.log(1);").unwrap());
+        assert!(write_file_atomic_if_changed(&css_path, b"body{color:#fff}").unwrap());
+        assert!(!write_file_atomic_if_changed(&js_path, b"console.log(1);").unwrap());
+        assert!(write_file_atomic_if_changed(&js_path, b"console.log(2);").unwrap());
+        assert_eq!(fs::read_to_string(&js_path).unwrap(), "console.log(2);");
+        assert_eq!(fs::read_to_string(&css_path).unwrap(), "body{color:#fff}");
     }
 }

@@ -70,7 +70,43 @@ impl MillenniumService {
         }
     }
 
-    /// Candidate Millennium data directories on Linux.
+    /// Resolves the Millennium plugins directory following Millennium v3.6+ env precedence:
+    /// `MILLENNIUM__PLUGINS_PATH` -> `MILLENNIUM__DATA_PATH/plugins` ->
+    /// `XDG_DATA_HOME/millennium/plugins` -> `~/.local/share/millennium/plugins`.
+    pub fn resolve_plugins_dir() -> PathBuf {
+        let plugins_env = std::env::var("MILLENNIUM__PLUGINS_PATH").ok();
+        let data_env = std::env::var("MILLENNIUM__DATA_PATH").ok();
+        let xdg_data_env = std::env::var("XDG_DATA_HOME").ok();
+        let home = dirs::home_dir();
+        Self::resolve_plugins_dir_from(
+            plugins_env.as_deref(),
+            data_env.as_deref(),
+            xdg_data_env.as_deref(),
+            home.as_deref(),
+        )
+    }
+
+    fn resolve_plugins_dir_from(
+        plugins_env: Option<&str>,
+        data_env: Option<&str>,
+        xdg_data_env: Option<&str>,
+        home: Option<&Path>,
+    ) -> PathBuf {
+        if let Some(p) = plugins_env.map(str::trim).filter(|s| !s.is_empty()) {
+            return PathBuf::from(p);
+        }
+        if let Some(d) = data_env.map(str::trim).filter(|s| !s.is_empty()) {
+            return PathBuf::from(d).join("plugins");
+        }
+        if let Some(xdg) = xdg_data_env.map(str::trim).filter(|s| !s.is_empty()) {
+            return PathBuf::from(xdg).join("millennium/plugins");
+        }
+        home.map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".local/share/millennium/plugins")
+    }
+
+    /// Candidate Millennium data directories on Linux (native + Flatpak Steam).
     pub fn data_dirs(steam_root: Option<&Path>) -> Vec<PathBuf> {
         let mut dirs_list = Vec::new();
         if let Ok(env_data) = std::env::var("MILLENNIUM__DATA_PATH") {
@@ -89,6 +125,10 @@ impl MillenniumService {
             dirs_list.push(h.join(".local/share/millennium"));
             dirs_list.push(h.join(".local/share/Steam/ext"));
             dirs_list.push(h.join(".local/share/Steam/millennium"));
+            // Flatpak Steam Millennium data directories
+            dirs_list.push(h.join(".var/app/com.valvesoftware.Steam/.local/share/millennium"));
+            dirs_list.push(h.join(".var/app/com.valvesoftware.Steam/.local/share/Steam/ext"));
+            dirs_list.push(h.join(".var/app/com.valvesoftware.Steam/.local/share/Steam/millennium"));
         }
         if let Some(sr) = steam_root {
             dirs_list.push(sr.join("ext"));
@@ -99,7 +139,8 @@ impl MillenniumService {
         dedup_paths(dirs_list)
     }
 
-    /// Candidate Millennium configuration files (`plugins.json` and `config.json`) on Linux.
+    /// Candidate Millennium configuration files (`plugins.json` and `config.json`) on Linux
+    /// (native + Flatpak Steam).
     pub fn config_paths(steam_root: Option<&Path>) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         if let Ok(env_cfg) = std::env::var("MILLENNIUM__CONFIG_PATH") {
@@ -128,6 +169,28 @@ impl MillenniumService {
             paths.push(h.join(".local/share/Steam/ext/plugins.json"));
             paths.push(h.join(".local/share/Steam/millennium/config/config.json"));
             paths.push(h.join(".local/share/Steam/millennium/config/plugins.json"));
+            // Flatpak Steam Millennium config paths
+            paths.push(h.join(".var/app/com.valvesoftware.Steam/.config/millennium/plugins.json"));
+            paths.push(h.join(".var/app/com.valvesoftware.Steam/.config/millennium/config.json"));
+            paths.push(h.join(
+                ".var/app/com.valvesoftware.Steam/.local/share/millennium/config/plugins.json",
+            ));
+            paths.push(h.join(
+                ".var/app/com.valvesoftware.Steam/.local/share/millennium/config/config.json",
+            ));
+            paths.push(
+                h.join(".var/app/com.valvesoftware.Steam/.local/share/millennium/plugins.json"),
+            );
+            paths.push(h.join(".var/app/com.valvesoftware.Steam/.local/share/Steam/ext/config.json"));
+            paths.push(
+                h.join(".var/app/com.valvesoftware.Steam/.local/share/Steam/ext/plugins.json"),
+            );
+            paths.push(h.join(
+                ".var/app/com.valvesoftware.Steam/.local/share/Steam/millennium/config/config.json",
+            ));
+            paths.push(h.join(
+                ".var/app/com.valvesoftware.Steam/.local/share/Steam/millennium/config/plugins.json",
+            ));
         }
         if let Some(sr) = steam_root {
             paths.push(sr.join("ext/config.json"));
@@ -611,7 +674,7 @@ impl MillenniumService {
             if modified {
                 let pretty = serde_json::to_string_pretty(&val)
                     .map_err(|e| format!("Failed to serialize {}: {}", path.display(), e))?;
-                let tmp = path.with_extension("json.tmp");
+                let tmp = atomic_tmp_path(path);
                 fs::write(&tmp, pretty)
                     .map_err(|e| format!("Failed to write {}: {}", tmp.display(), e))?;
                 fs::rename(&tmp, path)
@@ -693,8 +756,20 @@ impl MillenniumService {
         if Path::new("/usr/lib/millennium").is_dir() {
             return true;
         }
+        if let Ok(plugins_env) = std::env::var("MILLENNIUM__PLUGINS_PATH") {
+            let trimmed = plugins_env.trim();
+            if !trimmed.is_empty() && Path::new(trimmed).is_dir() {
+                return true;
+            }
+        }
         if let Some(h) = dirs::home_dir() {
-            if h.join(".local/share/millennium").is_dir() || h.join(".config/millennium").is_dir() {
+            if h.join(".local/share/millennium").is_dir()
+                || h.join(".config/millennium").is_dir()
+                || h.join(".var/app/com.valvesoftware.Steam/.local/share/millennium")
+                    .is_dir()
+                || h.join(".var/app/com.valvesoftware.Steam/.config/millennium")
+                    .is_dir()
+            {
                 return true;
             }
         }
@@ -713,7 +788,7 @@ impl MillenniumService {
             let _ = fs::create_dir_all(parent);
         }
         if let Ok(pretty) = serde_json::to_string_pretty(state) {
-            let tmp = state_path.with_extension("json.tmp");
+            let tmp = atomic_tmp_path(state_path);
             if fs::write(&tmp, pretty).is_ok() {
                 let _ = fs::rename(&tmp, state_path);
             }
@@ -725,6 +800,31 @@ impl MillenniumService {
             .and_then(|n| n.to_str())
             .map(|n| n.eq_ignore_ascii_case("config.json"))
             .unwrap_or(false)
+    }
+
+    /// Inspects existing `config.json` files to check whether any defines
+    /// `plugins.enabledPlugins` (`saw_enabled_list`) and whether `"LuaToolsLinux"` is enabled.
+    fn inspect_config_jsons_for_luatools(configs: &[&PathBuf]) -> (bool, bool) {
+        let mut saw_enabled_list = false;
+        let mut is_enabled = false;
+        for cfg in configs {
+            if let Ok(raw) = fs::read_to_string(cfg) {
+                if let Ok(val) = serde_json::from_str::<Value>(&raw) {
+                    if let Some(arr) = val
+                        .get("plugins")
+                        .and_then(|p| p.get("enabledPlugins"))
+                        .and_then(|e| e.as_array())
+                    {
+                        saw_enabled_list = true;
+                        if arr.iter().any(|v| v.as_str() == Some("LuaToolsLinux")) {
+                            is_enabled = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        (saw_enabled_list, is_enabled)
     }
 
     fn ensure_luatoolslinux_plugin_installed_in(
@@ -739,50 +839,42 @@ impl MillenniumService {
             return Err(msg.into());
         }
 
-        let target_plugin_dir = plugins_base_dir
-            .map(|p| p.join("LuaToolsLinux"))
-            .unwrap_or_else(|| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join(".local/share/millennium/plugins/LuaToolsLinux")
-            });
-
-        let mut state = Self::load_plugin_state(state_sentinel_path);
-        if state.user_opted_out {
-            PluginLog::global().info(
-                Some("Millennium"),
-                "Respecting user opt-out sentinel; skipping LuaToolsLinux Millennium plugin auto-enable",
-            );
-            return Ok(target_plugin_dir);
-        }
+        let resolved_base_dir = plugins_base_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(Self::resolve_plugins_dir);
+        let target_plugin_dir = resolved_base_dir.join("LuaToolsLinux");
 
         let existing_config_jsons: Vec<&PathBuf> = config_files
             .iter()
             .filter(|p| p.is_file() && Self::is_config_json_path(p))
             .collect();
 
-        // If we previously auto-enabled LuaToolsLinux and the user later removed it from
-        // Millennium's config.json enabledPlugins, record the opt-out sentinel and respect it.
-        if state.auto_enabled_once && !existing_config_jsons.is_empty() {
-            let mut saw_enabled_list = false;
-            let mut still_enabled = false;
-            for cfg in &existing_config_jsons {
-                if let Ok(raw) = fs::read_to_string(cfg) {
-                    if let Ok(val) = serde_json::from_str::<Value>(&raw) {
-                        if let Some(arr) = val
-                            .get("plugins")
-                            .and_then(|p| p.get("enabledPlugins"))
-                            .and_then(|e| e.as_array())
-                        {
-                            saw_enabled_list = true;
-                            if arr.iter().any(|v| v.as_str() == Some("LuaToolsLinux")) {
-                                still_enabled = true;
-                                break;
-                            }
-                        }
-                    }
-                }
+        let mut state = Self::load_plugin_state(state_sentinel_path);
+        if state.user_opted_out {
+            // Still inspect config.json: if the user manually re-enabled "LuaToolsLinux"
+            // inside Steam's Millennium UI, clear the opt-out sentinel and upgrade plugin files.
+            let (_, manually_reenabled) =
+                Self::inspect_config_jsons_for_luatools(&existing_config_jsons);
+            if manually_reenabled {
+                state.user_opted_out = false;
+                state.auto_enabled_once = true;
+                Self::save_plugin_state(state_sentinel_path, &state);
+                PluginLog::global().info(
+                    Some("Millennium"),
+                    "Detected manual re-enable of LuaToolsLinux in Millennium config; clearing opt-out sentinel and upgrading plugin files",
+                );
+            } else {
+                PluginLog::global().info(
+                    Some("Millennium"),
+                    "Respecting user opt-out sentinel; skipping LuaToolsLinux Millennium plugin auto-enable",
+                );
+                return Ok(target_plugin_dir);
             }
+        } else if state.auto_enabled_once && !existing_config_jsons.is_empty() {
+            // If we previously auto-enabled LuaToolsLinux and the user later removed it from
+            // Millennium's config.json enabledPlugins, record the opt-out sentinel and respect it.
+            let (saw_enabled_list, still_enabled) =
+                Self::inspect_config_jsons_for_luatools(&existing_config_jsons);
             if saw_enabled_list && !still_enabled {
                 state.user_opted_out = true;
                 Self::save_plugin_state(state_sentinel_path, &state);
@@ -796,10 +888,11 @@ impl MillenniumService {
 
         let installer =
             crate::services::plugin_installer_service::PluginInstallerService::default();
-        let plugin_path = installer.install_embedded_millennium_plugin(plugins_base_dir)?;
+        let plugin_path = installer.install_embedded_millennium_plugin(Some(&resolved_base_dir))?;
 
         // Ensure config.json has general.injectJavascript, general.injectCSS, and
         // plugins.enabledPlugins containing "LuaToolsLinux" (creating missing objects).
+        let mut confirmed_in_config = false;
         for cfg in existing_config_jsons {
             if let Ok(raw) = fs::read_to_string(cfg) {
                 if let Ok(mut val) = serde_json::from_str::<Value>(&raw) {
@@ -854,21 +947,33 @@ impl MillenniumService {
 
                     if modified {
                         if let Ok(pretty) = serde_json::to_string_pretty(&val) {
-                            let tmp = cfg.with_extension("json.tmp");
-                            if fs::write(&tmp, pretty).is_ok() {
-                                let _ = fs::rename(&tmp, cfg);
+                            let tmp = atomic_tmp_path(cfg);
+                            if fs::write(&tmp, pretty).is_ok() && fs::rename(&tmp, cfg).is_ok() {
+                                confirmed_in_config = true;
                                 PluginLog::global().info(
                                     Some("Millennium"),
                                     &format!("Enabled LuaToolsLinux plugin in {}", cfg.display()),
                                 );
                             }
                         }
+                    } else if val
+                        .get("plugins")
+                        .and_then(|p| p.get("enabledPlugins"))
+                        .and_then(Value::as_array)
+                        .map_or(false, |arr| {
+                            arr.iter().any(|v| v.as_str() == Some("LuaToolsLinux"))
+                        })
+                    {
+                        confirmed_in_config = true;
                     }
                 }
             }
         }
 
-        if !state.auto_enabled_once {
+        // Only mark auto_enabled_once after at least one config.json actually contains
+        // "LuaToolsLinux" so fresh Millennium installs (before Steam's first launch creates
+        // config.json) never trigger a false permanent opt-out later.
+        if confirmed_in_config && !state.auto_enabled_once {
             state.auto_enabled_once = true;
             Self::save_plugin_state(state_sentinel_path, &state);
         }
@@ -887,6 +992,15 @@ impl MillenniumService {
         let state_path = Self::default_plugin_state_path();
         Self::ensure_luatoolslinux_plugin_installed_in(installed, None, &cfgs, &state_path)
     }
+}
+
+fn atomic_tmp_path(target: &Path) -> PathBuf {
+    let mut tmp_name = target
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("file"));
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    target.with_file_name(tmp_name)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1115,5 +1229,107 @@ mod tests {
         let after_optout: Value =
             serde_json::from_str(&fs::read_to_string(&cfg_json).unwrap()).unwrap();
         assert_eq!(after_optout["plugins"]["enabledPlugins"], json!(["protondb"]));
+
+        // 5. If user manually re-enables "LuaToolsLinux" in config.json, clear opt-out sentinel
+        //    and deploy/upgrade plugin files.
+        fs::write(
+            &cfg_json,
+            r#"{"plugins":{"enabledPlugins":["protondb","LuaToolsLinux"]}}"#,
+        )
+        .unwrap();
+        MillenniumService::ensure_luatoolslinux_plugin_installed_in(
+            true,
+            Some(&plugins_dir2),
+            &[cfg_json.clone()],
+            &state_json,
+        )
+        .unwrap();
+        assert!(plugins_dir2
+            .join("LuaToolsLinux/.millennium/Dist/webkit.js")
+            .is_file());
+        let state_after_reenable: MillenniumPluginState =
+            serde_json::from_str(&fs::read_to_string(&state_json).unwrap()).unwrap();
+        assert!(!state_after_reenable.user_opted_out);
+        assert!(state_after_reenable.auto_enabled_once);
+    }
+
+    #[test]
+    fn ensure_luatoolslinux_waits_for_config_json_before_marking_auto_enabled_once() {
+        let tmp = tempdir().unwrap();
+        let plugins_dir = tmp.path().join("plugins");
+        let cfg_json = tmp.path().join("config.json"); // does NOT exist yet (fresh Millennium)
+        let state_json = tmp.path().join("millennium_plugin_state.json");
+
+        // 1. First run before Steam creates config.json deploys plugin files,
+        //    but must NOT mark auto_enabled_once = true yet.
+        MillenniumService::ensure_luatoolslinux_plugin_installed_in(
+            true,
+            Some(&plugins_dir),
+            &[cfg_json.clone()],
+            &state_json,
+        )
+        .unwrap();
+        assert!(plugins_dir.join("LuaToolsLinux/plugin.json").is_file());
+        assert!(!state_json.exists());
+
+        // 2. Steam launches for the first time and creates config.json with empty enabledPlugins.
+        fs::write(&cfg_json, r#"{"plugins":{"enabledPlugins":[]}}"#).unwrap();
+
+        // 3. Next run must auto-enable LuaToolsLinux (not falsely conclude user opted out).
+        MillenniumService::ensure_luatoolslinux_plugin_installed_in(
+            true,
+            Some(&plugins_dir),
+            &[cfg_json.clone()],
+            &state_json,
+        )
+        .unwrap();
+        let after: Value = serde_json::from_str(&fs::read_to_string(&cfg_json).unwrap()).unwrap();
+        assert_eq!(after["plugins"]["enabledPlugins"], json!(["LuaToolsLinux"]));
+        let state: MillenniumPluginState =
+            serde_json::from_str(&fs::read_to_string(&state_json).unwrap()).unwrap();
+        assert!(state.auto_enabled_once);
+        assert!(!state.user_opted_out);
+    }
+
+    #[test]
+    fn resolve_plugins_dir_precedence_and_flatpak_paths() {
+        let home = Path::new("/home/tester");
+        assert_eq!(
+            MillenniumService::resolve_plugins_dir_from(
+                Some("/custom/plugins"),
+                Some("/custom/data"),
+                Some("/custom/xdg"),
+                Some(home),
+            ),
+            PathBuf::from("/custom/plugins")
+        );
+        assert_eq!(
+            MillenniumService::resolve_plugins_dir_from(
+                Some("   "),
+                Some("/custom/data"),
+                Some("/custom/xdg"),
+                Some(home),
+            ),
+            PathBuf::from("/custom/data/plugins")
+        );
+        assert_eq!(
+            MillenniumService::resolve_plugins_dir_from(None, None, Some("/custom/xdg"), Some(home)),
+            PathBuf::from("/custom/xdg/millennium/plugins")
+        );
+        assert_eq!(
+            MillenniumService::resolve_plugins_dir_from(None, None, None, Some(home)),
+            PathBuf::from("/home/tester/.local/share/millennium/plugins")
+        );
+
+        let data_dirs = MillenniumService::data_dirs(None);
+        let config_paths = MillenniumService::config_paths(None);
+        if dirs::home_dir().is_some() {
+            assert!(data_dirs.iter().any(|p| p
+                .to_string_lossy()
+                .contains(".var/app/com.valvesoftware.Steam/.local/share/millennium")));
+            assert!(config_paths.iter().any(|p| p
+                .to_string_lossy()
+                .contains(".var/app/com.valvesoftware.Steam/.config/millennium/config.json")));
+        }
     }
 }

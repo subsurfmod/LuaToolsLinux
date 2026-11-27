@@ -956,6 +956,19 @@ fn render_help_tip_card(ui: &mut Ui, title: &str, body: &str, pinned: bool) {
     }
 }
 
+/// Records whether a modal scrim/dialog is currently active so background hover help tips
+/// stay hidden behind open dialogs.
+pub fn set_modal_layer_active(ctx: &egui::Context, active: bool) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("luatools_modal_layer_active"), active));
+}
+
+pub fn is_modal_layer_active(ctx: &egui::Context) -> bool {
+    ctx.data(|d| {
+        d.get_temp::<bool>(egui::Id::new("luatools_modal_layer_active"))
+            .unwrap_or(false)
+    })
+}
+
 /// Compact circular `?` help-tip icon button (`18×18 px`).
 ///
 /// - Hovering shows a dark obsidian floating info card with `title` and wrapped `body`.
@@ -964,18 +977,21 @@ fn render_help_tip_card(ui: &mut Ui, title: &str, body: &str, pinned: bool) {
 pub fn help_tip_icon(ui: &mut egui::Ui, id_salt: &str, title: &str, body: &str) {
     let popup_id = ui.make_persistent_id(id_salt);
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
+    let anchor_visible = ui.is_rect_visible(rect);
+    let modal_blocks_background =
+        is_modal_layer_active(ui.ctx()) && ui.layer_id().order == egui::Order::Background;
 
-    let just_toggled = resp.clicked();
+    let just_toggled = resp.clicked() && anchor_visible && !modal_blocks_background;
     if just_toggled {
         ui.memory_mut(|mem| mem.toggle_popup(popup_id));
     }
     let is_open = ui.memory(|mem| mem.is_popup_open(popup_id));
 
-    if resp.hovered() && ui.is_enabled() {
+    if resp.hovered() && ui.is_enabled() && anchor_visible && !modal_blocks_background {
         ui.ctx().set_cursor_icon(CursorIcon::Help);
     }
 
-    if ui.is_rect_visible(rect) {
+    if anchor_visible {
         let enabled = ui.is_enabled();
         let (bg, border, fg) = if !enabled {
             (
@@ -989,7 +1005,7 @@ pub fn help_tip_icon(ui: &mut egui::Ui, id_salt: &str, title: &str, body: &str) 
                 Palette::BLUE_LIGHT,
                 Palette::TEXT_PRIMARY,
             )
-        } else if resp.hovered() {
+        } else if resp.hovered() && !modal_blocks_background {
             (
                 Palette::BLUE_SUBTLE,
                 Palette::BLUE_LIGHT,
@@ -1025,6 +1041,19 @@ pub fn help_tip_icon(ui: &mut egui::Ui, id_salt: &str, title: &str, body: &str) 
         );
     }
 
+    // Dismiss pinned popup if its anchor scrolled outside the visible clip rect.
+    if !anchor_visible {
+        if is_open {
+            ui.memory_mut(|mem| mem.close_popup());
+        }
+        return;
+    }
+
+    // Suppress hover popups (and background pinned popups) while a modal scrim/dialog is open.
+    if modal_blocks_background {
+        return;
+    }
+
     if !is_open && !(resp.hovered() && ui.is_enabled()) {
         return;
     }
@@ -1035,16 +1064,24 @@ pub fn help_tip_icon(ui: &mut egui::Ui, id_salt: &str, title: &str, body: &str) 
     }
 
     let card_max_w = 296.0_f32;
+    let height_mem_id = popup_id.with("measured_height");
+    let est_h = ui
+        .ctx()
+        .data(|d| d.get_temp::<f32>(height_mem_id))
+        .filter(|h| *h > 20.0 && h.is_finite())
+        .unwrap_or(220.0);
+
     let screen = ui.ctx().screen_rect();
     let safe_screen = if screen.width() > 24.0 && screen.height() > 24.0 {
         screen.shrink(8.0)
     } else {
         screen
     };
-    let open_left = anchor_rect.left() + card_max_w + 32.0 > screen.right()
-        && anchor_rect.right() - (card_max_w + 32.0) >= screen.left();
-    let open_above = anchor_rect.bottom() + 140.0 > screen.bottom()
-        && anchor_rect.top() - 140.0 >= screen.top();
+    let open_left = anchor_rect.left() + card_max_w + 32.0 > safe_screen.right()
+        && anchor_rect.right() - (card_max_w + 32.0) >= safe_screen.left();
+    let space_below = (safe_screen.bottom() - (anchor_rect.bottom() + 6.0)).max(0.0);
+    let space_above = ((anchor_rect.top() - 6.0) - safe_screen.top()).max(0.0);
+    let open_above = space_below < est_h && (space_above >= est_h || space_above > space_below);
     let (pivot, anchor_pos) = match (open_left, open_above) {
         (false, false) => (
             egui::Align2::LEFT_TOP,
@@ -1078,6 +1115,12 @@ pub fn help_tip_icon(ui: &mut egui::Ui, id_salt: &str, title: &str, body: &str) 
                 });
             });
 
+        let measured_h = area_resp.response.rect.height();
+        if measured_h > 20.0 && measured_h.is_finite() {
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(height_mem_id, measured_h));
+        }
+
         let esc_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
         let clicked_outside =
             !just_toggled && resp.clicked_elsewhere() && area_resp.response.clicked_elsewhere();
@@ -1085,7 +1128,7 @@ pub fn help_tip_icon(ui: &mut egui::Ui, id_salt: &str, title: &str, body: &str) 
             ui.memory_mut(|mem| mem.close_popup());
         }
     } else {
-        egui::Area::new(popup_id.with("hover_card"))
+        let area_resp = egui::Area::new(popup_id.with("hover_card"))
             .kind(egui::UiKind::Popup)
             .order(egui::Order::Tooltip)
             .interactable(false)
@@ -1099,6 +1142,12 @@ pub fn help_tip_icon(ui: &mut egui::Ui, id_salt: &str, title: &str, body: &str) 
                     render_help_tip_card(ui, title, body, false);
                 });
             });
+
+        let measured_h = area_resp.response.rect.height();
+        if measured_h > 20.0 && measured_h.is_finite() {
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(height_mem_id, measured_h));
+        }
     }
 }
 

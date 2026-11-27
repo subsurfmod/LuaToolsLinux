@@ -107,14 +107,10 @@ fn test_cross_instance_unix_socket_ipc_protocol_forwarding() {
 #[test]
 fn test_steam_service_api() {
     let running = SteamService::is_steam_running();
-    // Should be boolean without panicking
+    // Should be boolean without panicking (never terminate live host Steam processes in unit tests)
     let _ = running;
 
-    // Terminate steam instances returns Ok(count)
-    let term_res = SteamService::terminate_steam_instances();
-    assert!(term_res.is_ok());
-
-    // Relaunch targeting a mock steam-sls in temp directory
+    // Relaunch command spec + detached spawn targeting an isolated mock steam.sh in temp directory
     let tmp = tempfile::tempdir().expect("tempdir");
     let mock_steam = tmp.path().join("steam.sh");
     std::fs::write(&mock_steam, "#!/bin/sh\nexit 0\n").expect("write mock steam.sh");
@@ -126,8 +122,15 @@ fn test_steam_service_api() {
         std::fs::set_permissions(&mock_steam, perms).unwrap();
     }
 
-    let res = SteamService::relaunch_steam_sls(Some(&tmp.path().to_path_buf()));
-    assert!(res.is_ok(), "relaunch with mock steam executable should succeed: {:?}", res);
+    let (prog, args, audit) =
+        SteamService::build_relaunch_command_spec(Some(tmp.path()), tmp.path());
+    assert_eq!(prog, mock_steam);
+    let res = SteamService::spawn_detached_steam_and_verify(&prog, &args, audit.as_deref(), |_| {});
+    assert!(
+        res.is_ok(),
+        "isolated spawn with mock steam executable should succeed: {:?}",
+        res
+    );
 }
 
 #[test]

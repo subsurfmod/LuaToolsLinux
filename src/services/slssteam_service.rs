@@ -321,8 +321,26 @@ impl SlssteamService {
             path: path.to_path_buf(),
             ..Default::default()
         };
-        let Ok(Value::Mapping(map)) = serde_yml::from_str::<Value>(raw) else {
-            return (cfg, !raw.trim().is_empty());
+        if raw.trim().is_empty() {
+            return (cfg, false);
+        }
+        let map = match serde_yml::from_str::<Value>(raw) {
+            Ok(Value::Mapping(map)) => map,
+            Ok(_) => {
+                log::error!(
+                    "SLSsteam config at {} does not contain a root YAML mapping; preserving file intact",
+                    path.display()
+                );
+                return (cfg, false);
+            }
+            Err(e) => {
+                log::error!(
+                    "Failed to parse malformed SLSsteam config at {}: {}; preserving file intact",
+                    path.display(),
+                    e
+                );
+                return (cfg, false);
+            }
         };
 
         let needs_heal = Self::mapping_needs_heal(&map);
@@ -929,17 +947,40 @@ impl SlssteamService {
 
     pub fn save(&self) -> bool {
         if let Some(parent) = self.config_path.parent() {
-            if fs::create_dir_all(parent).is_err() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                log::error!(
+                    "Failed to create SLSsteam config directory {}: {}",
+                    parent.display(),
+                    e
+                );
                 return false;
             }
         }
         let content = self.serialize_yaml();
         let cnt = SLS_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp = self.config_path.with_extension(format!("yaml.tmp.{}.{}", std::process::id(), cnt));
-        if fs::write(&tmp, content).is_err() {
+        let tmp = self
+            .config_path
+            .with_extension(format!("yaml.tmp.{}.{}", std::process::id(), cnt));
+        if let Err(e) = fs::write(&tmp, content) {
+            log::error!(
+                "Failed to write temporary SLSsteam config {}: {}",
+                tmp.display(),
+                e
+            );
+            let _ = fs::remove_file(&tmp);
             return false;
         }
-        fs::rename(&tmp, &self.config_path).is_ok()
+        if let Err(e) = fs::rename(&tmp, &self.config_path) {
+            log::error!(
+                "Failed to replace SLSsteam config {} from {}: {}",
+                self.config_path.display(),
+                tmp.display(),
+                e
+            );
+            let _ = fs::remove_file(&tmp);
+            return false;
+        }
+        true
     }
 
     pub fn get_fake_app_id(&self, app_id: u32) -> Option<u32> {
@@ -1478,5 +1519,50 @@ UserCustomSetting: 42
         assert!(!healed_raw.contains("pin2"));
         assert!(healed_raw.contains("SteamIdOverride:\n  0: 76561198000000001\n"));
         assert_eq!(healed_raw.matches("UserCustomSetting:").count(), 1);
+    }
+
+    #[test]
+    fn malformed_yaml_is_preserved_intact_on_new_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.yaml");
+
+        let malformed = "AppIds: [1, 2\n  broken: : :\n# user comment to preserve\n";
+        fs::write(&cfg_path, malformed).unwrap();
+
+        let mut svc = SlssteamService::new(Some(cfg_path.clone()));
+        assert_eq!(fs::read_to_string(&cfg_path).unwrap(), malformed);
+        svc.reload();
+        assert_eq!(fs::read_to_string(&cfg_path).unwrap(), malformed);
+
+        // Non-mapping root YAML must also be preserved intact without silent overwrite.
+        let non_map = "- 123\n- 456\n";
+        fs::write(&cfg_path, non_map).unwrap();
+        let mut svc2 = SlssteamService::new(Some(cfg_path.clone()));
+        assert_eq!(fs::read_to_string(&cfg_path).unwrap(), non_map);
+        svc2.reload();
+        assert_eq!(fs::read_to_string(&cfg_path).unwrap(), non_map);
+    }
+
+    #[test]
+    fn save_cleans_up_temp_file_when_rename_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.yaml");
+        // Make target path a directory so fs::rename(tmp_file, cfg_path) fails with EISDIR.
+        fs::create_dir_all(&cfg_path).unwrap();
+
+        let svc = SlssteamService::new(Some(cfg_path));
+        assert!(!svc.save());
+
+        let leaked_tmps: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|name| name.contains(".yaml.tmp."))
+            .collect();
+        assert!(
+            leaked_tmps.is_empty(),
+            "leaked temp files after failed rename: {:?}",
+            leaked_tmps
+        );
     }
 }

@@ -1,15 +1,35 @@
 --[[
-  LuaToolsLinux — Millennium v3.6+ Native Lua Backend
+  LuaToolsLinux — Millennium v3.6.3 Native Lua Backend
   Plugin: LuaToolsLinux
   Author: subsurfmod (https://github.com/subsurfmod/LuaToolsLinux)
   Executed inside /usr/lib/millennium/libmillennium_luavm_x64
   Handles RPC dispatch to local LuaTools Linux companion daemon (127.0.0.1:<port>),
-  automatic companion wake, Webkit browser registration, and offline fallback.
+  automatic companion wake, and offline fallback.
 --]]
 
 local millennium = require("millennium")
 local http = require("http")
 local logger = require("logger")
+
+-- Millennium v3.6.3 logger uses method syntax (`logger:info(msg)` -> self at stack #1, msg at stack #2).
+-- Always invoke via pcall-guarded colon helpers so logger mismatches can never abort execution.
+local function log_info(msg)
+    if logger then
+        pcall(function() logger:info(tostring(msg)) end)
+    end
+end
+
+local function log_warn(msg)
+    if logger then
+        pcall(function() logger:warn(tostring(msg)) end)
+    end
+end
+
+local function log_error(msg)
+    if logger then
+        pcall(function() logger:error(tostring(msg)) end)
+    end
+end
 
 -- Millennium v3.6+ preloads lua-cjson under require("json") (not "cjson.safe").
 -- Wrap encode/decode with pcall so malformed JSON never crashes the Lua host.
@@ -48,10 +68,10 @@ local json = {
 local luatools_backend = {
     name = "LuaToolsLinux",
     author = "subsurfmod",
-    version = "4.1.2",
+    version = "4.1.3",
     default_port = 6767,
     port = 6767,
-    token = "",
+    token = nil,
     connected = false,
     endpoint = "http://127.0.0.1:6767",
     browser_js_hook = nil,
@@ -116,11 +136,11 @@ local function discover_endpoint()
             f:close()
             if content and content ~= "" then
                 local data = json.decode(content)
-                if data and data.port then
+                if type(data) == "table" and data.port then
                     luatools_backend.port = data.port
                     luatools_backend.token = data.token or ""
                     luatools_backend.endpoint = "http://127.0.0.1:" .. tostring(data.port)
-                    logger.info("[LuaToolsLinux by subsurfmod] Discovered companion endpoint on " .. luatools_backend.endpoint)
+                    log_info("[LuaToolsLinux by subsurfmod] Discovered companion endpoint on " .. luatools_backend.endpoint)
                     return true
                 end
             end
@@ -133,7 +153,8 @@ local function discover_endpoint()
     return false
 end
 
--- Forward RPC call to LuaTools HTTP server
+-- Forward RPC call to LuaTools HTTP server and return a Lua table
+-- (libmillennium_luavm_x64 serializes returned Lua tables directly to JSON objects).
 local function rpc_call(method, params)
     discover_endpoint()
     local payload = json.encode({
@@ -152,7 +173,6 @@ local function rpc_call(method, params)
 
     local ok, response, err = pcall(http.post, luatools_backend.endpoint .. "/rpc", {
         data = payload,
-        body = payload,
         headers = headers,
         timeout = 10
     })
@@ -162,188 +182,231 @@ local function rpc_call(method, params)
         response = nil
     end
 
-    if err or not response then
-        logger.warn("[LuaToolsLinux] RPC call " .. method .. " failed: " .. tostring(err))
-        return json.encode({
+    if err or type(response) ~= "table" or type(response.status) ~= "number" then
+        local reason = tostring(err or "invalid HTTP response")
+        log_warn("[LuaToolsLinux] RPC call " .. tostring(method) .. " failed: " .. reason)
+        return {
             success = false,
-            error = "Companion daemon unreachable: " .. tostring(err)
-        })
+            error = "Companion daemon unreachable: " .. reason
+        }
     end
 
     if response.status >= 200 and response.status < 300 then
-        return response.body
+        local decoded = json.decode(response.body)
+        if type(decoded) == "table" then
+            return decoded
+        end
+        log_error("[LuaToolsLinux] RPC call " .. tostring(method) .. " returned non-JSON body")
+        return {
+            success = false,
+            error = "Invalid JSON response from companion daemon",
+            raw = response.body
+        }
     else
-        return json.encode({
+        local decoded = json.decode(response.body)
+        if type(decoded) == "table" then
+            if decoded.success == nil then
+                decoded.success = false
+            end
+            if not decoded.error then
+                decoded.error = "HTTP error " .. tostring(response.status)
+            end
+            return decoded
+        end
+        return {
             success = false,
             error = "HTTP error " .. tostring(response.status) .. ": " .. tostring(response.body)
-        })
+        }
     end
 end
 
--- Zero-latency offline fallback checking local stplug-in files
+-- Zero-latency offline fallback checking local stplug-in files (native + Flatpak Steam)
 local function local_has_lua_fallback(appid)
-    if not appid or appid == 0 then return false end
+    if not appid or appid == 0 then return false, false end
     local home = get_home_dir()
-    local paths = {
-        home .. "/.local/share/Steam/config/stplug-in/" .. tostring(appid) .. ".lua",
-        home .. "/.local/share/Steam/stplug-in/" .. tostring(appid) .. ".lua"
+    local id_str = tostring(appid)
+    local dirs = {
+        home .. "/.local/share/Steam/config/stplug-in/",
+        home .. "/.local/share/Steam/stplug-in/",
+        home .. "/.var/app/com.valvesoftware.Steam/.local/share/Steam/config/stplug-in/",
+        home .. "/.var/app/com.valvesoftware.Steam/.local/share/Steam/stplug-in/"
     }
-    for _, path in ipairs(paths) do
-        local f = io.open(path, "r")
+    for _, dir in ipairs(dirs) do
+        local f = io.open(dir .. id_str .. ".lua", "r")
         if f then
             f:close()
-            return true
+            return true, false
         end
     end
-    return false
+    for _, dir in ipairs(dirs) do
+        local f = io.open(dir .. id_str .. ".lua.disabled", "r")
+        if f then
+            f:close()
+            return false, true
+        end
+    end
+    return false, false
 end
 
 -- Millennium Lifecycle Callbacks
+-- Millennium v3.6.3 natively loads `.millennium/Dist/webkit.js`, so we do NOT call
+-- `add_browser_js("public/luatools.js")` or `add_browser_css("public/luatools.css")`
+-- (which resolve under `themes/public/...` and 404).
 function on_load()
-    logger.info("[LuaToolsLinux] Native Millennium plugin loading (v" .. luatools_backend.version .. " by subsurfmod)")
+    log_info("[LuaToolsLinux] Native Millennium plugin loading (v" .. luatools_backend.version .. " by subsurfmod)")
     discover_endpoint()
 
-    -- Inject Store scripts via Millennium Webkit API
-    if millennium.add_browser_js then
-        local ok_js, hook_js = pcall(millennium.add_browser_js, "public/luatools.js")
-        if ok_js then
-            luatools_backend.browser_js_hook = hook_js
-        else
-            logger.warn("[LuaToolsLinux] add_browser_js warning: " .. tostring(hook_js))
-        end
+    if millennium and millennium.ready then
+        pcall(millennium.ready)
     end
-    if millennium.add_browser_css then
-        local ok_css, hook_css = pcall(millennium.add_browser_css, "public/luatools.css")
-        if ok_css then
-            luatools_backend.browser_css_hook = hook_css
-        else
-            logger.warn("[LuaToolsLinux] add_browser_css warning: " .. tostring(hook_css))
-        end
-    end
-
-    if millennium.ready then
-        millennium.ready()
-    end
-    logger.info("[LuaToolsLinux] Plugin ready and registered for Millennium")
+    log_info("[LuaToolsLinux] Plugin ready and registered for Millennium")
 end
 
 function on_frontend_loaded()
     discover_endpoint()
-    logger.info("[LuaToolsLinux] Frontend loaded, checking companion status...")
+    log_info("[LuaToolsLinux] Frontend loaded, checking companion status...")
 end
 
 function on_unload()
-    logger.info("[LuaToolsLinux] Unloading plugin")
-    if luatools_backend.browser_js_hook and millennium.remove_browser_module then
-        millennium.remove_browser_module(luatools_backend.browser_js_hook)
+    log_info("[LuaToolsLinux] Unloading plugin")
+    if type(luatools_backend.browser_js_hook) == "number" and millennium and millennium.remove_browser_module then
+        pcall(millennium.remove_browser_module, luatools_backend.browser_js_hook)
     end
-    if luatools_backend.browser_css_hook and millennium.remove_browser_module then
-        millennium.remove_browser_module(luatools_backend.browser_css_hook)
+    if type(luatools_backend.browser_css_hook) == "number" and millennium and millennium.remove_browser_module then
+        pcall(millennium.remove_browser_module, luatools_backend.browser_css_hook)
     end
 end
 
 -- ============================================================================
--- Exported Methods for Millennium.callServerMethod("LuaToolsLinux", method, args)
+-- Exported Methods for Millennium.callServerMethod("LuaToolsLinux", method, [args])
+-- Accepts BOTH a single table/JSON-object argument AND positional arguments!
 -- ============================================================================
 
-local function parse_args(args)
-    if type(args) == "table" then
-        return args
-    elseif type(args) == "string" and args ~= "" then
-        local decoded = json.decode(args)
-        if type(decoded) == "table" then return decoded end
+local function parse_args(positional_keys, ...)
+    local n = select("#", ...)
+    if n == 0 then
+        return {}
     end
-    return {}
+
+    local first = select(1, ...)
+    if n == 1 then
+        if type(first) == "table" then
+            return first
+        elseif type(first) == "string" and first ~= "" then
+            local trimmed = first:match("^%s*(.-)%s*$")
+            local lead = trimmed:sub(1, 1)
+            if lead == "{" or lead == "[" then
+                local decoded = json.decode(trimmed)
+                if type(decoded) == "table" then
+                    return decoded
+                end
+            end
+        end
+    end
+
+    local out = {}
+    if type(positional_keys) == "table" then
+        for i, key in ipairs(positional_keys) do
+            if i <= n then
+                local v = select(i, ...)
+                if v ~= nil then
+                    out[key] = v
+                end
+            end
+        end
+    elseif type(first) == "table" then
+        return first
+    end
+    return out
 end
 
-function HasLuaToolsForApp(args)
-    local params = parse_args(args)
-    local appid = tonumber(params.appid or params.appId or 0)
-    
+function HasLuaToolsForApp(...)
+    local params = parse_args({ "appid" }, ...)
+    local appid = tonumber(params.appid or params.appId or 0) or 0
+
     local rpc_res = rpc_call("HasLuaToolsForApp", { appid = appid })
-    local parsed = json.decode(rpc_res)
-    if parsed and parsed.success then
+    if type(rpc_res) == "table" and rpc_res.success then
         return rpc_res
     end
 
     -- Fallback to local check
-    local fallback_exists = local_has_lua_fallback(appid)
-    return json.encode({
+    local fallback_exists, fallback_disabled = local_has_lua_fallback(appid)
+    return {
         success = true,
         exists = fallback_exists,
         has = fallback_exists,
-        disabled = false,
+        disabled = fallback_disabled,
         depotCount = 0,
         dlcCount = 0,
         source = "local_fs_fallback"
-    })
+    }
 end
 
-function CheckSources(args)
-    return rpc_call("CheckSources", parse_args(args))
+function CheckSources(...)
+    return rpc_call("CheckSources", parse_args({ "appid" }, ...))
 end
 
-function StartAddViaLuaTools(args)
-    return rpc_call("StartAddViaLuaTools", parse_args(args))
+function StartAddViaLuaTools(...)
+    return rpc_call("StartAddViaLuaTools", parse_args({ "appid", "name", "source" }, ...))
 end
 
-function GetAddViaLuaToolsStatus(args)
-    return rpc_call("GetAddViaLuaToolsStatus", parse_args(args))
+function GetAddViaLuaToolsStatus(...)
+    return rpc_call("GetAddViaLuaToolsStatus", parse_args({ "appid" }, ...))
 end
 
-function CancelAddViaLuaTools(args)
-    return rpc_call("CancelAddViaLuaTools", parse_args(args))
+function CancelAddViaLuaTools(...)
+    return rpc_call("CancelAddViaLuaTools", parse_args({ "appid" }, ...))
 end
 
-function DeleteLuaToolsForApp(args)
-    return rpc_call("DeleteLuaToolsForApp", parse_args(args))
+function DeleteLuaToolsForApp(...)
+    return rpc_call("DeleteLuaToolsForApp", parse_args({ "appid" }, ...))
 end
 
-function ToggleAppEnabled(args)
-    return rpc_call("ToggleAppEnabled", parse_args(args))
+function ToggleAppEnabled(...)
+    return rpc_call("ToggleAppEnabled", parse_args({ "appid", "enabled" }, ...))
 end
 
-function CheckForFixes(args)
-    return rpc_call("CheckForFixes", parse_args(args))
+function CheckForFixes(...)
+    return rpc_call("CheckForFixes", parse_args({ "appid" }, ...))
 end
 
-function ApplyRecommendedFixes(args)
-    return rpc_call("ApplyRecommendedFixes", parse_args(args))
+function ApplyRecommendedFixes(...)
+    return rpc_call("ApplyRecommendedFixes", parse_args({ "appid", "fixId" }, ...))
 end
 
-function GetApplyFixStatus(args)
-    return rpc_call("GetApplyFixStatus", parse_args(args))
+function GetApplyFixStatus(...)
+    return rpc_call("GetApplyFixStatus", parse_args({ "appid" }, ...))
 end
 
-function GetInstalledFixes(args)
-    return rpc_call("GetInstalledFixes", parse_args(args))
+function GetInstalledFixes(...)
+    return rpc_call("GetInstalledFixes", parse_args({ "appid" }, ...))
 end
 
-function RemoveAppliedFixes(args)
-    return rpc_call("RemoveAppliedFixes", parse_args(args))
+function RemoveAppliedFixes(...)
+    return rpc_call("RemoveAppliedFixes", parse_args({ "appid" }, ...))
 end
 
-function OpenFixInDesktopApp(args)
-    return rpc_call("OpenFix", parse_args(args))
+function OpenFixInDesktopApp(...)
+    return rpc_call("OpenFix", parse_args({ "appid" }, ...))
 end
 
-function SyncDlcForApp(args)
-    return rpc_call("SyncDlcForApp", parse_args(args))
+function SyncDlcForApp(...)
+    return rpc_call("SyncDlcForApp", parse_args({ "appid" }, ...))
 end
 
-function RestartSteam(args)
-    return rpc_call("RestartSteam", parse_args(args))
+function RestartSteam(...)
+    return rpc_call("RestartSteam", parse_args(nil, ...))
 end
 
-function GetCompanionStatus(args)
-    return rpc_call("GetCompanionStatus", parse_args(args))
+function GetCompanionStatus(...)
+    return rpc_call("GetCompanionStatus", parse_args(nil, ...))
 end
 
 local function shell_quote(s)
     return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
 end
 
-function WakeCompanion(args)
+function WakeCompanion(...)
     local home = get_home_dir()
     local candidates = {
         home .. "/.local/bin/luatools",
@@ -360,57 +423,61 @@ function WakeCompanion(args)
         end
     end
     os.execute(shell_quote(bin) .. " --minimized --tray-locked >/dev/null 2>&1 &")
-    return json.encode({ success = true, waking = true })
+    return { success = true, waking = true }
 end
 
-function GetInstalledLuaScripts(args)
-    return rpc_call("GetInstalledLuaScripts", parse_args(args))
+function GetInstalledLuaScripts(...)
+    return rpc_call("GetInstalledLuaScripts", parse_args(nil, ...))
 end
 
-function SetLoadedApps(args)
-    return rpc_call("SetLoadedApps", parse_args(args))
+function SetLoadedApps(...)
+    local params = parse_args({ "apps" }, ...)
+    if type(params) == "table" and params[1] ~= nil and params.apps == nil and params.appIds == nil then
+        params = { apps = params }
+    end
+    return rpc_call("SetLoadedApps", params)
 end
 
-function SyncSlsSteamConfig(args)
-    return rpc_call("SyncSlsSteamConfig", parse_args(args))
+function SyncSlsSteamConfig(...)
+    return rpc_call("SyncSlsSteamConfig", parse_args(nil, ...))
 end
 
-function GetSettingsConfig(args)
-    return rpc_call("GetSettingsConfig", parse_args(args))
+function GetSettingsConfig(...)
+    return rpc_call("GetSettingsConfig", parse_args(nil, ...))
 end
 
-function UpdateSettingValue(args)
-    return rpc_call("UpdateSettingValue", parse_args(args))
+function UpdateSettingValue(...)
+    return rpc_call("UpdateSettingValue", parse_args({ "key", "value" }, ...))
 end
 
-function GetApiList(args)
-    return rpc_call("GetApiList", parse_args(args))
+function GetApiList(...)
+    return rpc_call("GetApiList", parse_args(nil, ...))
 end
 
-function CheckUpdates(args)
-    return rpc_call("CheckUpdates", parse_args(args))
+function CheckUpdates(...)
+    return rpc_call("CheckUpdates", parse_args(nil, ...))
 end
 
-function OpenSettings(args)
-    return rpc_call("OpenSettings", parse_args(args))
+function OpenSettings(...)
+    return rpc_call("OpenSettings", parse_args(nil, ...))
 end
 
-function GetTranslations(args)
-    return rpc_call("GetTranslations", parse_args(args))
+function GetTranslations(...)
+    return rpc_call("GetTranslations", parse_args({ "lang" }, ...))
 end
 
-function GetBridgeDiagnostics(args)
-    return rpc_call("GetBridgeDiagnostics", parse_args(args))
+function GetBridgeDiagnostics(...)
+    return rpc_call("GetBridgeDiagnostics", parse_args(nil, ...))
 end
 
-function GetVersion(args)
-    return json.encode({
+function GetVersion(...)
+    return {
         pluginName = luatools_backend.name,
         pluginAuthor = luatools_backend.author,
         pluginVersion = luatools_backend.version,
         backendType = "lua",
         millenniumVersion = "3.6.3"
-    })
+    }
 end
 
 -- Millennium v3.6+ lua-host requires main.lua to return a lifecycle/export table

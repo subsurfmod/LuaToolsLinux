@@ -268,8 +268,10 @@ impl LuaToolsApp {
                 let hub_bridge_installed = bridge_st.integration_lib_installed;
                 let hub_bridge_ready = hub_bridge_active || hub_bridge_installed;
                 let hub_millennium_conn = self.millennium_connected;
+                let hub_native_plugin = self.native_millennium_plugin_installed;
                 let hub_cef_enabled = self.settings_service.settings.cef_bridge_enabled;
-                let hub_store_ready = hub_millennium_conn || hub_cef_enabled;
+                let hub_store_ready =
+                    hub_millennium_conn || hub_native_plugin || hub_cef_enabled;
                 let cloud_st = self.cloud_redirect_service.status();
                 let cloud_apps_count = self.cloud_redirect_service.list_cloud_apps().len();
                 let hub_cloud_ready = matches!(
@@ -436,15 +438,21 @@ impl LuaToolsApp {
                     );
 
                     // Row 3: Steam Store Plugin & luatools:// Links
-                    let (store_badge, store_tone) = if hub_millennium_conn {
+                    let (store_badge, store_tone) = if hub_millennium_conn && hub_native_plugin {
                         ("Connected", BadgeTone::Ready)
+                    } else if hub_millennium_conn || hub_native_plugin {
+                        ("Ready", BadgeTone::Ready)
                     } else if hub_cef_enabled {
                         ("Ready", BadgeTone::Blue)
                     } else {
                         ("Not Set Up", BadgeTone::Warn)
                     };
-                    let store_desc = if hub_millennium_conn {
-                        "Millennium store plugin is connected — add games directly from Steam Store pages."
+                    let store_desc = if hub_millennium_conn && hub_native_plugin {
+                        "LuaToolsLinux native Millennium plugin is installed and connected — add games directly from Steam Store pages."
+                    } else if hub_native_plugin {
+                        "LuaToolsLinux native Millennium plugin is installed — launch Steam with Millennium to see Store page buttons."
+                    } else if hub_millennium_conn {
+                        "Millennium is detected — install or enable the LuaToolsLinux store plugin to add games directly from Steam Store pages."
                     } else if hub_cef_enabled {
                         "CEF Store bridge is enabled — install the Store plugin or register luatools:// links."
                     } else {

@@ -4,20 +4,27 @@
 // Loaded in Steam Client SharedJSContext (steamloopback.host)
 (function () {
   'use strict';
-  console.log('[LuaToolsLinux] Initializing Steam Client UI bundle (v4.1.2 by subsurfmod)');
+  console.log('[LuaToolsLinux] Initializing Steam Client UI bundle (v4.1.3 by subsurfmod)');
 
   const PLUGIN_NAME = 'LuaToolsLinux';
+
+  function parseRpcResponse(res) {
+    let parsed = res;
+    for (let i = 0; i < 2 && typeof parsed === 'string'; i++) {
+      try {
+        parsed = JSON.parse(parsed);
+      } catch (e) {
+        return i === 0 ? { raw: parsed } : parsed;
+      }
+    }
+    return parsed;
+  }
 
   async function callBackend(method, args) {
     if (window.Millennium && window.Millennium.callServerMethod) {
       try {
-        let res;
-        try {
-          res = await window.Millennium.callServerMethod(PLUGIN_NAME, method, args || {});
-        } catch (e) {
-          res = await window.Millennium.callServerMethod('luatools', method, args || {});
-        }
-        return typeof res === 'string' ? JSON.parse(res) : res;
+        const res = await window.Millennium.callServerMethod(PLUGIN_NAME, method, [args || {}]);
+        return parseRpcResponse(res);
       } catch (e) {
         console.error('[LuaToolsLinux] Backend call error:', method, e);
         return null;
@@ -29,7 +36,7 @@
   window.LuaToolsLinux = {
     name: 'LuaToolsLinux',
     author: 'subsurfmod',
-    version: '4.1.2',
+    version: '4.1.3',
     callBackend: callBackend,
     openWorkbench: () => callBackend('OpenSettings', {}),
     syncSlsSteam: () => callBackend('SyncSlsSteamConfig', {}),

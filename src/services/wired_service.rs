@@ -7,6 +7,7 @@
 //! and a `~/.local/bin/steam-sls` `LD_AUDIT` launcher helper.
 use crate::services::file_hash::{FileHash, FileHashService};
 
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -466,12 +467,28 @@ impl WiredService {
         let _ = fs::remove_dir_all(&tmp_dir);
         let so_path = install_res?;
 
-        self.install_millennium_steambrew(|p, m| progress_cb(0.85 + p * 0.13, m))?;
-
-        progress_cb(
-            1.0,
-            format!("SLSsteam + Millennium installed ({})", so_path.display()),
-        );
+        match self.install_millennium_steambrew(|p, m| progress_cb(0.85 + p * 0.13, m)) {
+            Ok(_) => {
+                progress_cb(
+                    1.0,
+                    format!("SLSsteam + Millennium installed ({})", so_path.display()),
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "Optional Millennium (SteamBrew) installation failed (continuing with SLSsteam): {}",
+                    e
+                );
+                progress_cb(
+                    1.0,
+                    format!(
+                        "SLSsteam installed ({}); optional Millennium install skipped: {}",
+                        so_path.display(),
+                        e
+                    ),
+                );
+            }
+        }
         Ok(so_path)
     }
 
@@ -593,7 +610,8 @@ impl WiredService {
             target_so.display().to_string()
         };
 
-        let integration_lib_str = integration_lib.display().to_string();
+        let integration_lib_q = shell_single_quote(&integration_lib.to_string_lossy());
+        let audit_q = shell_single_quote(&audit);
         let script = format!(
             "#!/usr/bin/env bash\n\
              # Auto-start LuaTools companion in background minimized to tray unless opted out (LT-20)\n\
@@ -614,18 +632,20 @@ impl WiredService {
              export LUATOOLS_TARGET_ARCH=\"${{LUATOOLS_TARGET_ARCH:-x86_64}}\"\n\
              # Include LuaTools integration library via multilib $LIB or single 32-bit ELF\n\
              LIB_BASE=\"$HOME/.local/lib/luatools\"\n\
+             INTEGRATION_LIB={integration_lib_q}\n\
              if [ -f \"$LIB_BASE/lib/libsteam_integration.so\" ] && [ -f \"$LIB_BASE/lib64/libsteam_integration.so\" ]; then\n\
                  export LD_PRELOAD=\"$LIB_BASE/\\$LIB/libsteam_integration.so${{LD_PRELOAD:+:$LD_PRELOAD}}\"\n\
-             elif [ -f \"{integration_lib}\" ] && command -v file >/dev/null 2>&1; then\n\
-                 if file -L \"{integration_lib}\" | grep -q \"ELF 32-bit\"; then\n\
-                     export LD_PRELOAD=\"{integration_lib}${{LD_PRELOAD:+:$LD_PRELOAD}}\"\n\
+             elif [ -f \"$INTEGRATION_LIB\" ] && command -v file >/dev/null 2>&1; then\n\
+                 if file -L \"$INTEGRATION_LIB\" | grep -q \"ELF 32-bit\"; then\n\
+                     export LD_PRELOAD=\"${{INTEGRATION_LIB}}${{LD_PRELOAD:+:$LD_PRELOAD}}\"\n\
                  fi\n\
              fi\n\
-             # SLSsteam via LD_AUDIT (always use for SLSsteam hooks)\n\
-             export LD_AUDIT=\"{audit}\"\n\
+             # SLSsteam via LD_AUDIT (always use for SLSsteam hooks; preserve any existing LD_AUDIT)\n\
+             SLS_AUDIT={audit_q}\n\
+             export LD_AUDIT=\"${{SLS_AUDIT}}${{LD_AUDIT:+:$LD_AUDIT}}\"\n\
              exec steam \"$@\"\n",
-            integration_lib = integration_lib_str,
-            audit = audit
+            integration_lib_q = integration_lib_q,
+            audit_q = audit_q
         );
         fs::write(&wrapper, script)
             .map_err(|e| format!("Failed to write steam-sls wrapper: {}", e))?;
@@ -724,6 +744,327 @@ pub fn find_7z_bin() -> Option<PathBuf> {
     None
 }
 
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn has_windows_drive_prefix(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn validate_archive_entry_path(
+    entry_path: &str,
+    archive_label: &str,
+) -> Result<Vec<String>, String> {
+    if entry_path.is_empty() {
+        return Err(format!("Rejected empty entry path in {}", archive_label));
+    }
+    if entry_path.contains('\0')
+        || entry_path.starts_with('/')
+        || entry_path.starts_with('\\')
+        || has_windows_drive_prefix(entry_path)
+    {
+        return Err(format!(
+            "Rejected unsafe path-traversal entry in {}: {}",
+            archive_label, entry_path
+        ));
+    }
+    let mut parts = Vec::new();
+    for seg in entry_path.split(['/', '\\']) {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            return Err(format!(
+                "Rejected unsafe path-traversal entry in {}: {}",
+                archive_label, entry_path
+            ));
+        }
+        parts.push(seg.to_string());
+    }
+    Ok(parts)
+}
+
+fn check_no_symlink_ancestor(
+    parts: &[String],
+    symlink_paths: &HashSet<Vec<String>>,
+    raw_entry: &str,
+    archive_label: &str,
+) -> Result<(), String> {
+    for depth in 1..parts.len() {
+        if symlink_paths.contains(&parts[..depth]) {
+            return Err(format!(
+                "Rejected archive entry traversing symlink ancestor in {}: {}",
+                archive_label, raw_entry
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_archive_link_target(
+    entry_parts: &[String],
+    link_target: &str,
+    is_hardlink: bool,
+    archive_label: &str,
+) -> Result<(), String> {
+    let kind = if is_hardlink { "hardlink" } else { "symlink" };
+    if link_target.is_empty()
+        || link_target.contains('\0')
+        || link_target.starts_with('/')
+        || link_target.starts_with('\\')
+        || has_windows_drive_prefix(link_target)
+    {
+        return Err(format!(
+            "Rejected unsafe {} target escaping destination in {}: {}",
+            kind, archive_label, link_target
+        ));
+    }
+    let mut stack: Vec<&str> = if is_hardlink || entry_parts.is_empty() {
+        Vec::new()
+    } else {
+        entry_parts[..entry_parts.len() - 1]
+            .iter()
+            .map(String::as_str)
+            .collect()
+    };
+    for seg in link_target.split(['/', '\\']) {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            if stack.pop().is_none() {
+                return Err(format!(
+                    "Rejected unsafe {} target escaping destination in {}: {}",
+                    kind, archive_label, link_target
+                ));
+            }
+        } else {
+            stack.push(seg);
+        }
+    }
+    if stack.is_empty() {
+        return Err(format!(
+            "Rejected unsafe {} target resolving to archive root in {}: {}",
+            kind, archive_label, link_target
+        ));
+    }
+    Ok(())
+}
+
+fn extract_tar_verbose_entry_rest(line: &str) -> Option<&str> {
+    let mut tokens: Vec<(usize, usize, &str)> = Vec::with_capacity(9);
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && tokens.len() < 9 {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        tokens.push((start, i, &line[start..i]));
+    }
+    let after_idx = if tokens.len() >= 6
+        && tokens[3].2.len() == 10
+        && tokens[3].2.as_bytes()[4] == b'-'
+        && tokens[3].2.as_bytes()[7] == b'-'
+        && tokens[4].2.contains(':')
+    {
+        tokens[4].1
+    } else if tokens.len() >= 9
+        && tokens[5].2.len() == 3
+        && tokens[5].2.bytes().all(|b| b.is_ascii_alphabetic())
+        && tokens[6].2.bytes().all(|b| b.is_ascii_digit())
+        && (tokens[7].2.contains(':') || tokens[7].2.bytes().all(|b| b.is_ascii_digit()))
+    {
+        tokens[7].1
+    } else if tokens.len() >= 6 {
+        tokens[4].1
+    } else {
+        return None;
+    };
+    let tail = &line[after_idx..];
+    let rest = tail.strip_prefix(' ').unwrap_or_else(|| tail.trim_start());
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest)
+    }
+}
+
+fn validate_tar_verbose_listing(listing: &str, archive_label: &str) -> Result<(), String> {
+    let mut symlink_paths: HashSet<Vec<String>> = HashSet::new();
+    for raw_line in listing.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mode_char = line.chars().next().unwrap_or(' ');
+        if matches!(mode_char, 'c' | 'b' | 'p') {
+            return Err(format!(
+                "Rejected special device/FIFO entry in {}: {}",
+                archive_label, line
+            ));
+        }
+        let Some(rest) = extract_tar_verbose_entry_rest(line) else {
+            return Err(format!(
+                "Rejected unparseable tar listing entry in {}: {}",
+                archive_label, line
+            ));
+        };
+        if mode_char == 'l' {
+            if rest.matches(" -> ").count() != 1 {
+                return Err(format!(
+                    "Rejected ambiguous or malformed symlink entry in {}: {}",
+                    archive_label, line
+                ));
+            }
+            let (entry_path, target) = rest.split_once(" -> ").unwrap();
+            let parts = validate_archive_entry_path(entry_path, archive_label)?;
+            check_no_symlink_ancestor(&parts, &symlink_paths, entry_path, archive_label)?;
+            validate_archive_link_target(&parts, target, false, archive_label)?;
+            if !parts.is_empty() {
+                symlink_paths.insert(parts);
+            }
+        } else if mode_char == 'h' {
+            if rest.matches(" link to ").count() != 1 {
+                return Err(format!(
+                    "Rejected ambiguous or malformed hardlink entry in {}: {}",
+                    archive_label, line
+                ));
+            }
+            let (entry_path, target) = rest.split_once(" link to ").unwrap();
+            let parts = validate_archive_entry_path(entry_path, archive_label)?;
+            check_no_symlink_ancestor(&parts, &symlink_paths, entry_path, archive_label)?;
+            validate_archive_link_target(&parts, target, true, archive_label)?;
+        } else {
+            let parts = validate_archive_entry_path(rest, archive_label)?;
+            check_no_symlink_ancestor(&parts, &symlink_paths, rest, archive_label)?;
+        }
+    }
+    Ok(())
+}
+
+fn is_posix_symlink_mode_token(tok: &str) -> bool {
+    let bytes = tok.as_bytes();
+    bytes.len() == 10
+        && bytes[0] == b'l'
+        && bytes[1..].iter().all(|b| {
+            matches!(
+                b,
+                b'r' | b'w' | b'x' | b's' | b'S' | b't' | b'T' | b'-'
+            )
+        })
+}
+
+fn validate_7z_slt_listing(listing: &str) -> Result<(), String> {
+    let has_separator = listing.lines().any(|l| l.trim() == "----------");
+    let mut in_entries = !has_separator;
+    let mut symlink_paths: HashSet<Vec<String>> = HashSet::new();
+
+    let mut current_path: Option<String> = None;
+    let mut current_symlink: Option<String> = None;
+    let mut current_hardlink: Option<String> = None;
+    let mut current_is_symlink_attr = false;
+
+    let flush_entry = |path_opt: &mut Option<String>,
+                       sym_opt: &mut Option<String>,
+                       hard_opt: &mut Option<String>,
+                       is_sym_attr: &mut bool,
+                       symlink_paths: &mut HashSet<Vec<String>>|
+     -> Result<(), String> {
+        let path = path_opt.take();
+        let sym = sym_opt.take();
+        let hard = hard_opt.take();
+        let sym_attr = *is_sym_attr;
+        *is_sym_attr = false;
+
+        if let Some(ref entry_path) = path {
+            let parts = validate_archive_entry_path(entry_path, "7z")?;
+            check_no_symlink_ancestor(&parts, symlink_paths, entry_path, "7z")?;
+            if let Some(ref target) = sym {
+                validate_archive_link_target(&parts, target, false, "7z")?;
+                if !parts.is_empty() {
+                    symlink_paths.insert(parts.clone());
+                }
+            } else if sym_attr {
+                return Err(format!(
+                    "Rejected unverified symlink entry in 7z: {}",
+                    entry_path
+                ));
+            }
+            if let Some(ref target) = hard {
+                validate_archive_link_target(&parts, target, true, "7z")?;
+            }
+        } else {
+            if let Some(ref target) = sym {
+                validate_archive_link_target(&[], target, false, "7z")?;
+            }
+            if let Some(ref target) = hard {
+                validate_archive_link_target(&[], target, true, "7z")?;
+            }
+        }
+        Ok(())
+    };
+
+    for line in listing.lines() {
+        let trimmed = line.trim();
+        if !in_entries {
+            if trimmed == "----------" {
+                in_entries = true;
+            }
+            continue;
+        }
+        if trimmed.is_empty() {
+            flush_entry(
+                &mut current_path,
+                &mut current_symlink,
+                &mut current_hardlink,
+                &mut current_is_symlink_attr,
+                &mut symlink_paths,
+            )?;
+            continue;
+        }
+        if let Some(file_path) = trimmed.strip_prefix("Path = ") {
+            if current_path.is_some() {
+                flush_entry(
+                    &mut current_path,
+                    &mut current_symlink,
+                    &mut current_hardlink,
+                    &mut current_is_symlink_attr,
+                    &mut symlink_paths,
+                )?;
+            }
+            current_path = Some(file_path.to_string());
+        } else if let Some(target) = trimmed.strip_prefix("Symbolic Link = ") {
+            current_symlink = Some(target.to_string());
+        } else if let Some(target) = trimmed.strip_prefix("Hard Link = ") {
+            current_hardlink = Some(target.to_string());
+        } else if let Some(attrs) = trimmed
+            .strip_prefix("Attributes = ")
+            .or_else(|| trimmed.strip_prefix("Mode = "))
+        {
+            if attrs.split_whitespace().any(is_posix_symlink_mode_token) {
+                current_is_symlink_attr = true;
+            }
+        }
+    }
+    flush_entry(
+        &mut current_path,
+        &mut current_symlink,
+        &mut current_hardlink,
+        &mut current_is_symlink_attr,
+        &mut symlink_paths,
+    )?;
+    Ok(())
+}
+
 pub fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
     let lower = archive
         .file_name()
@@ -738,24 +1079,57 @@ pub fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
         let file = File::open(archive).map_err(|e| e.to_string())?;
         let gz = GzDecoder::new(file);
         let mut tar = Archive::new(gz);
+        let mut symlink_paths: HashSet<Vec<String>> = HashSet::new();
         for entry in tar.entries().map_err(|e| e.to_string())? {
             let mut entry = entry.map_err(|e| e.to_string())?;
-            let path = entry.path().map_err(|e| e.to_string())?;
-            if path.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::RootDir)) {
-                return Err(format!("Rejected unsafe path-traversal entry in tar: {}", path.display()));
+            let entry_type = entry.header().entry_type();
+            if entry_type.is_character_special()
+                || entry_type.is_block_special()
+                || entry_type.is_fifo()
+            {
+                return Err(format!("Rejected special device/FIFO entry in {}", lower));
+            }
+            let path_str = entry
+                .path()
+                .map_err(|e| e.to_string())?
+                .to_string_lossy()
+                .into_owned();
+            let parts = validate_archive_entry_path(&path_str, &lower)?;
+            check_no_symlink_ancestor(&parts, &symlink_paths, &path_str, &lower)?;
+            if entry_type.is_symlink() || entry_type.is_hard_link() {
+                let link_target = entry
+                    .link_name()
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| {
+                        format!(
+                            "Rejected link entry without target in {}: {}",
+                            lower, path_str
+                        )
+                    })?
+                    .to_string_lossy()
+                    .into_owned();
+                validate_archive_link_target(
+                    &parts,
+                    &link_target,
+                    entry_type.is_hard_link(),
+                    &lower,
+                )?;
+                if entry_type.is_symlink() && !parts.is_empty() {
+                    symlink_paths.insert(parts);
+                }
             }
             entry.unpack_in(dest).map_err(|e| e.to_string())?;
         }
         return Ok(());
     }
     if lower.ends_with(".tar.zst") || lower.ends_with(".tar.xz") || lower.ends_with(".tar.bz2") {
-        // Pre-screen tar archive listing for path traversal or absolute paths before extraction
+        // Pre-screen verbose tar listing for path traversal, symlink/hardlink escapes, and device nodes
         let mut list_cmd = Command::new("tar");
         if lower.ends_with(".tar.zst") {
             list_cmd.arg("--zstd");
         }
         let list_out = list_cmd
-            .arg("-tf")
+            .arg("-tvf")
             .arg(archive)
             .output()
             .map_err(|e| format!("Failed to inspect {} archive: {}", lower, e))?;
@@ -767,27 +1141,7 @@ pub fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
             ));
         }
         let listing = String::from_utf8_lossy(&list_out.stdout);
-        for line in listing.lines() {
-            let entry_path = line.trim();
-            if entry_path.is_empty() {
-                continue;
-            }
-            let p = Path::new(entry_path);
-            let is_unsafe = entry_path.starts_with('/')
-                || entry_path.starts_with('\\')
-                || p.components().any(|c| {
-                    matches!(
-                        c,
-                        std::path::Component::ParentDir | std::path::Component::RootDir
-                    )
-                });
-            if is_unsafe {
-                return Err(format!(
-                    "Rejected unsafe path-traversal entry in {}: {}",
-                    lower, entry_path
-                ));
-            }
-        }
+        validate_tar_verbose_listing(&listing, &lower)?;
         let mut cmd = Command::new("tar");
         if lower.ends_with(".tar.zst") {
             cmd.arg("--zstd");
@@ -813,8 +1167,8 @@ pub fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
             "7-Zip ('7z') is required to extract .7z archives (install p7zip / 7zip or zstd)."
                 .to_string()
         })?;
-        // Pre-screen 7z file listing for path traversal entries
-        // Use 7z l -slt for structured output that includes full paths
+        // Pre-screen 7z file listing for path traversal and symlink escapes
+        // Use 7z l -slt for structured output that includes full paths and Symbolic Link targets
         let list_out = Command::new(&bin)
             .arg("l")
             .arg("-slt")
@@ -828,28 +1182,7 @@ pub fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
             ));
         }
         let listing = String::from_utf8_lossy(&list_out.stdout);
-        // Parse 7z -slt output which has "Path = filename" lines
-        for line in listing.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("Path = ") {
-                let file_path = &trimmed[7..];
-                // Check for actual path traversal patterns
-                let is_traversal = file_path.starts_with('/')
-                    || file_path.starts_with('\\')
-                    || file_path.starts_with("../")
-                    || file_path.starts_with("..\\")
-                    || file_path.contains("/../")
-                    || file_path.contains("\\..\\")
-                    || file_path.ends_with("/..")
-                    || file_path.ends_with("\\..")
-                    || file_path == ".."
-                    || file_path == "../"
-                    || file_path == "..\\";
-                if is_traversal {
-                    return Err(format!("Rejected unsafe path-traversal entry in 7z: {}", file_path));
-                }
-            }
-        }
+        validate_7z_slt_listing(&listing)?;
         let out = Command::new(bin)
             .arg("x")
             .arg("-y")
@@ -1032,5 +1365,106 @@ mod tests {
         assert!(res.contains("skipped"));
         assert!(steps.len() >= 2);
         assert!((steps.last().unwrap().0 - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn tar_and_7z_prescreen_rejects_symlinks_hardlinks_and_traversal_escaping_dest() {
+        // Safe GNU tar -tvf listing (regular files, dirs, intra-dest relative symlinks)
+        let safe_tar = "\
+drwxr-xr-x 1000/1000 0 2026-11-28 01:18 ./
+drwxr-xr-x 1000/1000 0 2026-11-28 01:18 usr/lib/
+-rwxr-xr-x 1000/1000 1234 2026-11-28 01:18 usr/lib/SLSsteam.so
+lrwxrwxrwx 1000/1000 0 2026-11-28 01:18 usr/lib/libfoo.so -> libfoo.so.1
+lrwxrwxrwx 1000/1000 0 2026-11-28 01:18 usr/bin/tool -> ../lib/SLSsteam.so
+";
+        assert!(validate_tar_verbose_listing(safe_tar, "test.tar.zst").is_ok());
+
+        // Reject symlink escaping via absolute path
+        let abs_sym = "lrwxrwxrwx 1000/1000 0 2026-11-28 01:18 a/evil -> /etc/passwd\n";
+        assert!(validate_tar_verbose_listing(abs_sym, "test.tar.zst").is_err());
+
+        // Reject symlink escaping via parent traversal
+        let rel_escape = "lrwxrwxrwx 1000/1000 0 2026-11-28 01:18 a/evil -> ../../etc/passwd\n";
+        assert!(validate_tar_verbose_listing(rel_escape, "test.tar.zst").is_err());
+
+        // Reject symlink pointing to extraction root
+        let root_sym = "lrwxrwxrwx 1000/1000 0 2026-11-28 01:18 a/root -> ..\n";
+        assert!(validate_tar_verbose_listing(root_sym, "test.tar.zst").is_err());
+
+        // Reject symlink chain traversal
+        let chain = "\
+lrwxrwxrwx 1000/1000 0 2026-11-28 01:18 a/s -> ../b
+-rw-r--r-- 1000/1000 4 2026-11-28 01:18 a/s/payload.sh
+";
+        assert!(validate_tar_verbose_listing(chain, "test.tar.zst").is_err());
+
+        // Reject hardlink escaping destination
+        let bad_hardlink = "hrw-r--r-- 1000/1000 0 2026-11-28 01:18 a/h link to ../secret\n";
+        assert!(validate_tar_verbose_listing(bad_hardlink, "test.tar.zst").is_err());
+
+        // Reject special device node
+        let dev_node = "crw-r--r-- 0/0 1,3 2026-11-28 01:18 dev/null\n";
+        assert!(validate_tar_verbose_listing(dev_node, "test.tar.zst").is_err());
+
+        // Safe 7z -slt listing (header archive path may be absolute before ----------)
+        let safe_7z = "\
+Path = /tmp/luatools_slssteam_123/SLSsteam-Any-release.7z
+Type = 7z
+
+----------
+Path = SLSsteam
+Attributes = D drwxr-xr-x
+
+Path = SLSsteam/SLSsteam.so
+Attributes = A -rwxr-xr-x
+
+Path = SLSsteam/alias.so
+Attributes = A lrwxrwxrwx
+Symbolic Link = SLSsteam.so
+";
+        assert!(validate_7z_slt_listing(safe_7z).is_ok());
+
+        // Reject 7z Symbolic Link escaping dest
+        let bad_7z_abs = "\
+Path = /tmp/test.7z
+----------
+Path = sub/link
+Attributes = A lrwxrwxrwx
+Symbolic Link = /etc/passwd
+";
+        assert!(validate_7z_slt_listing(bad_7z_abs).is_err());
+
+        let bad_7z_rel = "\
+Path = /tmp/test.7z
+----------
+Path = sub/link
+Symbolic Link = ../../etc/passwd
+";
+        assert!(validate_7z_slt_listing(bad_7z_rel).is_err());
+
+        // Reject opaque POSIX symlink in 7z without explicit Symbolic Link target
+        let opaque_7z_sym = "\
+Path = /tmp/test.7z
+----------
+Path = sub/link
+Attributes = A lrwxrwxrwx
+";
+        assert!(validate_7z_slt_listing(opaque_7z_sym).is_err());
+    }
+
+    #[test]
+    fn write_steam_sls_wrapper_safely_quotes_paths_and_preserves_ld_audit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = WiredService::new(Some(tmp.path().join("sandbox")));
+        let weird_dir = tmp.path().join("dir's $(touch pwn) $HOME");
+        fs::create_dir_all(&weird_dir).unwrap();
+        let so_path = weird_dir.join("SLSsteam.so");
+        fs::write(&so_path, b"\x7fELF").unwrap();
+
+        let wrapper = svc.write_steam_sls_wrapper(&so_path, &weird_dir).unwrap();
+        let content = fs::read_to_string(wrapper).unwrap();
+        assert!(content.contains("SLS_AUDIT='"));
+        assert!(content.contains("'\\''s $(touch pwn) $HOME/SLSsteam.so'"));
+        assert!(content.contains("export LD_AUDIT=\"${SLS_AUDIT}${LD_AUDIT:+:$LD_AUDIT}\""));
     }
 }

@@ -2228,6 +2228,10 @@ impl LuaToolsApp {
                 .is_ok();
             let sls_ok = self.slssteam_service.save();
             let app_ok = self.settings_service.save();
+            crate::services::doh_resolver::DohResolver::configure_global(
+                self.settings_service.settings.doh_enabled,
+                &self.settings_service.settings.doh_endpoint,
+            );
             self.telemetry_service
                 .set_enabled(self.settings_service.settings.telemetry_enabled);
             self.telemetry_service.set_endpoint_url(

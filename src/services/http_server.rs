@@ -173,15 +173,136 @@ impl HttpServerService {
 
     pub fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::Relaxed);
-        let should_clear = active_session_token()
-            .read()
-            .map(|g| g.as_str() == self.rpc_token)
-            .unwrap_or(true);
-        if should_clear {
-            remove_rpc_discovery_file();
+        remove_rpc_discovery_file_for(self.port, &self.rpc_token);
+        if let Ok(mut guard) = active_session_token().write() {
+            if guard.as_str() == self.rpc_token {
+                guard.clear();
+            }
         }
         if let Some(h) = self.handle.take() {
             let _ = h.join();
+        }
+    }
+}
+
+static DISCOVERY_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn discovery_file_lock() -> &'static Mutex<()> {
+    DISCOVERY_FILE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn discovery_file_candidates() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+        if !xdg.trim().is_empty() {
+            paths.push(PathBuf::from(xdg.trim()).join("luatools_rpc.json"));
+        }
+    }
+    #[cfg(unix)]
+    {
+        let uid = unsafe { libc::getuid() };
+        paths.push(PathBuf::from(format!("/run/user/{}/luatools_rpc.json", uid)));
+    }
+    paths.push(std::env::temp_dir().join("luatools_rpc.json"));
+    paths
+}
+
+fn discovery_file_matches(
+    path: &Path,
+    expected_pid: u32,
+    expected_port: Option<u16>,
+    expected_token: Option<&str>,
+) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(val) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    let pid_ok = val
+        .get("pid")
+        .and_then(|v| v.as_u64())
+        .and_then(|p| u32::try_from(p).ok())
+        == Some(expected_pid);
+    if !pid_ok {
+        return false;
+    }
+    if let Some(exp_port) = expected_port {
+        let port_ok = val
+            .get("port")
+            .and_then(|v| v.as_u64())
+            .and_then(|p| u16::try_from(p).ok())
+            == Some(exp_port);
+        if !port_ok {
+            return false;
+        }
+    }
+    if let Some(exp_tok) = expected_token {
+        let tok_ok = val.get("token").and_then(|v| v.as_str()) == Some(exp_tok);
+        if !tok_ok {
+            return false;
+        }
+    }
+    true
+}
+
+fn write_rpc_discovery_file_in(dir: &Path, port: u16, tok: &str) -> Option<PathBuf> {
+    let _lock = discovery_file_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let path = dir.join("luatools_rpc.json");
+    let pid = std::process::id();
+    let payload = json!({
+        "port": port,
+        "url": format!("http://127.0.0.1:{}", port),
+        "pid": pid,
+        "version": crate::VERSION,
+        "token": tok
+    });
+    let payload_str = payload.to_string();
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = dir.join(format!("luatools_rpc.tmp.{}", pid));
+        let _ = std::fs::remove_file(&tmp);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+        {
+            if f.write_all(payload_str.as_bytes()).is_ok()
+                && f.sync_all().is_ok()
+                && std::fs::rename(&tmp, &path).is_ok()
+            {
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            } else {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let tmp = dir.join(format!("luatools_rpc.tmp.{}", pid));
+        if std::fs::write(&tmp, &payload_str).is_ok() {
+            if std::fs::rename(&tmp, &path).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+    }
+    Some(path)
+}
+
+fn remove_rpc_discovery_files_checked(
+    paths: &[PathBuf],
+    expected_pid: u32,
+    expected_port: Option<u16>,
+    expected_token: Option<&str>,
+) {
+    let _lock = discovery_file_lock().lock().unwrap_or_else(|e| e.into_inner());
+    for p in paths {
+        if discovery_file_matches(p, expected_pid, expected_port, expected_token) {
+            let _ = std::fs::remove_file(p);
         }
     }
 }
@@ -208,59 +329,23 @@ pub fn write_rpc_discovery_file(port: u16, token: Option<&str>) -> Option<PathBu
         }
     }
     let dir = target_dir.unwrap_or_else(std::env::temp_dir);
-    let path = dir.join("luatools_rpc.json");
-    let payload = json!({
-        "port": port,
-        "url": format!("http://127.0.0.1:{}", port),
-        "pid": std::process::id(),
-        "version": crate::VERSION,
-        "token": tok
-    });
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = path.with_extension("tmp");
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
-        {
-            let _ = f.write_all(payload.to_string().as_bytes());
-            let _ = f.sync_all();
-            let _ = std::fs::rename(&tmp, &path);
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        } else {
-            let _ = std::fs::write(&path, payload.to_string());
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = std::fs::write(&path, payload.to_string());
-    }
-    Some(path)
+    write_rpc_discovery_file_in(&dir, port, &tok)
+}
+
+pub fn remove_rpc_discovery_file_for(port: u16, token: &str) {
+    let paths = discovery_file_candidates();
+    let tok_opt = (!token.is_empty()).then_some(token);
+    remove_rpc_discovery_files_checked(&paths, std::process::id(), Some(port), tok_opt);
 }
 
 pub fn remove_rpc_discovery_file() {
-    let mut paths = Vec::new();
-    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        if !xdg.trim().is_empty() {
-            paths.push(PathBuf::from(xdg.trim()).join("luatools_rpc.json"));
-        }
-    }
-    #[cfg(unix)]
-    {
-        let uid = unsafe { libc::getuid() };
-        paths.push(PathBuf::from(format!("/run/user/{}/luatools_rpc.json", uid)));
-    }
-    paths.push(std::env::temp_dir().join("luatools_rpc.json"));
-    for p in paths {
-        let _ = std::fs::remove_file(p);
-    }
+    let active_tok = active_session_token()
+        .read()
+        .ok()
+        .map(|g| g.clone())
+        .filter(|t| !t.is_empty());
+    let paths = discovery_file_candidates();
+    remove_rpc_discovery_files_checked(&paths, std::process::id(), None, active_tok.as_deref());
     if let Ok(mut guard) = active_session_token().write() {
         guard.clear();
     }
@@ -317,66 +402,115 @@ fn get_request_header<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
         .map(|h| h.value.as_str())
 }
 
-/// Validates whether an incoming HTTP request `Origin` header is permitted
-/// to access local resources via CORS/PNA. Only official Steam domains (HTTPS)
-/// and local loopback origins are permitted.
-pub fn is_allowed_origin(origin: &str) -> bool {
+/// Validates and canonicalizes an incoming HTTP request `Origin` header into a safe ASCII
+/// `scheme://host[:port]` string if permitted to access local resources via CORS/PNA.
+/// Only official Steam domains (HTTPS) and local loopback origins are permitted.
+pub fn canonical_allowed_origin(origin: &str) -> Option<String> {
     let trimmed = origin.trim();
-    if trimmed.is_empty() {
-        return false;
+    if trimmed.is_empty()
+        || trimmed
+            .bytes()
+            .any(|b| !b.is_ascii() || b < 0x20 || b == 0x7f)
+    {
+        return None;
     }
-    let Ok(parsed) = url::Url::parse(trimmed) else {
-        return false;
-    };
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
+    let parsed = url::Url::parse(trimmed).ok()?;
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || (parsed.path() != "/" && !parsed.path().is_empty())
+    {
+        return None;
+    }
+    let host = parsed.host_str()?;
     let host_lower = host.to_ascii_lowercase();
 
+    let mut allowed = false;
+
     // Permitted Steam web domains (strictly HTTPS)
-    if parsed.scheme() == "https" {
-        if host_lower == "store.steampowered.com"
+    if parsed.scheme() == "https"
+        && (host_lower == "store.steampowered.com"
             || host_lower == "steamcommunity.com"
             || host_lower == "steamloopback.host"
             || host_lower.ends_with(".steampowered.com")
-            || host_lower.ends_with(".steamcommunity.com")
-        {
-            return true;
-        }
+            || host_lower.ends_with(".steamcommunity.com"))
+    {
+        allowed = true;
     }
 
     // Permitted local loopback origins
-    if matches!(parsed.scheme(), "http" | "https") {
-        if host_lower == "localhost"
-            || host_lower == "127.0.0.1"
-            || host_lower == "::1"
-            || host_lower == "[::1]"
-        {
-            return true;
-        }
-        if let Ok(ip) = host_lower.parse::<std::net::IpAddr>() {
+    if !allowed && matches!(parsed.scheme(), "http" | "https") {
+        let unbracketed = host_lower.trim_matches(|c| c == '[' || c == ']');
+        if unbracketed == "localhost" || unbracketed == "127.0.0.1" || unbracketed == "::1" {
+            allowed = true;
+        } else if let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() {
             if ip.is_loopback() {
-                return true;
+                allowed = true;
             }
         }
     }
 
-    false
+    if !allowed {
+        return None;
+    }
+
+    let canon = parsed.origin().ascii_serialization();
+    if canon == "null"
+        || canon.is_empty()
+        || canon
+            .bytes()
+            .any(|b| !b.is_ascii() || b < 0x20 || b == 0x7f)
+    {
+        return None;
+    }
+    Some(canon)
+}
+
+/// Validates whether an incoming HTTP request `Origin` header is permitted
+/// to access local resources via CORS/PNA. Only official Steam domains (HTTPS)
+/// and local loopback origins are permitted.
+pub fn is_allowed_origin(origin: &str) -> bool {
+    canonical_allowed_origin(origin).is_some()
 }
 
 /// Validates the `Host` header to protect local HTTP services from DNS rebinding attacks.
+/// Rejects empty `Host` headers and properly parses bracketed IPv6 loopback (`[::1]:6767`).
 pub fn is_allowed_host(host_header: &str) -> bool {
     let trimmed = host_header.trim();
     if trimmed.is_empty() {
-        return true;
+        return false;
     }
-    let host_part = trimmed.split(':').next().unwrap_or(trimmed).trim();
-    let host_lower = host_part.to_ascii_lowercase();
-    if host_lower == "127.0.0.1"
-        || host_lower == "localhost"
-        || host_lower == "::1"
-        || host_lower == "[::1]"
-    {
+    let host_part = if let Some(rest) = trimmed.strip_prefix('[') {
+        let Some(end) = rest.find(']') else {
+            return false;
+        };
+        let after = &rest[end + 1..];
+        if !after.is_empty() {
+            let Some(port_str) = after.strip_prefix(':') else {
+                return false;
+            };
+            if port_str.is_empty() || port_str.parse::<u16>().is_err() {
+                return false;
+            }
+        }
+        &rest[..end]
+    } else if let Some((h, port_str)) = trimmed.rsplit_once(':') {
+        if h.contains(':') {
+            // Bare IPv6 address without brackets (e.g. `::1`)
+            trimmed
+        } else {
+            if port_str.is_empty() || port_str.parse::<u16>().is_err() {
+                return false;
+            }
+            h
+        }
+    } else {
+        trimmed
+    };
+
+    let host_lower = host_part.trim().to_ascii_lowercase();
+    if host_lower == "127.0.0.1" || host_lower == "localhost" || host_lower == "::1" {
         return true;
     }
     if let Ok(ip) = host_lower.parse::<std::net::IpAddr>() {
@@ -387,29 +521,39 @@ pub fn is_allowed_host(host_header: &str) -> bool {
     false
 }
 
-fn is_rpc_path(url: &str) -> bool {
+fn requires_token_for_request(_method: &Method, url: &str) -> bool {
     let path_only = url.split('?').next().unwrap_or(url);
-    path_only.trim_end_matches('/') == "/rpc"
+    let parts: Vec<&str> = path_only.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        return false;
+    }
+    parts == ["rpc"]
+        || parts.first() == Some(&"add")
+        || (parts.len() == 2 && parts[0] == "api" && parts[1] == "add")
+        || parts.first() == Some(&"remove")
+        || parts.first() == Some(&"delete")
+        || (parts.len() == 2
+            && parts[0] == "api"
+            && (parts[1] == "remove" || parts[1] == "delete"))
+        || parts.first() == Some(&"cancel")
+        || parts == ["open-url"]
+        || parts == ["restart-steam"]
+        || parts == ["steam", "restart"]
+        || parts == ["restart"]
+        || parts.first() == Some(&"download")
+        || parts.first() == Some(&"add-source")
+        || parts == ["loaded-apps"]
+        || parts.first() == Some(&"open")
+        || parts.first() == Some(&"fix")
+        || parts == ["settings"]
+        || parts == ["library"]
 }
 
-/// Checks whether an incoming HTTP request is authorized to invoke sensitive operations.
-/// Validates `Host`, `Origin`, and `Sec-Fetch-Site` headers, allows `OPTIONS` CORS preflight,
-/// and strictly requires a valid `X-LuaTools-Token` header on `/rpc` requests.
-pub fn is_request_authorized(req: &Request) -> bool {
-    let active = active_session_token()
-        .read()
-        .map(|g| g.clone())
-        .unwrap_or_default();
-    is_request_authorized_with_token(req, &active)
-}
-
-/// Checks request authorization against an explicit per-server session token.
-pub fn is_request_authorized_with_token(req: &Request, expected_token: &str) -> bool {
-    // 1. Defend against DNS rebinding
-    if let Some(host) = get_request_header(req, "Host") {
-        if !is_allowed_host(host) {
-            return false;
-        }
+fn is_request_host_and_origin_allowed(req: &Request) -> bool {
+    // 1. Defend against DNS rebinding and reject missing/empty Host headers
+    match get_request_header(req, "Host") {
+        Some(host) if is_allowed_host(host) => {}
+        _ => return false,
     }
 
     // 2. Browser cross-origin requests must come from an allowed origin
@@ -432,13 +576,33 @@ pub fn is_request_authorized_with_token(req: &Request, expected_token: &str) -> 
         }
     }
 
+    true
+}
+
+/// Checks whether an incoming HTTP request is authorized to invoke sensitive operations.
+/// Validates `Host`, `Origin`, and `Sec-Fetch-Site` headers, allows `OPTIONS` CORS preflight,
+/// and strictly requires a valid `X-LuaTools-Token` header on mutating/privileged routes.
+pub fn is_request_authorized(req: &Request) -> bool {
+    let active = active_session_token()
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    is_request_authorized_with_token(req, &active)
+}
+
+/// Checks request authorization against an explicit per-server session token.
+pub fn is_request_authorized_with_token(req: &Request, expected_token: &str) -> bool {
+    if !is_request_host_and_origin_allowed(req) {
+        return false;
+    }
+
     // 4. Allow CORS preflight requests cleanly (they cannot carry custom auth headers)
     if req.method() == &Method::Options {
         return true;
     }
 
-    // 5. Strict token validation on `/rpc`; validate token when present on other routes
-    if is_rpc_path(req.url()) {
+    // 5. Strict token validation on all mutating / privileged routes; validate token if present on others
+    if requires_token_for_request(req.method(), req.url()) {
         match get_request_header(req, "X-LuaTools-Token") {
             Some(tok_header) if !expected_token.is_empty() && tok_header == expected_token => {}
             _ => return false,
@@ -452,68 +616,55 @@ pub fn is_request_authorized_with_token(req: &Request, expected_token: &str) -> 
     true
 }
 
-fn send_json(req: Request, status: u16, payload: Value) {
-    let origin_opt = get_request_header(&req, "Origin").map(ToString::to_string);
-    let body = payload.to_string();
-    let mut resp = Response::from_string(body)
-        .with_status_code(status)
-        .with_header(Header::from_bytes("Content-Type", "application/json").unwrap());
-
-    if let Some(ref orig) = origin_opt {
-        if is_allowed_origin(orig) {
-            resp = resp
-                .with_header(Header::from_bytes("Access-Control-Allow-Origin", orig.clone()).unwrap())
-                .with_header(Header::from_bytes("Vary", "Origin").unwrap())
-                .with_header(
-                    Header::from_bytes(
-                        "Access-Control-Allow-Methods",
-                        "GET, POST, PUT, DELETE, OPTIONS, HEAD",
-                    )
-                    .unwrap(),
-                )
-                .with_header(
-                    Header::from_bytes(
-                        "Access-Control-Allow-Headers",
-                        "Content-Type, Authorization, X-Requested-With, Accept, Origin, X-LuaTools-Token",
-                    )
-                    .unwrap(),
-                )
-                .with_header(Header::from_bytes("Access-Control-Max-Age", "86400").unwrap())
-                .with_header(Header::from_bytes("Access-Control-Allow-Private-Network", "true").unwrap());
+fn add_cors_headers<R: Read>(mut resp: Response<R>, allowed_origin: &str) -> Response<R> {
+    let pairs = [
+        ("Access-Control-Allow-Origin", allowed_origin),
+        ("Vary", "Origin"),
+        (
+            "Access-Control-Allow-Methods",
+            "GET, POST, PUT, DELETE, OPTIONS, HEAD",
+        ),
+        (
+            "Access-Control-Allow-Headers",
+            "Content-Type, Authorization, X-Requested-With, Accept, Origin, X-LuaTools-Token",
+        ),
+        ("Access-Control-Max-Age", "86400"),
+        ("Access-Control-Allow-Private-Network", "true"),
+    ];
+    for (k, v) in pairs {
+        if let Ok(hdr) = Header::from_bytes(k, v) {
+            resp = resp.with_header(hdr);
         }
+    }
+    resp
+}
+
+fn send_json(req: Request, status: u16, payload: Value) {
+    let allowed_origin =
+        get_request_header(&req, "Origin").and_then(canonical_allowed_origin);
+    let body = payload.to_string();
+    let mut resp = Response::from_string(body).with_status_code(status);
+    if let Ok(hdr) = Header::from_bytes("Content-Type", "application/json") {
+        resp = resp.with_header(hdr);
+    }
+
+    if let Some(ref orig) = allowed_origin {
+        resp = add_cors_headers(resp, orig);
     }
 
     let _ = req.respond(resp);
 }
 
 fn send_bytes(req: Request, status: u16, content_type: &str, bytes: Vec<u8>) {
-    let origin_opt = get_request_header(&req, "Origin").map(ToString::to_string);
-    let mut resp = Response::from_data(bytes)
-        .with_status_code(status)
-        .with_header(Header::from_bytes("Content-Type", content_type.to_string()).unwrap());
+    let allowed_origin =
+        get_request_header(&req, "Origin").and_then(canonical_allowed_origin);
+    let mut resp = Response::from_data(bytes).with_status_code(status);
+    if let Ok(hdr) = Header::from_bytes("Content-Type", content_type) {
+        resp = resp.with_header(hdr);
+    }
 
-    if let Some(ref orig) = origin_opt {
-        if is_allowed_origin(orig) {
-            resp = resp
-                .with_header(Header::from_bytes("Access-Control-Allow-Origin", orig.clone()).unwrap())
-                .with_header(Header::from_bytes("Vary", "Origin").unwrap())
-                .with_header(
-                    Header::from_bytes(
-                        "Access-Control-Allow-Methods",
-                        "GET, POST, PUT, DELETE, OPTIONS, HEAD",
-                    )
-                    .unwrap(),
-                )
-                .with_header(
-                    Header::from_bytes(
-                        "Access-Control-Allow-Headers",
-                        "Content-Type, Authorization, X-Requested-With, Accept, Origin, X-LuaTools-Token",
-                    )
-                    .unwrap(),
-                )
-                .with_header(Header::from_bytes("Access-Control-Max-Age", "86400").unwrap())
-                .with_header(Header::from_bytes("Access-Control-Allow-Private-Network", "true").unwrap());
-        }
+    if let Some(ref orig) = allowed_origin {
+        resp = add_cors_headers(resp, orig);
     }
 
     let _ = req.respond(resp);
@@ -562,13 +713,16 @@ fn list_installed_apps(stplug_dir: &Path) -> Vec<u32> {
     apps
 }
 
-fn collect_merged_loaded_apps(stplug_dir: &Path) -> Vec<u32> {
+fn collect_merged_loaded_apps(
+    stplug_dir: &Path,
+    slssteam_config_path: Option<&Path>,
+) -> Vec<u32> {
     let mut merged: BTreeSet<u32> = list_installed_apps(stplug_dir).into_iter().collect();
     if let Ok(guard) = reported_loaded_apps().lock() {
         merged.extend(guard.iter().copied());
     }
-    if allow_external_spawn() {
-        let sls = SlssteamService::new(None);
+    if slssteam_config_path.is_some() || allow_external_spawn() {
+        let sls = SlssteamService::new(slssteam_config_path.map(Path::to_path_buf));
         merged.extend(sls.config.additional_apps.iter().copied());
     }
     merged.into_iter().collect()
@@ -668,18 +822,37 @@ pub fn remove_app_completely_with_sls(
     (removed_lua, removed_disabled)
 }
 
-fn remove_app_completely(stplug_dir: &Path, aid: u32) -> (bool, bool) {
-    if allow_external_spawn() {
-        let mut sls = SlssteamService::new(None);
+fn remove_app_completely(
+    stplug_dir: &Path,
+    aid: u32,
+    slssteam_config_path: Option<&Path>,
+) -> (bool, bool) {
+    if slssteam_config_path.is_some() || allow_external_spawn() {
+        let mut sls = SlssteamService::new(slssteam_config_path.map(Path::to_path_buf));
         remove_app_completely_with_sls(stplug_dir, aid, Some(&mut sls))
     } else {
         remove_app_completely_with_sls(stplug_dir, aid, None)
     }
 }
 
-fn toggle_app_enabled(stplug_dir: &Path, aid: u32, target_enabled: Option<bool>) -> bool {
+fn toggle_app_enabled(
+    stplug_dir: &Path,
+    aid: u32,
+    target_enabled: Option<bool>,
+    slssteam_config_path: Option<&Path>,
+) -> Result<bool, (u16, String)> {
     let lua_path = stplug_dir.join(format!("{}.lua", aid));
     let disabled_path = stplug_dir.join(format!("{}.lua.disabled", aid));
+
+    if !lua_path.exists() && !disabled_path.exists() {
+        return Err((
+            404,
+            format!(
+                "No Lua script found for AppID {} (neither {}.lua nor {}.lua.disabled exists)",
+                aid, aid, aid
+            ),
+        ));
+    }
 
     let should_enable = match target_enabled {
         Some(enabled) => enabled,
@@ -688,24 +861,26 @@ fn toggle_app_enabled(stplug_dir: &Path, aid: u32, target_enabled: Option<bool>)
 
     if should_enable {
         if disabled_path.exists() {
-            let _ = std::fs::rename(&disabled_path, &lua_path);
+            std::fs::rename(&disabled_path, &lua_path)
+                .map_err(|e| (500, format!("Failed to enable AppID {}: {}", aid, e)))?;
         }
-        if allow_external_spawn() {
-            let mut sls = SlssteamService::new(None);
+        if slssteam_config_path.is_some() || allow_external_spawn() {
+            let mut sls = SlssteamService::new(slssteam_config_path.map(Path::to_path_buf));
             sls.add_additional_app(aid);
             let _ = sls.save();
         }
-        true
+        Ok(true)
     } else {
         if lua_path.exists() {
-            let _ = std::fs::rename(&lua_path, &disabled_path);
+            std::fs::rename(&lua_path, &disabled_path)
+                .map_err(|e| (500, format!("Failed to disable AppID {}: {}", aid, e)))?;
         }
-        if allow_external_spawn() {
-            let mut sls = SlssteamService::new(None);
+        if slssteam_config_path.is_some() || allow_external_spawn() {
+            let mut sls = SlssteamService::new(slssteam_config_path.map(Path::to_path_buf));
             sls.remove_additional_app(aid);
             let _ = sls.save();
         }
-        false
+        Ok(false)
     }
 }
 
@@ -911,37 +1086,34 @@ fn handle_request(
 ) {
     // 1. CORS preflight handling (LT-26)
     if req.method() == &Method::Options {
-        let origin_opt = get_request_header(&req, "Origin");
-        if let Some(orig) = origin_opt {
-            if is_allowed_origin(orig) {
-                let resp = Response::empty(204)
-                    .with_header(Header::from_bytes("Access-Control-Allow-Origin", orig).unwrap())
-                    .with_header(Header::from_bytes("Vary", "Origin").unwrap())
-                    .with_header(
-                        Header::from_bytes(
-                            "Access-Control-Allow-Methods",
-                            "GET, POST, PUT, DELETE, OPTIONS, HEAD",
-                        )
-                        .unwrap(),
-                    )
-                    .with_header(
-                        Header::from_bytes(
-                            "Access-Control-Allow-Headers",
-                            "Content-Type, Authorization, X-Requested-With, Accept, Origin, X-LuaTools-Token",
-                        )
-                        .unwrap(),
-                    )
-                    .with_header(Header::from_bytes("Access-Control-Max-Age", "86400").unwrap())
-                    .with_header(
-                        Header::from_bytes("Access-Control-Allow-Private-Network", "true").unwrap(),
-                    );
-                let _ = req.respond(resp);
-                return;
+        let host_ok = get_request_header(&req, "Host")
+            .map(is_allowed_host)
+            .unwrap_or(false);
+        if host_ok {
+            if let Some(orig) = get_request_header(&req, "Origin") {
+                if let Some(canon_orig) = canonical_allowed_origin(orig) {
+                    let resp = add_cors_headers(Response::empty(204), &canon_orig);
+                    let _ = req.respond(resp);
+                    return;
+                }
             }
         }
-        // Disallowed origin or missing origin receives 403 Forbidden without CORS/PNA grant
+        // Disallowed origin/host or missing origin receives 403 Forbidden without CORS/PNA grant
         let resp = Response::empty(403);
         let _ = req.respond(resp);
+        return;
+    }
+
+    // 2. Enforce Host, Origin, Sec-Fetch-Site, and X-LuaTools-Token uniformly across all routes
+    if !is_request_authorized_with_token(&req, rpc_token) {
+        send_json(
+            req,
+            403,
+            json!({
+                "success": false,
+                "error": "Unauthorized origin, host, or missing/invalid X-LuaTools-Token"
+            }),
+        );
         return;
     }
 
@@ -1039,17 +1211,6 @@ fn handle_request(
 
     // Route: /rpc (JSON-RPC — LT-27 & LT-28)
     if parts == ["rpc"] && req.method() == &Method::Post {
-        if !is_request_authorized_with_token(&req, rpc_token) {
-            send_json(
-                req,
-                403,
-                json!({
-                    "success": false,
-                    "error": "Unauthorized origin, host, or missing/invalid X-LuaTools-Token"
-                }),
-            );
-            return;
-        }
         let Some(payload) = body_json else {
             send_json(
                 req,
@@ -1232,8 +1393,11 @@ fn handle_request(
                         json!({ "success": false, "error": "Missing or invalid appid" }),
                     );
                 } else {
-                    let (removed_lua, removed_disabled) =
-                        remove_app_completely(stplug_dir, rpc_aid);
+                    let (removed_lua, removed_disabled) = remove_app_completely(
+                        stplug_dir,
+                        rpc_aid,
+                        overrides.slssteam_config_path.as_deref(),
+                    );
                     let _ = event_tx.send(RpcUiEvent::RemovedApp(rpc_aid));
                     notify();
                     send_json(
@@ -1255,7 +1419,7 @@ fn handle_request(
                     );
                 }
             }
-            "OpenFix" | "OpenFixes" => {
+            "OpenFix" | "OpenFixes" | "OpenFixInDesktopApp" => {
                 if rpc_aid > 0 {
                     let _ = event_tx.send(RpcUiEvent::OpenFix(rpc_aid));
                     notify();
@@ -1349,7 +1513,10 @@ fn handle_request(
                 send_json(req, 200, update_check_to_json(&check_res));
             }
             "GetInstalledLuaScripts" | "ReadLoadedApps" | "GetInstalledApps" | "GetLoadedApps" => {
-                let apps = collect_merged_loaded_apps(stplug_dir);
+                let apps = collect_merged_loaded_apps(
+                    stplug_dir,
+                    overrides.slssteam_config_path.as_deref(),
+                );
                 send_json(
                     req,
                     200,
@@ -1359,10 +1526,21 @@ fn handle_request(
             "SetLoadedApps" => {
                 let incoming = parse_app_id_list(&args);
                 let received = incoming.len();
-                if let Ok(mut guard) = reported_loaded_apps().lock() {
-                    guard.extend(incoming.iter().copied());
+                if !incoming.is_empty() {
+                    if let Ok(mut guard) = reported_loaded_apps().lock() {
+                        guard.extend(incoming.iter().copied());
+                    }
+                    if overrides.settings_config_path.is_some() || allow_external_spawn() {
+                        let mut ss = SettingsService::new(overrides.settings_config_path.clone());
+                        for id in &incoming {
+                            ss.record_loaded_app(*id);
+                        }
+                    }
                 }
-                let merged = collect_merged_loaded_apps(stplug_dir);
+                let merged = collect_merged_loaded_apps(
+                    stplug_dir,
+                    overrides.slssteam_config_path.as_deref(),
+                );
                 send_json(
                     req,
                     200,
@@ -1427,9 +1605,19 @@ fn handle_request(
             }
             "RestartSteam" => {
                 if allow_external_spawn() {
-                    let _ = SteamService::relaunch_steam_sls(None);
+                    thread::spawn(|| {
+                        let _ = SteamService::relaunch_steam_sls(None);
+                    });
                 }
-                send_json(req, 200, json!({ "success": true, "result": "restarted" }));
+                send_json(
+                    req,
+                    200,
+                    json!({
+                        "success": true,
+                        "restarting": true,
+                        "result": { "restarting": true }
+                    }),
+                );
             }
             "GetApiList" => {
                 let apis = configured_apis_json();
@@ -1470,17 +1658,36 @@ fn handle_request(
             "ToggleAppEnabled" => {
                 if rpc_aid > 0 {
                     let enabled_target = args.get("enabled").and_then(|v| v.as_bool());
-                    let now_enabled = toggle_app_enabled(stplug_dir, rpc_aid, enabled_target);
-                    send_json(
-                        req,
-                        200,
-                        json!({
-                            "success": true,
-                            "appid": rpc_aid,
-                            "enabled": now_enabled,
-                            "result": now_enabled
-                        }),
-                    );
+                    match toggle_app_enabled(
+                        stplug_dir,
+                        rpc_aid,
+                        enabled_target,
+                        overrides.slssteam_config_path.as_deref(),
+                    ) {
+                        Ok(now_enabled) => {
+                            send_json(
+                                req,
+                                200,
+                                json!({
+                                    "success": true,
+                                    "appid": rpc_aid,
+                                    "enabled": now_enabled,
+                                    "result": now_enabled
+                                }),
+                            );
+                        }
+                        Err((status, err)) => {
+                            send_json(
+                                req,
+                                status,
+                                json!({
+                                    "success": false,
+                                    "appid": rpc_aid,
+                                    "error": err
+                                }),
+                            );
+                        }
+                    }
                 } else {
                     send_json(
                         req,
@@ -1542,7 +1749,10 @@ fn handle_request(
                         if let Ok(txt) = std::fs::read_to_string(p) {
                             let parsed = LuaFileParser::parse_text(&txt, rpc_aid);
                             for entry in parsed.entries.iter().chain(parsed.disabled_entries.iter()) {
-                                if entry.id != rpc_aid && !dlc_ids.contains(&entry.id) {
+                                if !entry.has_key()
+                                    && entry.id != rpc_aid
+                                    && !dlc_ids.contains(&entry.id)
+                                {
                                     dlc_ids.push(entry.id);
                                 }
                             }
@@ -1645,7 +1855,10 @@ fn handle_request(
             }
             "GetCompanionStatus" | "GetBridgeDiagnostics" => {
                 let det = MillenniumService::default().detect();
-                let apps = collect_merged_loaded_apps(stplug_dir);
+                let apps = collect_merged_loaded_apps(
+                    stplug_dir,
+                    overrides.slssteam_config_path.as_deref(),
+                );
                 let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
                 let lib_base = home.join(".local/lib/luatools");
 
@@ -1746,10 +1959,16 @@ fn handle_request(
                     let parse_str = |v: &Value| -> Option<String> {
                         v.as_str().map(|s| s.to_string())
                     };
+                    let parse_port = |v: &Value| -> Option<u16> {
+                        v.as_u64()
+                            .and_then(|n| u16::try_from(n).ok())
+                            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u16>().ok()))
+                            .filter(|&p| p > 0)
+                    };
 
                     let mut svc = SettingsService::new(overrides.settings_config_path.clone());
                     match key {
-                        "fast_fetch" => {
+                        "fast_fetch" | "fastFetch" => {
                             if let Some(b) = parse_bool(val) {
                                 svc.settings.fast_fetch = b;
                                 updated = svc.save();
@@ -1761,7 +1980,7 @@ fn handle_request(
                                     Some(format!("Invalid boolean value for setting '{}'", key));
                             }
                         }
-                        "auto_update_apps" => {
+                        "auto_update_apps" | "autoUpdateApps" => {
                             if let Some(b) = parse_bool(val) {
                                 svc.settings.auto_update_apps = b;
                                 updated = svc.save();
@@ -1773,7 +1992,7 @@ fn handle_request(
                                     Some(format!("Invalid boolean value for setting '{}'", key));
                             }
                         }
-                        "donate_keys" => {
+                        "donate_keys" | "donateKeys" => {
                             if let Some(b) = parse_bool(val) {
                                 svc.settings.donate_keys = b;
                                 updated = svc.save();
@@ -1785,7 +2004,7 @@ fn handle_request(
                                     Some(format!("Invalid boolean value for setting '{}'", key));
                             }
                         }
-                        "check_updates_on_startup" => {
+                        "check_updates_on_startup" | "checkUpdatesOnStartup" => {
                             if let Some(b) = parse_bool(val) {
                                 svc.settings.check_updates_on_startup = b;
                                 updated = svc.save();
@@ -1797,7 +2016,7 @@ fn handle_request(
                                     Some(format!("Invalid boolean value for setting '{}'", key));
                             }
                         }
-                        "cef_bridge_enabled" => {
+                        "cef_bridge_enabled" | "cefBridgeEnabled" => {
                             if let Some(b) = parse_bool(val) {
                                 svc.settings.cef_bridge_enabled = b;
                                 updated = svc.save();
@@ -1809,7 +2028,7 @@ fn handle_request(
                                     Some(format!("Invalid boolean value for setting '{}'", key));
                             }
                         }
-                        "http_server_enabled" => {
+                        "http_server_enabled" | "httpServerEnabled" => {
                             if let Some(b) = parse_bool(val) {
                                 svc.settings.http_server_enabled = b;
                                 updated = svc.save();
@@ -1821,7 +2040,19 @@ fn handle_request(
                                     Some(format!("Invalid boolean value for setting '{}'", key));
                             }
                         }
-                        "close_to_tray" => {
+                        "http_server_port" | "httpServerPort" => {
+                            if let Some(p) = parse_port(val) {
+                                svc.settings.http_server_port = p;
+                                updated = svc.save();
+                                if !updated {
+                                    error_msg = Some(format!("Failed to save setting '{}'", key));
+                                }
+                            } else {
+                                error_msg =
+                                    Some(format!("Invalid port value for setting '{}'", key));
+                            }
+                        }
+                        "close_to_tray" | "closeToTray" => {
                             if let Some(b) = parse_bool(val) {
                                 svc.settings.close_to_tray = b;
                                 updated = svc.save();
@@ -1833,7 +2064,7 @@ fn handle_request(
                                     Some(format!("Invalid boolean value for setting '{}'", key));
                             }
                         }
-                        "minimize_to_tray" => {
+                        "minimize_to_tray" | "minimizeToTray" => {
                             if let Some(b) = parse_bool(val) {
                                 svc.settings.minimize_to_tray = b;
                                 updated = svc.save();
@@ -1845,7 +2076,7 @@ fn handle_request(
                                     Some(format!("Invalid boolean value for setting '{}'", key));
                             }
                         }
-                        "doh_enabled" => {
+                        "doh_enabled" | "dohEnabled" => {
                             if let Some(b) = parse_bool(val) {
                                 svc.settings.doh_enabled = b;
                                 updated = svc.save();
@@ -1880,7 +2111,7 @@ fn handle_request(
                                     Some(format!("Invalid string value for setting '{}'", key));
                             }
                         }
-                        "steam_path_override" => {
+                        "steam_path_override" | "steamPathOverride" => {
                             if let Some(s) = parse_str(val) {
                                 svc.settings.steam_path_override = s;
                                 updated = svc.save();
@@ -1892,7 +2123,7 @@ fn handle_request(
                                     Some(format!("Invalid string value for setting '{}'", key));
                             }
                         }
-                        "steam_username" => {
+                        "steam_username" | "steamUsername" => {
                             if let Some(s) = parse_str(val) {
                                 svc.settings.steam_username = s;
                                 updated = svc.save();
@@ -1904,7 +2135,7 @@ fn handle_request(
                                     Some(format!("Invalid string value for setting '{}'", key));
                             }
                         }
-                        "doh_endpoint" => {
+                        "doh_endpoint" | "dohEndpoint" => {
                             if let Some(s) = parse_str(val) {
                                 svc.settings.doh_endpoint = s;
                                 updated = svc.save();
@@ -1916,7 +2147,7 @@ fn handle_request(
                                     Some(format!("Invalid string value for setting '{}'", key));
                             }
                         }
-                        "hubcap_api_key" => {
+                        "hubcap_api_key" | "hubcapApiKey" => {
                             if let Some(s) = parse_str(val) {
                                 svc.settings.hubcap_api_key = s;
                                 updated = svc.save();
@@ -1996,14 +2227,6 @@ fn handle_request(
     if parts.first() == Some(&"add")
         || (parts.len() == 2 && parts[0] == "api" && parts[1] == "add")
     {
-        if !is_request_authorized_with_token(&req, rpc_token) {
-            send_json(
-                req,
-                403,
-                json!({ "success": false, "error": "Unauthorized origin or host" }),
-            );
-            return;
-        }
         if aid == 0 {
             send_json(
                 req,
@@ -2063,14 +2286,6 @@ fn handle_request(
 
     // Route: /add-source/:appid
     if parts.first() == Some(&"add-source") {
-        if !is_request_authorized_with_token(&req, rpc_token) {
-            send_json(
-                req,
-                403,
-                json!({ "success": false, "error": "Unauthorized origin or host" }),
-            );
-            return;
-        }
         let source_name = body_json
             .as_ref()
             .and_then(|v| v.get("source").or_else(|| v.get("sourceName")))
@@ -2100,14 +2315,6 @@ fn handle_request(
 
     // Route: /check-sources or /check-sources/:appid (GET and POST — LT-28)
     if parts.first() == Some(&"check-sources") {
-        if !is_request_authorized_with_token(&req, rpc_token) {
-            send_json(
-                req,
-                403,
-                json!({ "success": false, "error": "Unauthorized origin or host", "sources": [] }),
-            );
-            return;
-        }
         if aid == 0 {
             send_json(
                 req,
@@ -2160,14 +2367,6 @@ fn handle_request(
 
     // Route: /download/:appid
     if parts.first() == Some(&"download") {
-        if !is_request_authorized_with_token(&req, rpc_token) {
-            send_json(
-                req,
-                403,
-                json!({ "success": false, "error": "Unauthorized origin or host" }),
-            );
-            return;
-        }
         if aid == 0 {
             send_json(
                 req,
@@ -2207,14 +2406,6 @@ fn handle_request(
 
     // Route: /cancel or /cancel/:appid (POST — LT-28)
     if parts.first() == Some(&"cancel") {
-        if !is_request_authorized_with_token(&req, rpc_token) {
-            send_json(
-                req,
-                403,
-                json!({ "success": false, "error": "Unauthorized origin or host" }),
-            );
-            return;
-        }
         if req.method() != &Method::Post {
             send_json(
                 req,
@@ -2242,14 +2433,6 @@ fn handle_request(
 
     // Route: /open-url
     if parts == ["open-url"] {
-        if !is_request_authorized_with_token(&req, rpc_token) {
-            send_json(
-                req,
-                403,
-                json!({ "success": false, "error": "Unauthorized origin or host" }),
-            );
-            return;
-        }
         if req.method() != &Method::Post {
             send_json(
                 req,
@@ -2281,14 +2464,6 @@ fn handle_request(
 
     // Route: /restart-steam
     if parts == ["restart-steam"] {
-        if !is_request_authorized_with_token(&req, rpc_token) {
-            send_json(
-                req,
-                403,
-                json!({ "success": false, "error": "Unauthorized origin or host" }),
-            );
-            return;
-        }
         if req.method() != &Method::Post {
             send_json(
                 req,
@@ -2298,22 +2473,20 @@ fn handle_request(
             return;
         }
         if allow_external_spawn() {
-            let _ = SteamService::relaunch_steam_sls(None);
+            thread::spawn(|| {
+                let _ = SteamService::relaunch_steam_sls(None);
+            });
         }
-        send_json(req, 200, json!({ "success": true, "restarted": true }));
+        send_json(
+            req,
+            200,
+            json!({ "success": true, "restarting": true, "restarted": true }),
+        );
         return;
     }
 
     // Route: /check-updates (GET and POST — LT-28)
     if parts == ["check-updates"] {
-        if !is_request_authorized_with_token(&req, rpc_token) {
-            send_json(
-                req,
-                403,
-                json!({ "success": false, "error": "Unauthorized origin or host" }),
-            );
-            return;
-        }
         let res = run_update_check(body_json.as_ref());
         send_json(req, 200, update_check_to_json(&res));
         return;
@@ -2321,14 +2494,6 @@ fn handle_request(
 
     // Route: /loaded-apps (GET and POST — LT-28)
     if parts == ["loaded-apps"] {
-        if !is_request_authorized_with_token(&req, rpc_token) {
-            send_json(
-                req,
-                403,
-                json!({ "success": false, "error": "Unauthorized origin or host" }),
-            );
-            return;
-        }
         if req.method() == &Method::Post {
             let incoming = body_json
                 .as_ref()
@@ -2339,14 +2504,17 @@ fn handle_request(
                 if let Ok(mut guard) = reported_loaded_apps().lock() {
                     guard.extend(incoming.iter().copied());
                 }
-                if allow_external_spawn() {
-                    let mut ss = SettingsService::default();
+                if overrides.settings_config_path.is_some() || allow_external_spawn() {
+                    let mut ss = SettingsService::new(overrides.settings_config_path.clone());
                     for id in &incoming {
                         ss.record_loaded_app(*id);
                     }
                 }
             }
-            let merged = collect_merged_loaded_apps(stplug_dir);
+            let merged = collect_merged_loaded_apps(
+                stplug_dir,
+                overrides.slssteam_config_path.as_deref(),
+            );
             send_json(
                 req,
                 200,
@@ -2359,7 +2527,10 @@ fn handle_request(
             );
             return;
         } else {
-            let apps = collect_merged_loaded_apps(stplug_dir);
+            let apps = collect_merged_loaded_apps(
+                stplug_dir,
+                overrides.slssteam_config_path.as_deref(),
+            );
             send_json(
                 req,
                 200,
@@ -2378,6 +2549,7 @@ fn handle_request(
 
     // Route: /icon
     if parts == ["icon"] {
+        const MAX_ICON_BYTES: u64 = 10 * 1024 * 1024;
         if aid > 0 {
             let agent = ureq::AgentBuilder::new()
                 .timeout(Duration::from_secs(10))
@@ -2389,7 +2561,13 @@ fn handle_request(
             if let Ok(resp) = agent.get(&icon_url).call() {
                 if resp.status() == 200 {
                     let mut bytes = Vec::new();
-                    if resp.into_reader().read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
+                    if resp
+                        .into_reader()
+                        .take(MAX_ICON_BYTES)
+                        .read_to_end(&mut bytes)
+                        .is_ok()
+                        && !bytes.is_empty()
+                    {
                         let b64 = general_purpose::STANDARD.encode(&bytes);
                         send_json(
                             req,
@@ -2407,7 +2585,13 @@ fn handle_request(
             if let Ok(resp) = agent.get(&header_url).call() {
                 if resp.status() == 200 {
                     let mut bytes = Vec::new();
-                    if resp.into_reader().read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
+                    if resp
+                        .into_reader()
+                        .take(MAX_ICON_BYTES)
+                        .read_to_end(&mut bytes)
+                        .is_ok()
+                        && !bytes.is_empty()
+                    {
                         let b64 = general_purpose::STANDARD.encode(&bytes);
                         send_json(
                             req,
@@ -2430,14 +2614,6 @@ fn handle_request(
             && parts[0] == "api"
             && (parts[1] == "remove" || parts[1] == "delete"))
     {
-        if !is_request_authorized_with_token(&req, rpc_token) {
-            send_json(
-                req,
-                403,
-                json!({ "success": false, "error": "Unauthorized origin or host" }),
-            );
-            return;
-        }
         if req.method() != &Method::Post {
             send_json(
                 req,
@@ -2454,7 +2630,11 @@ fn handle_request(
             );
             return;
         }
-        let (removed_lua, removed_disabled) = remove_app_completely(stplug_dir, aid);
+        let (removed_lua, removed_disabled) = remove_app_completely(
+            stplug_dir,
+            aid,
+            overrides.slssteam_config_path.as_deref(),
+        );
         let _ = event_tx.send(RpcUiEvent::RemovedApp(aid));
         notify();
         send_json(
@@ -2476,10 +2656,6 @@ fn handle_request(
     if (parts.len() >= 2 && parts[0] == "open" && parts[1] == "fix")
         || parts.first() == Some(&"fix")
     {
-        if !is_request_authorized_with_token(&req, rpc_token) {
-            send_json(req, 403, json!({ "success": false, "error": "Unauthorized origin or host" }));
-            return;
-        }
         let _ = event_tx.send(RpcUiEvent::OpenFix(aid));
         notify();
         send_json(req, 200, json!({ "success": true, "ok": true, "appid": aid }));
@@ -2488,10 +2664,6 @@ fn handle_request(
 
     // Route: /open/settings or /settings
     if (parts.len() == 2 && parts[0] == "open" && parts[1] == "settings") || parts == ["settings"] {
-        if !is_request_authorized_with_token(&req, rpc_token) {
-            send_json(req, 403, json!({ "success": false, "error": "Unauthorized origin or host" }));
-            return;
-        }
         let _ = event_tx.send(RpcUiEvent::OpenSettings);
         notify();
         send_json(req, 200, json!({ "success": true, "ok": true }));
@@ -2502,10 +2674,6 @@ fn handle_request(
     if (parts.len() >= 2 && parts[0] == "open" && parts[1] == "app")
         || (parts.len() == 2 && parts[0] == "open" && aid > 0)
     {
-        if !is_request_authorized_with_token(&req, rpc_token) {
-            send_json(req, 403, json!({ "success": false, "error": "Unauthorized origin or host" }));
-            return;
-        }
         if aid > 0 {
             let _ = event_tx.send(RpcUiEvent::AddApp(aid));
             notify();
@@ -2516,10 +2684,6 @@ fn handle_request(
 
     // Route: /open/acquire or /open/acquire/:appid
     if parts.len() >= 2 && parts[0] == "open" && parts[1] == "acquire" {
-        if !is_request_authorized_with_token(&req, rpc_token) {
-            send_json(req, 403, json!({ "success": false, "error": "Unauthorized origin or host" }));
-            return;
-        }
         if aid > 0 {
             let _ = event_tx.send(RpcUiEvent::AddApp(aid));
             notify();
@@ -2534,10 +2698,6 @@ fn handle_request(
 
     // Route: /open/library
     if parts == ["open", "library"] || parts == ["library"] {
-        if !is_request_authorized_with_token(&req, rpc_token) {
-            send_json(req, 403, json!({ "success": false, "error": "Unauthorized origin or host" }));
-            return;
-        }
         let _ = event_tx.send(RpcUiEvent::OpenLibrary);
         notify();
         send_json(req, 200, json!({ "success": true, "ok": true }));
@@ -2546,10 +2706,6 @@ fn handle_request(
 
     // Route: /open/depots or /open/depots/:appid
     if parts.len() >= 2 && parts[0] == "open" && parts[1] == "depots" {
-        if !is_request_authorized_with_token(&req, rpc_token) {
-            send_json(req, 403, json!({ "success": false, "error": "Unauthorized origin or host" }));
-            return;
-        }
         let _ = event_tx.send(RpcUiEvent::OpenDepots(aid));
         notify();
         send_json(req, 200, json!({ "success": true, "ok": true, "appid": aid }));
@@ -2558,14 +2714,6 @@ fn handle_request(
 
     // Route: /steam/restart or /restart
     if parts == ["steam", "restart"] || parts == ["restart"] {
-        if !is_request_authorized_with_token(&req, rpc_token) {
-            send_json(
-                req,
-                403,
-                json!({ "success": false, "error": "Unauthorized origin or host" }),
-            );
-            return;
-        }
         if req.method() != &Method::Post {
             send_json(
                 req,
@@ -2575,7 +2723,9 @@ fn handle_request(
             return;
         }
         if allow_external_spawn() {
-            let _ = SteamService::relaunch_steam_sls(None);
+            thread::spawn(|| {
+                let _ = SteamService::relaunch_steam_sls(None);
+            });
         }
         send_json(
             req,
@@ -2956,8 +3106,12 @@ mod tests {
             .unwrap();
         assert_eq!(has2["has"], false);
 
-        // 2. /add
+        // 2. /add (requires X-LuaTools-Token)
+        let add_unauth = ureq::get(&format!("http://127.0.0.1:{}/add/1245620", port)).call();
+        assert!(matches!(add_unauth, Err(ureq::Error::Status(403, _))));
+
         let add1: Value = ureq::get(&format!("http://127.0.0.1:{}/add/1245620", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .call()
             .unwrap()
             .into_json()
@@ -2984,11 +3138,18 @@ mod tests {
         assert_eq!(apps["apps"], json!([1245620]));
         assert_eq!(apps["success"], true);
 
-        // 4. /remove (POST required to prevent GET CSRF mutations) & removes .lua + .lua.disabled
-        let rem_get = ureq::get(&format!("http://127.0.0.1:{}/remove/1245620", port)).call();
+        // 4. /remove (requires token, and POST required to prevent GET CSRF mutations) & removes .lua + .lua.disabled
+        let rem_unauth = ureq::post(&format!("http://127.0.0.1:{}/remove/1245620", port))
+            .send_json(json!({}));
+        assert!(matches!(rem_unauth, Err(ureq::Error::Status(403, _))));
+
+        let rem_get = ureq::get(&format!("http://127.0.0.1:{}/remove/1245620", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
+            .call();
         assert!(matches!(rem_get, Err(ureq::Error::Status(405, _))));
 
         let rem: Value = ureq::post(&format!("http://127.0.0.1:{}/remove/1245620", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .send_json(json!({}))
             .unwrap()
             .into_json()
@@ -3017,8 +3178,9 @@ mod tests {
         assert!(!dir.path().join("730.lua.disabled").exists());
         assert!(matches!(rx.try_recv().unwrap(), RpcUiEvent::RemovedApp(730)));
 
-        // 5. /open/fix and /open/settings
+        // 5. /open/fix and /open/settings (require token)
         let fix: Value = ureq::get(&format!("http://127.0.0.1:{}/open/fix/1245620", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .call()
             .unwrap()
             .into_json()
@@ -3028,6 +3190,7 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap(), RpcUiEvent::OpenFix(1245620)));
 
         let set: Value = ureq::get(&format!("http://127.0.0.1:{}/open/settings", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .call()
             .unwrap()
             .into_json()
@@ -3104,6 +3267,7 @@ mod tests {
         assert_eq!(add_st["success"], true);
 
         let add_src: Value = ureq::post(&format!("http://127.0.0.1:{}/add-source/1245620", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .send_json(json!({ "source": "Sadie (Morrenus)" }))
             .unwrap()
             .into_json()
@@ -3118,6 +3282,7 @@ mod tests {
         assert_eq!(chk_src["success"], true);
 
         let dl: Value = ureq::post(&format!("http://127.0.0.1:{}/download/1245620", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .send_json(json!({ "source": "Sadie (Morrenus)" }))
             .unwrap()
             .into_json()
@@ -3126,6 +3291,7 @@ mod tests {
 
         // Cancel sets real cancelled state reflected in /download-status
         let cancel: Value = ureq::post(&format!("http://127.0.0.1:{}/cancel/1245620", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .send_json(json!({}))
             .unwrap()
             .into_json()
@@ -3143,14 +3309,17 @@ mod tests {
 
         // Reserved example.com and non-HTTP schemes must be rejected cleanly
         let blocked_example = ureq::post(&format!("http://127.0.0.1:{}/open-url", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .send_json(json!({ "url": "https://example.com" }));
         assert!(matches!(blocked_example, Err(ureq::Error::Status(400, _))));
 
         let blocked_file = ureq::post(&format!("http://127.0.0.1:{}/open-url", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .send_json(json!({ "url": "file:///etc/passwd" }));
         assert!(matches!(blocked_file, Err(ureq::Error::Status(400, _))));
 
         let open_url: Value = ureq::post(&format!("http://127.0.0.1:{}/open-url", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .send_json(json!({ "url": "https://store.steampowered.com/app/1245620" }))
             .unwrap()
             .into_json()
@@ -3159,11 +3328,13 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap(), RpcUiEvent::RestoreFromTray));
 
         let r_steam: Value = ureq::post(&format!("http://127.0.0.1:{}/restart-steam", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .send_json(json!({}))
             .unwrap()
             .into_json()
             .unwrap();
         assert_eq!(r_steam["success"], true);
+        assert_eq!(r_steam["restarting"], true);
 
         let chk_up: Value = ureq::post(&format!("http://127.0.0.1:{}/check-updates", port))
             .send_json(json!({}))
@@ -3176,6 +3347,7 @@ mod tests {
         // POST /loaded-apps parses JSON app list and merges with stplug-in
         std::fs::write(dir.path().join("570.lua"), "addappid(570)").unwrap();
         let l_apps_post: Value = ureq::post(&format!("http://127.0.0.1:{}/loaded-apps", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .send_json(json!({ "apps": [440, "620"] }))
             .unwrap()
             .into_json()
@@ -3188,6 +3360,7 @@ mod tests {
         assert!(merged_arr.contains(&json!(620)));
 
         let l_apps_get: Value = ureq::get(&format!("http://127.0.0.1:{}/loaded-apps", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .call()
             .unwrap()
             .into_json()
@@ -3211,6 +3384,7 @@ mod tests {
 
         // 9. /open/library and /open/depots emit RpcUiEvent
         let lib_resp: Value = ureq::get(&format!("http://127.0.0.1:{}/open/library", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .call()
             .unwrap()
             .into_json()
@@ -3219,6 +3393,7 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap(), RpcUiEvent::OpenLibrary));
 
         let depots_resp: Value = ureq::get(&format!("http://127.0.0.1:{}/open/depots/1245620", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .call()
             .unwrap()
             .into_json()
@@ -3227,20 +3402,26 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap(), RpcUiEvent::OpenDepots(1245620)));
 
         // 10. /steam/restart and /restart enforce POST and reject GET with 405
-        let get_steam_restart = ureq::get(&format!("http://127.0.0.1:{}/steam/restart", port)).call();
+        let get_steam_restart = ureq::get(&format!("http://127.0.0.1:{}/steam/restart", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
+            .call();
         assert!(matches!(get_steam_restart, Err(ureq::Error::Status(405, _))));
 
         let post_steam_restart: Value = ureq::post(&format!("http://127.0.0.1:{}/steam/restart", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .send_json(json!({}))
             .unwrap()
             .into_json()
             .unwrap();
         assert_eq!(post_steam_restart["success"], true);
 
-        let get_restart = ureq::get(&format!("http://127.0.0.1:{}/restart", port)).call();
+        let get_restart = ureq::get(&format!("http://127.0.0.1:{}/restart", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
+            .call();
         assert!(matches!(get_restart, Err(ureq::Error::Status(405, _))));
 
         let post_restart: Value = ureq::post(&format!("http://127.0.0.1:{}/restart", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .send_json(json!({}))
             .unwrap()
             .into_json()
@@ -3441,7 +3622,7 @@ mod tests {
         assert_eq!(has_res["depotCount"], 2);
         assert_eq!(has_res["dlcCount"], 1);
 
-        // 5. SyncDlcForApp (isolated temp SLSsteam config.yaml — never touches real $HOME)
+        // 5. SyncDlcForApp (isolated temp SLSsteam config.yaml — skips keyed base-game depots)
         let dlc_res: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
             .set("X-LuaTools-Token", &token)
             .send_json(json!({
@@ -3452,11 +3633,65 @@ mod tests {
             .into_json()
             .unwrap();
         assert_eq!(dlc_res["success"], true);
-        assert_eq!(dlc_res["dlcCount"], 3);
-        assert_eq!(dlc_res["dlcIds"], json!([1245621, 1245622, 2778580]));
+        assert_eq!(dlc_res["dlcCount"], 1);
+        assert_eq!(dlc_res["dlcIds"], json!([2778580]));
         assert!(sls_cfg_path.is_file());
         let sls_after_dlc = SlssteamService::new(Some(sls_cfg_path.clone()));
         assert!(sls_after_dlc.config.additional_apps.contains(&2778580));
+        assert!(!sls_after_dlc.config.additional_apps.contains(&1245621));
+        assert!(!sls_after_dlc.config.additional_apps.contains(&1245622));
+
+        // 5b. OpenFixInDesktopApp alias & RestartSteam non-blocking response
+        let open_fix_desktop: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &token)
+            .send_json(json!({
+                "method": "OpenFixInDesktopApp",
+                "args": { "appid": 1245620 }
+            }))
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(open_fix_desktop["success"], true);
+        assert!(matches!(rx.try_recv().unwrap(), RpcUiEvent::OpenFix(1245620)));
+
+        let restart_rpc: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &token)
+            .send_json(json!({
+                "method": "RestartSteam",
+                "args": {}
+            }))
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(restart_rpc["success"], true);
+        assert_eq!(restart_rpc["restarting"], true);
+
+        // 5c. ToggleAppEnabled returns 404 error when neither .lua nor .lua.disabled exists
+        let toggle_missing = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &token)
+            .send_json(json!({
+                "method": "ToggleAppEnabled",
+                "args": { "appid": 9999999, "enabled": true }
+            }));
+        assert!(matches!(toggle_missing, Err(ureq::Error::Status(404, _))));
+
+        // 5d. SetLoadedApps persists via SettingsService::record_loaded_app using isolated settings path
+        let set_loaded_res: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &token)
+            .send_json(json!({
+                "method": "SetLoadedApps",
+                "args": { "apps": [413150, 1091500] }
+            }))
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(set_loaded_res["success"], true);
+        assert_eq!(set_loaded_res["received"], 2);
+        let persisted_loaded = SettingsService::new(Some(settings_cfg_path.clone()))
+            .settings
+            .loaded_app_ids;
+        assert!(persisted_loaded.contains(&413150));
+        assert!(persisted_loaded.contains(&1091500));
 
         // 6. SyncSlsSteamConfig (isolated temp SLSsteam config.yaml)
         let sync_res: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
@@ -3511,7 +3746,7 @@ mod tests {
         assert!(chk_fixes["availableFixes"].is_array());
         assert!(chk_fixes["hasFixes"].is_boolean());
 
-        // 9. UpdateSettingValue real mutation (isolated temp settings.json)
+        // 9. UpdateSettingValue real mutation (both snake_case and camelCase, isolated temp settings.json)
         let set_res: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
             .set("X-LuaTools-Token", &token)
             .send_json(json!({
@@ -3528,6 +3763,41 @@ mod tests {
                 .settings
                 .fast_fetch,
             false
+        );
+
+        let set_camel_res: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &token)
+            .send_json(json!({
+                "method": "UpdateSettingValue",
+                "args": { "key": "fastFetch", "value": true }
+            }))
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(set_camel_res["success"], true);
+        assert_eq!(set_camel_res["updated"], true);
+        assert_eq!(
+            SettingsService::new(Some(settings_cfg_path.clone()))
+                .settings
+                .fast_fetch,
+            true
+        );
+
+        let set_port_res: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &token)
+            .send_json(json!({
+                "method": "UpdateSettingValue",
+                "args": { "key": "httpServerPort", "value": 6868 }
+            }))
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(set_port_res["success"], true);
+        assert_eq!(
+            SettingsService::new(Some(settings_cfg_path.clone()))
+                .settings
+                .http_server_port,
+            6868
         );
 
         // Unknown setting key must return success: false, updated: false with error
@@ -3623,5 +3893,113 @@ mod tests {
         ));
 
         srv.stop();
+    }
+
+    #[test]
+    fn host_origin_and_token_hardening_regression() {
+        // 1. Host header parsing: IPv6 loopback accepted, empty and non-loopback rejected
+        assert!(is_allowed_host("127.0.0.1:6767"));
+        assert!(is_allowed_host("localhost:6767"));
+        assert!(is_allowed_host("[::1]:6767"));
+        assert!(is_allowed_host("[::1]"));
+        assert!(is_allowed_host("::1"));
+        assert!(!is_allowed_host(""));
+        assert!(!is_allowed_host("   "));
+        assert!(!is_allowed_host("[::1]:notaport"));
+        assert!(!is_allowed_host("evil.com:6767"));
+        assert!(!is_allowed_host("127.0.0.1.evil.com:6767"));
+
+        // 2. Origin canonicalization rejects control chars, non-ASCII, paths, and untrusted hosts
+        assert_eq!(
+            canonical_allowed_origin("https://store.steampowered.com"),
+            Some("https://store.steampowered.com".into())
+        );
+        assert_eq!(
+            canonical_allowed_origin("http://[::1]:6767"),
+            Some("http://[::1]:6767".into())
+        );
+        assert!(!is_allowed_origin("https://store.steampowered.com\r\nX-Injected: 1"));
+        assert!(!is_allowed_origin("https://store.steampowered.com/é"));
+        assert!(!is_allowed_origin("https://store.steampowered.com/app/123"));
+        assert!(!is_allowed_origin("http://store.steampowered.com"));
+        assert!(!is_allowed_origin("https://evil.com"));
+
+        // 3. Uniform Host/Origin/Token enforcement across routes
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let port = get_free_port();
+        let mut srv = HttpServerService::start(port, dir.path().to_path_buf(), tx, None).unwrap();
+
+        // Read-only /ping rejects unauthorized Origin uniformly
+        let bad_ping = ureq::get(&format!("http://127.0.0.1:{}/ping", port))
+            .set("Origin", "https://evil-attacker.com")
+            .call();
+        assert!(matches!(bad_ping, Err(ureq::Error::Status(403, _))));
+
+        // Mutating routes require valid X-LuaTools-Token
+        for (method, path) in [
+            ("POST", "/rpc"),
+            ("GET", "/add/1245620"),
+            ("POST", "/remove/1245620"),
+            ("POST", "/delete/1245620"),
+            ("POST", "/cancel/1245620"),
+            ("POST", "/open-url"),
+            ("POST", "/restart-steam"),
+            ("POST", "/steam/restart"),
+            ("POST", "/restart"),
+            ("POST", "/download/1245620"),
+            ("POST", "/add-source/1245620"),
+            ("POST", "/loaded-apps"),
+            ("GET", "/open/fix/1245620"),
+            ("GET", "/open/settings"),
+            ("GET", "/open/library"),
+            ("GET", "/open/depots/1245620"),
+        ] {
+            let url = format!("http://127.0.0.1:{}{}", port, path);
+            let res = if method == "POST" {
+                ureq::post(&url).send_json(json!({}))
+            } else {
+                ureq::get(&url).call()
+            };
+            assert!(
+                matches!(res, Err(ureq::Error::Status(403, _))),
+                "Expected 403 without token for {} {}",
+                method,
+                path
+            );
+        }
+
+        srv.stop();
+    }
+
+    #[test]
+    fn rpc_discovery_file_uses_pid_tmp_0600_and_only_unlinks_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_rpc_discovery_file_in(dir.path(), 6767, "tok-owner").unwrap();
+        assert!(path.is_file());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let my_pid = std::process::id();
+        // Mismatched PID must not remove file
+        remove_rpc_discovery_files_checked(&[path.clone()], my_pid.wrapping_add(1), Some(6767), Some("tok-owner"));
+        assert!(path.exists());
+
+        // Mismatched port must not remove file
+        remove_rpc_discovery_files_checked(&[path.clone()], my_pid, Some(9999), Some("tok-owner"));
+        assert!(path.exists());
+
+        // Mismatched token must not remove file
+        remove_rpc_discovery_files_checked(&[path.clone()], my_pid, Some(6767), Some("tok-other"));
+        assert!(path.exists());
+
+        // Exact PID + port + token match removes file
+        remove_rpc_discovery_files_checked(&[path.clone()], my_pid, Some(6767), Some("tok-owner"));
+        assert!(!path.exists());
     }
 }

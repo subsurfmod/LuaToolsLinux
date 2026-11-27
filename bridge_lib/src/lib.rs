@@ -2401,6 +2401,22 @@ unsafe fn real_connect_fn() -> Option<ConnectFn> {
         .map(|p| std::mem::transmute::<*mut libc::c_void, ConnectFn>(p))
 }
 
+#[cfg(test)]
+static TEST_MILLENNIUM_UID_OVERRIDE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+#[inline]
+unsafe fn millennium_socket_uid() -> libc::uid_t {
+    #[cfg(test)]
+    {
+        let override_uid = TEST_MILLENNIUM_UID_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+        if override_uid != 0 {
+            return override_uid as libc::uid_t;
+        }
+    }
+    libc::getuid()
+}
+
 /// Async-signal-safe, allocation-free formatter for `/tmp/millennium-mep-{uid}.sock\0`.
 fn format_millennium_socket_path(uid: libc::uid_t) -> ([u8; 64], usize) {
     let mut buf = [0u8; 64];
@@ -2459,7 +2475,7 @@ unsafe fn redirect_millennium_socket(
     let path_slice = &raw_bytes[..path_len];
 
     if path_slice == b"/tmp/millennium-mep.sock" {
-        let (target_buf, target_len) = format_millennium_socket_path(libc::getuid());
+        let (target_buf, target_len) = format_millennium_socket_path(millennium_socket_uid());
         let mut new_un: libc::sockaddr_un = std::mem::zeroed();
         new_un.sun_family = libc::AF_UNIX as libc::sa_family_t;
 
@@ -2507,7 +2523,7 @@ pub unsafe extern "C" fn unlink(pathname: *const libc::c_char) -> libc::c_int {
     if !pathname.is_null()
         && std::ffi::CStr::from_ptr(pathname).to_bytes() == b"/tmp/millennium-mep.sock"
     {
-        let (target_buf, _) = format_millennium_socket_path(libc::getuid());
+        let (target_buf, _) = format_millennium_socket_path(millennium_socket_uid());
         return real_unlink(target_buf.as_ptr() as *const libc::c_char);
     }
     real_unlink(pathname)
@@ -2737,6 +2753,19 @@ mod tests {
         assert_eq!(path, expected);
 
         // End-to-end live socket bind + listen + EADDRINUSE protection + stale-socket recovery + unlink
+        // Use an isolated synthetic UID so a live Steam/Millennium listener on /tmp/millennium-mep-{uid}.sock
+        // is neither collided with nor unlinked by unit tests.
+        struct TestUidGuard;
+        impl Drop for TestUidGuard {
+            fn drop(&mut self) {
+                TEST_MILLENNIUM_UID_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let isolated_uid = 1_000_000u32.saturating_add(std::process::id());
+        TEST_MILLENNIUM_UID_OVERRIDE.store(isolated_uid, std::sync::atomic::Ordering::Relaxed);
+        let _uid_guard = TestUidGuard;
+        let _ = std::fs::remove_file(format!("/tmp/millennium-mep-{}.sock", isolated_uid));
+
         unsafe {
             let sfd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
             assert!(sfd >= 0);

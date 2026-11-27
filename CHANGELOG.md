@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [4.1.3] - 2026-11-27
+
+> **Release (`v4.1.3`)**: Hardens native Millennium v3.6.3 plugin runtime compatibility, companion HTTP/CEF/bridge security and stability, self-updater semver and multilib synchronization, Home Setup Hub & `?` tooltip UX, and cross-distro `$LIB` multilib packaging — verified with **631 passing workspace tests**.
+
+### Fixed & Improved
+- **Millennium v3.6.3 Native Plugin Runtime (`assets/millennium_plugin/`, `src/services/millennium_service.rs`, `src/services/plugin_installer_service.rs`)**:
+  - Updated the embedded `LuaToolsLinux` Lua backend for Millennium v3.6.3 API compatibility (`require("json")`, `logger:info`, positional and table RPC argument normalization, and structured table return values).
+  - Shipped native `.millennium/Dist/webkit.js` store-page injection support alongside `dist/index.js` so Steam Store integration works reliably under Millennium v3.6.3+.
+- **Companion HTTP, CEF & Bridge Hardening (`src/services/http_server.rs`, `src/services/cef_bridge.rs`, `bridge_lib/src/lib.rs`)**:
+  - Hardened companion RPC routing, CEF coexistence detection, and native Linux Steam bridge safety across 32-bit (`i686`) and 64-bit (`x86_64`) processes.
+- **Self-Updater & Multilib Sync (`src/services/update_service.rs`)**:
+  - Prevented prebuilt release update loops by only installing a GitHub Release binary when its semver is strictly newer than the running `VERSION`, falling back cleanly to `git pull` + `cargo build` when tracking newer commits on `main`.
+  - Atomically synced the full multi-arch `$LIB` bridge layout (`lib/`, `lib64/`, `32/`, `64/`, `lib/i386-linux-gnu -> ../32`, `lib/x86_64-linux-gnu -> ../lib64`, `libsteam_integration32.so`, `libsteam_integration64.so`) during source self-updates.
+- **Home Steam Setup Hub, Top Bar, `?` Help Tips & Settings Sync (`src/ui/app.rs`, `src/ui/views_primary.rs`, `src/ui/views_workbench.rs`, `src/ui/theme.rs`)**:
+  - Triggered automatic Millennium bridge probing at startup and after Steam Unlocker / Store Plugin installation, and recognized an installed native `LuaToolsLinux` Millennium plugin as ready in Home Hub Row 3.
+  - Synchronized live Steam PID polling with cached bridge state so Top Bar controls update immediately when Steam exits externally.
+  - Improved `?` help-tip popups with measured-height memory (`220px` fallback), automatic dismissal when pinned anchors scroll out of view, and suppression behind active modal dialogs.
+  - Synced `DohResolver::configure_global` on `Save Changes`, resynced `bridge_system_preload` after bridge actions, and switched update badge comparison to semver (`is_newer_semver`).
+- **Installer, Uninstaller, Launcher, Packaging & Build (`install.sh`, `uninstall.sh`, `assets/luatools-steam-launcher`, `Makefile`, `packaging/`, `build.rs`)**:
+  - Fixed cyclic `lib/i386-linux-gnu -> .` symlink to `../32` and added Debian/Ubuntu `$LIB` symlinks across `install.sh`, `Makefile`, `.tar.gz`, `.deb`, and `.rpm`.
+  - Hardened `install.sh` (`sudo` user-local target resolution, expanded Millennium & opt-out detection, `null`-safe JSON merge, safe JSON escaping for `source_repo.json`, path-safe `.desktop` rendering, expanded staleness checks) and `uninstall.sh` (`--system --purge` `$SUDO_USER` cleanup and ownership-preserving atomic `mimeapps.list` cleanup).
+  - Updated `luatools-steam-launcher` to handle colon- and space-separated `LD_PRELOAD` and verify multilib `$LIB` layout before exporting `$LIB`.
+  - Staged `LICENSE` in `.tar.gz`, `.deb`, and `.rpm`, expanded runtime `Depends`/`Requires`/`Recommends`, fixed `find | head` SIGPIPE and quoting in packaging scripts, and added git worktree + conditional rerun tracking in `build.rs`.
+
+---
+
 ## [4.1.2] - 2026-11-27
 
 > **Release (`v4.1.2`)**: Introduces the Home Steam Setup Hub, plain-English `?` help popups across all Settings tabs, the native Linux Millennium v3.6+ `LuaToolsLinux` plugin, strict `X-LuaTools-Token` companion RPC authentication with real DLC/config/settings handlers, lock-free `bridge_lib` socket isolation and crash guards, multi-arch `$LIB` packaging, and unconditional `.git` build SHA tracking — verified with **617 passing workspace tests**.
