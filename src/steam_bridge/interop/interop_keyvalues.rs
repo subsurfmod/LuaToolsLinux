@@ -285,8 +285,7 @@ pub fn install_forced(steam_root: &std::path::Path) -> Result<(), String> {
         let patch = unsafe {
             memory_patch::patch_by_offset_with_callback(addr, 0, replacement, |tramp| {
                 if tramp != 0 {
-                    let orig_fn: KeyValuesReadAsBinaryFn =
-                        unsafe { std::mem::transmute(tramp) };
+                    let orig_fn: KeyValuesReadAsBinaryFn = std::mem::transmute(tramp);
                     *original_keyvalues_read_as_binary()
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);

@@ -44,7 +44,7 @@ fn decode_hex_robust(hex: &str) -> Option<Vec<u8>> {
 }
 
 /// ConfigStore type enum.
-#[allow(dead_code)]
+#[allow(dead_code, non_snake_case, non_upper_case_globals)]
 pub mod EConfigStore {
     pub const k_EConfigStoreInvalid: u32 = 0;
     pub const k_EConfigStoreUserLocal: u32 = 1;
@@ -394,7 +394,7 @@ pub fn install(steam_root: &std::path::Path) -> Result<(), String> {
     ) {
         let replacement = config_store_get_binary_detour as *const () as *mut u8;
         let patch = unsafe { memory_patch::patch_by_offset_with_callback(addr, 0, replacement, |trampoline| {
-            let orig_fn: ConfigStoreGetBinaryFn = unsafe { std::mem::transmute(trampoline as *const ()) };
+            let orig_fn: ConfigStoreGetBinaryFn = std::mem::transmute(trampoline as *const ());
             *original_config_store_get_binary().lock().unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
         }) }
             .map_err(|e| format!("Failed to install ConfigStoreGetBinary hook: {}", e))?;

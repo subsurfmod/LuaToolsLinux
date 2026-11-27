@@ -135,7 +135,7 @@ pub struct PackageInfo {
 }
 
 /// EPackageStatus enum.
-#[allow(dead_code)]
+#[allow(dead_code, non_snake_case, non_upper_case_globals)]
 pub mod EPackageStatus {
     pub const Available: u32 = 1;
     pub const Expired: u32 = 2;
@@ -143,7 +143,7 @@ pub mod EPackageStatus {
 }
 
 /// EAppReleaseState enum.
-#[allow(dead_code)]
+#[allow(dead_code, non_snake_case, non_upper_case_globals)]
 pub mod EAppReleaseState {
     pub const Released: u32 = 1;
     pub const PreLoadOnly: u32 = 2;
@@ -154,7 +154,7 @@ pub mod EAppReleaseState {
 }
 
 /// K_EAppOwnershipFlags enum.
-#[allow(dead_code)]
+#[allow(dead_code, non_snake_case, non_upper_case_globals)]
 pub mod EAppOwnershipFlags {
     pub const None: u32 = 0;
 }
@@ -851,7 +851,7 @@ pub fn install(steam_root: &std::path::Path) -> Result<(), String> {
     ) {
         let replacement = cutl_memory_grow_detour as *const () as *mut u8;
         let patch = unsafe { memory_patch::patch_by_offset_with_callback(addr, 0, replacement, |trampoline| {
-            let orig_fn: CUtlMemoryGrowFn = unsafe { std::mem::transmute(trampoline as *const ()) };
+            let orig_fn: CUtlMemoryGrowFn = std::mem::transmute(trampoline as *const ());
             *original_cutl_memory_grow().lock().unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
         }) }
             .map_err(|e| format!("Failed to install CUtlMemoryGrow hook: {}", e))?;
@@ -871,7 +871,7 @@ pub fn install(steam_root: &std::path::Path) -> Result<(), String> {
     ) {
         let replacement = mark_license_as_changed_detour as *const () as *mut u8;
         let patch = unsafe { memory_patch::patch_by_offset_with_callback(addr, 0, replacement, |trampoline| {
-            let orig_fn: MarkLicenseAsChangedFn = unsafe { std::mem::transmute(trampoline as *const ()) };
+            let orig_fn: MarkLicenseAsChangedFn = std::mem::transmute(trampoline as *const ());
             *original_mark_license_as_changed().lock().unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
         }) }
             .map_err(|e| format!("Failed to install MarkLicenseAsChanged hook: {}", e))?;
@@ -891,7 +891,7 @@ pub fn install(steam_root: &std::path::Path) -> Result<(), String> {
     ) {
         let replacement = process_pending_license_updates_detour as *const () as *mut u8;
         let patch = unsafe { memory_patch::patch_by_offset_with_callback(addr, 0, replacement, |trampoline| {
-            let orig_fn: ProcessPendingLicenseUpdatesFn = unsafe { std::mem::transmute(trampoline as *const ()) };
+            let orig_fn: ProcessPendingLicenseUpdatesFn = std::mem::transmute(trampoline as *const ());
             *original_process_pending_license_updates().lock().unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
         }) }
             .map_err(|e| format!("Failed to install ProcessPendingLicenseUpdates hook: {}", e))?;
@@ -925,7 +925,7 @@ pub fn install(steam_root: &std::path::Path) -> Result<(), String> {
     ) {
         let replacement = check_app_ownership_detour as *const () as *mut u8;
         let patch = unsafe { memory_patch::patch_by_offset_with_callback(addr, 0, replacement, |trampoline| {
-            let orig_fn: CheckAppOwnershipFn = unsafe { std::mem::transmute(trampoline as *const ()) };
+            let orig_fn: CheckAppOwnershipFn = std::mem::transmute(trampoline as *const ());
             *original_check_app_ownership().lock().unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
         }) }
             .map_err(|e| format!("Failed to install CheckAppOwnership hook: {}", e))?;

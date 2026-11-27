@@ -278,7 +278,7 @@ pub fn install(steam_root: &std::path::Path) -> Result<(), String> {
     ) {
         let replacement = send_callback_to_pipe_detour as *const () as *mut u8;
         let patch = unsafe { memory_patch::patch_by_offset_with_callback(addr, 0, replacement, |trampoline| {
-            let orig_fn: SendCallbackToPipeFn = unsafe { std::mem::transmute(trampoline as *const ()) };
+            let orig_fn: SendCallbackToPipeFn = std::mem::transmute(trampoline as *const ());
             *original_send_callback_to_pipe().lock().unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
         }) }
             .map_err(|e| format!("Failed to install SendCallbackToPipe hook: {}", e))?;

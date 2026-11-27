@@ -152,7 +152,10 @@ enum RelocType {
     None,
     Rel32Call { disp_offset: usize },
     Rel32Jmp { disp_offset: usize },
-    Rel8Jmp { disp_offset: usize },
+    Rel8Jmp {
+        #[allow(dead_code)]
+        disp_offset: usize,
+    },
     RipRelative { disp_offset: usize },
 }
 

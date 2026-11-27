@@ -347,7 +347,7 @@ pub fn install() -> Result<(), String> {
         0,
         replacement,
         |trampoline| {
-            let original: IPCProcessMessageFn = unsafe { std::mem::transmute(trampoline as *const ()) };
+            let original: IPCProcessMessageFn = std::mem::transmute(trampoline as *const ());
             *original_ipc_process_message()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = Some(original);
@@ -939,6 +939,7 @@ fn get_pipe_client(p_server: *mut c_void, h_steam_pipe: u32) -> *mut c_void {
     client_ptr
 }
 
+#[allow(dead_code)]
 fn start_ipc_server() -> Result<(), String> {
     let mut server = IpcServer::new();
     server.set_handler(handle_gui_message);
@@ -949,6 +950,7 @@ fn start_ipc_server() -> Result<(), String> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn handle_gui_message(msg: IpcMessage) -> Option<IpcMessage> {
     match msg {
         IpcMessage::Ping => Some(IpcMessage::Pong {

@@ -12,7 +12,7 @@ use crate::steam_bridge::memory_patch::{self, MemoryPatch, JMP_ABS64_LEN};
 use crate::steam_bridge::pattern_db::{BinaryComponent, PatternChannel, PatternDb};
 
 /// App state flags.
-#[allow(dead_code)]
+#[allow(dead_code, non_snake_case, non_upper_case_globals)]
 pub mod EAppState {
     pub const k_EAppStateUpdateRunning: u32 = 1 << 5;
     pub const k_EAppStateUpdateStarted: u32 = 1 << 6;
@@ -20,13 +20,13 @@ pub mod EAppState {
 }
 
 /// App ownership flags.
-#[allow(dead_code)]
+#[allow(dead_code, non_snake_case, non_upper_case_globals)]
 pub mod EAppOwnershipFlags {
     pub const None: u32 = 0;
 }
 
 /// App change flags.
-#[allow(dead_code)]
+#[allow(dead_code, non_snake_case, non_upper_case_globals)]
 pub mod EAppChangeFlags {
     pub const AppInfoOrConfig: u32 = 1;
 }
@@ -445,7 +445,7 @@ pub fn install(steam_root: &std::path::Path) -> Result<(), String> {
     ) {
         let replacement = fill_in_app_overview_detour as *const () as *mut u8;
         let patch = unsafe { memory_patch::patch_by_offset_with_callback(addr, 0, replacement, |trampoline| {
-            let orig_fn: FillInAppOverviewFn = unsafe { std::mem::transmute(trampoline as *const ()) };
+            let orig_fn: FillInAppOverviewFn = std::mem::transmute(trampoline as *const ());
             *original_fill_in_app_overview().lock().unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
         }) }
             .map_err(|e| format!("Failed to install FillInAppOverview hook: {}", e))?;
@@ -465,7 +465,7 @@ pub fn install(steam_root: &std::path::Path) -> Result<(), String> {
     ) {
         let replacement = build_complete_app_overview_change_detour as *const () as *mut u8;
         let patch = unsafe { memory_patch::patch_by_offset_with_callback(addr, 0, replacement, |trampoline| {
-            let orig_fn: BuildCompleteAppOverviewChangeFn = unsafe { std::mem::transmute(trampoline as *const ()) };
+            let orig_fn: BuildCompleteAppOverviewChangeFn = std::mem::transmute(trampoline as *const ());
             *original_build_complete_app_overview_change().lock().unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
         }) }
             .map_err(|e| format!("Failed to install BuildCompleteAppOverviewChange hook: {}", e))?;
@@ -485,7 +485,7 @@ pub fn install(steam_root: &std::path::Path) -> Result<(), String> {
     ) {
         let replacement = csteam_ui_app_controller_run_frame_detour as *const () as *mut u8;
         let patch = unsafe { memory_patch::patch_by_offset_with_callback(addr, 0, replacement, |trampoline| {
-            let orig_fn: CSteamUIAppControllerRunFrameFn = unsafe { std::mem::transmute(trampoline as *const ()) };
+            let orig_fn: CSteamUIAppControllerRunFrameFn = std::mem::transmute(trampoline as *const ());
             *original_csteam_ui_app_controller_run_frame().lock().unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
         }) }
             .map_err(|e| format!("Failed to install CSteamUIAppControllerRunFrame hook: {}", e))?;

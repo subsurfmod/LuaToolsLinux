@@ -1425,10 +1425,8 @@ fn install_bis_subscribed_app_patch(target_addr: u64) -> bool {
     let replacement_ptr = bis_subscribed_app_replacement as *const () as *mut u8;
     match unsafe {
         memory_patch::patch_by_offset_with_callback(target_addr, 0, replacement_ptr, |trampoline_ptr| {
-            unsafe {
-                let trampoline: BisSubscribedAppFn = std::mem::transmute(trampoline_ptr);
-                *write_lock(original_bis()) = Some(trampoline);
-            }
+            let trampoline: BisSubscribedAppFn = std::mem::transmute(trampoline_ptr);
+            *write_lock(original_bis()) = Some(trampoline);
         })
     } {
         Ok(patch) => {
@@ -1449,10 +1447,8 @@ fn install_get_app_id_patch(target_addr: u64) -> bool {
     let replacement_ptr = get_app_id_replacement as *const () as *mut u8;
     match unsafe {
         memory_patch::patch_by_offset_with_callback(target_addr, 0, replacement_ptr, |trampoline_ptr| {
-            unsafe {
-                let trampoline: GetAppIdFn = std::mem::transmute(trampoline_ptr);
-                *write_lock(original_get_app_id()) = Some(trampoline);
-            }
+            let trampoline: GetAppIdFn = std::mem::transmute(trampoline_ptr);
+            *write_lock(original_get_app_id()) = Some(trampoline);
         })
     } {
         Ok(patch) => {
@@ -1473,10 +1469,8 @@ fn install_get_app_ownership_ticket_patch(target_addr: u64) -> bool {
     let replacement_ptr = get_app_ownership_ticket_replacement as *const () as *mut u8;
     match unsafe {
         memory_patch::patch_by_offset_with_callback(target_addr, 0, replacement_ptr, |trampoline_ptr| {
-            unsafe {
-                let trampoline: GetAppOwnershipTicketFn = std::mem::transmute(trampoline_ptr);
-                *write_lock(original_get_app_ownership_ticket()) = Some(trampoline);
-            }
+            let trampoline: GetAppOwnershipTicketFn = std::mem::transmute(trampoline_ptr);
+            *write_lock(original_get_app_ownership_ticket()) = Some(trampoline);
         })
     } {
         Ok(patch) => {
@@ -1497,10 +1491,8 @@ fn install_request_encrypted_app_ticket_patch(target_addr: u64) -> bool {
     let replacement_ptr = request_encrypted_app_ticket_replacement as *const () as *mut u8;
     match unsafe {
         memory_patch::patch_by_offset_with_callback(target_addr, 0, replacement_ptr, |trampoline_ptr| {
-            unsafe {
-                let trampoline: RequestEncryptedAppTicketFn = std::mem::transmute(trampoline_ptr);
-                *write_lock(original_request_encrypted_app_ticket()) = Some(trampoline);
-            }
+            let trampoline: RequestEncryptedAppTicketFn = std::mem::transmute(trampoline_ptr);
+            *write_lock(original_request_encrypted_app_ticket()) = Some(trampoline);
         })
     } {
         Ok(patch) => {
@@ -1521,10 +1513,8 @@ fn install_get_encrypted_app_ticket_patch(target_addr: u64) -> bool {
     let replacement_ptr = get_encrypted_app_ticket_replacement as *const () as *mut u8;
     match unsafe {
         memory_patch::patch_by_offset_with_callback(target_addr, 0, replacement_ptr, |trampoline_ptr| {
-            unsafe {
-                let trampoline: GetEncryptedAppTicketFn = std::mem::transmute(trampoline_ptr);
-                *write_lock(original_get_encrypted_app_ticket()) = Some(trampoline);
-            }
+            let trampoline: GetEncryptedAppTicketFn = std::mem::transmute(trampoline_ptr);
+            *write_lock(original_get_encrypted_app_ticket()) = Some(trampoline);
         })
     } {
         Ok(patch) => {
@@ -1545,10 +1535,8 @@ fn install_get_steam_id_patch(target_addr: u64) -> bool {
     let replacement_ptr = get_steam_id_replacement as *const () as *mut u8;
     match unsafe {
         memory_patch::patch_by_offset_with_callback(target_addr, 0, replacement_ptr, |trampoline_ptr| {
-            unsafe {
-                let trampoline: GetSteamIDFn = std::mem::transmute(trampoline_ptr);
-                *write_lock(original_get_steam_id()) = Some(trampoline);
-            }
+            let trampoline: GetSteamIDFn = std::mem::transmute(trampoline_ptr);
+            *write_lock(original_get_steam_id()) = Some(trampoline);
         })
     } {
         Ok(patch) => {
@@ -1569,10 +1557,8 @@ fn install_depot_decrypt_patch(target_addr: u64) -> bool {
     let replacement_ptr = depot_decrypt_replacement as *const () as *mut u8;
     match unsafe {
         memory_patch::patch_by_offset_with_callback(target_addr, 0, replacement_ptr, |trampoline_ptr| {
-            unsafe {
-                let trampoline: DepotKeyIntegrationFn = std::mem::transmute(trampoline_ptr);
-                *write_lock(original_depot_decrypt()) = Some(trampoline);
-            }
+            let trampoline: DepotKeyIntegrationFn = std::mem::transmute(trampoline_ptr);
+            *write_lock(original_depot_decrypt()) = Some(trampoline);
         })
     } {
         Ok(patch) => {
@@ -1594,10 +1580,8 @@ fn install_config_store_get_binary_patch(target_addr: u64) -> bool {
     let replacement_ptr = config_store_get_binary_replacement as *const () as *mut u8;
     match unsafe {
         memory_patch::patch_by_offset_with_callback(target_addr, 0, replacement_ptr, |trampoline_ptr| {
-            unsafe {
-                let trampoline: ConfigStoreGetBinaryFn = std::mem::transmute(trampoline_ptr);
-                *write_lock(original_config_store_get_binary()) = Some(trampoline);
-            }
+            let trampoline: ConfigStoreGetBinaryFn = std::mem::transmute(trampoline_ptr);
+            *write_lock(original_config_store_get_binary()) = Some(trampoline);
         })
     } {
         Ok(patch) => {

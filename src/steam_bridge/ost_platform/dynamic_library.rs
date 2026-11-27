@@ -316,7 +316,7 @@ pub fn get_module_directory(module: ModuleHandle) -> PathBuf {
     }
 
     // 1. Call dladdr first: safe on arbitrary pointers, code addresses, symbols or dlopen handles
-    let (dladdr_path, dladdr_ok) = unsafe {
+    let (dladdr_path, _dladdr_ok) = unsafe {
         let mut info: libc::Dl_info = std::mem::zeroed();
         let result = libc::dladdr(module as *const _, &mut info);
         if result != 0 {
