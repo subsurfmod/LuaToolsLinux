@@ -2,6 +2,8 @@
 //! Rasterizes `egui`'s tessellated `ClippedPrimitive` triangle meshes + font atlas directly
 //! to PNG files when `LUATOOLS_QA_OUT` is set — zero X11/Wayland/GPU required.
 
+#![cfg(feature = "gui")]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 

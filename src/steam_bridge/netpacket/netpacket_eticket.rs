@@ -209,6 +209,20 @@ pub fn parse_eticket_steam_id(write_buf: &[u8]) -> Option<u64> {
         }
     }
 
+    // Standard Valve AppOwnershipTicket/ETicket layout: [size:4][version:4][steam_id:8]...
+    // SteamID is at ticket_data_start + 8 = write_buf[24..32]
+    if ticket_data_end >= 32 && write_buf.len() >= 32 {
+        let sid = u64::from_le_bytes([
+            write_buf[24], write_buf[25], write_buf[26], write_buf[27],
+            write_buf[28], write_buf[29], write_buf[30], write_buf[31],
+        ]);
+        if (sid >> 32) == 0x0110_0001 || (sid >= 0x0110_0001_0000_0000 && (sid >> 56) == 1) {
+            return Some(sid);
+        }
+    }
+
+    // Compact ticket layout: [version:4][steam_id:8]...
+    // SteamID is at ticket_data_start + 4 = write_buf[20..28]
     if ticket_data_end >= 28 && write_buf.len() >= 28 {
         let potential_steam_id = u64::from_le_bytes([
             write_buf[20],
@@ -220,7 +234,9 @@ pub fn parse_eticket_steam_id(write_buf: &[u8]) -> Option<u64> {
             write_buf[26],
             write_buf[27],
         ]);
-        if potential_steam_id >= 0x0110_0001_0000_0000 {
+        if (potential_steam_id >> 32) == 0x0110_0001
+            || (potential_steam_id >= 0x0110_0001_0000_0000 && (potential_steam_id >> 56) == 1)
+        {
             return Some(potential_steam_id);
         }
     }
@@ -241,6 +257,125 @@ fn encode_varint(mut val: u64, out: &mut Vec<u8>) {
             break;
         }
     }
+}
+
+/// Standard IEEE 802.3 CRC-32 for `EncryptedAppTicket.crc_encryptedticket`.
+fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// Encode `EncryptedAppTicket` submessage.
+pub fn encode_encrypted_app_ticket_submessage(ticket_bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32 + ticket_bytes.len());
+    // Field 1: ticket_version_no = 1
+    out.push(0x08);
+    encode_varint(1, &mut out);
+    // Field 2: crc_encryptedticket
+    let crc = crc32_ieee(ticket_bytes);
+    out.push(0x10);
+    encode_varint(u64::from(crc), &mut out);
+    // Field 3: cb_encrypteduserdata = 0
+    out.push(0x18);
+    encode_varint(0, &mut out);
+    // Field 4: cb_encrypted_appownershipticket = 0
+    out.push(0x20);
+    encode_varint(0, &mut out);
+    // Field 5: encrypted_ticket (bytes)
+    out.push(0x2A);
+    encode_varint(ticket_bytes.len() as u64, &mut out);
+    out.extend_from_slice(ticket_bytes);
+    out
+}
+
+/// Encode `CMsgClientRequestEncryptedAppTicketResponse` (EMsg 5527) protobuf payload.
+pub fn encode_encrypted_app_ticket_response(app_id: u32, ticket_bytes: &[u8]) -> Vec<u8> {
+    let submessage = encode_encrypted_app_ticket_submessage(ticket_bytes);
+    let mut out = Vec::with_capacity(16 + submessage.len());
+    // Field 1: app_id
+    out.push(0x08);
+    encode_varint(u64::from(app_id), &mut out);
+    // Field 2: eresult = 1 (k_EResultOK)
+    out.push(0x10);
+    encode_varint(1, &mut out);
+    // Field 3: encrypted_app_ticket (submessage bytes)
+    out.push(0x1A);
+    encode_varint(submessage.len() as u64, &mut out);
+    out.extend_from_slice(&submessage);
+    out
+}
+
+/// Parse `CMsgClientRequestEncryptedAppTicketResponse` (EMsg 5527) protobuf payload.
+pub fn parse_encrypted_app_ticket_response(
+    body: &[u8],
+) -> (Option<u32>, Option<i32>, Option<Vec<u8>>) {
+    let mut idx = 0;
+    let mut app_id = None;
+    let mut eresult = None;
+    let mut ticket_submessage = None;
+    while idx < body.len() {
+        let Some((tag, tag_len)) = decode_varint(&body[idx..]) else {
+            break;
+        };
+        idx += tag_len;
+        let field_num = tag >> 3;
+        let wire_type = tag & 0x07;
+        match (field_num, wire_type) {
+            (1, 0) => {
+                if let Some((val, vlen)) = decode_varint(&body[idx..]) {
+                    app_id = Some(val as u32);
+                    idx += vlen;
+                } else {
+                    break;
+                }
+            }
+            (2, 0) => {
+                if let Some((val, vlen)) = decode_varint(&body[idx..]) {
+                    eresult = Some(val as i32);
+                    idx += vlen;
+                } else {
+                    break;
+                }
+            }
+            (3, 2) => {
+                if let Some((len, vlen)) = decode_varint(&body[idx..]) {
+                    idx += vlen;
+                    let len = len as usize;
+                    if idx + len <= body.len() {
+                        ticket_submessage = Some(body[idx..idx + len].to_vec());
+                        idx += len;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            (_, 0) => {
+                if let Some((_, vlen)) = decode_varint(&body[idx..]) {
+                    idx += vlen;
+                } else {
+                    break;
+                }
+            }
+            (_, 2) => {
+                if let Some((len, vlen)) = decode_varint(&body[idx..]) {
+                    idx += vlen + len as usize;
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    (app_id, eresult, ticket_submessage)
 }
 
 /// Pure helper that forces `eresult = OK` and appends an encoded ETicket protobuf block
@@ -281,9 +416,66 @@ pub fn handle_recv_get_encrypted_app_ticket_response(write_buf: &mut Vec<u8>, ap
     );
 }
 
-/// IPC adapter for Recv: CMsgClientRequestEncryptedAppTicketResponse (5527)
-pub fn handle_recv_request_encrypted_app_ticket_response_ipc(ctx: &mut crate::steam_bridge::netpacket::netpacket_core::NetPacketContext) -> Result<(), String> {
-    handle_recv_get_encrypted_app_ticket_response(&mut ctx.frame_buffer, ctx.app_id);
+/// IPC adapter for Recv: CMsgClientRequestEncryptedAppTicketResponse (5527) (BST-40)
+pub fn handle_recv_request_encrypted_app_ticket_response_ipc(
+    ctx: &mut crate::steam_bridge::netpacket::netpacket_core::NetPacketContext,
+) -> Result<(), String> {
+    let body = ctx.body();
+    let (parsed_app_id, eresult, _existing_submessage) = parse_encrypted_app_ticket_response(body);
+    if eresult == Some(1) {
+        // Steam already returned OK (account genuinely has valid encrypted ticket)
+        return Ok(());
+    }
+
+    let app_id = parsed_app_id
+        .filter(|&id| id != 0)
+        .unwrap_or(if ctx.app_id != 0 {
+            ctx.app_id
+        } else {
+            resolve_app_id()
+        });
+    if app_id == 0 {
+        return Ok(());
+    }
+
+    // Retrieve encrypted ticket from fresh cache, TicketStore, or eticketclient
+    let ticket_bytes = {
+        let fresh_opt = crate::steam_bridge::interop::interop_ipc_isteamuser::fresh_eticket()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&app_id)
+            .cloned();
+
+        fresh_opt.or_else(|| {
+            let mut store = crate::steam_bridge::ticket_store::TicketStore::global()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            store.get_encrypted_ticket(app_id)
+        }).or_else(|| {
+            let sid = read_spoofed_steam_id(app_id);
+            let effective_sid = if sid != 0 { sid } else { 76_561_197_960_287_930 };
+            crate::steam_bridge::credentials::eticketclient::EticketClient::fetch_fresh_eticket(
+                app_id,
+                &[],
+                effective_sid,
+            )
+        })
+    };
+
+    let Some(ticket_bytes) = ticket_bytes else {
+        return Ok(());
+    };
+
+    let new_body = encode_encrypted_app_ticket_response(app_id, &ticket_bytes);
+    let mut new_frame = Vec::with_capacity(ctx.body_offset + new_body.len());
+    new_frame.extend_from_slice(&ctx.frame_buffer[..ctx.body_offset]);
+    new_frame.extend_from_slice(&new_body);
+    ctx.replace_frame(new_frame);
+    log::info!(
+        "[ETicket] Rewrote EMsg 5527 response for AppId={} (ticket len={})",
+        app_id,
+        ticket_bytes.len()
+    );
     Ok(())
 }
 
@@ -413,5 +605,16 @@ mod tests {
         assert_eq!(write_buf[13 + n1], 0x10);
         let (decoded_sid, _) = decode_varint(&write_buf[14 + n1..]).unwrap();
         assert_eq!(decoded_sid, test_sid);
+    }
+
+    #[test]
+    fn test_encrypted_app_ticket_protobuf_codec_roundtrip() {
+        let app_id = 1245620u32;
+        let ticket = vec![0xCA, 0xFE, 0xBA, 0xBE, 0x01, 0x02, 0x03];
+        let encoded = encode_encrypted_app_ticket_response(app_id, &ticket);
+        let (parsed_app, eresult, submsg) = parse_encrypted_app_ticket_response(&encoded);
+        assert_eq!(parsed_app, Some(app_id));
+        assert_eq!(eresult, Some(1));
+        assert!(submsg.is_some());
     }
 }

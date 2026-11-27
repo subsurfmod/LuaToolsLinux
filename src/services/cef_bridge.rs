@@ -1,5 +1,6 @@
-//! CefBridgeService — polls Steam CEF CDP on `127.0.0.1:8080/json` and injects
-//! `window.Millennium` polyfill + `luatools.js` into store tabs via WebSocket.
+//! CefBridgeService — polls Steam CEF CDP on `127.0.0.1:8080/json`, probes `:8080`
+//! for port conflicts, self-heals `.cef-enable-remote-debugging` symlink markers, and
+//! injects `window.Millennium` + `window.PluginConfig` + `luatools.js` into store tabs.
 
 use std::collections::HashSet;
 use std::fs;
@@ -20,7 +21,74 @@ use tungstenite::protocol::Role;
 use tungstenite::{Message, WebSocket};
 use url::Url;
 
+use crate::services::plugin_log::PluginLog;
+
+pub const DEFAULT_CEF_DEBUG_PORT: u16 = 8080;
 const CEF_DEBUG_URL: &str = "http://127.0.0.1:8080/json";
+
+/// Result of probing a local TCP port to distinguish Steam CEF CDP from another service (LT-22).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CefPortProbe {
+    /// No listener is bound on the port.
+    Free,
+    /// A Chromium / Steam CEF DevTools Protocol endpoint responded on `/json/version`.
+    SteamCef { browser: String },
+    /// Another non-CDP service is occupying the port.
+    Conflict { detail: String },
+}
+
+/// Probes `127.0.0.1:<port>` via TCP connect + `GET /json/version` to distinguish
+/// Steam CEF remote debugging from an unrelated service occupying `:8080` (LT-22).
+pub fn probe_cef_port(port: u16) -> CefPortProbe {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    match TcpStream::connect_timeout(&addr, Duration::from_millis(500)) {
+        Err(_) => return CefPortProbe::Free,
+        Ok(stream) => drop(stream),
+    }
+
+    let url = format!("http://127.0.0.1:{}/json/version", port);
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_millis(500))
+        .timeout(Duration::from_millis(1200))
+        .build();
+
+    match agent.get(&url).call() {
+        Ok(resp) => {
+            let status = resp.status();
+            if status != 200 {
+                return CefPortProbe::Conflict {
+                    detail: format!("HTTP {} on /json/version (not Steam CEF)", status),
+                };
+            }
+            match resp.into_json::<Value>() {
+                Ok(val) => {
+                    let browser_opt = val.get("Browser").and_then(|v| v.as_str());
+                    let has_cdp_fields = browser_opt.is_some()
+                        || val.get("Protocol-Version").is_some()
+                        || val.get("webSocketDebuggerUrl").is_some();
+                    if has_cdp_fields {
+                        CefPortProbe::SteamCef {
+                            browser: browser_opt.unwrap_or("Steam CEF").to_string(),
+                        }
+                    } else {
+                        CefPortProbe::Conflict {
+                            detail: "HTTP 200 JSON without CDP fields on /json/version".into(),
+                        }
+                    }
+                }
+                Err(_) => CefPortProbe::Conflict {
+                    detail: "Non-JSON HTTP service occupying port".into(),
+                },
+            }
+        }
+        Err(ureq::Error::Status(code, _)) => CefPortProbe::Conflict {
+            detail: format!("HTTP {} on /json/version (another service on :{})", code, port),
+        },
+        Err(e) => CefPortProbe::Conflict {
+            detail: format!("Non-CDP TCP listener on :{} ({})", port, e),
+        },
+    }
+}
 
 pub struct CefBridgeService {
     pub steam_root: Option<PathBuf>,
@@ -49,25 +117,122 @@ impl CefBridgeService {
     }
 
     pub fn last_status(&self) -> String {
-        self.status.lock().unwrap().clone()
+        self.status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
+    /// Probes the default Steam CEF remote debugging port (`:8080`).
+    pub fn probe_port() -> CefPortProbe {
+        probe_cef_port(DEFAULT_CEF_DEBUG_PORT)
+    }
+
+    /// Creates or repairs `.cef-enable-remote-debugging` as a symlink pointing to
+    /// `<steam_root>/cef_debug_enabled` (LT-22).
     pub fn ensure_cef_debugging_enabled(steam_root: &Path) -> Result<String, String> {
         let marker = steam_root.join(".cef-enable-remote-debugging");
-        // LT-22: Create symlink instead of empty file - Millennium/CEF expects a symlink
-        // pointing to a marker file or just create the symlink itself
         let target = steam_root.join("cef_debug_enabled");
-        if !target.exists() {
+
+        if !target.is_file() {
             fs::write(&target, b"1").map_err(|e| e.to_string())?;
         }
-        // Remove existing file/symlink if present
-        let _ = fs::remove_file(&marker);
+
+        if let Ok(meta) = fs::symlink_metadata(&marker) {
+            if meta.file_type().is_symlink() {
+                if let Ok(dest) = fs::read_link(&marker) {
+                    if dest == target {
+                        return Ok(format!(
+                            "CEF remote debugging symlink already active: {} -> {}",
+                            marker.display(),
+                            target.display()
+                        ));
+                    }
+                }
+            }
+            if meta.file_type().is_dir() {
+                fs::remove_dir_all(&marker).map_err(|e| e.to_string())?;
+            } else {
+                fs::remove_file(&marker).map_err(|e| e.to_string())?;
+            }
+        }
+
         std::os::unix::fs::symlink(&target, &marker).map_err(|e| e.to_string())?;
-        Ok(format!(
+        let msg = format!(
             "Created symlink {} -> {} (restart Steam to open CDP on :8080)",
             marker.display(),
             target.display()
-        ))
+        );
+        PluginLog::global().info(Some("CefBridge"), &msg);
+        Ok(msg)
+    }
+
+    /// Startup self-heal for `.cef-enable-remote-debugging`:
+    /// detects missing, regular-file, directory, or broken/stale symlinks and repairs them (LT-22).
+    pub fn self_heal_cef_marker(steam_root: &Path) -> Result<String, String> {
+        let marker = steam_root.join(".cef-enable-remote-debugging");
+        let target = steam_root.join("cef_debug_enabled");
+
+        let needs_repair = match fs::symlink_metadata(&marker) {
+            Err(_) => true,
+            Ok(meta) => {
+                if !meta.file_type().is_symlink() {
+                    true
+                } else {
+                    match fs::read_link(&marker) {
+                        Ok(dest) => dest != target || !target.is_file(),
+                        Err(_) => true,
+                    }
+                }
+            }
+        };
+
+        if needs_repair {
+            PluginLog::global().info(
+                Some("CefBridge"),
+                &format!(
+                    "Self-healing CEF remote debugging marker at {}",
+                    marker.display()
+                ),
+            );
+            Self::ensure_cef_debugging_enabled(steam_root)
+        } else {
+            Ok(format!(
+                "CEF marker healthy: {} -> {}",
+                marker.display(),
+                target.display()
+            ))
+        }
+    }
+
+    /// Removes `.cef-enable-remote-debugging` and companion `cef_debug_enabled` marker files (LT-22).
+    pub fn cleanup_cef_debugging_marker(steam_root: &Path) -> Result<bool, String> {
+        let marker = steam_root.join(".cef-enable-remote-debugging");
+        let target = steam_root.join("cef_debug_enabled");
+        let mut removed = false;
+
+        if let Ok(meta) = fs::symlink_metadata(&marker) {
+            if meta.file_type().is_dir() {
+                fs::remove_dir_all(&marker).map_err(|e| e.to_string())?;
+            } else {
+                fs::remove_file(&marker).map_err(|e| e.to_string())?;
+            }
+            removed = true;
+        }
+        if target.exists() {
+            fs::remove_file(&target).map_err(|e| e.to_string())?;
+            removed = true;
+        }
+        if removed {
+            PluginLog::global().info(
+                Some("CefBridge"),
+                &format!(
+                    "Cleaned up CEF debugging marker in {}",
+                    steam_root.display()
+                ),
+            );
+        }
+        Ok(removed)
     }
 
     pub fn start(&mut self) {
@@ -81,20 +246,36 @@ impl CefBridgeService {
         let steam_root = self.steam_root.clone();
 
         self.handle = Some(thread::spawn(move || {
-            *status.lock().unwrap() = "Polling CDP :8080...".into();
+            // Startup self-heal of .cef-enable-remote-debugging symlink (LT-22)
+            if let Some(ref sr) = steam_root {
+                if let Err(e) = Self::self_heal_cef_marker(sr) {
+                    PluginLog::global().warn(
+                        Some("CefBridge"),
+                        &format!("CEF marker self-heal skipped: {}", e),
+                    );
+                }
+            }
+
+            *status.lock().unwrap_or_else(|e| e.into_inner()) = "Polling CDP :8080...".into();
             let agent = ureq::AgentBuilder::new()
                 .timeout(Duration::from_secs(2))
                 .build();
             let mut injected_tabs: HashSet<String> = HashSet::new();
+            let mut logged_port_conflict = false;
 
             while !stop.load(Ordering::Relaxed) {
                 match agent.get(CEF_DEBUG_URL).call() {
-                    Ok(resp) => {
-                        if let Ok(tabs) = resp.into_json::<Vec<Value>>() {
+                    Ok(resp) => match resp.into_json::<Vec<Value>>() {
+                        Ok(tabs) => {
+                            logged_port_conflict = false;
                             let mut store_count = 0usize;
                             let active_tids: HashSet<String> = tabs
                                 .iter()
-                                .filter_map(|t| t.get("id").and_then(|v| v.as_str()).map(ToString::to_string))
+                                .filter_map(|t| {
+                                    t.get("id")
+                                        .and_then(|v| v.as_str())
+                                        .map(ToString::to_string)
+                                })
                                 .collect();
                             injected_tabs.retain(|tid| active_tids.contains(tid));
 
@@ -123,13 +304,57 @@ impl CefBridgeService {
                                     }
                                 }
                             }
-                            *status.lock().unwrap() =
+                            *status.lock().unwrap_or_else(|e| e.into_inner()) =
                                 format!("CDP connected ({} store tab(s))", store_count);
                         }
-                    }
-                    Err(_) => {
-                        *status.lock().unwrap() = "Waiting for Steam CDP :8080...".into();
-                    }
+                        Err(_) => {
+                            // :8080 returned HTTP 200 but not a CDP tab array — probe conflict
+                            match probe_cef_port(DEFAULT_CEF_DEBUG_PORT) {
+                                CefPortProbe::Conflict { detail } => {
+                                    if !logged_port_conflict {
+                                        PluginLog::global().warn(
+                                            Some("CefBridge"),
+                                            &format!("Port :8080 conflict detected: {}", detail),
+                                        );
+                                        logged_port_conflict = true;
+                                    }
+                                    *status.lock().unwrap_or_else(|e| e.into_inner()) =
+                                        format!("Port :8080 conflict ({})", detail);
+                                }
+                                CefPortProbe::SteamCef { browser } => {
+                                    *status.lock().unwrap_or_else(|e| e.into_inner()) =
+                                        format!("CDP :8080 ({}) — waiting for tabs...", browser);
+                                }
+                                CefPortProbe::Free => {
+                                    *status.lock().unwrap_or_else(|e| e.into_inner()) =
+                                        "Waiting for Steam CDP :8080...".into();
+                                }
+                            }
+                        }
+                    },
+                    Err(_) => match probe_cef_port(DEFAULT_CEF_DEBUG_PORT) {
+                        CefPortProbe::Conflict { detail } => {
+                            if !logged_port_conflict {
+                                PluginLog::global().warn(
+                                    Some("CefBridge"),
+                                    &format!("Port :8080 conflict detected: {}", detail),
+                                );
+                                logged_port_conflict = true;
+                            }
+                            *status.lock().unwrap_or_else(|e| e.into_inner()) =
+                                format!("Port :8080 conflict ({})", detail);
+                        }
+                        CefPortProbe::SteamCef { browser } => {
+                            logged_port_conflict = false;
+                            *status.lock().unwrap_or_else(|e| e.into_inner()) =
+                                format!("CDP :8080 ({}) — waiting for store tabs...", browser);
+                        }
+                        CefPortProbe::Free => {
+                            logged_port_conflict = false;
+                            *status.lock().unwrap_or_else(|e| e.into_inner()) =
+                                "Waiting for Steam CDP :8080...".into();
+                        }
+                    },
                 }
                 for _ in 0..8 {
                     if stop.load(Ordering::Relaxed) {
@@ -138,7 +363,7 @@ impl CefBridgeService {
                     thread::sleep(Duration::from_millis(250));
                 }
             }
-            *status.lock().unwrap() = "Stopped".into();
+            *status.lock().unwrap_or_else(|e| e.into_inner()) = "Stopped".into();
         }));
     }
 
@@ -147,7 +372,7 @@ impl CefBridgeService {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
-        *self.status.lock().unwrap() = "Stopped".into();
+        *self.status.lock().unwrap_or_else(|e| e.into_inner()) = "Stopped".into();
     }
 }
 
@@ -157,15 +382,17 @@ impl Drop for CefBridgeService {
     }
 }
 
+/// Locates `luatools.js` across the exact canonical search paths written by
+/// `PluginInstallerService::install_ltsp_js_payload` (LT-19 / LT-23).
 pub fn find_luatools_js(steam_root: Option<&Path>) -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(root) = steam_root {
         candidates.push(root.join("steamui/LuaTools/luatools.js"));
     }
     if let Some(home) = dirs::home_dir() {
-        candidates.push(home.join(".local/share/millennium/plugins/luatools/public/luatools.js"));
-        candidates.push(home.join(".local/share/Steam/steamui/LuaTools/luatools.js"));
         candidates.push(home.join(".local/share/luatools/plugins/luatools/luatools.js"));
+        candidates.push(home.join(".local/share/Steam/steamui/LuaTools/luatools.js"));
+        candidates.push(home.join(".local/share/millennium/plugins/luatools/public/luatools.js"));
     }
     candidates.into_iter().find(|p| p.is_file())
 }
@@ -179,6 +406,7 @@ pub fn ensure_luatools_js_installed(steam_root: Option<&Path>) -> Result<PathBuf
 }
 
 fn build_polyfill_js(http_port: u16) -> String {
+    let version = crate::VERSION;
     format!(
         r#"(function() {{
   if (window.__luatoolsLinuxPolyfill) return;
@@ -245,10 +473,14 @@ fn build_polyfill_js(http_port: u16) -> String {
     window.Millennium.findElement = function() {{ return null; }};
   }}
 
-  // LT-23: CEF Protocol Configuration for LuaTools Store Plugin
+  // LT-23 / LT-28: CEF Protocol Configuration for LuaTools Store Plugin
   window.PluginConfig = {{
     backendPort: {http_port},
-    pollInterval: 500
+    backendUrl: BASE,
+    baseUrl: BASE,
+    pollInterval: 500,
+    platform: "linux",
+    version: "{version}"
   }};
 }})();"#
     )
@@ -263,6 +495,13 @@ pub fn connect_ws_local(ws_url: &str) -> Result<WebSocket<TcpStream>, String> {
         .map_err(|e| e.to_string())?
         .next()
         .ok_or_else(|| "No socket address resolved".to_string())?;
+
+    if !addr.ip().is_loopback() {
+        return Err(format!(
+            "Forbidden non-loopback WebSocket address in CEF bridge: {}",
+            addr
+        ));
+    }
 
     let mut stream =
         TcpStream::connect_timeout(&addr, Duration::from_secs(2)).map_err(|e| e.to_string())?;
@@ -423,7 +662,7 @@ pub fn bridge_ws_tab_with_stop(
     // 5. Keep WebSocket open and poll window.__lt_drain() to dispatch queued RPC calls outside browser CSP
     let mut cmd_id: i64 = 5;
     let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(4))
+        .timeout(Duration::from_secs(8))
         .build();
 
     loop {
@@ -443,23 +682,24 @@ pub fn bridge_ws_tab_with_stop(
         });
         cmd_id += 1;
 
-        if socket.send(Message::Text(drain_eval.to_string().into())).is_err() {
+        if socket
+            .send(Message::Text(drain_eval.to_string().into()))
+            .is_err()
+        {
             break;
         }
 
         let msg = match socket.read() {
             Ok(m) => m,
-            Err(e) => {
-                match e {
-                    tungstenite::Error::Io(ref io_err)
-                        if io_err.kind() == std::io::ErrorKind::WouldBlock
-                            || io_err.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        continue;
-                    }
-                    _ => break,
+            Err(e) => match e {
+                tungstenite::Error::Io(ref io_err)
+                    if io_err.kind() == std::io::ErrorKind::WouldBlock
+                        || io_err.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    continue;
                 }
-            }
+                _ => break,
+            },
         };
 
         if let Ok(txt) = msg.into_text() {
@@ -478,21 +718,42 @@ pub fn bridge_ws_tab_with_stop(
                                     .and_then(|m| m.as_str())
                                     .unwrap_or("");
                                 let args = item.get("args").cloned().unwrap_or_else(|| json!({}));
-                                let rpc_res = agent
+                                let rpc_res = match agent
                                     .post(&format!("http://127.0.0.1:{}/rpc", http_port))
                                     .send_json(json!({ "method": method, "args": args }))
-                                    .ok()
-                                    .and_then(|r| r.into_string().ok())
-                                    .unwrap_or_else(|| json!({ "success": true }).to_string());
+                                {
+                                    Ok(r) => r.into_string().unwrap_or_else(|_| {
+                                        json!({ "success": false, "error": "Failed to read RPC response" }).to_string()
+                                    }),
+                                    Err(ureq::Error::Status(_, resp)) => {
+                                        resp.into_string().unwrap_or_else(|_| {
+                                            json!({ "success": false, "error": "RPC error status" }).to_string()
+                                        })
+                                    }
+                                    Err(e) => {
+                                        PluginLog::global().warn(
+                                            Some("CefBridge"),
+                                            &format!("RPC '{}' dispatch failed: {}", method, e),
+                                        );
+                                        json!({
+                                            "success": false,
+                                            "error": format!("Local LuaTools backend unreachable: {}", e)
+                                        })
+                                        .to_string()
+                                    }
+                                };
 
                                 let res_arg = match serde_json::from_str::<Value>(&rpc_res) {
                                     Ok(v) => v.to_string(),
-                                    Err(_) => serde_json::to_string(&rpc_res).unwrap_or_else(|_| "{}".into()),
+                                    Err(_) => serde_json::to_string(&rpc_res)
+                                        .unwrap_or_else(|_| "{}".into()),
                                 };
+                                let req_id_json =
+                                    serde_json::to_string(req_id).unwrap_or_else(|_| "\"\"".into());
 
                                 let resolve_js = format!(
-                                    "if (typeof window.__lt_resolve === 'function') window.__lt_resolve('{}', {});",
-                                    req_id, res_arg
+                                    "if (typeof window.__lt_resolve === 'function') window.__lt_resolve({}, {});",
+                                    req_id_json, res_arg
                                 );
                                 let resolve_cmd = json!({
                                     "id": cmd_id,
@@ -502,7 +763,10 @@ pub fn bridge_ws_tab_with_stop(
                                     }
                                 });
                                 cmd_id += 1;
-                                if socket.send(Message::Text(resolve_cmd.to_string().into())).is_err() {
+                                if socket
+                                    .send(Message::Text(resolve_cmd.to_string().into()))
+                                    .is_err()
+                                {
                                     break;
                                 }
                                 let _ = socket.read();
@@ -589,7 +853,10 @@ mod tests {
                             .and_then(|v| v.get("id").and_then(|i| i.as_i64()))
                             .unwrap_or(1);
                         received.push(text_str);
-                        let _ = ws.send(Message::Text(format!(r#"{{"id":{},"result":{{"result":{{"value":"[]"}}}}}}"#, id).into()));
+                        let _ = ws.send(Message::Text(
+                            format!(r#"{{"id":{},"result":{{"result":{{"value":"[]"}}}}}}"#, id)
+                                .into(),
+                        ));
                     }
                 }
             }
@@ -606,6 +873,7 @@ mod tests {
         assert!(received[2].contains("Page.addScriptToEvaluateOnNewDocument"));
         assert!(received[3].contains("Runtime.evaluate"));
         assert!(received[3].contains("http://127.0.0.1:6767"));
+        assert!(received[3].contains("PluginConfig"));
         assert!(received[4].contains("__lt_drain"));
     }
 
@@ -670,7 +938,6 @@ mod tests {
             let mut ws = WebSocket::from_raw_socket(conn, Role::Server, None);
             let mut received = Vec::new();
 
-            // 1: Page.enable, 2: Page.setBypassCSP, 3: Page.addScript, 4: Runtime.eval polyfill
             for _ in 0..4 {
                 if let Ok(msg) = ws.read() {
                     if let Ok(text) = msg.into_text() {
@@ -679,12 +946,13 @@ mod tests {
                             .and_then(|v| v.get("id").and_then(|i| i.as_i64()))
                             .unwrap_or(1);
                         received.push(text.to_string());
-                        let _ = ws.send(Message::Text(format!(r#"{{"id":{},"result":{{}}}}"#, id).into()));
+                        let _ = ws.send(Message::Text(
+                            format!(r#"{{"id":{},"result":{{}}}}"#, id).into(),
+                        ));
                     }
                 }
             }
 
-            // 5: First drain eval -> return queued Ping request
             if let Ok(msg) = ws.read() {
                 if let Ok(text) = msg.into_text() {
                     let id = serde_json::from_str::<Value>(&text)
@@ -705,7 +973,6 @@ mod tests {
                 }
             }
 
-            // 6: bridge_ws_tab sends Runtime.evaluate with __lt_resolve
             if let Ok(msg) = ws.read() {
                 if let Ok(text) = msg.into_text() {
                     let id = serde_json::from_str::<Value>(&text)
@@ -713,17 +980,23 @@ mod tests {
                         .and_then(|v| v.get("id").and_then(|i| i.as_i64()))
                         .unwrap_or(6);
                     received.push(text.to_string());
-                    let _ = ws.send(Message::Text(format!(r#"{{"id":{},"result":{{}}}}"#, id).into()));
+                    let _ = ws.send(Message::Text(
+                        format!(r#"{{"id":{},"result":{{}}}}"#, id).into(),
+                    ));
                 }
             }
 
-            // Signal stop and exit
             stop_clone.store(true, Ordering::Relaxed);
             received
         });
 
         let ws_url = format!("ws://127.0.0.1:{}/devtools/page/TAB1", ws_port);
-        assert!(bridge_ws_tab_with_stop(&ws_url, http_port, None, Some(&stop)));
+        assert!(bridge_ws_tab_with_stop(
+            &ws_url,
+            http_port,
+            None,
+            Some(&stop)
+        ));
         let received = server.join().unwrap();
         assert!(received.len() >= 6);
         assert!(received[4].contains("__lt_drain"));
@@ -732,5 +1005,86 @@ mod tests {
         assert!(received[5].contains("pong"));
 
         srv.stop();
+    }
+
+    #[test]
+    fn probe_cef_port_distinguishes_free_steam_cef_and_conflict() {
+        // 1. Free port
+        let tmp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let free_port = tmp_listener.local_addr().unwrap().port();
+        drop(tmp_listener);
+        assert_eq!(probe_cef_port(free_port), CefPortProbe::Free);
+
+        // 2. Steam CEF mock (/json/version returning Browser + Protocol-Version)
+        let cef_srv = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let cef_port = cef_srv.server_addr().to_ip().unwrap().port();
+        let cef_handle = thread::spawn(move || {
+            if let Ok(req) = cef_srv.recv() {
+                let resp = tiny_http::Response::from_string(
+                    r#"{"Browser":"Chrome/126.0.6478.183","Protocol-Version":"1.3"}"#,
+                )
+                .with_header(
+                    tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
+                );
+                let _ = req.respond(resp);
+            }
+        });
+        assert_eq!(
+            probe_cef_port(cef_port),
+            CefPortProbe::SteamCef {
+                browser: "Chrome/126.0.6478.183".into()
+            }
+        );
+        let _ = cef_handle.join();
+
+        // 3. Non-CDP HTTP service conflict
+        let conflict_srv = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let conflict_port = conflict_srv.server_addr().to_ip().unwrap().port();
+        let conflict_handle = thread::spawn(move || {
+            if let Ok(req) = conflict_srv.recv() {
+                let resp = tiny_http::Response::from_string("<html>Apache Tomcat</html>")
+                    .with_status_code(404);
+                let _ = req.respond(resp);
+            }
+        });
+        assert!(matches!(
+            probe_cef_port(conflict_port),
+            CefPortProbe::Conflict { .. }
+        ));
+        let _ = conflict_handle.join();
+    }
+
+    #[test]
+    fn self_heal_and_cleanup_cef_marker_repairs_plain_file_and_broken_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let steam_root = dir.path();
+        let marker = steam_root.join(".cef-enable-remote-debugging");
+        let target = steam_root.join("cef_debug_enabled");
+
+        // Regular file gets repaired into symlink -> cef_debug_enabled
+        fs::write(&marker, b"").unwrap();
+        let healed = CefBridgeService::self_heal_cef_marker(steam_root).unwrap();
+        assert!(healed.contains("Created symlink"));
+        assert!(fs::symlink_metadata(&marker).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_link(&marker).unwrap(), target);
+        assert!(target.is_file());
+
+        // Broken symlink pointing elsewhere gets repaired
+        fs::remove_file(&marker).unwrap();
+        std::os::unix::fs::symlink(steam_root.join("nonexistent_other"), &marker).unwrap();
+        let healed2 = CefBridgeService::self_heal_cef_marker(steam_root).unwrap();
+        assert!(healed2.contains("Created symlink"));
+        assert_eq!(fs::read_link(&marker).unwrap(), target);
+
+        // Cleanup removes both symlink and target cleanly
+        assert!(CefBridgeService::cleanup_cef_debugging_marker(steam_root).unwrap());
+        assert!(fs::symlink_metadata(&marker).is_err());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn connect_ws_local_rejects_non_loopback() {
+        let err = connect_ws_local("ws://1.1.1.1:8080/devtools").unwrap_err();
+        assert!(err.contains("Forbidden non-loopback WebSocket address"));
     }
 }

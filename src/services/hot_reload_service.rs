@@ -10,6 +10,9 @@ use std::thread;
 
 use chrono::Utc;
 
+use crate::parsers::lua_parser::LuaFileParser;
+use crate::services::lua_installer::LuaInstaller;
+use crate::services::slssteam_service::SlssteamService;
 use crate::steam_bridge::ipc::{IpcClient, IpcMessage};
 use crate::steam_bridge::ost_platform::directory_watch::{
     wait_any, ChangeAction, WaitStatus, Watch,
@@ -52,6 +55,8 @@ pub struct HotReloadService {
     thread_handle: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
     recent: Arc<Mutex<VecDeque<FileChangeEvent>>>,
     change_callback: Option<Arc<dyn Fn(FileChangeEvent) + Send + Sync>>,
+    auto_sync_slssteam: Arc<AtomicBool>,
+    sls_config_path: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl Default for HotReloadService {
@@ -71,6 +76,68 @@ impl HotReloadService {
             thread_handle: Arc::new(Mutex::new(None)),
             recent: Arc::new(Mutex::new(VecDeque::new())),
             change_callback: None,
+            auto_sync_slssteam: Arc::new(AtomicBool::new(!cfg!(test))),
+            sls_config_path: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Enables or disables automatic `SLSsteam` `config.yaml` re-sync on external `.lua` edits (LT-35).
+    pub fn with_auto_slssteam_sync(self, enabled: bool) -> Self {
+        self.auto_sync_slssteam.store(enabled, Ordering::SeqCst);
+        self
+    }
+
+    /// Sets an explicit `SLSsteam` `config.yaml` path for automatic hot-reload sync (useful in tests).
+    pub fn with_slssteam_config_path<P: AsRef<Path>>(self, path: P) -> Self {
+        *self.sls_config_path.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Re-syncs `SLSsteam` `config.yaml` in response to an external `.lua` create/modify/delete event (LT-35).
+    /// Returns `true` if `SLSsteam` config was updated.
+    pub fn sync_lua_event_to_slssteam(
+        event: &FileChangeEvent,
+        sls_config_path: Option<&Path>,
+    ) -> bool {
+        let Some(stem) = event.path.file_stem().and_then(|s| s.to_str()) else {
+            return false;
+        };
+        let Ok(app_id) = stem.parse::<u32>() else {
+            return false;
+        };
+        let mut sls = SlssteamService::new(sls_config_path.map(Path::to_path_buf));
+        let config_dir = event
+            .path
+            .parent()
+            .and_then(|p| p.parent())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(crate::steam_bridge::ticket_store::TicketStore::default_path);
+
+        match event.event_type {
+            FileChangeType::Created | FileChangeType::Modified | FileChangeType::Moved => {
+                if let Ok(text) = fs::read_to_string(&event.path) {
+                    let parsed = LuaFileParser::parse_text(&text, app_id);
+                    LuaInstaller::sync_with_slssteam_to(&mut sls, app_id, &parsed, &config_dir);
+                    return true;
+                }
+                false
+            }
+            FileChangeType::Deleted => {
+                if event.path.exists() {
+                    return false;
+                }
+                sls.remove_additional_app(app_id);
+                sls.remove_fake_app_id(app_id);
+                sls.remove_token(app_id);
+                sls.remove_cd_key(app_id);
+                sls.remove_game_title(app_id);
+                sls.remove_process_mapping(app_id);
+                sls.remove_force_denuvo(app_id);
+                sls.remove_pinned_app(app_id);
+                sls.config.dlc_data.remove(&app_id);
+                sls.save()
+            }
         }
     }
 
@@ -132,6 +199,8 @@ impl HotReloadService {
         let running = Arc::clone(&self.running);
         let recent = Arc::clone(&self.recent);
         let callback = self.change_callback.clone();
+        let auto_sync = Arc::clone(&self.auto_sync_slssteam);
+        let sls_cfg_path = Arc::clone(&self.sls_config_path);
 
         let handle = thread::spawn(move || {
             while running.load(Ordering::Relaxed) {
@@ -169,6 +238,17 @@ impl HotReloadService {
                             while log.len() > MAX_RECENT_EVENTS {
                                 log.pop_back();
                             }
+                        }
+
+                        if auto_sync.load(Ordering::Relaxed) {
+                            let cfg_opt = sls_cfg_path
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone();
+                            let _ = Self::sync_lua_event_to_slssteam(
+                                &file_event,
+                                cfg_opt.as_deref(),
+                            );
                         }
 
                         let _ = send_hot_reload_ipc(&file_event);
@@ -257,5 +337,41 @@ mod tests {
         svc.stop();
         thread::sleep(Duration::from_millis(200));
         assert!(!svc.is_running());
+    }
+
+    #[test]
+    fn external_lua_edit_auto_syncs_slssteam_and_deletion_cleans_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stplug = tmp.path().join("Steam/config/stplug-in");
+        let sls_path = tmp.path().join("SLSsteam/config.yaml");
+        let svc = HotReloadService::new()
+            .set_watch_dir(&stplug)
+            .with_slssteam_config_path(&sls_path)
+            .with_auto_slssteam_sync(true);
+
+        svc.start().unwrap();
+        thread::sleep(Duration::from_millis(60));
+
+        let lua_file = stplug.join("1245620.lua");
+        fs::write(
+            &lua_file,
+            format!("addappid(1245620)\naddappid(1245621, 1, \"{}\")\n", "a".repeat(64)),
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(250));
+
+        let sls_after_create = SlssteamService::new(Some(sls_path.clone()));
+        assert!(sls_after_create.config.additional_apps.contains(&1245620));
+        assert_eq!(
+            sls_after_create.config.depot_keys.get(&1245621).map(String::len),
+            Some(64)
+        );
+
+        fs::remove_file(&lua_file).unwrap();
+        thread::sleep(Duration::from_millis(250));
+        let sls_after_delete = SlssteamService::new(Some(sls_path));
+        assert!(!sls_after_delete.config.additional_apps.contains(&1245620));
+
+        svc.stop();
     }
 }

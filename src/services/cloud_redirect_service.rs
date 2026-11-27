@@ -1,7 +1,8 @@
-//! CloudRedirectService — Steam Cloud revival integration (`CloudRedirect`).
+//! CloudRedirectService — Steam Cloud & local achievement sync integration (`CloudRedirect`, LT-71).
 //!
-//! Detects local `CloudRedirect` installations, persists per-app cloud sync flags in
-//! `cloudredirect.conf`, and notifies `bridge_lib` via Unix socket IPC.
+//! Persists structured local redirect state in `cloud_state.json` (eliminating unread placebo
+//! `cloudredirect.conf`), resolves `UserGameStatsSchema_<app>.bin` when available for canonical
+//! achievement API name extraction, and notifies `bridge_lib` via Unix socket IPC.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -9,11 +10,27 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 use crate::steam_bridge::cloud_redirect::{AchievementBlock, CloudRedirectHost};
 use crate::steam_bridge::ipc::{IpcClient, IpcMessage};
-use crate::steam_bridge::ost_platform::bkv_parser::{
-    extract_achievements, find_user_game_stats_file, parse_bkv_file,
+use crate::steam_bridge::ost_platform::keyvalues1::{
+    extract_achievements_with_schema, find_user_game_stats_file,
+    find_user_game_stats_schema_file as find_kv1_schema_file, parse_kv1_file,
 };
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct CloudRedirectState {
+    pub enabled: bool,
+    #[serde(default)]
+    pub steam_path: Option<PathBuf>,
+    #[serde(default)]
+    pub account_id: Option<u32>,
+    #[serde(default)]
+    pub apps: Vec<u32>,
+    #[serde(default)]
+    pub app_save_dirs: BTreeMap<u32, PathBuf>,
+}
 
 /// Status of CloudRedirect integration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,8 +97,25 @@ impl CloudRedirectService {
         let mut apps = HashSet::new();
         let mut parsed_steam_path: Option<PathBuf> = None;
         let mut parsed_account_id: Option<u32> = None;
-        let conf_path = Self::conf_path_for(&redirect_path);
-        if let Ok(raw) = fs::read_to_string(&conf_path) {
+
+        let state_path = Self::state_path_for(&redirect_path);
+        let legacy_conf_path = Self::legacy_conf_path_for(&redirect_path);
+        let mut has_persisted_state = false;
+
+        if let Ok(raw) = fs::read_to_string(&state_path) {
+            if let Ok(st) = serde_json::from_str::<CloudRedirectState>(&raw) {
+                has_persisted_state = true;
+                for aid in st.apps {
+                    if aid != 0 {
+                        apps.insert(aid);
+                    }
+                }
+                parsed_steam_path = st.steam_path;
+                parsed_account_id = st.account_id.filter(|&a| a != 0);
+            }
+        } else if let Ok(raw) = fs::read_to_string(&legacy_conf_path) {
+            // One-time read of legacy cloudredirect.conf for seamless migration
+            has_persisted_state = true;
             for line in raw.lines() {
                 let trimmed = line.trim();
                 if let Some(rhs) = trimmed.strip_prefix("appid") {
@@ -105,7 +139,7 @@ impl CloudRedirectService {
             }
         }
 
-        let status = if conf_path.is_file() && !apps.is_empty() {
+        let status = if has_persisted_state && !apps.is_empty() {
             CloudRedirectStatus::Active
         } else if redirect_path.exists() {
             CloudRedirectStatus::Installed
@@ -157,11 +191,28 @@ impl CloudRedirectService {
         Some(parent.to_path_buf())
     }
 
-    fn conf_path_for(redirect_path: &Path) -> PathBuf {
+    fn state_path_for(redirect_path: &Path) -> PathBuf {
+        redirect_path.join("cloud_state.json")
+    }
+
+    fn legacy_conf_path_for(redirect_path: &Path) -> PathBuf {
         redirect_path
             .parent()
             .unwrap_or(redirect_path)
             .join("cloudredirect.conf")
+    }
+
+    /// Locates `UserGameStatsSchema_<app_id>.bin` alongside the stats file or under Steam's
+    /// `appcache/stats` directory so KV1 achievement bitmasks resolve to real API names (LT-71 / BST-46).
+    pub fn find_user_game_stats_schema_file(
+        steam_config_dir: &Path,
+        stats_file: &Path,
+        app_id: u32,
+    ) -> Option<PathBuf> {
+        stats_file
+            .parent()
+            .and_then(|dir| find_kv1_schema_file(dir, app_id))
+            .or_else(|| find_kv1_schema_file(steam_config_dir, app_id))
     }
 
     pub fn is_installed(&self) -> bool {
@@ -202,8 +253,8 @@ impl CloudRedirectService {
         &self.host
     }
 
-    /// Loads local BKV `UserGameStats_<account_id>_<app_id>.bin` achievements for `app_id`
-    /// into `CloudRedirectHost` and records the parsed achievement count.
+    /// Loads local Valve KV1 `UserGameStats_<account_id>_<app_id>.bin` achievements for `app_id`
+    /// (resolved against `UserGameStatsSchema_<app_id>.bin`) into `CloudRedirectHost`.
     pub fn load_app_achievements(
         &self,
         steam_config_dir: &Path,
@@ -217,29 +268,21 @@ impl CloudRedirectService {
         else {
             return 0;
         };
-        let extracted: Vec<AchievementBlock> =
-            if let Ok(kv1) = crate::steam_bridge::ost_platform::parse_kv1_file(&stats_file) {
-                crate::steam_bridge::ost_platform::extract_achievements_kv1(&kv1)
-                    .into_values()
-                    .map(|ach| AchievementBlock {
-                        name: ach.name,
-                        state: if ach.unlocked { 1 } else { 0 },
-                        unlock_time: ach.unlock_time.unwrap_or(0),
-                    })
-                    .collect()
-            } else if let Ok(bkv) = parse_bkv_file(&stats_file) {
-                extract_achievements(&bkv)
-                    .into_values()
-                    .map(|ach| AchievementBlock {
-                        name: ach.name,
-                        state: if ach.unlocked { 1 } else { 0 },
-                        unlock_time: ach.unlock_time.unwrap_or(0),
-                    })
-                    .collect()
-            } else {
-                return 0;
-            };
-        let blocks = extracted;
+        let Ok(kv1) = parse_kv1_file(&stats_file) else {
+            return 0;
+        };
+        let schema_kv1 =
+            Self::find_user_game_stats_schema_file(steam_config_dir, &stats_file, app_id)
+                .and_then(|sp| parse_kv1_file(sp).ok());
+        let blocks: Vec<AchievementBlock> =
+            extract_achievements_with_schema(&kv1, schema_kv1.as_ref())
+                .into_values()
+                .map(|ach| AchievementBlock {
+                    name: ach.name,
+                    state: u8::from(ach.unlocked),
+                    unlock_time: ach.unlock_time.unwrap_or(0),
+                })
+                .collect();
         let count = blocks.len();
         self.host.set_achievements(app_id, blocks);
         self.achievement_counts.lock().unwrap().insert(app_id, count);
@@ -271,12 +314,15 @@ impl CloudRedirectService {
         self.achievement_counts.lock().unwrap().clone()
     }
 
-    /// Writes `cloudredirect.conf` (creating `redirect_path` if needed so users can initialize CloudRedirect).
+    /// Persists structured local redirect state (`cloud_state.json`) and removes any stale
+    /// legacy `cloudredirect.conf` placebo file (LT-71).
     pub fn sync_to_cloudredirect(&self) -> Result<PathBuf, String> {
         self.generate_cloudredirect_conf(None, None)
     }
 
-    /// Generates `cloudredirect.conf` with optional steam_root and account_id override.
+    /// Persists local redirect state (`cloud_state.json`) with optional `steam_root` and `account_id`,
+    /// creates per-app save directories, syncs `CloudRedirectHost` + schema-backed achievements,
+    /// and cleans up any legacy `cloudredirect.conf` file (LT-71).
     pub fn generate_cloudredirect_conf(
         &self,
         steam_root: Option<&Path>,
@@ -284,30 +330,32 @@ impl CloudRedirectService {
     ) -> Result<PathBuf, String> {
         fs::create_dir_all(&self.redirect_path).map_err(|e| e.to_string())?;
         let apps = self.list_cloud_apps();
-        let config_path = Self::conf_path_for(&self.redirect_path);
-        if let Some(parent) = config_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
+        let state_path = Self::state_path_for(&self.redirect_path);
 
-        let mut content = String::from("# CloudRedirect config — generated by LuaTools Linux\n");
-        content.push_str("[general]\nenabled = true\n");
-        if let Some(root) = steam_root {
-            content.push_str(&format!("steam_path = {}\n", root.to_string_lossy()));
-        }
-        if let Some(acc) = account_id {
-            content.push_str(&format!("account_id = {}\n", acc));
-        }
-        content.push_str("\n[apps]\n");
-        for app_id in &apps {
-            content.push_str(&format!("appid = {}\n", app_id));
-        }
-        content.push_str("\n[paths]\n");
-        for app_id in &apps {
+        let mut app_save_dirs = BTreeMap::new();
+        for &app_id in &apps {
             let app_save_dir = self.redirect_path.join(app_id.to_string());
             let _ = fs::create_dir_all(&app_save_dir);
-            content.push_str(&format!("{} = {}\n", app_id, app_save_dir.to_string_lossy()));
+            app_save_dirs.insert(app_id, app_save_dir);
         }
-        fs::write(&config_path, content).map_err(|e| e.to_string())?;
+
+        let state = CloudRedirectState {
+            enabled: !apps.is_empty(),
+            steam_path: steam_root.map(Path::to_path_buf),
+            account_id: account_id.filter(|&a| a != 0),
+            apps: apps.clone(),
+            app_save_dirs,
+        };
+        let json = serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?;
+        let tmp = state_path.with_extension("json.tmp");
+        fs::write(&tmp, json).map_err(|e| e.to_string())?;
+        fs::rename(&tmp, &state_path).map_err(|e| e.to_string())?;
+
+        // Clean up any stale legacy unread placebo cloudredirect.conf
+        let legacy_conf = Self::legacy_conf_path_for(&self.redirect_path);
+        if legacy_conf.is_file() {
+            let _ = fs::remove_file(&legacy_conf);
+        }
 
         let effective_root = steam_root
             .map(Path::to_path_buf)
@@ -319,7 +367,7 @@ impl CloudRedirectService {
             self.host.set_account_id(acc);
             let config_dir = steam_root
                 .map(|r| r.join("config"))
-                .or_else(|| config_path.parent().map(Path::to_path_buf))
+                .or_else(|| self.redirect_path.parent().map(Path::to_path_buf))
                 .unwrap_or_else(|| effective_root.join("config"));
             self.sync_local_achievements(&config_dir, acc);
         }
@@ -331,7 +379,7 @@ impl CloudRedirectService {
         } else {
             CloudRedirectStatus::Active
         };
-        Ok(config_path)
+        Ok(state_path)
     }
 
     pub fn notify_bridge(&self, app_id: u32, cloud_enabled: bool) -> Result<(), String> {
@@ -374,31 +422,24 @@ mod tests {
 
     #[test]
     fn syncs_local_bkv_achievements_into_cloud_redirect_host() {
+        use crate::steam_bridge::ost_platform::keyvalues1::{write_kv1, Kv1Value};
+
         let tmp = tempfile::tempdir().unwrap();
         let steam_root = tmp.path().join("Steam");
         let cr_dir = steam_root.join("config/cloudredirect");
         let stats_dir = steam_root.join("appcache/stats");
         fs::create_dir_all(&stats_dir).unwrap();
 
-        // Build minimal BKV UserGameStats_123456_1245620.bin with 1 unlocked achievement
-        let mut bkv = vec![b'B', b'K', b'V', 0];
-        bkv.push(9);
-        bkv.extend_from_slice(b"root\0");
-        bkv.push(9);
-        bkv.extend_from_slice(b"ach0\0");
-        bkv.push(1);
-        bkv.extend_from_slice(b"name\0");
-        bkv.push(10);
-        bkv.extend_from_slice(b"FIRST_KILL");
-        bkv.push(2);
-        bkv.extend_from_slice(b"unlocked\0");
-        bkv.push(1);
-        bkv.push(2);
-        bkv.extend_from_slice(b"unlockTime\0");
-        bkv.push(42);
-        bkv.extend_from_slice(&[0, 0, 0, 0]);
+        // Build real Valve KV1 UserGameStats_123456_1245620.bin with 1 unlocked achievement
+        let mut ach0 = BTreeMap::new();
+        ach0.insert("name".into(), Kv1Value::String("FIRST_KILL".into()));
+        ach0.insert("unlocked".into(), Kv1Value::Int32(1));
+        ach0.insert("unlockTime".into(), Kv1Value::Int32(42));
+        let mut root = BTreeMap::new();
+        root.insert("ach0".into(), Kv1Value::Object(ach0));
+        let kv1_bytes = write_kv1("UserGameStats", &Kv1Value::Object(root)).unwrap();
 
-        fs::write(stats_dir.join("UserGameStats_123456_1245620.bin"), &bkv).unwrap();
+        fs::write(stats_dir.join("UserGameStats_123456_1245620.bin"), &kv1_bytes).unwrap();
 
         let svc = CloudRedirectService::with_path(cr_dir.clone());
         svc.enable_cloud_for_app(1245620);
@@ -414,9 +455,51 @@ mod tests {
         assert_eq!(blocks[0].state, 1);
         assert_eq!(blocks[0].unlock_time, 42);
 
-        // Reloading from cloudredirect.conf preserves synced app & BKV achievements
+        // Reloading from cloud_state.json preserves synced app & BKV achievements
         let reloaded = CloudRedirectService::with_path(cr_dir);
         assert_eq!(reloaded.local_achievement_count(1245620), 1);
         assert!(reloaded.host().is_app(1245620));
+        assert!(!steam_root.join("config/cloudredirect.conf").exists());
+    }
+
+    #[test]
+    fn resolves_kv1_bitmask_achievements_using_user_game_stats_schema() {
+        use crate::steam_bridge::ost_platform::keyvalues1::{write_kv1, Kv1Value};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let steam_root = tmp.path().join("Steam");
+        let cr_dir = steam_root.join("config/cloudredirect");
+        let stats_dir = steam_root.join("appcache/stats");
+        fs::create_dir_all(&stats_dir).unwrap();
+
+        // Build KV1 UserGameStatsSchema_1245620.bin mapping (stat_id=1, bit=0) -> "ACH_ELDEN_LORD"
+        let mut bit0 = BTreeMap::new();
+        bit0.insert("name".into(), Kv1Value::String("ACH_ELDEN_LORD".into()));
+        let mut bits = BTreeMap::new();
+        bits.insert("0".into(), Kv1Value::Object(bit0));
+        let mut stat1 = BTreeMap::new();
+        stat1.insert("bits".into(), Kv1Value::Object(bits));
+        let mut stats = BTreeMap::new();
+        stats.insert("1".into(), Kv1Value::Object(stat1));
+        let mut schema_root = BTreeMap::new();
+        schema_root.insert("stats".into(), Kv1Value::Object(stats));
+        let schema_bytes = write_kv1("1245620", &Kv1Value::Object(schema_root)).unwrap();
+        fs::write(stats_dir.join("UserGameStatsSchema_1245620.bin"), &schema_bytes).unwrap();
+
+        // Build KV1 UserGameStats_123456_1245620.bin with stat 1 bitmask = 1 (unlocked)
+        let mut user_root = BTreeMap::new();
+        user_root.insert("1".into(), Kv1Value::Int32(1));
+        let user_bytes = write_kv1("UserGameStats", &Kv1Value::Object(user_root)).unwrap();
+        fs::write(stats_dir.join("UserGameStats_123456_1245620.bin"), &user_bytes).unwrap();
+
+        let svc = CloudRedirectService::with_path(cr_dir);
+        svc.enable_cloud_for_app(1245620);
+        svc.generate_cloudredirect_conf(Some(&steam_root), Some(123456))
+            .unwrap();
+        assert_eq!(svc.local_achievement_count(1245620), 1);
+        let blocks = svc.host().get_achievements(1245620, 10);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].name, "ACH_ELDEN_LORD");
+        assert_eq!(blocks[0].state, 1);
     }
 }

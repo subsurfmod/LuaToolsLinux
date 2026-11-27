@@ -4,11 +4,21 @@
 //! (Google Public DNS & Cloudflare compatible) with TTL-aware caching.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+#[derive(Debug, Clone)]
+struct GlobalDohConfig {
+    enabled: bool,
+    endpoint: String,
+    resolver: DohResolver,
+}
+
+static GLOBAL_DOH: OnceLock<Mutex<Option<GlobalDohConfig>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DohRecord {
@@ -122,6 +132,107 @@ impl DohResolver {
 
     pub fn clear_cache(&mut self) {
         self.cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    /// Updates the process-wide DoH runtime configuration (invoked by `SettingsService` on load/save, LT-47).
+    pub fn configure_global(enabled: bool, endpoint: &str) {
+        let clean_ep = endpoint.trim();
+        let eff_ep = if clean_ep.is_empty() {
+            "https://1.1.1.1/dns-query".to_string()
+        } else {
+            clean_ep.to_string()
+        };
+        let lock = GLOBAL_DOH.get_or_init(|| Mutex::new(None));
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let needs_new = match guard.as_ref() {
+            Some(cfg) => cfg.endpoint != eff_ep,
+            None => true,
+        };
+        let resolver = if needs_new {
+            DohResolver::new(Some(&eff_ep))
+        } else {
+            guard.as_ref().unwrap().resolver.clone()
+        };
+        *guard = Some(GlobalDohConfig {
+            enabled,
+            endpoint: eff_ep,
+            resolver,
+        });
+    }
+
+    /// Returns the active global `DohResolver` if `doh_enabled` is true in settings (LT-47).
+    pub fn active_global_resolver() -> Option<DohResolver> {
+        let lock = GLOBAL_DOH.get_or_init(|| Mutex::new(None));
+        let needs_init = {
+            let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            guard.is_none()
+        };
+        if needs_init {
+            // Release lock before reading SettingsService::default(), which calls configure_global()
+            let settings = crate::services::settings_service::SettingsService::default().settings;
+            Self::configure_global(settings.doh_enabled, &settings.doh_endpoint);
+        }
+        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .filter(|cfg| cfg.enabled)
+            .map(|cfg| cfg.resolver.clone())
+    }
+
+    /// Resolves `netloc` (`host:port`) via DoH with graceful system DNS fallback (LT-47).
+    pub fn resolve_netloc(&self, netloc: &str) -> std::io::Result<Vec<SocketAddr>> {
+        let (host, port_str) = if let Some(rest) = netloc.strip_prefix('[') {
+            if let Some((h, p)) = rest.split_once("]:") {
+                (h, p)
+            } else {
+                return netloc.to_socket_addrs().map(|it| it.collect());
+            }
+        } else if let Some((h, p)) = netloc.rsplit_once(':') {
+            (h, p)
+        } else {
+            return netloc.to_socket_addrs().map(|it| it.collect());
+        };
+
+        let Ok(port) = port_str.parse::<u16>() else {
+            return netloc.to_socket_addrs().map(|it| it.collect());
+        };
+
+        // Never recurse DoH for literal IP addresses, localhost, or the DoH server's own host
+        let doh_host = url::Url::parse(&self.doh_endpoint)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
+        if host.parse::<IpAddr>().is_ok()
+            || host.eq_ignore_ascii_case("localhost")
+            || doh_host
+                .as_deref()
+                .map(|dh| dh.eq_ignore_ascii_case(host))
+                .unwrap_or(false)
+        {
+            return netloc.to_socket_addrs().map(|it| it.collect());
+        }
+
+        if let Some(records) = self.resolve(host) {
+            let addrs: Vec<SocketAddr> = records
+                .into_iter()
+                .filter_map(|r| {
+                    r.value
+                        .parse::<IpAddr>()
+                        .ok()
+                        .map(|ip| SocketAddr::new(ip, port))
+                })
+                .collect();
+            if !addrs.is_empty() {
+                return Ok(addrs);
+            }
+        }
+
+        netloc.to_socket_addrs().map(|it| it.collect())
+    }
+}
+
+impl ureq::Resolver for DohResolver {
+    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<SocketAddr>> {
+        self.resolve_netloc(netloc)
     }
 }
 

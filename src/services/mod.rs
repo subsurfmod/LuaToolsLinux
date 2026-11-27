@@ -19,7 +19,6 @@ pub mod game_process_injection_service;
 pub mod github_proxy;
 pub mod hot_reload_service;
 pub mod http_server;
-pub mod localization;
 pub mod lua_installer;
 pub mod manifest_binding_service;
 pub mod millennium_service;
@@ -42,6 +41,7 @@ pub mod depot_cache_migration;
 pub mod download_queue;
 pub mod launch_mod_store;
 pub mod telemetry_service;
+#[cfg(feature = "gui")]
 pub mod tray_service;
 pub mod update_service;
 pub mod wired_service;

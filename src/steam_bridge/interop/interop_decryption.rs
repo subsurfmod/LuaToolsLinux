@@ -119,9 +119,10 @@ unsafe extern "C" fn config_store_get_binary_detour(
 
         // Record appticket keys for forge fallback
         if e_config_store == EConfigStore::k_EConfigStoreUserLocal {
+            let norm = name.replace('/', "\\");
             const APP_TICKET_PREFIX: &str = "apptickets\\";
-            if name.starts_with(APP_TICKET_PREFIX) {
-                let rest = &name[APP_TICKET_PREFIX.len()..];
+            if norm.starts_with(APP_TICKET_PREFIX) {
+                let rest = &norm[APP_TICKET_PREFIX.len()..];
                 if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
                     if let Ok(app_id) = rest.parse::<u32>() {
                         seen_app_ticket_ids()
@@ -134,12 +135,19 @@ unsafe extern "C" fn config_store_get_binary_detour(
         }
 
         // Check for depot decryption key request
-        // Expected shape: ".../<DepotId>\\DecryptionKey"
-        if let Some(last) = name.find("\\DecryptionKey") {
-            if let Some(start) = name[..last].rfind('\\') {
-                let depot_id_str = &name[start + 1..last];
-                if let Ok(depot_id) = depot_id_str.parse::<u32>() {
+        // Expected shape: ".../<DepotId>\DecryptionKey" or ".../<DepotId>/DecryptionKey"
+        let norm_name = name.replace('/', "\\");
+        let lower_norm = norm_name.to_ascii_lowercase();
+        if let Some(last) = lower_norm.rfind("\\decryptionkey") {
+            let depot_id_str = match lower_norm[..last].rfind('\\') {
+                Some(start) => &norm_name[start + 1..last],
+                None => &norm_name[..last],
+            };
+            if let Ok(depot_id) = depot_id_str.parse::<u32>() {
                     if let Some(decryption_key) = get_decryption_key(depot_id) {
+                        if key.is_null() {
+                            return 0;
+                        }
                         if key_size as usize >= decryption_key.len() {
                             eprintln!(
                                 "[InteropDecryption] Providing decryption key for depot {}: {}",
@@ -167,7 +175,6 @@ unsafe extern "C" fn config_store_get_binary_detour(
                     }
                 }
             }
-        }
 
         // Call original function
         let orig = *original_config_store_get_binary()
@@ -224,39 +231,79 @@ pub fn read_config_store_local_binary(key_name: &str) -> Vec<u8> {
     value
 }
 
-/// Get decryption key for a depot (integrates with LuaConfig / bridge_lib depot_keys).
+/// Get decryption key for a depot (integrates with LuaConfig / bridge_lib depot_keys / SLSsteam config).
 fn get_decryption_key(depot_id: u32) -> Option<Vec<u8>> {
-    // Try to get from bridge_lib's depot_keys store
-    let hex = crate::steam_bridge::interop::bridge_lib::read_depot_key(depot_id)?;
-
-    // Use robust hex decoder that handles 0x prefix and whitespace
-    let key_bytes = decode_hex_robust(&hex)?;
-
-    // Validate key length (Steam depot decryption keys are 32 bytes / 256-bit AES)
-    if key_bytes.len() != 32 {
-        log::warn!(
-            "[InteropDecryption] Depot {} decryption key has invalid length ({} bytes, expected 32): hex='{}'",
-            depot_id,
-            key_bytes.len(),
-            hex
-        );
-        return None;
+    // 1. Try to get from bridge_lib's depot_keys store
+    if let Some(hex) = crate::steam_bridge::interop::bridge_lib::read_depot_key(depot_id) {
+        if let Some(key_bytes) = decode_hex_robust(&hex).filter(|b| b.len() == 32) {
+            return Some(key_bytes);
+        }
     }
 
-    Some(key_bytes)
+    // 2. Fallback: check SLSsteam config (~/.config/SLSsteam/config.yaml)
+    if let Some(home) = dirs::home_dir() {
+        let sls_cfg = home.join(".config/SLSsteam/config.yaml");
+        if let Ok(content) = std::fs::read_to_string(&sls_cfg) {
+            let needle = format!("{}:", depot_id);
+            for line in content.lines() {
+                let line_trim = line.trim();
+                if line_trim.starts_with(&needle) {
+                    let hex_val = line_trim[needle.len()..]
+                        .trim()
+                        .trim_matches(|c| c == '"' || c == '\'');
+                    if let Some(key_bytes) = decode_hex_robust(hex_val).filter(|b| b.len() == 32) {
+                        return Some(key_bytes);
+                    }
+                }
+            }
+        }
+
+        // 3. Fallback: check Steam config.vdf
+        for vdf_rel in &["config/config.vdf", ".steam/steam/config/config.vdf", ".local/share/Steam/config/config.vdf"] {
+            let vdf_path = home.join(vdf_rel);
+            if let Ok(content) = std::fs::read_to_string(&vdf_path) {
+                let needle = format!("\"{}\"", depot_id);
+                if content.contains(&needle) {
+                    let mut in_depot = false;
+                    for line in content.lines() {
+                        let line_trim = line.trim();
+                        if line_trim.contains(&needle) {
+                            in_depot = true;
+                        } else if in_depot {
+                            if line_trim.to_ascii_lowercase().contains("decryptionkey") {
+                                let parts: Vec<&str> = line_trim.split('"').filter(|s| !s.trim().is_empty()).collect();
+                                if parts.len() >= 2 {
+                                    let hex_val = parts[parts.len() - 1];
+                                    if let Some(key_bytes) = decode_hex_robust(hex_val).filter(|b| b.len() == 32) {
+                                        return Some(key_bytes);
+                                    }
+                                }
+                            } else if line_trim == "}" {
+                                in_depot = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Check if a depot decryption key is available (public API for verification).
 pub fn has_depot_decryption_key(depot_id: u32) -> bool {
-    crate::steam_bridge::interop::bridge_lib::read_depot_key(depot_id)
-        .and_then(|hex| decode_hex_robust(&hex))
-        .map(|b| b.len() == 32)
-        .unwrap_or(false)
+    get_decryption_key(depot_id).is_some()
 }
 
 /// Get cached app ownership ticket.
 pub fn get_cache_app_ownership_ticket(app_id: u32) -> Vec<u8> {
-    read_config_store_local_binary(&format!("apptickets\\{}", app_id))
+    let ticket = read_config_store_local_binary(&format!("apptickets\\{}", app_id));
+    if ticket.is_empty() {
+        read_config_store_local_binary(&format!("apptickets/{}", app_id))
+    } else {
+        ticket
+    }
 }
 
 /// Get seen app ticket IDs (for forge fallback).
@@ -271,18 +318,25 @@ fn resolve_function_address(
     channel: PatternChannel,
     pattern_name: &str,
 ) -> Result<u64, String> {
+    let expected_class = if cfg!(target_pointer_width = "64") {
+        crate::steam_bridge::binary_reader::ElfClass::Class64
+    } else {
+        crate::steam_bridge::binary_reader::ElfClass::Class32
+    };
+
     let binaries = crate::steam_bridge::binary_reader::scan_steam_binaries(steam_root);
     let binary = binaries
         .into_iter()
         .find(|b| {
-            b.path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| match component {
-                    BinaryComponent::SteamClient => n.contains("steamclient"),
-                    BinaryComponent::SteamUi => n.contains("steamui"),
-                })
-                .unwrap_or(false)
+            b.class == expected_class
+                && b.path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| match component {
+                        BinaryComponent::SteamClient => n.contains("steamclient"),
+                        BinaryComponent::SteamUi => n.contains("steamui"),
+                    })
+                    .unwrap_or(false)
         })
         .ok_or_else(|| "Steam binary not found".to_string())?;
 
@@ -291,10 +345,18 @@ fn resolve_function_address(
         .lookup_by_binary(&binary, channel, component)
         .map_err(|e| format!("Pattern lookup failed: {}", e))?;
 
+    if pf.is_fallback() {
+        return Err("Fallback patterns not permitted for in-process memory hooks".to_string());
+    }
+
     let entry = pf
         .patterns
         .get(pattern_name)
         .ok_or_else(|| format!("Pattern '{}' not found", pattern_name))?;
+
+    if entry.is_generic_compiler_prologue() {
+        return Err(format!("Pattern '{}' is a generic compiler prologue", pattern_name));
+    }
 
     let mod_name = binary
         .path
@@ -331,15 +393,11 @@ pub fn install(steam_root: &std::path::Path) -> Result<(), String> {
         "ConfigStoreGetBinary",
     ) {
         let replacement = config_store_get_binary_detour as *const () as *mut u8;
-        let patch = unsafe { memory_patch::patch_by_offset(addr, 0, replacement) }
+        let patch = unsafe { memory_patch::patch_by_offset_with_callback(addr, 0, replacement, |trampoline| {
+            let orig_fn: ConfigStoreGetBinaryFn = unsafe { std::mem::transmute(trampoline as *const ()) };
+            *original_config_store_get_binary().lock().unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
+        }) }
             .map_err(|e| format!("Failed to install ConfigStoreGetBinary hook: {}", e))?;
-
-        if !patch.trampoline.is_null() {
-            let orig_fn: ConfigStoreGetBinaryFn = unsafe { std::mem::transmute(patch.trampoline) };
-            *original_config_store_get_binary()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
-        }
         installed_decryption_patches()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -379,5 +437,43 @@ mod tests {
     #[test]
     fn test_config_store_types() {
         assert_eq!(EConfigStore::k_EConfigStoreUserLocal, 1);
+    }
+
+    #[test]
+    fn test_decode_hex_robust() {
+        // Standard 64-char hex string (32 bytes)
+        let raw_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let bytes = decode_hex_robust(raw_hex).unwrap();
+        assert_eq!(bytes.len(), 32);
+
+        // With 0x prefix and spaces
+        let prefixed = "0x01 23 45 67 89 ab cd ef 01 23 45 67 89 ab cd ef 01 23 45 67 89 ab cd ef 01 23 45 67 89 ab cd ef";
+        let bytes2 = decode_hex_robust(prefixed).unwrap();
+        assert_eq!(bytes, bytes2);
+
+        // Invalid hex
+        assert!(decode_hex_robust("invalid").is_none());
+        assert!(decode_hex_robust("123").is_none()); // Odd length
+    }
+
+    #[test]
+    fn test_depot_key_path_normalization() {
+        let test_paths = [
+            "depots\\123456\\DecryptionKey",
+            "depots/123456/DecryptionKey",
+            "123456\\DecryptionKey",
+            "123456/decryptionkey",
+        ];
+        for path in test_paths {
+            let norm_name = path.replace('/', "\\");
+            let lower_norm = norm_name.to_ascii_lowercase();
+            assert!(lower_norm.contains("\\decryptionkey"));
+            let last = lower_norm.rfind("\\decryptionkey").unwrap();
+            let depot_id_str = match lower_norm[..last].rfind('\\') {
+                Some(start) => &norm_name[start + 1..last],
+                None => &norm_name[..last],
+            };
+            assert_eq!(depot_id_str, "123456");
+        }
     }
 }

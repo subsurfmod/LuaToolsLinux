@@ -2,18 +2,47 @@
 //! atomic executable replacement (immune to Linux `ETXTBSY`), and one-click relaunch.
 
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::models::config::default_luatools_data_dir;
+use crate::services::file_hash::FileHashService;
+use crate::services::proxied_file_downloader::ProxiedFileDownloader;
 use crate::services::steam_service::expand_tilde;
 use crate::{BUILD_GIT_SHA, VERSION};
 
+static PREBUILT_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrebuiltAssetKind {
+    RawBinary,
+    TarGz,
+    TarXz,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrebuiltReleaseAsset {
+    pub name: String,
+    pub download_url: String,
+    pub digest: Option<String>,
+    pub size: Option<u64>,
+    pub kind: PrebuiltAssetKind,
+}
+
 pub const DEFAULT_GIT_REMOTE_URL: &str = "https://github.com/subsurfmod/LuaToolsLinux.git";
+pub const BACKUP_GIT_REMOTE_URLS: &[&str] = &[
+    "https://ghfast.top/https://github.com/subsurfmod/LuaToolsLinux.git",
+    "https://gh-proxy.com/https://github.com/subsurfmod/LuaToolsLinux.git",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SourceRepoMeta {
@@ -40,6 +69,276 @@ pub struct UpdateApplyResult {
     pub new_version: String,
     pub commit_info: String,
     pub updated_exe: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateProgressEvent {
+    pub fraction: f32,
+    pub stage_label: String,
+    pub current_crate: String,
+    pub compiled_crates: usize,
+    pub total_crates: usize,
+    pub log_line: Option<String>,
+}
+
+/// Parses live `cargo build` stderr/stdout output lines into smooth, monotonic fractional
+/// progress (`base_fraction..=end_fraction`) with real crate counts and active crate name.
+#[derive(Debug, Clone)]
+pub struct CargoProgressTracker {
+    pub compiled_crates: usize,
+    pub total_crates: usize,
+    pub current_crate: String,
+    pub stage_label: String,
+    pub fraction: f32,
+    pub in_linking: bool,
+    pub finished: bool,
+    pub base_fraction: f32,
+    pub end_fraction: f32,
+}
+
+impl CargoProgressTracker {
+    pub fn new(total_crates_est: usize, base_fraction: f32, end_fraction: f32) -> Self {
+        let base = base_fraction.clamp(0.0, 1.0);
+        let end = end_fraction.clamp(base, 1.0);
+        Self {
+            compiled_crates: 0,
+            total_crates: total_crates_est.max(1),
+            current_crate: String::new(),
+            stage_label: "Compiling Rust".into(),
+            fraction: base,
+            in_linking: false,
+            finished: false,
+            base_fraction: base,
+            end_fraction: end,
+        }
+    }
+
+    pub fn feed_line(&mut self, raw_line: &str) -> UpdateProgressEvent {
+        let cleaned = strip_ansi_escapes(raw_line);
+        let trimmed = cleaned.trim();
+        let span = (self.end_fraction - self.base_fraction).max(0.0);
+
+        if let Some((done, total, active)) = parse_cargo_building_progress(trimmed) {
+            if total > 0 {
+                self.total_crates = total;
+                self.compiled_crates = done.min(total);
+                if let Some(crate_hint) = active {
+                    self.current_crate = crate_hint;
+                }
+                self.stage_label = "Compiling Rust".into();
+                let ratio = (self.compiled_crates as f32 / self.total_crates as f32).clamp(0.0, 1.0);
+                let target = self.base_fraction + ratio * span;
+                self.fraction = self.fraction.max(target).min(self.end_fraction);
+            }
+        } else if let Some(crate_desc) = parse_cargo_crate_action(trimmed) {
+            self.compiled_crates = self.compiled_crates.saturating_add(1);
+            if self.compiled_crates > self.total_crates {
+                let bump = (self.compiled_crates / 6).max(8);
+                self.total_crates = self.compiled_crates.saturating_add(bump);
+            }
+            self.current_crate = crate_desc;
+            self.stage_label = "Compiling Rust".into();
+            let ratio = (self.compiled_crates as f32 / self.total_crates.max(1) as f32).clamp(0.0, 0.96);
+            let target = self.base_fraction + ratio * span;
+            let cap = (self.end_fraction - 0.015).max(self.base_fraction);
+            self.fraction = self.fraction.max(target).min(cap);
+        } else if trimmed.starts_with("Updating ") {
+            self.stage_label = "Updating crate index".into();
+            let target = (self.base_fraction + span * 0.02).min(self.end_fraction);
+            self.fraction = self.fraction.max(target);
+        } else if let Some(rest) = trimmed
+            .strip_prefix("Downloaded ")
+            .or_else(|| trimmed.strip_prefix("Downloading "))
+        {
+            self.stage_label = "Downloading crates".into();
+            let desc = compact_crate_tokens(rest);
+            if !desc.is_empty() && !desc.starts_with("crates") {
+                self.current_crate = desc;
+            }
+            let target = (self.base_fraction + span * 0.05).min(self.end_fraction);
+            self.fraction = self.fraction.max(target);
+        } else if trimmed.starts_with("Linking ")
+            || trimmed.to_ascii_lowercase().contains("linking with")
+        {
+            self.in_linking = true;
+            self.stage_label = "Linking release binary".into();
+            let target = (self.end_fraction - 0.015).max(self.base_fraction);
+            self.fraction = self.fraction.max(target).min(self.end_fraction);
+        } else if trimmed.starts_with("Finished ") {
+            self.finished = true;
+            self.total_crates = self.total_crates.max(self.compiled_crates);
+            self.compiled_crates = self.total_crates;
+            self.stage_label = "Compilation finished".into();
+            self.fraction = self.fraction.max(self.end_fraction);
+        }
+
+        UpdateProgressEvent {
+            fraction: self.fraction,
+            stage_label: self.stage_label.clone(),
+            current_crate: self.current_crate.clone(),
+            compiled_crates: self.compiled_crates,
+            total_crates: self.total_crates,
+            log_line: (!trimmed.is_empty()).then(|| trimmed.to_string()),
+        }
+    }
+}
+
+fn strip_ansi_escapes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for ch in chars.by_ref() {
+                    if ch.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn compact_crate_tokens(rest: &str) -> String {
+    let mut parts = rest.split_whitespace();
+    let Some(first) = parts.next() else {
+        return String::new();
+    };
+    let clean_first = first.trim_end_matches(':');
+    if let Some(second) = parts.next() {
+        if second.starts_with('v') && second.len() > 1 && second[1..].starts_with(|c: char| c.is_ascii_digit()) {
+            return format!("{} {}", clean_first, second.trim_end_matches(|c| c == '(' || c == ':'));
+        }
+    }
+    clean_first.to_string()
+}
+
+fn parse_cargo_crate_action(trimmed: &str) -> Option<String> {
+    let rest = trimmed
+        .strip_prefix("Compiling ")
+        .or_else(|| trimmed.strip_prefix("Checking "))
+        .or_else(|| trimmed.strip_prefix("Fresh "))?;
+    let desc = compact_crate_tokens(rest);
+    (!desc.is_empty()).then_some(desc)
+}
+
+fn parse_cargo_building_progress(trimmed: &str) -> Option<(usize, usize, Option<String>)> {
+    let after_build = trimmed.strip_prefix("Building [")?;
+    let close_idx = after_build.find(']')?;
+    let tail = after_build[close_idx + 1..].trim();
+    let (counts_part, active_part) = match tail.split_once(':') {
+        Some((c, a)) => (c.trim(), Some(a.trim())),
+        None => (tail, None),
+    };
+    let (done_s, total_s) = counts_part.split_once('/')?;
+    let done = done_s.trim().parse::<usize>().ok()?;
+    let total_token = total_s.split_whitespace().next().unwrap_or("");
+    let total = total_token.parse::<usize>().ok()?;
+    let active = active_part
+        .and_then(|a| a.split(',').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    Some((done, total, active))
+}
+
+fn stream_reader_lines<R: Read>(mut reader: R, tx: mpsc::Sender<String>) {
+    let mut buf = [0u8; 4096];
+    let mut acc: Vec<u8> = Vec::with_capacity(256);
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => {
+                if !acc.is_empty() {
+                    let s = String::from_utf8_lossy(&acc).to_string();
+                    let _ = tx.send(s);
+                }
+                break;
+            }
+            Ok(n) => {
+                for &b in &buf[..n] {
+                    if b == b'\n' || b == b'\r' {
+                        if !acc.is_empty() {
+                            let s = String::from_utf8_lossy(&acc).to_string();
+                            acc.clear();
+                            if tx.send(s).is_err() {
+                                return;
+                            }
+                        }
+                    } else {
+                        acc.push(b);
+                        if acc.len() >= 4096 {
+                            let s = String::from_utf8_lossy(&acc).to_string();
+                            acc.clear();
+                            if tx.send(s).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+fn run_command_streaming<F>(mut cmd: Command, mut on_line: F) -> Result<Vec<String>, (String, Vec<String>)>
+where
+    F: FnMut(&str),
+{
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| (format!("Failed to spawn process: {}", e), Vec::new()))?;
+
+    let (tx, rx) = mpsc::channel::<String>();
+    let h_out = child.stdout.take().map(|out| {
+        let tx_c = tx.clone();
+        thread::spawn(move || stream_reader_lines(out, tx_c))
+    });
+    let h_err = child.stderr.take().map(|err| {
+        let tx_c = tx.clone();
+        thread::spawn(move || stream_reader_lines(err, tx_c))
+    });
+    drop(tx);
+
+    let mut captured: Vec<String> = Vec::new();
+    for raw in rx {
+        let clean = strip_ansi_escapes(&raw);
+        let trimmed = clean.trim();
+        if !trimmed.is_empty() {
+            on_line(trimmed);
+            captured.push(trimmed.to_string());
+            if captured.len() > 250 {
+                captured.remove(0);
+            }
+        }
+    }
+
+    if let Some(h) = h_out {
+        let _ = h.join();
+    }
+    if let Some(h) = h_err {
+        let _ = h.join();
+    }
+
+    match child.wait() {
+        Ok(status) if status.success() => Ok(captured),
+        Ok(status) => {
+            let tail: Vec<String> = captured.iter().rev().take(6).cloned().collect::<Vec<_>>().into_iter().rev().collect();
+            let msg = if tail.is_empty() {
+                format!("Process exited with status {}", status)
+            } else {
+                tail.join(" | ")
+            };
+            Err((msg, captured))
+        }
+        Err(e) => Err((format!("Failed waiting on process: {}", e), captured)),
+    }
 }
 
 pub struct UpdateService;
@@ -221,6 +520,58 @@ impl UpdateService {
         }
     }
 
+    /// Builds ordered failover git remote URLs: primary URL first, followed by GitHub mirror
+    /// proxies and backup repository mirrors (LT-50).
+    pub fn remote_failover_urls(primary_url: &str) -> Vec<String> {
+        let mut urls = Vec::new();
+        let trimmed = primary_url.trim();
+        if !trimmed.is_empty() {
+            urls.push(trimmed.to_string());
+            if crate::services::github_proxy::GithubProxy::is_github(trimmed) {
+                for cand in crate::services::github_proxy::GithubProxy::new().candidates(trimmed) {
+                    if !urls.contains(&cand) {
+                        urls.push(cand);
+                    }
+                }
+            }
+        }
+        if trimmed == DEFAULT_GIT_REMOTE_URL || trimmed.is_empty() {
+            for &b in BACKUP_GIT_REMOTE_URLS {
+                let s = b.to_string();
+                if crate::services::github_proxy::GithubProxy::is_trusted_mirror(&s) && !urls.contains(&s) {
+                    urls.push(s);
+                }
+            }
+        }
+        urls
+    }
+
+    /// Checks whether the target executable path (or its parent directory) is writable by the
+    /// current user before attempting an in-place self-update (LT-50).
+    pub fn is_path_writable(target_bin: &Path) -> bool {
+        let Some(parent) = target_bin.parent() else {
+            return false;
+        };
+        if !parent.exists() {
+            return false;
+        }
+        let probe = parent.join(format!(
+            ".luatools.write_probe.{}.tmp",
+            std::process::id()
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+        {
+            Ok(_) => {
+                let _ = fs::remove_file(&probe);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Performs a single lightweight background check against the Git remote.
     pub fn check_once(override_repo_dir: &str, override_remote_url: &str) -> UpdateCheckResult {
         Self::check_once_with_build_info(
@@ -259,11 +610,21 @@ impl UpdateService {
                     .or(meta_remote);
 
                 if let Some(ref rem_url) = effective_remote {
-                    let fetch_res = if origin_url.is_some() && explicit_remote.is_none() {
+                    let mut fetch_res = if origin_url.is_some() && explicit_remote.is_none() {
                         Self::git_cmd(dir, &["fetch", "--quiet", "origin"])
                     } else {
                         Self::git_cmd(dir, &["fetch", "--quiet", rem_url])
                     };
+                    let mut used_mirror = false;
+                    if fetch_res.is_err() {
+                        for mirror_url in Self::remote_failover_urls(rem_url).into_iter().skip(1) {
+                            if Self::git_cmd(dir, &["fetch", "--quiet", &mirror_url]).is_ok() {
+                                fetch_res = Ok(String::new());
+                                used_mirror = true;
+                                break;
+                            }
+                        }
+                    }
 
                     if let Err(e) = fetch_res {
                         return UpdateCheckResult {
@@ -278,7 +639,10 @@ impl UpdateService {
                         };
                     }
 
-                    let upstream_candidates = if origin_url.is_some() && explicit_remote.is_none() {
+                    let upstream_candidates = if origin_url.is_some()
+                        && explicit_remote.is_none()
+                        && !used_mirror
+                    {
                         vec![
                             "@{u}",
                             "origin/HEAD",
@@ -443,17 +807,57 @@ impl UpdateService {
         }
     }
 
-    fn check_github_remote_version(remote_url: &str) -> Option<(String, Option<String>)> {
+    fn parse_github_owner_repo(remote_url: &str) -> Option<(String, String)> {
         let trimmed = remote_url
             .trim()
             .trim_end_matches(".git")
             .trim_end_matches('/');
-        let slug = trimmed.strip_prefix("https://github.com/")?;
-        let mut parts = slug.split('/');
-        let owner = parts.next()?;
-        let repo = parts.next()?;
 
-        let downloader = crate::services::proxied_file_downloader::ProxiedFileDownloader::new();
+        let slug = if let Some(idx) = trimmed.find("https://github.com/") {
+            &trimmed[idx + "https://github.com/".len()..]
+        } else if let Some(idx) = trimmed.find("http://github.com/") {
+            &trimmed[idx + "http://github.com/".len()..]
+        } else if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
+            rest
+        } else {
+            return None;
+        };
+
+        let mut parts = slug.split('/');
+        let owner = parts.next()?.trim();
+        let repo = parts.next()?.trim();
+        if owner.is_empty() || repo.is_empty() {
+            return None;
+        }
+        Some((owner.to_string(), repo.to_string()))
+    }
+
+    fn resolve_effective_remote_url(override_repo_dir: &str, override_remote_url: &str) -> String {
+        if !override_remote_url.trim().is_empty() {
+            return override_remote_url.trim().to_string();
+        }
+        if let Some(dir) = Self::discover_repo_dir(override_repo_dir) {
+            if dir.join(".git").exists() {
+                if let Ok(origin) = Self::git_cmd(&dir, &["remote", "get-url", "origin"]) {
+                    if !origin.trim().is_empty() {
+                        return origin.trim().to_string();
+                    }
+                }
+            }
+        }
+        if override_repo_dir.trim().is_empty() {
+            let meta = Self::load_meta();
+            if !meta.remote_url.trim().is_empty() {
+                return meta.remote_url.trim().to_string();
+            }
+        }
+        DEFAULT_GIT_REMOTE_URL.to_string()
+    }
+
+    fn check_github_remote_version(remote_url: &str) -> Option<(String, Option<String>)> {
+        let (owner, repo) = Self::parse_github_owner_repo(remote_url)?;
+
+        let downloader = ProxiedFileDownloader::new();
 
         // Check latest release first (with GitHub proxy mirror fallback)
         let rel_url = format!(
@@ -495,6 +899,34 @@ impl UpdateService {
         override_repo_dir: &str,
         override_remote_url: &str,
     ) -> Result<(PathBuf, String), String> {
+        Self::pull_git_changes_streaming(override_repo_dir, override_remote_url, |_| {})
+    }
+
+    fn git_cmd_streaming<F>(repo_dir: &Path, args: &[&str], mut on_line: F) -> Result<(), String>
+    where
+        F: FnMut(&str),
+    {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
+            .arg(repo_dir)
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_HTTP_LOW_SPEED_LIMIT", "1000")
+            .env("GIT_HTTP_LOW_SPEED_TIME", "8");
+        run_command_streaming(cmd, |line| on_line(line))
+            .map(|_| ())
+            .map_err(|(err, _)| err)
+    }
+
+    /// Streaming variant of `pull_git_changes` emitting every git status/progress line live.
+    pub fn pull_git_changes_streaming<F>(
+        override_repo_dir: &str,
+        override_remote_url: &str,
+        mut on_line: F,
+    ) -> Result<(PathBuf, String), String>
+    where
+        F: FnMut(&str),
+    {
         let meta = if override_repo_dir.trim().is_empty() {
             Self::load_meta()
         } else {
@@ -505,6 +937,7 @@ impl UpdateService {
 
         if let Some(dir) = Self::discover_repo_dir(override_repo_dir) {
             if dir.join(".git").exists() {
+                on_line(&format!("Repository: {}", dir.display()));
                 if let Some(ref rem) = explicit_remote {
                     if Self::git_cmd(&dir, &["remote", "get-url", "origin"]).is_ok() {
                         let _ = Self::git_cmd(&dir, &["remote", "set-url", "origin", rem]);
@@ -513,14 +946,63 @@ impl UpdateService {
                     }
                 }
 
-                // Try clean fast-forward pull first, then rebase+autostash fallback
-                if Self::git_cmd(&dir, &["pull", "--ff-only"]).is_err() {
-                    Self::git_cmd(&dir, &["pull", "--rebase", "--autostash"])
-                        .map_err(|e| format!("git pull failed: {}", e))?;
+                on_line("$ git pull --ff-only --progress");
+                if Self::git_cmd_streaming(&dir, &["pull", "--ff-only", "--progress"], &mut on_line)
+                    .is_err()
+                {
+                    on_line("Fast-forward unavailable; trying git pull --rebase --autostash…");
+                    if let Err(primary_err) = Self::git_cmd_streaming(
+                        &dir,
+                        &["pull", "--rebase", "--autostash", "--progress"],
+                        &mut on_line,
+                    ) {
+                        let base_remote = explicit_remote
+                            .clone()
+                            .or_else(|| Self::git_cmd(&dir, &["remote", "get-url", "origin"]).ok())
+                            .unwrap_or_else(|| DEFAULT_GIT_REMOTE_URL.to_string());
+                        let mut pulled_via_mirror = false;
+                        for mirror in Self::remote_failover_urls(&base_remote).into_iter().skip(1) {
+                            on_line(&format!("Retrying via mirror: {}", mirror));
+                            if Self::git_cmd_streaming(
+                                &dir,
+                                &["pull", "--ff-only", "--progress", &mirror],
+                                &mut on_line,
+                            )
+                            .is_ok()
+                                || Self::git_cmd_streaming(
+                                    &dir,
+                                    &["pull", "--rebase", "--autostash", "--progress", &mirror],
+                                    &mut on_line,
+                                )
+                                .is_ok()
+                            {
+                                pulled_via_mirror = true;
+                                break;
+                            }
+                        }
+                        if !pulled_via_mirror {
+                            return Err(format!("git pull failed: {}", primary_err));
+                        }
+
+                        // Verify integrity of code pulled from third-party mirror before building
+                        let allow_unverified = std::env::var("LUATOOLS_ALLOW_UNVERIFIED_MIRROR").is_ok();
+                        let verified = Self::git_cmd(&dir, &["verify-commit", "HEAD"])
+                            .or_else(|_| Self::git_cmd(&dir, &["verify-tag", "HEAD"]))
+                            .is_ok();
+                        if !allow_unverified && !verified {
+                            return Err(
+                                "Security: Refusing to compile source code pulled from third-party mirror without commit/tag signature verification. Set LUATOOLS_ALLOW_UNVERIFIED_MIRROR=1 or use direct GitHub.".into()
+                            );
+                        }
+                        if allow_unverified && !verified {
+                            on_line("Warning: Using unverified third-party mirror source per LUATOOLS_ALLOW_UNVERIFIED_MIRROR opt-in.");
+                        }
+                    }
                 }
 
                 let head_info = Self::git_cmd(&dir, &["log", "-1", "--format=%h — %s"])
                     .unwrap_or_else(|_| "updated".into());
+                on_line(&format!("HEAD now at {}", head_info));
                 if override_repo_dir.trim().is_empty() {
                     let saved_rem = Self::git_cmd(&dir, &["remote", "get-url", "origin"]).ok();
                     Self::save_meta(
@@ -553,22 +1035,54 @@ impl UpdateService {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
 
-        let out = Command::new("git")
-            .args(["clone", "--depth", "1", &rem])
-            .arg(&target_dir)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .map_err(|e| format!("Failed to invoke git clone: {}", e))?;
-        if !out.status.success() {
+        let mut last_clone_err = String::new();
+        let mut cloned_url = None;
+        for cand_url in Self::remote_failover_urls(&rem) {
+            let _ = fs::remove_dir_all(&target_dir);
+            on_line(&format!("$ git clone --depth 1 --progress {}", cand_url));
+            let mut cmd = Command::new("git");
+            cmd.args(["clone", "--depth", "1", "--progress", &cand_url])
+                .arg(&target_dir)
+                .env("GIT_TERMINAL_PROMPT", "0");
+            match run_command_streaming(cmd, |line| on_line(line)) {
+                Ok(_) => {
+                    cloned_url = Some(cand_url);
+                    break;
+                }
+                Err((err, _)) => {
+                    last_clone_err = err;
+                }
+            }
+        }
+        let Some(used_url) = cloned_url else {
             return Err(format!(
-                "git clone failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
+                "git clone failed (all mirrors exhausted): {}",
+                last_clone_err
             ));
+        };
+
+        let is_mirror = used_url != DEFAULT_GIT_REMOTE_URL
+            && (used_url.contains("ghfast") || used_url.contains("proxy") || !used_url.starts_with("https://github.com/"));
+        if is_mirror {
+            let allow_unverified = std::env::var("LUATOOLS_ALLOW_UNVERIFIED_MIRROR").is_ok();
+            let verified = Self::git_cmd(&target_dir, &["verify-commit", "HEAD"])
+                .or_else(|_| Self::git_cmd(&target_dir, &["verify-tag", "HEAD"]))
+                .is_ok();
+            if !allow_unverified && !verified {
+                let _ = fs::remove_dir_all(&target_dir);
+                return Err(
+                    "Security: Refusing to compile source code cloned from third-party mirror without commit/tag signature verification. Set LUATOOLS_ALLOW_UNVERIFIED_MIRROR=1 or use direct GitHub.".into()
+                );
+            }
+            if allow_unverified && !verified {
+                on_line("Warning: Using unverified third-party mirror source per LUATOOLS_ALLOW_UNVERIFIED_MIRROR opt-in.");
+            }
         }
 
         let head_info = Self::git_cmd(&target_dir, &["log", "-1", "--format=%h — %s"])
             .unwrap_or_else(|_| "cloned".into());
-        Self::save_meta(Some(&target_dir), Some(&rem));
+        on_line(&format!("Cloned at {}", head_info));
+        Self::save_meta(Some(&target_dir), Some(&used_url));
         Ok((target_dir, head_info))
     }
 
@@ -588,7 +1102,18 @@ impl UpdateService {
         }
 
         let tmp = parent.join(format!(".luatools.update.{}.tmp", std::process::id()));
-        fs::copy(src_bin, &tmp).map_err(|e| format!("Copy failed: {}", e))?;
+        fs::copy(src_bin, &tmp).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                format!(
+                    "Permission denied writing to {} (system install — run `sudo install -m 755 {} {}`)",
+                    parent.display(),
+                    src_bin.display(),
+                    dst_bin.display()
+                )
+            } else {
+                format!("Copy failed: {}", e)
+            }
+        })?;
         let mut perms = fs::metadata(&tmp).map_err(|e| e.to_string())?.permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&tmp, perms).map_err(|e| e.to_string())?;
@@ -597,6 +1122,896 @@ impl UpdateService {
             format!("Atomic rename onto {} failed: {}", dst_bin.display(), e)
         })?;
         Ok(())
+    }
+
+    /// Selects the highest-priority prebuilt Linux `x86_64` asset from a GitHub Release JSON
+    /// payload (`assets[]`), preferring standalone `luatools` binaries over `.tar.gz`/`.tgz`/`.tar.xz`
+    /// archives and skipping packages (`.deb`, `.rpm`, `.AppImage`), checksums/signatures, and
+    /// non-Linux or non-`x86_64` assets (LT-50).
+    pub fn select_prebuilt_linux_asset(release_json: &Value) -> Option<PrebuiltReleaseAsset> {
+        const DISALLOWED_SUFFIXES: &[&str] = &[
+            ".deb",
+            ".rpm",
+            ".appimage",
+            ".flatpak",
+            ".snap",
+            ".exe",
+            ".msi",
+            ".dmg",
+            ".pkg",
+            ".zip",
+            ".7z",
+            ".rar",
+            ".sha256",
+            ".sha256sum",
+            ".sha512",
+            ".sha1",
+            ".md5",
+            ".sig",
+            ".asc",
+            ".minisig",
+            ".sbom",
+            ".json",
+            ".txt",
+            ".md",
+            ".pem",
+            ".pub",
+            ".cert",
+            ".so",
+            ".dll",
+            ".dylib",
+            ".dwp",
+            ".debug",
+            ".sh",
+            ".py",
+            ".desktop",
+            ".png",
+            ".svg",
+            ".ico",
+            ".toml",
+            ".yml",
+            ".yaml",
+            ".zst",
+            ".bz2",
+        ];
+
+        const DISALLOWED_SUBSTRINGS: &[&str] = &[
+            "checksum",
+            "sha256sum",
+            "shasum",
+            "windows",
+            "win32",
+            "win64",
+            "msvc",
+            "mingw",
+            "macos",
+            "darwin",
+            "apple",
+            "osx",
+            "freebsd",
+            "openbsd",
+            "netbsd",
+            "android",
+            "ios",
+            "aarch64",
+            "arm64",
+            "armv7",
+            "armv6",
+            "armhf",
+            "i686",
+            "i386",
+            "i586",
+            "ia32",
+            "32bit",
+            "riscv64",
+            "ppc64",
+            "s390x",
+            "mips",
+            "libsteam_integration",
+            "libsteam_auto_patch",
+            "bridge_lib",
+        ];
+
+        let assets = release_json.get("assets")?.as_array()?;
+        let mut best: Option<(u32, PrebuiltReleaseAsset)> = None;
+
+        for asset in assets {
+            let Some(name) = asset
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let Some(download_url) = asset
+                .get("browser_download_url")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+
+            let low = name.to_ascii_lowercase();
+            if DISALLOWED_SUFFIXES.iter().any(|s| low.ends_with(s)) {
+                continue;
+            }
+            if DISALLOWED_SUBSTRINGS.iter().any(|s| low.contains(s)) {
+                continue;
+            }
+
+            let kind = if low.ends_with(".tar.gz") || low.ends_with(".tgz") {
+                PrebuiltAssetKind::TarGz
+            } else if low.ends_with(".tar.xz") || low.ends_with(".txz") {
+                PrebuiltAssetKind::TarXz
+            } else if low.ends_with(".tar") || low.ends_with(".gz") || low.ends_with(".xz") {
+                continue;
+            } else {
+                PrebuiltAssetKind::RawBinary
+            };
+
+            let has_linux = low.contains("linux");
+            let has_x86_64 =
+                low.contains("x86_64") || low.contains("amd64") || low.contains("x64");
+            let has_luatools = low.contains("luatools");
+
+            let score = match kind {
+                PrebuiltAssetKind::RawBinary => {
+                    if low == "luatools" {
+                        Some(100)
+                    } else if has_luatools && has_linux && has_x86_64 {
+                        Some(95)
+                    } else if has_luatools && has_linux {
+                        Some(90)
+                    } else if has_luatools && has_x86_64 {
+                        Some(88)
+                    } else if has_linux && has_x86_64 {
+                        Some(85)
+                    } else {
+                        None
+                    }
+                }
+                PrebuiltAssetKind::TarGz => {
+                    if has_linux && has_x86_64 {
+                        Some(if has_luatools { 60 } else { 55 })
+                    } else {
+                        None
+                    }
+                }
+                PrebuiltAssetKind::TarXz => {
+                    if has_linux && has_x86_64 {
+                        Some(if has_luatools { 50 } else { 45 })
+                    } else {
+                        None
+                    }
+                }
+            };
+
+            let Some(score) = score else {
+                continue;
+            };
+
+            let digest = asset
+                .get("digest")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string);
+            let size = asset.get("size").and_then(|v| v.as_u64());
+
+            let candidate = PrebuiltReleaseAsset {
+                name: name.to_string(),
+                download_url: download_url.to_string(),
+                digest,
+                size,
+                kind,
+            };
+
+            if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+                best = Some((score, candidate));
+            }
+        }
+
+        best.map(|(_, asset)| asset)
+    }
+
+    /// Validates that `bytes` begin with the Linux ELF magic (`\x7fELF`) and match
+    /// `ELFCLASS64` (and `EM_X86_64` when `e_machine` is populated on `x86_64`).
+    pub fn verify_elf_executable_bytes(bytes: &[u8]) -> Result<(), String> {
+        if bytes.len() < 16 {
+            return Err(format!(
+                "Downloaded payload is too small to be an ELF binary ({} bytes)",
+                bytes.len()
+            ));
+        }
+        if &bytes[0..4] != b"\x7fELF" {
+            return Err(
+                "Downloaded payload is not a valid ELF executable (missing \\x7fELF header)"
+                    .into(),
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            const ELFCLASS64: u8 = 2;
+            const ELFDATA2LSB: u8 = 1;
+            const EM_X86_64: u16 = 62;
+            if bytes[4] != ELFCLASS64 {
+                return Err(format!(
+                    "Downloaded ELF binary is not 64-bit ELFCLASS64 (got class {})",
+                    bytes[4]
+                ));
+            }
+            if bytes.len() >= 20 && bytes[5] == ELFDATA2LSB {
+                let e_machine = u16::from_le_bytes([bytes[18], bytes[19]]);
+                if e_machine != 0 && e_machine != EM_X86_64 {
+                    return Err(format!(
+                        "Downloaded ELF binary architecture mismatch (expected x86_64 EM_X86_64=62, got {})",
+                        e_machine
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_elf_executable_file(path: &Path) -> Result<(), String> {
+        let mut f = fs::File::open(path)
+            .map_err(|e| format!("Failed to open staged binary {}: {}", path.display(), e))?;
+        let mut hdr = [0u8; 64];
+        let n = f
+            .read(&mut hdr)
+            .map_err(|e| format!("Failed to read ELF header from {}: {}", path.display(), e))?;
+        Self::verify_elf_executable_bytes(&hdr[..n])
+    }
+
+    /// Pre-screens `tar -tf` entry listings against path traversal (`..`) and leading `/` or `\`.
+    pub fn validate_tar_entries(listing: &str) -> Result<(), String> {
+        let mut count = 0usize;
+        for raw_line in listing.lines() {
+            let entry = raw_line.trim_end_matches('\r');
+            if entry.is_empty() {
+                continue;
+            }
+            count += 1;
+            if entry.starts_with('/') || entry.starts_with('\\') {
+                return Err(format!(
+                    "Unsafe tarball entry with leading path separator: '{}'",
+                    entry
+                ));
+            }
+            if entry.contains('\\') {
+                return Err(format!(
+                    "Unsafe tarball entry containing backslash: '{}'",
+                    entry
+                ));
+            }
+            for comp in entry.split('/') {
+                if comp == ".." {
+                    return Err(format!(
+                        "Unsafe tarball entry with path traversal ('..'): '{}'",
+                        entry
+                    ));
+                }
+            }
+        }
+        if count == 0 {
+            return Err("Release archive contains no entries".into());
+        }
+        Ok(())
+    }
+
+    fn find_extracted_luatools_binary(extract_dir: &Path) -> Option<PathBuf> {
+        let mut stack: Vec<(PathBuf, usize)> = vec![(extract_dir.to_path_buf(), 0)];
+        let mut best: Option<(u32, PathBuf)> = None;
+
+        while let Some((dir, depth)) = stack.pop() {
+            if depth > 4 {
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(meta) = fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if meta.file_type().is_symlink() {
+                    continue;
+                }
+                if meta.is_dir() {
+                    stack.push((path, depth + 1));
+                    continue;
+                }
+                if !meta.is_file() {
+                    continue;
+                }
+                let Some(fname) = path.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let low = fname.to_ascii_lowercase();
+                if low.ends_with(".so") || low.starts_with("lib") {
+                    continue;
+                }
+                if Self::verify_elf_executable_file(&path).is_err() {
+                    continue;
+                }
+                let score = if fname == "luatools" {
+                    100
+                } else if low.starts_with("luatools") {
+                    80
+                } else {
+                    40
+                };
+                if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+                    best = Some((score, path));
+                }
+            }
+        }
+
+        best.map(|(_, p)| p)
+    }
+
+    /// Pre-screens a `.tar.gz`/`.tar.xz` archive with `tar -tf` against path traversal and
+    /// extracts the verified `luatools` ELF binary into `extract_dir`.
+    fn extract_prebuilt_tarball(
+        archive_path: &Path,
+        extract_dir: &Path,
+    ) -> Result<PathBuf, (bool, String)> {
+        let list_out = Command::new("tar")
+            .arg("-tf")
+            .arg(archive_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| (false, format!("Failed to invoke tar -tf: {}", e)))?;
+
+        if !list_out.status.success() {
+            let err = String::from_utf8_lossy(&list_out.stderr).trim().to_string();
+            return Err((
+                false,
+                format!("tar -tf failed on {}: {}", archive_path.display(), err),
+            ));
+        }
+
+        let listing = String::from_utf8_lossy(&list_out.stdout);
+        if let Err(unsafe_msg) = Self::validate_tar_entries(&listing) {
+            return Err((
+                true,
+                format!("Refusing to extract unsafe release archive: {}", unsafe_msg),
+            ));
+        }
+
+        fs::create_dir_all(extract_dir)
+            .map_err(|e| (false, format!("Failed to create extract dir: {}", e)))?;
+
+        let extract_out = Command::new("tar")
+            .arg("-xf")
+            .arg(archive_path)
+            .arg("-C")
+            .arg(extract_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| (false, format!("Failed to invoke tar -xf: {}", e)))?;
+
+        if !extract_out.status.success() {
+            let err = String::from_utf8_lossy(&extract_out.stderr)
+                .trim()
+                .to_string();
+            return Err((
+                false,
+                format!("tar -xf failed on {}: {}", archive_path.display(), err),
+            ));
+        }
+
+        Self::find_extracted_luatools_binary(extract_dir).ok_or_else(|| {
+            (
+                false,
+                format!(
+                    "Archive {} did not contain a valid Linux x86_64 ELF binary",
+                    archive_path.display()
+                ),
+            )
+        })
+    }
+
+    /// Verifies optional SHA-256 digest and ELF64 header on raw binary `bytes`, sets `0o755`,
+    /// and atomically installs onto `target_bin` (immune to Linux `ETXTBSY`).
+    pub fn install_prebuilt_binary_bytes(
+        bytes: &[u8],
+        asset_name: &str,
+        expected_sha256_digest: Option<&str>,
+        target_bin: &Path,
+    ) -> Result<(), String> {
+        let Some(parent) = target_bin.parent() else {
+            return Err("Invalid target executable path".into());
+        };
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+
+        let seq = PREBUILT_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = parent.join(format!(
+            ".luatools.prebuilt.{}.{}.tmp",
+            std::process::id(),
+            seq
+        ));
+
+        if let Err(e) = fs::write(&tmp, bytes) {
+            let _ = fs::remove_file(&tmp);
+            return Err(if e.kind() == std::io::ErrorKind::PermissionDenied {
+                format!(
+                    "Permission denied writing to {} (system install — install to ~/.local/bin/luatools or run with sudo)",
+                    parent.display()
+                )
+            } else {
+                format!("Failed to stage prebuilt binary at {}: {}", tmp.display(), e)
+            });
+        }
+
+        if let Some(digest) = expected_sha256_digest
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let hash_svc = FileHashService::new();
+            if let Err(err) = hash_svc.verify_sha256_digest(&tmp, asset_name, digest) {
+                let _ = fs::remove_file(&tmp);
+                return Err(err);
+            }
+        }
+
+        if let Err(err) = Self::verify_elf_executable_bytes(bytes) {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
+
+        let mut perms = fs::metadata(&tmp)
+            .map_err(|e| {
+                let _ = fs::remove_file(&tmp);
+                e.to_string()
+            })?
+            .permissions();
+        perms.set_mode(0o755);
+        if let Err(e) = fs::set_permissions(&tmp, perms) {
+            let _ = fs::remove_file(&tmp);
+            return Err(format!("Failed to chmod 0o755 staged binary: {}", e));
+        }
+
+        fs::rename(&tmp, target_bin).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            format!("Atomic rename onto {} failed: {}", target_bin.display(), e)
+        })?;
+
+        Ok(())
+    }
+
+    fn find_git_bin() -> Option<PathBuf> {
+        let path_var = std::env::var_os("PATH")?;
+        std::env::split_paths(&path_var)
+            .map(|d| d.join("git"))
+            .find(|p| p.is_file())
+    }
+
+    fn check_source_build_toolchain_with(has_git: bool, has_cargo: bool) -> Result<(), String> {
+        match (has_git, has_cargo) {
+            (true, true) => Ok(()),
+            (false, false) => Err(
+                "Source-build fallback unavailable: neither `git` nor `cargo` was found in PATH (or ~/.cargo/bin). Install Git and the Rust toolchain (https://rustup.rs), or download a prebuilt LuaTools release binary from GitHub Releases."
+                    .into(),
+            ),
+            (false, true) => Err(
+                "Source-build fallback unavailable: `git` was not found in PATH. Install Git (`sudo apt install git` / `sudo dnf install git` / `sudo pacman -S git`), or download a prebuilt LuaTools release binary from GitHub Releases."
+                    .into(),
+            ),
+            (true, false) => Err(
+                "Source-build fallback unavailable: `cargo` (Rust toolchain) was not found in PATH or ~/.cargo/bin. Install Rust via https://rustup.rs, or download a prebuilt LuaTools release binary from GitHub Releases."
+                    .into(),
+            ),
+        }
+    }
+
+    fn ensure_source_build_toolchain() -> Result<(), String> {
+        Self::check_source_build_toolchain_with(
+            Self::find_git_bin().is_some(),
+            Self::find_cargo_bin().is_some(),
+        )
+    }
+
+    /// Attempts to update LuaTools directly from the latest GitHub Release prebuilt Linux
+    /// `x86_64` binary asset without requiring `git` or `cargo`.
+    ///
+    /// Returns:
+    /// - `Ok(Some(UpdateApplyResult))` when a prebuilt release binary installed cleanly.
+    /// - `Ok(None)` when no matching prebuilt asset is available or downloadable (caller falls
+    ///   back to Git + Cargo source build).
+    /// - `Err(String)` on a hard integrity/security error (SHA-256 mismatch, unsafe tarball path
+    ///   traversal) or when no target install location is writable.
+    pub fn try_install_prebuilt_release_stream<F>(
+        override_repo_dir: &str,
+        override_remote_url: &str,
+        mut progress_cb: F,
+    ) -> Result<Option<UpdateApplyResult>, String>
+    where
+        F: FnMut(UpdateProgressEvent),
+    {
+        let emit = |cb: &mut F, frac: f32, stage: &str, asset: &str, line: String| {
+            cb(UpdateProgressEvent {
+                fraction: frac,
+                stage_label: stage.to_string(),
+                current_crate: asset.to_string(),
+                compiled_crates: 0,
+                total_crates: 0,
+                log_line: Some(line),
+            });
+        };
+
+        let effective_remote =
+            Self::resolve_effective_remote_url(override_repo_dir, override_remote_url);
+        let Some((owner, repo)) = Self::parse_github_owner_repo(&effective_remote) else {
+            emit(
+                &mut progress_cb,
+                0.05,
+                "Checking prebuilt release",
+                "",
+                format!(
+                    "No prebuilt Linux binary available (remote '{}' is not a GitHub repository); falling back to Git + Cargo source build...",
+                    effective_remote
+                ),
+            );
+            return Ok(None);
+        };
+
+        emit(
+            &mut progress_cb,
+            0.05,
+            "Checking latest GitHub Release",
+            "",
+            format!("Checking GitHub Releases for {}/{}…", owner, repo),
+        );
+
+        let api_url = format!(
+            "https://api.github.com/repos/{}/{}/releases/latest",
+            owner, repo
+        );
+        let meta_downloader = ProxiedFileDownloader::new().with_timeout(Duration::from_secs(20));
+        let release_text = match meta_downloader.download_string_sync(&api_url) {
+            Ok(txt) => txt,
+            Err(err) => {
+                emit(
+                    &mut progress_cb,
+                    0.08,
+                    "Checking latest GitHub Release",
+                    "",
+                    format!(
+                        "No prebuilt Linux binary available (release lookup failed: {}); falling back to Git + Cargo source build...",
+                        err
+                    ),
+                );
+                return Ok(None);
+            }
+        };
+
+        let release_json: Value = match serde_json::from_str(&release_text) {
+            Ok(val) => val,
+            Err(err) => {
+                emit(
+                    &mut progress_cb,
+                    0.08,
+                    "Checking latest GitHub Release",
+                    "",
+                    format!(
+                        "No prebuilt Linux binary available (invalid release JSON: {}); falling back to Git + Cargo source build...",
+                        err
+                    ),
+                );
+                return Ok(None);
+            }
+        };
+
+        let release_tag = release_json
+            .get("tag_name")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(VERSION);
+        let new_version = release_tag.trim_start_matches('v').to_string();
+
+        if Self::is_newer_semver(VERSION, &new_version) {
+            emit(
+                &mut progress_cb,
+                0.10,
+                "Checking latest GitHub Release",
+                "",
+                format!(
+                    "No prebuilt Linux binary available (latest GitHub Release v{} is older than running v{}); falling back to Git + Cargo source build...",
+                    new_version, VERSION
+                ),
+            );
+            return Ok(None);
+        }
+
+        let Some(asset) = Self::select_prebuilt_linux_asset(&release_json) else {
+            emit(
+                &mut progress_cb,
+                0.10,
+                "Checking latest GitHub Release",
+                "",
+                format!(
+                    "No prebuilt Linux binary available (release {} has no Linux x86_64 binary/tarball asset); falling back to Git + Cargo source build...",
+                    release_tag
+                ),
+            );
+            return Ok(None);
+        };
+
+        emit(
+            &mut progress_cb,
+            0.14,
+            &format!("Downloading prebuilt {}", release_tag),
+            &asset.name,
+            format!(
+                "Downloading prebuilt Linux asset {} ({})…",
+                asset.name, release_tag
+            ),
+        );
+
+        struct StagingDir(PathBuf);
+        impl StagingDir {
+            fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+        impl Drop for StagingDir {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let staging_path = std::env::temp_dir().join(format!(
+            "luatools-update-{}-{}",
+            std::process::id(),
+            stamp
+        ));
+        fs::create_dir_all(&staging_path)
+            .map_err(|e| format!("Failed to create prebuilt staging directory: {}", e))?;
+        let staging_dir = StagingDir(staging_path);
+        let downloaded_path = staging_dir.path().join(&asset.name);
+
+        let bin_downloader = ProxiedFileDownloader::new().with_timeout(Duration::from_secs(120));
+        let mut last_pct: i32 = -1;
+        let dl_stage = format!("Downloading {}", asset.name);
+        let dl_asset_name = asset.name.clone();
+        let mut dl_cb = |p: f64| {
+            let pct = (p.clamp(0.0, 1.0) * 100.0).round() as i32;
+            if pct >= last_pct + 4 || pct == 100 || last_pct < 0 {
+                last_pct = pct;
+                let frac = 0.15 + (p.clamp(0.0, 1.0) as f32) * 0.57;
+                progress_cb(UpdateProgressEvent {
+                    fraction: frac,
+                    stage_label: dl_stage.clone(),
+                    current_crate: dl_asset_name.clone(),
+                    compiled_crates: 0,
+                    total_crates: 0,
+                    log_line: (pct > 0 && pct % 20 == 0)
+                        .then(|| format!("Downloading {}: {}%", dl_asset_name, pct)),
+                });
+            }
+        };
+
+        if let Err(err) =
+            bin_downloader.download_file_sync(&asset.download_url, &downloaded_path, Some(&mut dl_cb))
+        {
+            emit(
+                &mut progress_cb,
+                0.15,
+                "Downloading prebuilt binary",
+                &asset.name,
+                format!(
+                    "No prebuilt Linux binary available (download of {} failed: {}); falling back to Git + Cargo source build...",
+                    asset.name, err
+                ),
+            );
+            return Ok(None);
+        }
+
+        if let Some(ref digest) = asset.digest {
+            emit(
+                &mut progress_cb,
+                0.75,
+                "Verifying SHA-256 digest",
+                &asset.name,
+                format!("Verifying SHA-256 digest for {}…", asset.name),
+            );
+            let hash_svc = FileHashService::new();
+            let verified = hash_svc
+                .verify_sha256_digest(&downloaded_path, &asset.name, digest)
+                .map_err(|e| format!("Prebuilt release SHA-256 verification failed: {}", e))?;
+            let short_hash = &verified.sha256[..verified.sha256.len().min(16)];
+            emit(
+                &mut progress_cb,
+                0.78,
+                "Verifying SHA-256 digest",
+                &asset.name,
+                format!("SHA-256 digest verified ({}…)", short_hash),
+            );
+        } else {
+            emit(
+                &mut progress_cb,
+                0.76,
+                "Verifying prebuilt asset",
+                &asset.name,
+                format!(
+                    "Release asset {} has no SHA-256 digest metadata; verifying ELF64 executable header…",
+                    asset.name
+                ),
+            );
+        }
+
+        let staged_bin = match asset.kind {
+            PrebuiltAssetKind::RawBinary => downloaded_path.clone(),
+            PrebuiltAssetKind::TarGz | PrebuiltAssetKind::TarXz => {
+                emit(
+                    &mut progress_cb,
+                    0.80,
+                    "Extracting prebuilt archive",
+                    &asset.name,
+                    format!("Pre-screening archive {} with tar -tf…", asset.name),
+                );
+                let extract_dir = staging_dir.path().join("extracted");
+                match Self::extract_prebuilt_tarball(&downloaded_path, &extract_dir) {
+                    Ok(bin_path) => {
+                        emit(
+                            &mut progress_cb,
+                            0.85,
+                            "Extracting prebuilt archive",
+                            &asset.name,
+                            format!("Extracted verified binary {}", bin_path.display()),
+                        );
+                        bin_path
+                    }
+                    Err((true, hard_err)) => return Err(hard_err),
+                    Err((false, soft_err)) => {
+                        emit(
+                            &mut progress_cb,
+                            0.82,
+                            "Extracting prebuilt archive",
+                            &asset.name,
+                            format!(
+                                "No prebuilt Linux binary available ({}); falling back to Git + Cargo source build...",
+                                soft_err
+                            ),
+                        );
+                        return Ok(None);
+                    }
+                }
+            }
+        };
+
+        emit(
+            &mut progress_cb,
+            0.88,
+            "Verifying ELF executable",
+            "luatools",
+            "Verifying Linux ELF64 executable header…".into(),
+        );
+        if let Err(elf_err) = Self::verify_elf_executable_file(&staged_bin) {
+            if asset.digest.is_some() {
+                return Err(format!("Prebuilt release ELF check failed: {}", elf_err));
+            }
+            emit(
+                &mut progress_cb,
+                0.88,
+                "Verifying ELF executable",
+                &asset.name,
+                format!(
+                    "No prebuilt Linux binary available ({}); falling back to Git + Cargo source build...",
+                    elf_err
+                ),
+            );
+            return Ok(None);
+        }
+
+        let mut perms = fs::metadata(&staged_bin)
+            .map_err(|e| format!("Failed to stat staged binary: {}", e))?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&staged_bin, perms)
+            .map_err(|e| format!("Failed to chmod 0o755 staged binary: {}", e))?;
+
+        emit(
+            &mut progress_cb,
+            0.91,
+            "Installing prebuilt binary",
+            "luatools",
+            "Atomically installing verified prebuilt binary…".into(),
+        );
+
+        let mut primary_target: Option<PathBuf> = None;
+        let mut permission_note: Option<String> = None;
+        let mut updated_curr_exe = false;
+
+        if let Ok(curr_exe) = std::env::current_exe() {
+            if Self::is_path_writable(&curr_exe) {
+                if Self::atomic_replace_executable(&staged_bin, &curr_exe).is_ok() {
+                    emit(
+                        &mut progress_cb,
+                        0.93,
+                        "Installing prebuilt binary",
+                        "luatools",
+                        format!("Atomically replaced {}", curr_exe.display()),
+                    );
+                    primary_target = Some(curr_exe);
+                    updated_curr_exe = true;
+                }
+            } else {
+                permission_note = Some(format!(
+                    "system binary {} is read-only; installed user copy to ~/.local/bin/luatools",
+                    curr_exe.display()
+                ));
+            }
+        }
+
+        if let Some(home) = dirs::home_dir() {
+            let local_bin = home.join(".local/bin/luatools");
+            if local_bin.exists() || !updated_curr_exe {
+                match Self::atomic_replace_executable(&staged_bin, &local_bin) {
+                    Ok(()) => {
+                        emit(
+                            &mut progress_cb,
+                            0.95,
+                            "Installing prebuilt binary",
+                            "luatools",
+                            format!("Installed {}", local_bin.display()),
+                        );
+                        if primary_target.is_none() {
+                            primary_target = Some(local_bin);
+                        }
+                    }
+                    Err(err) if primary_target.is_none() => {
+                        return Err(format!(
+                            "Cannot write prebuilt binary to running executable path or {}: {}",
+                            local_bin.display(),
+                            err
+                        ));
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+
+        let Some(updated_exe) = primary_target else {
+            return Err(
+                "Cannot write prebuilt binary: neither the running executable path nor ~/.local/bin/luatools is writable."
+                    .into(),
+            );
+        };
+
+        let base_info = format!("prebuilt release {} ({})", release_tag, asset.name);
+        let final_commit_info = match permission_note {
+            Some(note) => format!("{} ({})", base_info, note),
+            None => base_info,
+        };
+
+        progress_cb(UpdateProgressEvent {
+            fraction: 1.0,
+            stage_label: "Done updating via prebuilt release binary — restart to apply".into(),
+            current_crate: String::new(),
+            compiled_crates: 0,
+            total_crates: 0,
+            log_line: Some(format!(
+                "Done updating via prebuilt release binary — restart to apply (v{}, {})",
+                new_version, final_commit_info
+            )),
+        });
+
+        Ok(Some(UpdateApplyResult {
+            new_version,
+            commit_info: final_commit_info,
+            updated_exe,
+        }))
     }
 
     fn find_cargo_bin() -> Option<PathBuf> {
@@ -612,7 +2027,44 @@ impl UpdateService {
             .find(|p| p.is_file())
     }
 
-    /// Full one-click update workflow: `git pull` -> `cargo build --release` -> atomic binary update.
+    /// Estimates total dependency/workspace crates to compile cleanly before invoking Cargo.
+    /// Counts `[[package]]` blocks in `Cargo.lock`, falling back to `cargo metadata`, then `120`.
+    pub fn estimate_total_crates(crate_dir: &Path, cargo_bin: Option<&Path>) -> usize {
+        let lock_path = crate_dir.join("Cargo.lock");
+        if let Ok(lock_txt) = fs::read_to_string(&lock_path) {
+            let count = lock_txt
+                .lines()
+                .filter(|line| line.trim() == "[[package]]")
+                .count();
+            if count > 0 {
+                return count;
+            }
+        }
+
+        if let Some(cargo) = cargo_bin {
+            if let Ok(out) = Command::new(cargo)
+                .args(["metadata", "--format-version=1"])
+                .current_dir(crate_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output()
+            {
+                if out.status.success() {
+                    if let Ok(val) = serde_json::from_slice::<Value>(&out.stdout) {
+                        if let Some(n) = val.get("packages").and_then(|p| p.as_array()).map(|a| a.len()) {
+                            if n > 0 {
+                                return n;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        120
+    }
+
+    /// Full one-click update workflow (legacy `(f32, String)` callback wrapper).
     pub fn pull_and_update<F>(
         override_repo_dir: &str,
         override_remote_url: &str,
@@ -621,9 +2073,71 @@ impl UpdateService {
     where
         F: FnMut(f32, String),
     {
-        progress_cb(0.15, "1/3 Pulling latest files from Git...".into());
+        Self::pull_and_update_stream(override_repo_dir, override_remote_url, |ev| {
+            let label = if ev.total_crates > 0 && ev.compiled_crates > 0 {
+                if ev.current_crate.is_empty() {
+                    format!(
+                        "{}: {}/{} crates",
+                        ev.stage_label, ev.compiled_crates, ev.total_crates
+                    )
+                } else {
+                    format!(
+                        "{}: {}/{} crates — {}",
+                        ev.stage_label, ev.compiled_crates, ev.total_crates, ev.current_crate
+                    )
+                }
+            } else if let Some(line) = ev.log_line {
+                format!("{}: {}", ev.stage_label, line)
+            } else {
+                ev.stage_label
+            };
+            progress_cb(ev.fraction, label);
+        })
+    }
+
+    /// Full one-click update workflow: tries prebuilt GitHub Release Linux binary first,
+    /// falling back to live-streaming `git`, `cargo`, and atomic install if unavailable.
+    pub fn pull_and_update_stream<F>(
+        override_repo_dir: &str,
+        override_remote_url: &str,
+        mut progress_cb: F,
+    ) -> Result<UpdateApplyResult, String>
+    where
+        F: FnMut(UpdateProgressEvent),
+    {
+        if let Some(prebuilt_result) = Self::try_install_prebuilt_release_stream(
+            override_repo_dir,
+            override_remote_url,
+            &mut progress_cb,
+        )? {
+            return Ok(prebuilt_result);
+        }
+
+        // Source-build fallback requires git + cargo; return an actionable error if missing.
+        Self::ensure_source_build_toolchain()?;
+
+        let mut git_frac: f32 = 0.02;
+        progress_cb(UpdateProgressEvent {
+            fraction: git_frac,
+            stage_label: "1/3 Pulling latest files from Git".into(),
+            current_crate: String::new(),
+            compiled_crates: 0,
+            total_crates: 0,
+            log_line: Some("Step 1/3: Syncing source repository with Git remote…".into()),
+        });
+
         let (repo_dir, commit_info) =
-            Self::pull_git_changes(override_repo_dir, override_remote_url)?;
+            Self::pull_git_changes_streaming(override_repo_dir, override_remote_url, |line| {
+                git_frac = (git_frac + 0.015).min(0.14);
+                progress_cb(UpdateProgressEvent {
+                    fraction: git_frac,
+                    stage_label: "1/3 Pulling latest files from Git".into(),
+                    current_crate: String::new(),
+                    compiled_crates: 0,
+                    total_crates: 0,
+                    log_line: Some(line.to_string()),
+                });
+            })?;
 
         let crate_dir = Self::resolve_crate_dir(&repo_dir).ok_or_else(|| {
             format!(
@@ -637,27 +2151,73 @@ impl UpdateService {
             .and_then(|t| Self::parse_cargo_version(&t))
             .unwrap_or_else(|| VERSION.to_string());
 
-        progress_cb(
-            0.45,
-            format!("2/3 Building native release binary (v{})...", new_version),
-        );
-
         let built_bin = if let Some(cargo) = Self::find_cargo_bin() {
-            let out = Command::new(&cargo)
-                .args(["build", "--workspace", "--release", "-j", "2"])
-                .current_dir(&crate_dir)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .map_err(|e| format!("Failed to run cargo build: {}", e))?;
-            if !out.status.success() {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let tail = stderr.lines().rev().take(6).collect::<Vec<_>>();
-                let msg: Vec<_> = tail.into_iter().rev().collect();
-                return Err(format!("Cargo build failed: {}", msg.join(" | ")));
+            let total_est = Self::estimate_total_crates(&crate_dir, Some(&cargo));
+            let mut tracker = CargoProgressTracker::new(total_est, 0.15, 0.88);
+            progress_cb(UpdateProgressEvent {
+                fraction: 0.15,
+                stage_label: format!("2/3 Compiling Rust (v{})", new_version),
+                current_crate: String::new(),
+                compiled_crates: 0,
+                total_crates: total_est,
+                log_line: Some(format!(
+                    "$ {} build --workspace --release -j 2 --color=never (est. {} crates)",
+                    cargo.display(),
+                    total_est
+                )),
+            });
+
+            let mut build_cmd = Command::new(&cargo);
+            build_cmd
+                .args([
+                    "build",
+                    "--workspace",
+                    "--release",
+                    "-j",
+                    "2",
+                    "--color=never",
+                ])
+                .current_dir(&crate_dir);
+
+            if let Err((err_msg, _)) = run_command_streaming(build_cmd, |line| {
+                let ev = tracker.feed_line(line);
+                progress_cb(ev);
+            }) {
+                return Err(format!("Cargo build failed: {}", err_msg));
             }
-            // Prefer debug-debug symbols for bridge_lib so crash diagnostics are always symbolicated
-            let _ = Command::new(&cargo)
+
+            // Prefer 32-bit i686 build for bridge_lib for native 32-bit Steam LD_PRELOAD
+            let mut bridge_i686_cmd = Command::new(&cargo);
+            bridge_i686_cmd
+                .args([
+                    "build",
+                    "--manifest-path",
+                    "bridge_lib/Cargo.toml",
+                    "--target",
+                    "i686-unknown-linux-gnu",
+                    "--release",
+                    "-j",
+                    "2",
+                    "--color=never",
+                ])
+                .current_dir(&crate_dir);
+            let _ = run_command_streaming(bridge_i686_cmd, |_| {});
+
+            // Also build debug-debug symbols for bridge_lib as fallback
+            let mut bridge_tracker = CargoProgressTracker::new(6, 0.88, 0.92);
+            bridge_tracker.stage_label = "Building bridge_lib symbols".into();
+            progress_cb(UpdateProgressEvent {
+                fraction: 0.88,
+                stage_label: "Building bridge_lib symbols".into(),
+                current_crate: "bridge_lib".into(),
+                compiled_crates: tracker.compiled_crates,
+                total_crates: tracker.total_crates,
+                log_line: Some(
+                    "$ cargo build --profile debug-debug -p bridge_lib -j 2 --color=never".into(),
+                ),
+            });
+            let mut bridge_cmd = Command::new(&cargo);
+            bridge_cmd
                 .args([
                     "build",
                     "--profile",
@@ -666,45 +2226,81 @@ impl UpdateService {
                     "bridge_lib",
                     "-j",
                     "2",
+                    "--color=never",
                 ])
-                .current_dir(&crate_dir)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+                .current_dir(&crate_dir);
+            let _ = run_command_streaming(bridge_cmd, |line| {
+                let mut ev = bridge_tracker.feed_line(line);
+                ev.compiled_crates = tracker.compiled_crates;
+                ev.total_crates = tracker.total_crates;
+                progress_cb(ev);
+            });
 
             let built_so = {
+                let i686_so = crate_dir.join("target/i686-unknown-linux-gnu/release/libsteam_integration.so");
                 let dbg_so = crate_dir.join("target/debug-debug/libsteam_integration.so");
-                if dbg_so.is_file() {
+                if i686_so.is_file() {
+                    i686_so
+                } else if dbg_so.is_file() {
                     dbg_so
                 } else {
                     crate_dir.join("target/release/libsteam_integration.so")
                 }
             };
             if built_so.is_file() {
-                let _ = Self::atomic_replace_executable(
-                    &built_so,
-                    &crate_dir.join("dist/libsteam_integration.so"),
-                );
+                let dist_so = crate_dir.join("dist/libsteam_integration.so");
+                let _ = Self::atomic_replace_executable(&built_so, &dist_so);
+                progress_cb(UpdateProgressEvent {
+                    fraction: 0.93,
+                    stage_label: "3/3 Installing binaries".into(),
+                    current_crate: "libsteam_integration.so".into(),
+                    compiled_crates: tracker.compiled_crates,
+                    total_crates: tracker.total_crates,
+                    log_line: Some(format!("Installed {}", dist_so.display())),
+                });
                 if let Some(home) = dirs::home_dir() {
                     let lib_dst = home.join(".local/lib/luatools/libsteam_integration.so");
-                    let _ = Self::atomic_replace_executable(&built_so, &lib_dst);
+                    if Self::atomic_replace_executable(&built_so, &lib_dst).is_ok() {
+                        progress_cb(UpdateProgressEvent {
+                            fraction: 0.94,
+                            stage_label: "3/3 Installing binaries".into(),
+                            current_crate: "libsteam_integration.so".into(),
+                            compiled_crates: tracker.compiled_crates,
+                            total_crates: tracker.total_crates,
+                            log_line: Some(format!("Installed {}", lib_dst.display())),
+                        });
+                    }
                 }
             }
             let built_patch_so = crate_dir.join("target/release/libsteam_auto_patch_linux.so");
             if built_patch_so.is_file() {
-                let _ = Self::atomic_replace_executable(
-                    &built_patch_so,
-                    &crate_dir.join("dist/libsteam_auto_patch_linux.so"),
-                );
+                let dist_patch = crate_dir.join("dist/libsteam_auto_patch_linux.so");
+                let _ = Self::atomic_replace_executable(&built_patch_so, &dist_patch);
                 if let Some(home) = dirs::home_dir() {
                     let lib_dst = home.join(".local/lib/luatools/libsteam_auto_patch_linux.so");
                     let _ = Self::atomic_replace_executable(&built_patch_so, &lib_dst);
                 }
+                progress_cb(UpdateProgressEvent {
+                    fraction: 0.95,
+                    stage_label: "3/3 Installing binaries".into(),
+                    current_crate: "libsteam_auto_patch_linux.so".into(),
+                    compiled_crates: tracker.compiled_crates,
+                    total_crates: tracker.total_crates,
+                    log_line: Some(format!("Installed {}", dist_patch.display())),
+                });
             }
             crate_dir.join("target/release/luatools")
         } else {
             let prebuilt = crate_dir.join("dist/luatools");
             if prebuilt.is_file() {
+                progress_cb(UpdateProgressEvent {
+                    fraction: 0.92,
+                    stage_label: "Using prebuilt binary".into(),
+                    current_crate: String::new(),
+                    compiled_crates: 0,
+                    total_crates: 0,
+                    log_line: Some(format!("Using prebuilt binary at {}", prebuilt.display())),
+                });
                 prebuilt
             } else {
                 return Err(
@@ -721,40 +2317,105 @@ impl UpdateService {
             ));
         }
 
-        progress_cb(0.85, "3/3 Installing updated executable...".into());
+        progress_cb(UpdateProgressEvent {
+            fraction: 0.96,
+            stage_label: "3/3 Installing updated executable".into(),
+            current_crate: "luatools".into(),
+            compiled_crates: 0,
+            total_crates: 0,
+            log_line: Some(format!(
+                "Step 3/3: Atomically installing {}…",
+                built_bin.display()
+            )),
+        });
 
         // 1. Update <crate_dir>/dist/luatools
         let dist_bin = crate_dir.join("dist/luatools");
-        let _ = Self::atomic_replace_executable(&built_bin, &dist_bin);
+        if Self::atomic_replace_executable(&built_bin, &dist_bin).is_ok() {
+            progress_cb(UpdateProgressEvent {
+                fraction: 0.97,
+                stage_label: "3/3 Installing updated executable".into(),
+                current_crate: "luatools".into(),
+                compiled_crates: 0,
+                total_crates: 0,
+                log_line: Some(format!("Updated {}", dist_bin.display())),
+            });
+        }
 
-        // 2. Update ~/.local/bin/luatools if installed there
+        // 2. Check write permissions on the running binary before replacing (LT-50: graceful /usr/local/bin fallback)
         let mut primary_target = dist_bin;
+        let mut permission_note: Option<String> = None;
+        let mut updated_curr_exe = false;
+
+        if let Ok(curr_exe) = std::env::current_exe() {
+            if Self::is_path_writable(&curr_exe) {
+                if Self::atomic_replace_executable(&built_bin, &curr_exe).is_ok() {
+                    progress_cb(UpdateProgressEvent {
+                        fraction: 0.985,
+                        stage_label: "3/3 Installing updated executable".into(),
+                        current_crate: "luatools".into(),
+                        compiled_crates: 0,
+                        total_crates: 0,
+                        log_line: Some(format!("Atomically replaced {}", curr_exe.display())),
+                    });
+                    primary_target = curr_exe;
+                    updated_curr_exe = true;
+                }
+            } else {
+                permission_note = Some(format!(
+                    "system binary {} is read-only; installed user copy to ~/.local/bin/luatools",
+                    curr_exe.display()
+                ));
+            }
+        }
+
+        // 3. Install/update ~/.local/bin/luatools (also acts as fallback when /usr/local/bin is read-only)
         if let Some(home) = dirs::home_dir() {
             let local_bin = home.join(".local/bin/luatools");
-            if local_bin.exists() && Self::atomic_replace_executable(&built_bin, &local_bin).is_ok()
-            {
-                primary_target = local_bin;
+            if local_bin.exists() || !updated_curr_exe {
+                if Self::atomic_replace_executable(&built_bin, &local_bin).is_ok() {
+                    progress_cb(UpdateProgressEvent {
+                        fraction: 0.995,
+                        stage_label: "3/3 Installing updated executable".into(),
+                        current_crate: "luatools".into(),
+                        compiled_crates: 0,
+                        total_crates: 0,
+                        log_line: Some(format!("Installed {}", local_bin.display())),
+                    });
+                    if !updated_curr_exe {
+                        primary_target = local_bin;
+                    }
+                } else if !updated_curr_exe && !primary_target.is_file() {
+                    return Err(format!(
+                        "Cannot write updated binary to {} or {}. Run manually: sudo install -m 755 {} /usr/local/bin/luatools",
+                        primary_target.display(),
+                        local_bin.display(),
+                        built_bin.display()
+                    ));
+                }
             }
         }
 
-        // 3. Update the currently running binary path if writable
-        if let Ok(curr_exe) = std::env::current_exe() {
-            if Self::atomic_replace_executable(&built_bin, &curr_exe).is_ok() {
-                primary_target = curr_exe;
-            }
-        }
+        let final_commit_info = match permission_note {
+            Some(note) => format!("{} ({})", commit_info, note),
+            None => commit_info,
+        };
 
-        progress_cb(
-            1.0,
-            format!(
-                "Updated to v{} ({}) — ready to restart!",
-                new_version, commit_info
-            ),
-        );
+        progress_cb(UpdateProgressEvent {
+            fraction: 1.0,
+            stage_label: format!("Done updating to v{}", new_version),
+            current_crate: String::new(),
+            compiled_crates: 0,
+            total_crates: 0,
+            log_line: Some(format!(
+                "Done updating to v{} ({}) — restart to apply!",
+                new_version, final_commit_info
+            )),
+        });
 
         Ok(UpdateApplyResult {
             new_version,
-            commit_info,
+            commit_info: final_commit_info,
             updated_exe: primary_target,
         })
     }
@@ -908,5 +2569,278 @@ mod tests {
         ));
         assert!(!UpdateService::is_newer_semver("2.0.0-beta", "2.0-beta"));
         assert!(!UpdateService::is_newer_semver("2.0-beta", "2.0.0"));
+    }
+
+    #[test]
+    fn parses_cargo_compiling_and_building_progress_lines_monotonically() {
+        let mut tracker = CargoProgressTracker::new(4, 0.15, 0.92);
+
+        let e0 = tracker.feed_line("    Updating crates.io index");
+        assert!(e0.fraction >= 0.15);
+        assert_eq!(e0.stage_label, "Updating crate index");
+
+        let e1 = tracker.feed_line("  Downloaded serde v1.0.219");
+        assert!(e1.fraction >= e0.fraction);
+        assert_eq!(e1.current_crate, "serde v1.0.219");
+
+        let e2 = tracker.feed_line("   Compiling egui v0.31.1");
+        assert_eq!(e2.compiled_crates, 1);
+        assert_eq!(e2.total_crates, 4);
+        assert_eq!(e2.current_crate, "egui v0.31.1");
+        assert!(e2.fraction > e1.fraction);
+
+        let e3 = tracker.feed_line("   Compiling tokio v1.44.0 (/tmp/tokio)");
+        assert_eq!(e3.compiled_crates, 2);
+        assert_eq!(e3.current_crate, "tokio v1.44.0");
+        assert!(e3.fraction > e2.fraction);
+
+        // Exact Cargo progress bar line updates total & done accurately without jumping backward
+        let e4 = tracker.feed_line("   Building [===>     ] 48/162: egui, eframe");
+        assert_eq!(e4.compiled_crates, 48);
+        assert_eq!(e4.total_crates, 162);
+        assert_eq!(e4.current_crate, "egui");
+        assert!(e4.fraction >= e3.fraction);
+
+        // Exceeding initial estimate dynamically bumps total_crates cleanly
+        let mut small = CargoProgressTracker::new(2, 0.15, 0.92);
+        let s1 = small.feed_line("   Compiling a v0.1.0");
+        let s2 = small.feed_line("   Compiling b v0.1.0");
+        let s3 = small.feed_line("   Compiling c v0.1.0");
+        assert_eq!(s3.compiled_crates, 3);
+        assert!(s3.total_crates > 3);
+        assert!(s2.fraction >= s1.fraction);
+        assert!(s3.fraction >= s2.fraction);
+        assert!(s3.fraction < 0.92);
+
+        // Linking and Finished advance smoothly to end_fraction
+        let e5 = tracker.feed_line("   Linking target/release/luatools");
+        assert!(e5.fraction >= e4.fraction);
+        assert!(tracker.in_linking);
+
+        let e6 = tracker.feed_line("    Finished `release` profile [optimized] target(s) in 41.2s");
+        assert!(tracker.finished);
+        assert!((e6.fraction - 0.92).abs() < 1e-5);
+        assert_eq!(e6.compiled_crates, e6.total_crates);
+
+        // Estimate crate count from Cargo.lock and fallback when missing
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(UpdateService::estimate_total_crates(tmp.path(), None), 120);
+        fs::write(
+            tmp.path().join("Cargo.lock"),
+            "[[package]]\nname = \"a\"\n[[package]]\nname = \"b\"\n[[package]]\nname = \"c\"\n",
+        )
+        .unwrap();
+        assert_eq!(UpdateService::estimate_total_crates(tmp.path(), None), 3);
+    }
+
+    fn make_valid_elf64_x86_64_bytes() -> Vec<u8> {
+        let mut bytes = vec![0u8; 64];
+        bytes[0..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2; // ELFCLASS64
+        bytes[5] = 1; // ELFDATA2LSB
+        bytes[6] = 1; // EV_CURRENT
+        bytes[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        bytes[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+        bytes.extend_from_slice(b"LUATOOLS_ELF_TEST_PAYLOAD");
+        bytes
+    }
+
+    #[test]
+    fn select_prebuilt_linux_asset_prioritizes_binary_and_tarball_and_filters_incompatible() {
+        let with_raw_and_tar = serde_json::json!({
+            "tag_name": "v3.4.0",
+            "assets": [
+                {
+                    "name": "luatools-3.4.0-linux-x86_64.deb",
+                    "browser_download_url": "https://github.com/subsurfmod/LuaToolsLinux/releases/download/v3.4.0/luatools.deb"
+                },
+                {
+                    "name": "luatools-3.4.0-linux-x86_64.rpm",
+                    "browser_download_url": "https://github.com/subsurfmod/LuaToolsLinux/releases/download/v3.4.0/luatools.rpm"
+                },
+                {
+                    "name": "luatools-3.4.0-linux-x86_64.AppImage",
+                    "browser_download_url": "https://github.com/subsurfmod/LuaToolsLinux/releases/download/v3.4.0/luatools.AppImage"
+                },
+                {
+                    "name": "luatools-linux-x86_64.sha256",
+                    "browser_download_url": "https://github.com/subsurfmod/LuaToolsLinux/releases/download/v3.4.0/luatools-linux-x86_64.sha256"
+                },
+                {
+                    "name": "luatools-windows-x86_64.exe",
+                    "browser_download_url": "https://github.com/subsurfmod/LuaToolsLinux/releases/download/v3.4.0/luatools.exe"
+                },
+                {
+                    "name": "luatools-linux-aarch64.tar.gz",
+                    "browser_download_url": "https://github.com/subsurfmod/LuaToolsLinux/releases/download/v3.4.0/luatools-arm64.tar.gz"
+                },
+                {
+                    "name": "luatools-linux-x86_64.tar.gz",
+                    "browser_download_url": "https://github.com/subsurfmod/LuaToolsLinux/releases/download/v3.4.0/luatools-linux-x86_64.tar.gz",
+                    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                {
+                    "name": "luatools-linux-x86_64",
+                    "browser_download_url": "https://github.com/subsurfmod/LuaToolsLinux/releases/download/v3.4.0/luatools-linux-x86_64",
+                    "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+            ]
+        });
+
+        let picked_raw = UpdateService::select_prebuilt_linux_asset(&with_raw_and_tar)
+            .expect("should pick raw linux x86_64 binary");
+        assert_eq!(picked_raw.name, "luatools-linux-x86_64");
+        assert_eq!(picked_raw.kind, PrebuiltAssetKind::RawBinary);
+        assert_eq!(
+            picked_raw.digest.as_deref(),
+            Some("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+
+        let tar_only = serde_json::json!({
+            "tag_name": "v3.4.0",
+            "assets": [
+                {
+                    "name": "luatools-linux-x86_64.deb",
+                    "browser_download_url": "https://example.invalid/luatools.deb"
+                },
+                {
+                    "name": "luatools-linux-x86_64.tar.gz.sig",
+                    "browser_download_url": "https://example.invalid/luatools.tar.gz.sig"
+                },
+                {
+                    "name": "luatools-macos-x86_64.tar.gz",
+                    "browser_download_url": "https://example.invalid/luatools-macos.tar.gz"
+                },
+                {
+                    "name": "luatools-linux-arm64.tar.gz",
+                    "browser_download_url": "https://example.invalid/luatools-arm64.tar.gz"
+                },
+                {
+                    "name": "luatools-linux-x86_64.tar.xz",
+                    "browser_download_url": "https://example.invalid/luatools.tar.xz"
+                },
+                {
+                    "name": "luatools-linux-amd64.tar.gz",
+                    "browser_download_url": "https://example.invalid/luatools-amd64.tar.gz",
+                    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                }
+            ]
+        });
+
+        let picked_tar = UpdateService::select_prebuilt_linux_asset(&tar_only)
+            .expect("should pick .tar.gz linux amd64 archive");
+        assert_eq!(picked_tar.name, "luatools-linux-amd64.tar.gz");
+        assert_eq!(picked_tar.kind, PrebuiltAssetKind::TarGz);
+        assert_eq!(
+            picked_tar.digest.as_deref(),
+            Some("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+        );
+
+        let incompatible_only = serde_json::json!({
+            "tag_name": "v3.4.0",
+            "assets": [
+                { "name": "luatools-linux-x86_64.deb", "browser_download_url": "https://example.invalid/a.deb" },
+                { "name": "luatools-linux-x86_64.rpm", "browser_download_url": "https://example.invalid/a.rpm" },
+                { "name": "luatools-linux-x86_64.AppImage", "browser_download_url": "https://example.invalid/a.AppImage" },
+                { "name": "luatools-linux-x86_64.sha256", "browser_download_url": "https://example.invalid/a.sha256" },
+                { "name": "luatools-linux-x86_64.zip", "browser_download_url": "https://example.invalid/a.zip" },
+                { "name": "luatools-windows-x86_64.exe", "browser_download_url": "https://example.invalid/a.exe" },
+                { "name": "luatools-macos-x86_64.tar.gz", "browser_download_url": "https://example.invalid/m.tar.gz" },
+                { "name": "luatools-linux-aarch64.tar.gz", "browser_download_url": "https://example.invalid/arm.tar.gz" }
+            ]
+        });
+        assert!(UpdateService::select_prebuilt_linux_asset(&incompatible_only).is_none());
+    }
+
+    #[test]
+    fn verify_elf_executable_bytes_accepts_elf64_and_rejects_html_and_corrupt() {
+        let valid_elf = make_valid_elf64_x86_64_bytes();
+        assert!(UpdateService::verify_elf_executable_bytes(&valid_elf).is_ok());
+
+        let html_err = b"<!DOCTYPE html><html><body>502 Bad Gateway</body></html>";
+        assert!(UpdateService::verify_elf_executable_bytes(html_err).is_err());
+
+        let corrupt_short = b"\x7fELF";
+        assert!(UpdateService::verify_elf_executable_bytes(corrupt_short).is_err());
+
+        let mut elf32 = make_valid_elf64_x86_64_bytes();
+        elf32[4] = 1; // ELFCLASS32
+        #[cfg(target_arch = "x86_64")]
+        assert!(UpdateService::verify_elf_executable_bytes(&elf32).is_err());
+
+        let mut elf_arm64 = make_valid_elf64_x86_64_bytes();
+        elf_arm64[18..20].copy_from_slice(&183u16.to_le_bytes()); // EM_AARCH64
+        #[cfg(target_arch = "x86_64")]
+        assert!(UpdateService::verify_elf_executable_bytes(&elf_arm64).is_err());
+    }
+
+    #[test]
+    fn install_prebuilt_binary_bytes_installs_atomically_with_0755_and_rejects_digest_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target_bin = tmp.path().join("bin/luatools");
+        fs::create_dir_all(target_bin.parent().unwrap()).unwrap();
+        fs::write(&target_bin, b"ORIGINAL_BINARY").unwrap();
+
+        let elf_bytes = make_valid_elf64_x86_64_bytes();
+        let ref_file = tmp.path().join("ref_elf");
+        fs::write(&ref_file, &elf_bytes).unwrap();
+        let real_hash = FileHashService::new().hash_file(&ref_file, "luatools-linux-x86_64");
+        let good_digest = format!("sha256:{}", real_hash.sha256);
+        let bad_digest =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+        // Reject SHA-256 digest mismatch and leave original binary untouched
+        let mismatch_err = UpdateService::install_prebuilt_binary_bytes(
+            &elf_bytes,
+            "luatools-linux-x86_64",
+            Some(bad_digest),
+            &target_bin,
+        );
+        assert!(mismatch_err.is_err());
+        assert!(mismatch_err.unwrap_err().contains("SHA-256 mismatch"));
+        assert_eq!(fs::read(&target_bin).unwrap(), b"ORIGINAL_BINARY");
+
+        // Reject non-ELF payload even without digest
+        let html_err = UpdateService::install_prebuilt_binary_bytes(
+            b"<html>not a binary</html>",
+            "luatools-linux-x86_64",
+            None,
+            &target_bin,
+        );
+        assert!(html_err.is_err());
+        assert_eq!(fs::read(&target_bin).unwrap(), b"ORIGINAL_BINARY");
+
+        // Verified ELF64 with matching SHA-256 installs atomically with 0o755 permissions
+        UpdateService::install_prebuilt_binary_bytes(
+            &elf_bytes,
+            "luatools-linux-x86_64",
+            Some(&good_digest),
+            &target_bin,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&target_bin).unwrap(), elf_bytes);
+        let mode = fs::metadata(&target_bin).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+    }
+
+    #[test]
+    fn validate_tar_entries_blocks_traversal_and_toolchain_check_is_actionable() {
+        assert!(UpdateService::validate_tar_entries("luatools\nREADME.md\n").is_ok());
+        assert!(UpdateService::validate_tar_entries("luatools-v3.4.0/luatools\n").is_ok());
+        assert!(UpdateService::validate_tar_entries("../luatools\n").is_err());
+        assert!(UpdateService::validate_tar_entries("sub/../../etc/passwd\n").is_err());
+        assert!(UpdateService::validate_tar_entries("/usr/bin/luatools\n").is_err());
+        assert!(UpdateService::validate_tar_entries("\\evil\\luatools\n").is_err());
+        assert!(UpdateService::validate_tar_entries("").is_err());
+
+        assert!(UpdateService::check_source_build_toolchain_with(true, true).is_ok());
+        assert!(UpdateService::check_source_build_toolchain_with(false, true)
+            .unwrap_err()
+            .contains("git"));
+        assert!(UpdateService::check_source_build_toolchain_with(true, false)
+            .unwrap_err()
+            .contains("cargo"));
+        let both_err = UpdateService::check_source_build_toolchain_with(false, false).unwrap_err();
+        assert!(both_err.contains("git") && both_err.contains("cargo"));
     }
 }

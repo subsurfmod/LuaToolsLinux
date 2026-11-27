@@ -7,17 +7,74 @@
 //! On Linux, these hooks are installed via pattern scanning in `libsteam_integration.so`
 //! using 14-byte RIP-relative indirect jumps.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::raw::c_void;
 use std::panic::{self, AssertUnwindSafe};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::binary_reader::{BinaryFile, LoadedModuleMapping};
 use super::memory_patch::{self, MemoryPatch, JMP_ABS64_LEN};
 use super::pattern_db::{BinaryComponent, PatternChannel, PatternDb, PatternFile};
+
+/// Single depot manifest entry (0x20 / 32 bytes) matching Steam's internal structure:
+/// DepotId (0x00), AppId (0x04), ManifestGid (0x08), ManifestSize (0x10), DlcAppId (0x18),
+/// LcsRequired (0x1C), bNotNewTarget (0x1D), SharedInstall (0x1E), Padding (0x1F).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DepotEntry {
+    pub depot_id: u32,
+    pub app_id: u32,
+    pub manifest_gid: u64,
+    pub manifest_size: u64,
+    pub dlc_app_id: u32,
+    pub lcs_required: u8,
+    pub b_not_new_target: u8,
+    pub shared_install: u8,
+    pub padding: u8,
+}
+
+impl DepotEntry {
+    pub fn new(
+        app_id: u32,
+        depot_id: u32,
+        manifest_gid: u64,
+        manifest_size: u64,
+        dlc_app_id: u32,
+    ) -> Self {
+        Self {
+            depot_id,
+            app_id,
+            manifest_gid,
+            manifest_size,
+            dlc_app_id,
+            lcs_required: 0,
+            b_not_new_target: 0,
+            shared_install: 0,
+            padding: 0,
+        }
+    }
+}
+
+/// Valve Tier1 CUtlMemory structure
+#[repr(C)]
+#[derive(Debug)]
+pub struct CUtlMemory<T> {
+    pub memory: *mut T,
+    pub allocation_count: i32,
+    pub grow_size: i32,
+}
+
+/// Valve Tier1 CUtlVector structure
+#[repr(C)]
+#[derive(Debug)]
+pub struct CUtlVector<T> {
+    pub memory: CUtlMemory<T>,
+    pub size: i32,
+}
 
 /// Manifest override configuration.
 #[derive(Debug, Clone)]
@@ -33,12 +90,28 @@ impl ManifestOverride {
 }
 
 /// Function pointer type for `BuildDepotDependency`:
-/// `void BuildDepotDependency(void* this, DepotEntry* entries, int count, ...)`
-type BuildDepotDependencyFn = unsafe extern "C" fn(*mut c_void, *mut DepotEntry, i32, ...) -> i64;
+/// `bool BuildDepotDependency(void* pUserAppMgr, AppId_t AppId, void* pUserConfig, CUtlVector<DepotEntry>* pDepotInfo, CUtlVector<DepotEntry>* pSharedDepotInfo, void* pSteamApp, uint32* pBuildId, bool* pbBetaFallback)`
+pub type BuildDepotDependencyFn = unsafe extern "C" fn(
+    *mut c_void,                 // pUserAppMgr
+    u32,                         // AppId
+    *mut c_void,                 // pUserConfig
+    *mut CUtlVector<DepotEntry>, // pDepotInfo
+    *mut CUtlVector<DepotEntry>, // pSharedDepotInfo
+    *mut c_void,                 // pSteamApp
+    *mut u32,                    // pBuildId
+    *mut bool,                   // pbBetaFallback
+) -> bool;
 
 /// Function pointer type for `YldLoadDepotManifest`:
-/// `bool YldLoadDepotManifest(void* this, u32 depot_id, u64 gid, ...)`
-type YldLoadDepotManifestFn = unsafe extern "C" fn(*mut c_void, u32, u64, ...) -> bool;
+/// `i64 YldLoadDepotManifest(void* a1, void* a2, int appId, uint32_t depotId, uint64_t manifestGid, const char* branch)`
+pub type YldLoadDepotManifestFn = unsafe extern "C" fn(
+    *mut c_void,                 // a1
+    *mut c_void,                 // a2
+    i32,                         // appId
+    u32,                         // depotId
+    u64,                         // manifestGid
+    *const std::os::raw::c_char, // branch
+) -> i64;
 
 /// Storage for original function pointers.
 static ORIGINAL_BUILD_DEPOT_DEPENDENCY: OnceLock<Mutex<Option<BuildDepotDependencyFn>>> =
@@ -214,12 +287,150 @@ pub fn report_missing_manifest(depot_id: u32, gid: u64) {
     }
 }
 
-/// Pre-seed manifest cache check for a depot (must be a non-empty regular file).
+pub const ARCHIVE_BASE_URL: &str = "https://manifest.luastools.xyz";
+pub const MAX_MANIFEST_BODY_BYTES: usize = 64 * 1024 * 1024;
+pub const MIN_MANIFEST_BODY_BYTES: usize = 16;
+pub const PAYLOAD_MAGIC: [u8; 4] = [0xD0, 0x17, 0xF6, 0x71]; // 0x71F617D0
+pub const EOF_MAGIC: [u8; 4] = [0xAB, 0x15, 0xC4, 0x32];     // 0x32C415AB
+
+/// Validate manifest payload against Steam binary manifest magic headers:
+/// starts with PAYLOAD_MAGIC (`0x71F617D0`) and ends with EOF_MAGIC (`0x32C415AB`).
+pub fn looks_like_manifest(data: &[u8]) -> bool {
+    if data.len() < MIN_MANIFEST_BODY_BYTES {
+        return false;
+    }
+    data.starts_with(&PAYLOAD_MAGIC) && data.ends_with(&EOF_MAGIC)
+}
+
+/// Checks if a file exists on disk and is a valid binary manifest (BST-44).
+/// If the file exists but fails validation, it is removed so a fresh copy can be fetched.
+pub fn is_valid_cached_manifest(path: &Path) -> bool {
+    if let Ok(data) = std::fs::read(path) {
+        if looks_like_manifest(&data) {
+            return true;
+        }
+        log::warn!(
+            "[manifest] cached manifest at {:?} failed validation (magic/EOF mismatch or truncated), re-fetching",
+            path
+        );
+        let _ = std::fs::remove_file(path);
+    }
+    false
+}
+
+static NEGATIVE_CACHE: OnceLock<Mutex<HashMap<(u32, u64), Instant>>> = OnceLock::new();
+static IN_FLIGHT_MANIFESTS: OnceLock<Mutex<HashSet<(u32, u64)>>> = OnceLock::new();
+
+fn negative_cache() -> &'static Mutex<HashMap<(u32, u64), Instant>> {
+    NEGATIVE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn in_flight_manifests() -> &'static Mutex<HashSet<(u32, u64)>> {
+    IN_FLIGHT_MANIFESTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Clear negative cache (useful in tests or when new manifests are uploaded).
+pub fn clear_manifest_negative_cache() {
+    negative_cache().lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// Discover active Linux Steam installation root.
+pub fn get_default_steam_root() -> Option<std::path::PathBuf> {
+    if let Ok(val) = std::env::var("STEAM_ROOT") {
+        let p = std::path::PathBuf::from(val);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let h = std::path::PathBuf::from(home);
+        for rel in &[
+            ".local/share/Steam",
+            ".steam/steam",
+            ".steam/root",
+            ".var/app/com.valvesoftware.Steam/.local/share/Steam",
+        ] {
+            let p = h.join(rel);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// Atomically write manifest payload to destination file (`<dest>.tmp.<pid>.<rand> -> rename`).
+pub fn write_manifest_atomic(dest: &std::path::Path, body: &[u8]) -> bool {
+    if let Some(parent) = dest.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            log::warn!("[manifest] failed to create parent dir {}: {}", parent.display(), e);
+            return false;
+        }
+    }
+
+    let pid = std::process::id();
+    let tmp = dest.with_extension(format!("tmp.{}.{}", pid, rand_nanos()));
+    {
+        let mut file = match std::fs::File::create(&tmp) {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("[manifest] cannot create temp {}: {}", tmp.display(), e);
+                return false;
+            }
+        };
+        use std::io::Write;
+        if let Err(e) = file.write_all(body) {
+            log::warn!("[manifest] write failed for {}: {}", tmp.display(), e);
+            let _ = std::fs::remove_file(&tmp);
+            return false;
+        }
+        if let Err(e) = file.sync_all() {
+            log::warn!("[manifest] sync failed for {}: {}", tmp.display(), e);
+            let _ = std::fs::remove_file(&tmp);
+            return false;
+        }
+    }
+
+    if let Err(e) = std::fs::rename(&tmp, dest) {
+        log::warn!("[manifest] rename {} -> {} failed: {}", tmp.display(), dest.display(), e);
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    true
+}
+
+fn rand_nanos() -> u32 {
+    use std::time::SystemTime;
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(12345)
+}
+
+/// Pre-seed manifest cache check and on-demand fetch for a depot.
+///
+/// If `<steam_root>/depotcache/<depot>_<gid>.manifest` exists and is non-empty, returns `true`.
+/// Otherwise, checks negative cache (TTL 10 min), acquires in-flight deduplication, and
+/// fetches the `.manifest` file from `https://manifest.luastools.xyz/m/{depot}/{gid}`.
+/// Validates payload magic (`0x71F617D0` .. `0x32C415AB`) and writes atomically to `depotcache`.
+/// On 404 (definitive miss), records in negative cache, queues `report_missing_manifest`, and returns `false`.
 pub fn ensure_manifest_cached(
     steam_root: &std::path::Path,
     app_id: u32,
     depot_id: u32,
     gid: u64,
+) -> bool {
+    ensure_manifest_cached_with_timeout(steam_root, app_id, depot_id, gid, 5000, 30000, false)
+}
+
+pub fn ensure_manifest_cached_with_timeout(
+    steam_root: &std::path::Path,
+    app_id: u32,
+    depot_id: u32,
+    gid: u64,
+    connect_timeout_ms: u64,
+    recv_timeout_ms: u64,
+    bypass_negative_cache: bool,
 ) -> bool {
     if depot_id == 0 || gid == 0 {
         return false;
@@ -228,19 +439,155 @@ pub fn ensure_manifest_cached(
         .join("depotcache")
         .join(format!("{}_{}.manifest", depot_id, gid));
 
-    if let Ok(meta) = std::fs::metadata(&manifest_path) {
-        if meta.is_file() && meta.len() > 0 {
-            return true;
+    let default_url = format!("{}/m/{}/{}", ARCHIVE_BASE_URL, depot_id, gid);
+    ensure_manifest_cached_from_url(
+        &manifest_path,
+        &default_url,
+        app_id,
+        depot_id,
+        gid,
+        connect_timeout_ms,
+        recv_timeout_ms,
+        bypass_negative_cache,
+    )
+}
+
+pub fn ensure_manifest_cached_from_url(
+    manifest_path: &std::path::Path,
+    url: &str,
+    app_id: u32,
+    depot_id: u32,
+    gid: u64,
+    connect_timeout_ms: u64,
+    recv_timeout_ms: u64,
+    bypass_negative_cache: bool,
+) -> bool {
+    if depot_id == 0 || gid == 0 {
+        return false;
+    }
+
+    if is_valid_cached_manifest(manifest_path) {
+        return true;
+    }
+
+    if !bypass_negative_cache {
+        let neg = negative_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = neg.get(&(depot_id, gid)) {
+            if t.elapsed() < Duration::from_secs(600) {
+                return false;
+            }
         }
     }
 
-    log::debug!(
-        "[manifest] pre-seed missing: app={} depot={} gid={}",
+    {
+        let mut in_flight = in_flight_manifests().lock().unwrap_or_else(|e| e.into_inner());
+        if !in_flight.insert((depot_id, gid)) {
+            return false;
+        }
+    }
+
+    struct InFlightGuard(u32, u64);
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            in_flight_manifests()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(self.0, self.1));
+        }
+    }
+    let _guard = InFlightGuard(depot_id, gid);
+
+    if is_valid_cached_manifest(manifest_path) {
+        return true;
+    }
+
+    log::info!(
+        "[manifest] pre-seed download: fetching app={} depot={} gid={} from {}",
         app_id,
         depot_id,
-        gid
+        gid,
+        url
     );
-    false
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_millis(connect_timeout_ms.max(500)))
+        .timeout_read(Duration::from_millis(recv_timeout_ms.max(1000)))
+        .build();
+
+    let call_res = agent.get(url).call();
+    match call_res {
+        Ok(resp) => {
+            if resp.status() == 200 {
+                use std::io::Read;
+                let mut body = Vec::new();
+                let mut reader = resp.into_reader().take((MAX_MANIFEST_BODY_BYTES + 1) as u64);
+                if reader.read_to_end(&mut body).is_err() || body.len() > MAX_MANIFEST_BODY_BYTES {
+                    log::warn!(
+                        "[manifest] manifest for depot={} gid={} exceeded {} bytes or read failed",
+                        depot_id,
+                        gid,
+                        MAX_MANIFEST_BODY_BYTES
+                    );
+                    return false;
+                }
+
+                if !looks_like_manifest(&body) {
+                    log::warn!(
+                        "[manifest] rejected body for depot={} gid={} ({} bytes): magic header/EOF mismatch",
+                        depot_id,
+                        gid,
+                        body.len()
+                    );
+                    return false;
+                }
+
+                if write_manifest_atomic(manifest_path, &body) {
+                    log::info!(
+                        "[manifest] cached app={} depot={} gid={} ({} bytes) -> {}",
+                        app_id,
+                        depot_id,
+                        gid,
+                        body.len(),
+                        manifest_path.display()
+                    );
+                    return true;
+                }
+                false
+            } else {
+                log::warn!(
+                    "[manifest] unexpected HTTP status {} for depot={} gid={}",
+                    resp.status(),
+                    depot_id,
+                    gid
+                );
+                false
+            }
+        }
+        Err(ureq::Error::Status(404, _)) => {
+            negative_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert((depot_id, gid), Instant::now());
+            log::info!(
+                "[manifest] archive 404: app={} depot={} gid={} not found on remote",
+                app_id,
+                depot_id,
+                gid
+            );
+            report_missing_manifest(depot_id, gid);
+            false
+        }
+        Err(e) => {
+            log::warn!(
+                "[manifest] transient fetch failure for app={} depot={} gid={}: {}",
+                app_id,
+                depot_id,
+                gid,
+                e
+            );
+            false
+        }
+    }
 }
 
 /// Record depots seen in a `BuildDepotDependency` call.
@@ -295,28 +642,25 @@ pub fn get_seen_depot(app_id: u32, depot_id: u32) -> Option<(u32, u64)> {
     }
 }
 
-/// Depot entry structure (matches Steam's internal structure).
-#[derive(Debug, Clone)]
-pub struct DepotEntry {
-    pub app_id: u32,
-    pub depot_id: u32,
-    pub manifest_gid: u64,
-    pub manifest_size: u64,
-    pub dlc_app_id: u32,
-}
-
 /// Install manifest hooks in `steamclient.so`.
 pub fn install_manifest_hooks(
     steam_root: &std::path::Path,
     mapping: &LoadedModuleMapping,
 ) -> Result<usize, String> {
+    let expected_class = if cfg!(target_pointer_width = "64") {
+        super::binary_reader::ElfClass::Class64
+    } else {
+        super::binary_reader::ElfClass::Class32
+    };
+
     let binaries = super::binary_reader::scan_steam_binaries(steam_root);
 
     let steam_client = binaries.into_iter().find(|b| {
-        b.path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|name| name == "steamclient.so")
+        b.class == expected_class
+            && b.path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name == "steamclient.so")
     });
 
     let Some(client) = steam_client else {
@@ -329,7 +673,13 @@ pub fn install_manifest_hooks(
         PatternChannel::Pattern,
         BinaryComponent::SteamClient,
     ) {
-        Ok(pf) => pf,
+        Ok(pf) => {
+            if pf.is_fallback() {
+                log::warn!("[manifest] fallback patterns detected; skipping memory hooks");
+                return Err("Fallback patterns not permitted for manifest hooks".to_string());
+            }
+            pf
+        }
         Err(e) => {
             let sha = client.sha256_hex();
             log::warn!(
@@ -366,6 +716,10 @@ fn resolve_hook_target(
     hook_name: &str,
 ) -> Option<u64> {
     let entry = pf.patterns.get(hook_name)?;
+    if entry.is_generic_compiler_prologue() {
+        log::warn!("[manifest] pattern for '{}' is generic compiler prologue; skipping", hook_name);
+        return None;
+    }
 
     let vaddr = if let Some(pattern_hex) = entry.pattern.as_ref() {
         let (pattern_bytes, mask_bytes) =
@@ -380,44 +734,108 @@ fn resolve_hook_target(
 }
 
 /// Replacement function for `BuildDepotDependency`.
-/// This intercepts the call, applies manifest overrides, then calls the original.
+/// Exact signature:
+/// `bool BuildDepotDependency(void* pUserAppMgr, AppId_t AppId, void* pUserConfig, CUtlVector<DepotEntry>* pDepotInfo, CUtlVector<DepotEntry>* pSharedDepotInfo, void* pSteamApp, uint32* pBuildId, bool* pbBetaFallback)`
 unsafe extern "C" fn build_depot_dependency_replacement(
-    this: *mut c_void,
-    entries: *mut DepotEntry,
-    count: i32,
-    _: ...
-) -> i64 {
+    p_user_app_mgr: *mut c_void,
+    app_id: u32,
+    p_user_config: *mut c_void,
+    p_depot_info: *mut CUtlVector<DepotEntry>,
+    p_shared_depot_info: *mut CUtlVector<DepotEntry>,
+    p_steam_app: *mut c_void,
+    p_build_id: *mut u32,
+    pb_beta_fallback: *mut bool,
+) -> bool {
     panic::catch_unwind(AssertUnwindSafe(|| {
-        if !entries.is_null() && count > 0 {
-            let slice = std::slice::from_raw_parts_mut(entries, count as usize);
-            apply_depot_overrides(slice);
-        }
-
         let orig = *original_build_depot_dependency()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(orig_fn) = orig {
-            return unsafe { orig_fn(this, entries, count) };
+        let Some(orig_fn) = orig else {
+            return false;
+        };
+
+        let result = orig_fn(
+            p_user_app_mgr,
+            app_id,
+            p_user_config,
+            p_depot_info,
+            p_shared_depot_info,
+            p_steam_app,
+            p_build_id,
+            pb_beta_fallback,
+        );
+
+        if !result {
+            return false;
         }
-        0
+
+        // Empty-depot PICS mid-refresh guard ("Instant-Complete" Bug Fix, lines 164-172):
+        // When Package 0 injects thousands of Lua AppIDs at login, Steam runs a massive PICS
+        // refresh during which an app's old depot list is briefly dropped before new appinfo
+        // arrives (nCount = 0). Without protection, Steam writes an empty depot config and
+        // stamps the game "Fully Installed" at 0 bytes.
+        // Failing this call makes Steam bail on its clean failure path and keep the app's
+        // previous depot config until appinfo finishes landing.
+        if app_id != 0
+            && (p_depot_info.is_null() || (*p_depot_info).size <= 0)
+            && crate::steam_bridge::interop::interop_package::has_depot_ex(app_id, false)
+        {
+            log::warn!(
+                "[manifest] BuildDepotDependency: app {} returned 0 depots (appinfo mid-refresh) - failing call so Steam retains existing depot config",
+                app_id
+            );
+            return false;
+        }
+
+        // Record genuine depots seen before overrides
+        if !p_depot_info.is_null() && (*p_depot_info).size > 0 && !(*p_depot_info).memory.memory.is_null() {
+            let slice = std::slice::from_raw_parts((*p_depot_info).memory.memory, (*p_depot_info).size as usize);
+            record_depots(Some(slice));
+        }
+        if !p_shared_depot_info.is_null() && (*p_shared_depot_info).size > 0 && !(*p_shared_depot_info).memory.memory.is_null() {
+            let slice = std::slice::from_raw_parts((*p_shared_depot_info).memory.memory, (*p_shared_depot_info).size as usize);
+            record_depots(Some(slice));
+        }
+
+        // Apply manifest overrides in place
+        if !p_depot_info.is_null() && (*p_depot_info).size > 0 && !(*p_depot_info).memory.memory.is_null() {
+            let slice = std::slice::from_raw_parts_mut(
+                (*p_depot_info).memory.memory,
+                (*p_depot_info).size as usize,
+            );
+            apply_depot_overrides(slice);
+        }
+
+        result
     }))
-    .unwrap_or(0)
+    .unwrap_or(false)
 }
 
 /// Replacement function for `YldLoadDepotManifest`.
-/// This pre-seeds the manifest cache and calls the original.
+/// Exact signature:
+/// `i64 YldLoadDepotManifest(void* a1, void* a2, int appId, uint32_t depotId, uint64_t manifestGid, const char* branch)`
 unsafe extern "C" fn yld_load_depot_manifest_replacement(
-    this: *mut c_void,
+    a1: *mut c_void,
+    a2: *mut c_void,
+    app_id: i32,
     depot_id: u32,
-    gid: u64,
-    _: ...
-) -> bool {
+    manifest_gid: u64,
+    branch: *const std::os::raw::c_char,
+) -> i64 {
     panic::catch_unwind(AssertUnwindSafe(|| {
-        // Pre-seed: check if manifest is already cached
-        let steam_root = std::env::var("STEAM_ROOT").ok().map(std::path::PathBuf::from);
-        if let Some(root) = steam_root {
-            if !ensure_manifest_cached(&root, 0, depot_id, gid) {
-                log::debug!("[manifest] YldLoadDepotManifest: pre-seed for depot={} gid={}", depot_id, gid);
+        if depot_id != 0 && manifest_gid != 0 && crate::steam_bridge::interop::interop_package::has_depot(depot_id) {
+            log::debug!(
+                "[manifest] YldLoadDepotManifest: pre-seed app={} depot={} gid={}",
+                app_id,
+                depot_id,
+                manifest_gid
+            );
+            let steam_root = std::env::var("STEAM_ROOT")
+                .ok()
+                .map(std::path::PathBuf::from)
+                .or_else(get_default_steam_root);
+            if let Some(ref root) = steam_root {
+                ensure_manifest_cached(root, app_id as u32, depot_id, manifest_gid);
             }
         }
 
@@ -425,11 +843,12 @@ unsafe extern "C" fn yld_load_depot_manifest_replacement(
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if let Some(orig_fn) = orig {
-            return unsafe { orig_fn(this, depot_id, gid) };
+            orig_fn(a1, a2, app_id, depot_id, manifest_gid, branch)
+        } else {
+            0
         }
-        false
     }))
-    .unwrap_or(false)
+    .unwrap_or(0)
 }
 
 fn install_build_depot_hook(target_addr: u64) -> bool {
@@ -437,27 +856,26 @@ fn install_build_depot_hook(target_addr: u64) -> bool {
         return false;
     }
 
-    // Install the memory patch
+    // Install the memory patch with pre-activation trampoline callback
     let patch = unsafe {
-        memory_patch::patch_by_offset(
+        memory_patch::patch_by_offset_with_callback(
             target_addr,
             0,
             build_depot_dependency_replacement as *const () as *mut u8,
+            |tramp| {
+                if tramp != 0 {
+                    *original_build_depot_dependency()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(std::mem::transmute::<usize, BuildDepotDependencyFn>(
+                            tramp,
+                        ));
+                }
+            },
         )
     };
 
     match patch {
         Ok(patch) => {
-            // Save the trampoline as the original function
-            if !patch.trampoline.is_null() {
-                unsafe {
-                    *original_build_depot_dependency()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = Some(std::mem::transmute::<*mut u8, BuildDepotDependencyFn>(
-                            patch.trampoline,
-                        ));
-                }
-            }
             installed_manifest_patches()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -477,27 +895,26 @@ fn install_manifest_load_hook(target_addr: u64, _steam_root: &std::path::Path) -
         return false;
     }
 
-    // Install the memory patch
+    // Install the memory patch with pre-activation trampoline callback
     let patch = unsafe {
-        memory_patch::patch_by_offset(
+        memory_patch::patch_by_offset_with_callback(
             target_addr,
             0,
             yld_load_depot_manifest_replacement as *const () as *mut u8,
+            |tramp| {
+                if tramp != 0 {
+                    *original_yld_load_depot_manifest()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(std::mem::transmute::<usize, YldLoadDepotManifestFn>(
+                            tramp,
+                        ));
+                }
+            },
         )
     };
 
     match patch {
         Ok(patch) => {
-            // Save the trampoline as the original function
-            if !patch.trampoline.is_null() {
-                unsafe {
-                    *original_yld_load_depot_manifest()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = Some(std::mem::transmute::<*mut u8, YldLoadDepotManifestFn>(
-                            patch.trampoline,
-                        ));
-                }
-            }
             installed_manifest_patches()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -562,20 +979,8 @@ mod tests {
         assert!(overrides.contains_key(&(12345, 123456)));
 
         let mut entries = vec![
-            DepotEntry {
-                app_id: 12345,
-                depot_id: 123456,
-                manifest_gid: 111,
-                manifest_size: 512,
-                dlc_app_id: 0,
-            },
-            DepotEntry {
-                app_id: 99999,
-                depot_id: 123456,
-                manifest_gid: 222,
-                manifest_size: 256,
-                dlc_app_id: 0,
-            },
+            DepotEntry::new(12345, 123456, 111, 512, 0),
+            DepotEntry::new(99999, 123456, 222, 256, 0),
         ];
         assert_eq!(apply_depot_overrides(&mut entries), 1);
         assert_eq!(entries[0].manifest_gid, 999999);
@@ -591,16 +996,57 @@ mod tests {
     }
 
     #[test]
-    fn test_ensure_manifest_cached_requires_non_empty_file() {
+    fn test_depot_entry_memory_layout_and_cutlvector() {
+        assert_eq!(std::mem::size_of::<DepotEntry>(), 32);
+        let entry = DepotEntry::new(1245620, 1245621, 987654321, 1024, 0);
+        assert_eq!(entry.depot_id, 1245621);
+        assert_eq!(entry.app_id, 1245620);
+        assert_eq!(entry.manifest_gid, 987654321);
+        assert_eq!(entry.manifest_size, 1024);
+
+        // Test in-place vector patching via CUtlVector
+        set_manifest_override(1245620, 1245621, ManifestOverride::new(1122334455, Some(2048)));
+        let mut data = vec![entry];
+        let cutl_vec = CUtlVector {
+            memory: CUtlMemory {
+                memory: data.as_mut_ptr(),
+                allocation_count: 1,
+                grow_size: 0,
+            },
+            size: 1,
+        };
+
+        unsafe {
+            let slice = std::slice::from_raw_parts_mut(cutl_vec.memory.memory, cutl_vec.size as usize);
+            apply_depot_overrides(slice);
+        }
+
+        assert_eq!(data[0].manifest_gid, 1122334455);
+        assert_eq!(data[0].manifest_size, 2048);
+        remove_manifest_override(1245620, 1245621);
+    }
+
+    #[test]
+    fn test_ensure_manifest_cached_requires_valid_manifest_magic() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = tmp.path().join("depotcache");
         std::fs::create_dir_all(&cache).unwrap();
 
-        let empty_path = cache.join("100_200.manifest");
-        std::fs::write(&empty_path, b"").unwrap();
+        let manifest_path = cache.join("100_200.manifest");
+        std::fs::write(&manifest_path, b"").unwrap();
         assert!(!ensure_manifest_cached(tmp.path(), 10, 100, 200));
 
-        std::fs::write(&empty_path, b"manifest-bytes").unwrap();
+        // Arbitrary non-manifest bytes must be rejected and deleted
+        std::fs::write(&manifest_path, b"not-a-valid-manifest-bytes").unwrap();
+        assert!(!ensure_manifest_cached(tmp.path(), 10, 100, 200));
+        assert!(!manifest_path.exists(), "Corrupted cached manifest should be removed");
+
+        // Valid binary manifest bytes (PAYLOAD_MAGIC + padding + EOF_MAGIC) must be accepted
+        let mut valid_bytes = Vec::new();
+        valid_bytes.extend_from_slice(&PAYLOAD_MAGIC);
+        valid_bytes.extend_from_slice(&[0u8; 16]);
+        valid_bytes.extend_from_slice(&EOF_MAGIC);
+        std::fs::write(&manifest_path, &valid_bytes).unwrap();
         assert!(ensure_manifest_cached(tmp.path(), 10, 100, 200));
         assert!(!ensure_manifest_cached(tmp.path(), 10, 0, 200));
     }

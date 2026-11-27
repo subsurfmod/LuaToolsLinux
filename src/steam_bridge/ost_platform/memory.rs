@@ -18,39 +18,19 @@ pub struct ModuleImage {
 struct LinkMap {
     l_addr: usize,
     l_name: *const libc::c_char,
+    l_ld: *const libc::c_void,
+    l_next: *mut LinkMap,
+    l_prev: *mut LinkMap,
 }
 
+/// Safely resolves the name of a module represented either by an internal code/data address
+/// or by a dlopen handle. Avoids invoking `dlinfo` on arbitrary pointers that would cause a SIGSEGV.
 fn resolve_module_path(module: *mut std::ffi::c_void) -> Option<String> {
     if module.is_null() {
         return None;
     }
 
-    // 1. Prefer dlinfo(RTLD_DI_LINKMAP) for dlopen() handles (on glibc, dlopen returns a
-    //    heap-allocated link_map pointer which dladdr() cannot resolve).
-    let mut link_map: *mut LinkMap = ptr::null_mut();
-    let dlinfo_res = unsafe {
-        libc::dlinfo(
-            module,
-            libc::RTLD_DI_LINKMAP,
-            (&mut link_map as *mut *mut LinkMap).cast::<libc::c_void>(),
-        )
-    };
-    if dlinfo_res == 0 && !link_map.is_null() {
-        let name_ptr = unsafe { (*link_map).l_name };
-        if !name_ptr.is_null() {
-            let name = unsafe { CStr::from_ptr(name_ptr) }
-                .to_string_lossy()
-                .into_owned();
-            if !name.is_empty() {
-                return Some(name);
-            }
-            if let Ok(exe) = fs::read_link("/proc/self/exe") {
-                return Some(exe.to_string_lossy().into_owned());
-            }
-        }
-    }
-
-    // 2. Fallback to dladdr() when caller passed an address inside a loaded shared object.
+    // 1. Call dladdr() first: safe on arbitrary pointers, code addresses, symbols or mapped code
     let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
     let result = unsafe { libc::dladdr(module as *const _, &mut info) };
     if result != 0 && !info.dli_fname.is_null() {
@@ -62,6 +42,64 @@ fn resolve_module_path(module: *mut std::ffi::c_void) -> Option<String> {
         }
     }
 
+    // 2. If dladdr did not resolve a path (e.g. `module` is a `dlopen()` handle),
+    // safely verify if `module` is a valid link_map by traversing the dynamic linker's link_map list
+    // rooted at `dlopen(NULL)`. Only if `module` matches a known link_map in the chain do we read `l_name`.
+    unsafe {
+        let self_handle = libc::dlopen(ptr::null(), libc::RTLD_LAZY);
+        if !self_handle.is_null() {
+            let mut map: *mut LinkMap = ptr::null_mut();
+            if libc::dlinfo(
+                self_handle,
+                libc::RTLD_DI_LINKMAP,
+                (&mut map as *mut *mut LinkMap).cast::<libc::c_void>(),
+            ) == 0
+                && !map.is_null()
+            {
+                let mut cur = map;
+                while !(*cur).l_prev.is_null() {
+                    cur = (*cur).l_prev;
+                }
+                while !cur.is_null() {
+                    if cur as *mut std::ffi::c_void == module {
+                        let name_ptr = (*cur).l_name;
+                        if !name_ptr.is_null() {
+                            let name = CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
+                            libc::dlclose(self_handle);
+                            if !name.is_empty() {
+                                return Some(name);
+                            }
+                            if let Ok(exe) = fs::read_link("/proc/self/exe") {
+                                return Some(exe.to_string_lossy().into_owned());
+                            }
+                        }
+                        break;
+                    }
+                    cur = (*cur).l_next;
+                }
+            }
+            libc::dlclose(self_handle);
+        }
+    }
+
+    // 3. Fallback: resolve module path via /proc/self/maps safely without risking SIGSEGV in glibc
+    find_path_in_maps(module as usize)
+}
+
+fn find_path_in_maps(addr: usize) -> Option<String> {
+    let maps = fs::read_to_string("/proc/self/maps").ok()?;
+    for line in maps.lines() {
+        let Some((start, end, _, path)) = parse_maps_line(line) else {
+            continue;
+        };
+        if addr >= start && addr < end {
+            if let Some(p) = path {
+                if !p.is_empty() && !p.starts_with('[') {
+                    return Some(p.to_string());
+                }
+            }
+        }
+    }
     None
 }
 

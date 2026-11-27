@@ -17,11 +17,12 @@ pub mod ipc;
 
 pub use interop_ipc::{
     install as interop_ipc_install, register_handler, uninstall as interop_ipc_uninstall,
+    get_pipe_app_id, register_pipe_app_id, clear_pipe_app_ids,
     EIPCCommand, EIPCInterface, IpcHandlerEntry,
 };
 
 pub use interop_ipc_isteamuser::{
-    handler_post_get_app_ownership_ticket, handler_post_get_encrypted_app_ticket,
+    forge_ownership_ticket, handler_post_get_app_ownership_ticket, handler_post_get_encrypted_app_ticket,
     handler_post_get_steam_id, handler_post_request_encrypted_app_ticket,
     install_iclientuser_handlers,
 };
@@ -41,6 +42,7 @@ pub use interop_misc::{
 pub use interop_package::{
     install as interop_package_install, uninstall as interop_package_uninstall,
     on_license_list, try_dump_owned_depots, get_owned_depots, has_depot,
+    add_owned_depot_id,
     notify_license_changed, K_INJECTED_PACKAGE_ID, K_INJECTED_PKG_ACCESS_TOKEN,
     License, AppOwnership,
 };
@@ -53,6 +55,7 @@ pub use interop_decryption::{
 pub use interop_steamui::{
     install as interop_steamui_install, uninstall as interop_steamui_uninstall,
     queue_removal, cancel_removal, active_download_count,
+    set_purchase_time, get_purchase_time, clear_purchase_times,
     EAppState, EAppOwnershipFlags, EAppChangeFlags, CSteamApp, CAppOverviewChange,
 };
 

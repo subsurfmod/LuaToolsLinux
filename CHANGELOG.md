@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [4.0.0] - 2026-11-27
+
+> **Major Release (`v4.0.0`)**: Reaches full production maturity across the native Rust/`egui` desktop app, dual-architecture (`i686` 32-bit + `x86_64` 64-bit) Linux Steam bridge, live streaming self-updater, authoritative Steam lifecycle management, and hardened sandboxed Lua 5.4 execution — verified with **603 passing workspace tests**.
+
+### Highlights
+- **Live Self-Updater & Unified UI Feedback**: Built a true streaming self-updater progress bar with dynamic crate estimation, monotonic progress, SHA-256 GitHub release digest verification, and a live dark monospace Rust compiler feed (`egui::ScrollArea` sticky auto-scroll) in both the updater modal and **Settings › Updates & Tools**. Added a unified `ActionProgressModal` and audited every button across the app for immediate in-progress and completion feedback with zero silent clicks.
+- **Authoritative Steam Lifecycle & Topbar Controls**: Upgraded Steam PID detection to verify authoritative PID lockfiles (`~/.steam/steam.pid`, Flatpak) with non-zombie and `cmdline` validation; topbar now consistently displays `Restart Steam` and `Kill Steam` whenever Steam is active, with graceful `-shutdown` (timeout + `SIGKILL` fallback, Flatpak support) and crash-diagnosing detached spawn.
+- **Dual-Arch Steam Bridge, NetPacket & Protocol Parity**: Completed `ELFCLASS32`/`ELFCLASS64` binary pattern scanning and `ElfClass` filtering, POSIX `SIGTRAP` SysV `ucontext_t` trap handling, full `BST-46` KV1 schema resolution, `CMsgProtoBufHeader` NetPacket manifest/cloud/probe codecs, `PersonaStateMsg` LEB128 varint tags, `CMsgClientGetUserStatsResponse` protobuf encoding with live `drain_achievements` delivery, local-filesystem `CloudRedirectHost` RPCs, active-user `LegacyCdKeyStore` (`0600` sidecar), and `bst://refreshachievements/<appid|all>`.
+- **Packaging & Distribution**: Shipped native `.deb`, `.rpm`, and portable `.tar.gz` release bundles alongside dual-arch `dist/32` & `dist/64` bridge libraries and full GNU GPL-3.0 `LICENSE` text.
+
+### Added & Improved
+- **Store Plugin, Millennium & CEF (`http_server.rs`, `plugin_add_service.rs`, `millennium_service.rs`, `cef_bridge.rs`)**: Completed `:6767` store-plugin routes, headless `PluginAddService` pipeline, `MillenniumService` Linux detection, and CEF `:8080` debug probe.
+- **Core Services & Verification**: Wired `DownloadQueue`, `DohResolver`, `ModeMigration`, `ManifestFile`/AES key validation, `AppliedFixIndexService`, and GitHub release SHA-256 digest verification across `update_service` and `wired_service`.
+- **Lua 5.4 Sandbox & Bridge Directives (`lua_parser.rs`, `lua_installer.rs`, `bridge_lib`)**: Hardened `mlua` 5.4 VM straight-line execution, `SafeSsrfResolver`, `fetch_manifest_code(_ex)`, and `bridge_directives.json` propagation.
+
+### Removed
+- **UI Localization Removed**: Removed UI localization (`localization.rs`, `en.json`, `zh.json`) in favor of a direct, streamlined English UI across all views, dialogs, and workbench controls.
+
+---
+
 ## [3.3.11] - 2026-11-26
 
 ### Fixed

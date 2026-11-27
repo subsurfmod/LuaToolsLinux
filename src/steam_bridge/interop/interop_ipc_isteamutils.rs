@@ -10,7 +10,7 @@ use crate::steam_bridge::interop::interop_misc;
 use crate::steam_bridge::memory_patch::MemoryPatch;
 use crate::steam_bridge::ticket_store::TicketStore;
 
-const ENCRYPTED_APP_TICKET_RESPONSE_CALLBACK: u32 = 1010;
+const ENCRYPTED_APP_TICKET_RESPONSE_CALLBACK: u32 = 154;
 
 /// Install IClientUtils IPC handlers into `interop_ipc`.
 pub fn install_iclientutils_handlers() -> Result<(), String> {
@@ -36,8 +36,8 @@ pub fn install_iclientutils_patches() -> Result<Vec<MemoryPatch>, String> {
     Ok(Vec::new())
 }
 
-/// Buffer-aware post-handler for `IClientUtils::GetAppID`.
-pub fn handle_post_get_app_id(_pipe: *mut c_void, _read: &mut [u8], write: &mut [u8]) -> bool {
+/// Buffer-aware post-handler for `IClientUtils::GetAppID` with per-pipe isolation (BST-52).
+pub fn handle_post_get_app_id(pipe: *mut c_void, _read: &mut [u8], write: &mut [u8]) -> bool {
     if write.len() < 4 {
         return false;
     }
@@ -49,7 +49,14 @@ pub fn handle_post_get_app_id(_pipe: *mut c_void, _read: &mut [u8], write: &mut 
         write[0..4].copy_from_slice(&interop_misc::ONLINE_FIX_APP_ID.to_le_bytes());
         return true;
     }
-    let real_app_id = interop_misc::resolve_app_id();
+    let real_app_id = {
+        let from_pipe = crate::steam_bridge::interop::interop_ipc::get_pipe_app_id(pipe);
+        if from_pipe != 0 {
+            from_pipe
+        } else {
+            interop_misc::resolve_app_id()
+        }
+    };
     if real_app_id == 0 {
         return false;
     }

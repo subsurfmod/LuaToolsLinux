@@ -138,60 +138,342 @@ impl SteamService {
         crate::steam_bridge::preload_loader::find_steam_pid().is_some()
     }
 
-    /// Cleanly terminates any running Steam instances and relaunches Steam via `steam-sls`
-    /// (with `LD_AUDIT=library-inject.so:SLSsteam.so`) so SLSsteam is retained without 32-bit / 64-bit LD_PRELOAD crashes.
-    pub fn relaunch_steam_sls(override_root: Option<&Path>) -> Result<(), String> {
-        // 1. Terminate all running Steam processes
-        let _ = Self::terminate_steam_instances();
+    /// Returns true if `root` points to a Flatpak `com.valvesoftware.Steam` installation.
+    pub fn is_flatpak_steam_root(root: &Path) -> bool {
+        let s = root.to_string_lossy();
+        s.contains(".var/app/com.valvesoftware.Steam")
+    }
 
-        // 2. Brief grace delay for socket unbinding
-        std::thread::sleep(std::time::Duration::from_millis(150));
-
-        // 3. Resolve steam-sls launcher path
-        let home = dirs::home_dir().ok_or_else(|| "Cannot determine HOME directory".to_string())?;
+    /// Builds the command program, arguments, and optional `LD_AUDIT` value for relaunching Steam.
+    /// Flatpak Steam installations launch via `flatpak run com.valvesoftware.Steam` (LT-18)
+    /// rather than spawning the inner sandbox `steam.sh`.
+    pub fn build_relaunch_command_spec(
+        override_root: Option<&Path>,
+        home: &Path,
+    ) -> (PathBuf, Vec<String>, Option<String>) {
+        let flatpak_root = home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam");
+        let native_steam_sh = home.join(".local/share/Steam/steam.sh");
         let steam_sls_bin = home.join(".local/bin/steam-sls");
 
-        let mut cmd = if steam_sls_bin.is_file() {
-            std::process::Command::new(&steam_sls_bin)
-        } else {
-            // Find steam binary (override_root/steam.sh, native ~/.local/share/Steam/steam.sh,
-            // Flatpak ~/.var/app/com.valvesoftware.Steam/.local/share/Steam/steam.sh, or fallback to PATH)
-            let native_steam_sh = home.join(".local/share/Steam/steam.sh");
-            let flatpak_steam_sh =
-                home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam/steam.sh");
+        let is_flatpak = override_root
+            .map(Self::is_flatpak_steam_root)
+            .unwrap_or_else(|| {
+                !steam_sls_bin.is_file()
+                    && !native_steam_sh.is_file()
+                    && crate::services::depot_downloader::which_in_path("steam").is_none()
+                    && flatpak_root.exists()
+            });
 
-            let steam_bin = override_root
-                .map(|r| r.join("steam.sh"))
-                .filter(|p| p.is_file())
-                .or_else(|| native_steam_sh.is_file().then_some(native_steam_sh))
-                .or_else(|| flatpak_steam_sh.is_file().then_some(flatpak_steam_sh))
-                .unwrap_or_else(|| PathBuf::from("steam"));
-            let mut c = std::process::Command::new(steam_bin);
-
-            // Retain library-inject.so + SLSsteam.so via LD_AUDIT
-            let sls_dir = home.join(".local/share/SLSsteam");
-            let lib_inject_so = sls_dir.join("library-inject.so");
-            let sls_so = sls_dir.join("SLSsteam.so");
-            let mut audit_entries = Vec::new();
-            if lib_inject_so.is_file() {
-                audit_entries.push(lib_inject_so.to_string_lossy().into_owned());
+        let resolve_audit = |sls_dirs: &[PathBuf]| -> Option<String> {
+            for sls_dir in sls_dirs {
+                let lib_inject_so = sls_dir.join("library-inject.so");
+                let sls_so = sls_dir.join("SLSsteam.so");
+                let mut audit_entries = Vec::new();
+                if lib_inject_so.is_file() {
+                    audit_entries.push(lib_inject_so.to_string_lossy().into_owned());
+                }
+                if sls_so.is_file() {
+                    audit_entries.push(sls_so.to_string_lossy().into_owned());
+                }
+                if !audit_entries.is_empty() {
+                    return Some(audit_entries.join(":"));
+                }
             }
-            if sls_so.is_file() {
-                audit_entries.push(sls_so.to_string_lossy().into_owned());
-            }
-            if !audit_entries.is_empty() {
-                c.env("LD_AUDIT", audit_entries.join(":"));
-            }
-            c
+            None
         };
 
+        if is_flatpak {
+            let flatpak_sls =
+                home.join(".var/app/com.valvesoftware.Steam/.local/share/SLSsteam");
+            let native_sls = home.join(".local/share/SLSsteam");
+            let mut args = vec!["run".to_string()];
+            if let Some(audit) = resolve_audit(&[flatpak_sls, native_sls.clone()]) {
+                if audit.contains(&native_sls.to_string_lossy().to_string()) {
+                    args.push(format!("--filesystem={}:ro", native_sls.display()));
+                }
+                args.push(format!("--env=LD_AUDIT={}", audit));
+            }
+            args.push("com.valvesoftware.Steam".to_string());
+            return (PathBuf::from("flatpak"), args, None);
+        }
+
+        if steam_sls_bin.is_file() {
+            return (steam_sls_bin, Vec::new(), None);
+        }
+
+        let steam_bin = override_root
+            .map(|r| r.join("steam.sh"))
+            .filter(|p| p.is_file())
+            .or_else(|| native_steam_sh.is_file().then_some(native_steam_sh))
+            .unwrap_or_else(|| PathBuf::from("steam"));
+        let audit = resolve_audit(&[home.join(".local/share/SLSsteam")]);
+        (steam_bin, Vec::new(), audit)
+    }
+
+    /// Runs graceful Steam `-shutdown` (with a hard 5s timeout so `-shutdown` never hangs),
+    /// waits up to 6s for `find_steam_pid()` to exit, and falls back to `kill_all_steam_instances()`
+    /// plus a brief 400ms settle delay so `steam.pid` and IPC sockets release cleanly.
+    pub fn graceful_shutdown_steam<F>(override_root: Option<&Path>, mut on_step: F) -> Result<(), String>
+    where
+        F: FnMut(&str),
+    {
+        let running = crate::steam_bridge::preload_loader::find_steam_pid().is_some()
+            || !crate::steam_bridge::preload_loader::find_all_steam_pids().is_empty();
+        if !running {
+            return Ok(());
+        }
+
+        let is_flatpak = override_root
+            .map(Self::is_flatpak_steam_root)
+            .unwrap_or_else(|| {
+                dirs::home_dir().is_some_and(|h| {
+                    h.join(".var/app/com.valvesoftware.Steam/.steam/steam.pid")
+                        .exists()
+                        && !h.join(".local/share/Steam/steam.sh").is_file()
+                })
+            });
+
+        on_step("Requesting graceful Steam shutdown…");
+        let mut shutdown_cmd = if is_flatpak {
+            let mut c = std::process::Command::new("flatpak");
+            c.args(["run", "com.valvesoftware.Steam", "-shutdown"]);
+            c
+        } else {
+            let steam_cmd = override_root
+                .map(|r| r.join("steam.sh"))
+                .filter(|p| p.is_file())
+                .or_else(|| {
+                    dirs::home_dir()
+                        .map(|h| h.join(".local/share/Steam/steam.sh"))
+                        .filter(|p| p.is_file())
+                })
+                .unwrap_or_else(|| PathBuf::from("steam"));
+            let mut c = std::process::Command::new(steam_cmd);
+            c.arg("-shutdown");
+            c
+        };
+        shutdown_cmd
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        if let Ok(mut child) = shutdown_cmd.spawn() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        if std::time::Instant::now() >= deadline {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(120));
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        // Poll up to 6 seconds for Steam main client to exit cleanly
+        on_step("Waiting for Steam processes to exit…");
+        for _ in 0..30 {
+            if crate::steam_bridge::preload_loader::find_steam_pid().is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+
+        if crate::steam_bridge::preload_loader::find_steam_pid().is_some()
+            || !crate::steam_bridge::preload_loader::find_all_steam_pids().is_empty()
+        {
+            on_step("Terminating remaining Steam processes…");
+            let _ = Self::terminate_steam_instances();
+        }
+
+        // Brief settle wait so steam.pid and IPC sockets release cleanly before relaunch
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        Ok(())
+    }
+
+    /// Spawns a detached Steam launcher process (`setsid` via `pre_exec`), captures immediate
+    /// stderr crashes for up to ~3 seconds, and verifies Steam PID startup cleanly.
+    pub fn spawn_detached_steam_and_verify<F>(
+        program: &Path,
+        args: &[String],
+        ld_audit: Option<&str>,
+        mut on_step: F,
+    ) -> Result<Option<u32>, String>
+    where
+        F: FnMut(&str),
+    {
+        use std::io::Read;
+        use std::os::unix::process::CommandExt;
+
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args);
+        if let Some(audit) = ld_audit {
+            cmd.env("LD_AUDIT", audit);
+        }
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| format!("Failed to spawn steam-sls: {}", e))?;
+            .stderr(std::process::Stdio::piped());
 
-        Ok(())
+        unsafe {
+            cmd.pre_exec(|| {
+                let _ = libc::setsid();
+                Ok(())
+            });
+        }
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to spawn {}: {}", program.display(), e))?;
+
+        let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        if let Some(mut err_pipe) = child.stderr.take() {
+            let buf_c = std::sync::Arc::clone(&stderr_buf);
+            std::thread::spawn(move || {
+                let mut chunk = [0u8; 1024];
+                loop {
+                    match err_pipe.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if let Ok(mut g) = buf_c.lock() {
+                                if g.len() < 4096 {
+                                    g.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+
+        on_step("Verifying Steam startup…");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
+        let mut child_exited_ok = false;
+
+        loop {
+            if !child_exited_ok {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        if !status.success() {
+                            std::thread::sleep(std::time::Duration::from_millis(120));
+                            let err_txt = stderr_buf
+                                .lock()
+                                .map(|g| g.trim().to_string())
+                                .unwrap_or_default();
+                            let compact = err_txt
+                                .lines()
+                                .rev()
+                                .take(4)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .collect::<Vec<_>>()
+                                .join(" | ");
+                            if compact.is_empty() {
+                                return Err(format!(
+                                    "{} exited with {}",
+                                    program.display(),
+                                    status
+                                ));
+                            } else {
+                                return Err(format!(
+                                    "{} failed ({}): {}",
+                                    program.display(),
+                                    status,
+                                    compact
+                                ));
+                            }
+                        }
+                        child_exited_ok = true;
+                    }
+                    Ok(None) => {}
+                    Err(_) => {}
+                }
+            }
+
+            if let Some(pid) = crate::steam_bridge::preload_loader::find_steam_pid() {
+                return Ok(Some(pid));
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+
+        Ok(crate::steam_bridge::preload_loader::find_steam_pid())
+    }
+
+    /// Unified launch / restart workflow with live step progress callback (`0.0..=1.0`, message).
+    pub fn launch_or_restart_steam_with_progress<F>(
+        override_root: Option<&Path>,
+        prefer_bridge_launcher: bool,
+        mut on_progress: F,
+    ) -> Result<(Option<u32>, String), String>
+    where
+        F: FnMut(f32, String),
+    {
+        let was_running = crate::steam_bridge::preload_loader::find_steam_pid().is_some()
+            || !crate::steam_bridge::preload_loader::find_all_steam_pids().is_empty();
+        if was_running {
+            on_progress(0.15, "Stopping running Steam processes…".into());
+            Self::graceful_shutdown_steam(override_root, |step| {
+                on_progress(0.32, step.to_string());
+            })?;
+        }
+
+        let home = dirs::home_dir().ok_or_else(|| "Cannot determine HOME directory".to_string())?;
+        let steam_sls = home.join(".local/bin/steam-sls");
+        let bridge_launcher = home.join(".local/bin/luatools-steam-launcher");
+        let is_flatpak = override_root
+            .map(Self::is_flatpak_steam_root)
+            .unwrap_or(false);
+
+        let (program, args, ld_audit, label) = if is_flatpak {
+            let (p, a, audit) = Self::build_relaunch_command_spec(override_root, &home);
+            (p, a, audit, "Flatpak Steam")
+        } else if steam_sls.is_file() {
+            (steam_sls, Vec::new(), None, "steam-sls (SLSsteam LD_AUDIT)")
+        } else if prefer_bridge_launcher && bridge_launcher.is_file() {
+            (
+                bridge_launcher,
+                Vec::new(),
+                None,
+                "luatools-steam-launcher (Bridge)",
+            )
+        } else {
+            let (p, a, audit) = Self::build_relaunch_command_spec(override_root, &home);
+            (p, a, audit, "Steam")
+        };
+
+        on_progress(
+            0.60,
+            format!("Launching Steam via {} ({})…", label, program.display()),
+        );
+        let pid_opt = Self::spawn_detached_steam_and_verify(
+            &program,
+            &args,
+            ld_audit.as_deref(),
+            |step| on_progress(0.82, step.to_string()),
+        )?;
+
+        let done_msg = match pid_opt {
+            Some(pid) => format!("Steam is running (PID {}) via {}", pid, label),
+            None => format!("Steam launched via {} (initializing…)", label),
+        };
+        on_progress(1.0, done_msg.clone());
+        Ok((pid_opt, done_msg))
+    }
+
+    /// Cleanly terminates any running Steam instances and relaunches Steam via `steam-sls`
+    /// (with `LD_AUDIT=library-inject.so:SLSsteam.so`) or `flatpak run com.valvesoftware.Steam`
+    /// for Flatpak Steam roots so SLSsteam is retained without 32-bit / 64-bit LD_PRELOAD crashes.
+    pub fn relaunch_steam_sls(override_root: Option<&Path>) -> Result<(), String> {
+        Self::launch_or_restart_steam_with_progress(override_root, false, |_, _| {}).map(|_| ())
     }
 
     /// Instance method: cleanly terminates running Steam and relaunches via `steam-sls`.
@@ -392,6 +674,9 @@ impl SteamService {
                     home.join(".var/app/com.valvesoftware.Steam/.steam/registry.vdf"),
                 );
             }
+            // LT-16: Include system-wide /var/lib/steam discovery path in language scan
+            candidate_files.push(PathBuf::from("/var/lib/steam/config/config.vdf"));
+            candidate_files.push(PathBuf::from("/var/lib/steam/registry.vdf"));
         }
 
         for p in candidate_files {
@@ -566,5 +851,21 @@ mod tests {
             SteamService::detect_steam_ui_language_code(Some(&steam_root)),
             Some("ja".to_string())
         );
+    }
+
+    #[test]
+    fn test_flatpak_relaunch_uses_flatpak_run_instead_of_inner_steam_sh() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let fp_root = home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam");
+        fs::create_dir_all(&fp_root).unwrap();
+        fs::write(fp_root.join("steam.sh"), b"#!/bin/sh\n").unwrap();
+
+        let (prog, args, audit) = SteamService::build_relaunch_command_spec(Some(&fp_root), home);
+        assert_eq!(prog, PathBuf::from("flatpak"));
+        assert!(args.iter().any(|a| a == "run"));
+        assert!(args.iter().any(|a| a == "com.valvesoftware.Steam"));
+        assert!(audit.is_none());
+        assert!(SteamService::is_flatpak_steam_root(&fp_root));
     }
 }

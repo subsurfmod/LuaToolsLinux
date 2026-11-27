@@ -4,6 +4,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::models::config::{default_app_settings_path, AppSettings};
+use crate::services::credential_encryption::{
+    decrypt_secret_string, encrypt_secret_string, SECRET_PREFIX,
+};
+use crate::services::doh_resolver::DohResolver;
 
 #[derive(Debug, Clone)]
 pub struct SettingsService {
@@ -27,41 +31,68 @@ impl SettingsService {
         } else {
             path.parent().map(|p| p.join("autostart/luatools.desktop"))
         };
-        let mut settings = Self::load_from(&path);
+        let (mut settings, needs_key_migration) = Self::load_from_with_migration(&path);
         if let Some(ref ap) = autostart_path {
             if is_default_config || ap.exists() {
                 settings.autostart = ap.is_file();
             }
         }
-        Self {
+        if is_default_config {
+            DohResolver::configure_global(settings.doh_enabled, &settings.doh_endpoint);
+        }
+        let svc = Self {
             config_path: path,
             autostart_path,
             settings,
+        };
+        if needs_key_migration {
+            let _ = svc.save();
         }
+        svc
     }
 
     pub fn with_autostart_path(config_path: PathBuf, autostart_path: PathBuf) -> Self {
-        let mut settings = Self::load_from(&config_path);
+        let (mut settings, needs_key_migration) = Self::load_from_with_migration(&config_path);
         settings.autostart = autostart_path.is_file();
-        Self {
+        let svc = Self {
             config_path,
             autostart_path: Some(autostart_path),
             settings,
+        };
+        if needs_key_migration {
+            let _ = svc.save();
         }
+        svc
     }
 
-    fn load_from(path: &Path) -> AppSettings {
+    fn load_from_with_migration(path: &Path) -> (AppSettings, bool) {
         if let Ok(raw) = fs::read_to_string(path) {
-            if let Ok(parsed) = serde_json::from_str::<AppSettings>(&raw) {
-                return parsed;
+            if let Ok(mut parsed) = serde_json::from_str::<AppSettings>(&raw) {
+                let key = parsed.hubcap_api_key.trim().to_string();
+                if key.starts_with(SECRET_PREFIX) {
+                    match decrypt_secret_string(&key) {
+                        Ok(plain) => parsed.hubcap_api_key = plain,
+                        Err(e) => {
+                            log::warn!("Failed to decrypt stored hubcap_api_key: {}", e);
+                            parsed.hubcap_api_key.clear();
+                        }
+                    }
+                    return (parsed, false);
+                }
+                let had_plaintext_key = !key.is_empty();
+                return (parsed, had_plaintext_key);
             }
         }
-        AppSettings::default()
+        (AppSettings::default(), false)
     }
 
     pub fn reload(&mut self) {
-        self.settings = Self::load_from(&self.config_path);
+        let (settings, needs_key_migration) = Self::load_from_with_migration(&self.config_path);
+        self.settings = settings;
         let _ = self.sync_autostart_from_disk();
+        if needs_key_migration {
+            let _ = self.save();
+        }
     }
 
     pub fn save(&self) -> bool {
@@ -70,19 +101,50 @@ impl SettingsService {
                 return false;
             }
         }
-        let Ok(json) = serde_json::to_string_pretty(&self.settings) else {
+        // LT-40: Encrypt `hubcap_api_key` at rest (`enc:v1:...`) without mutating in-memory plaintext
+        let mut disk_settings = self.settings.clone();
+        let raw_key = disk_settings.hubcap_api_key.trim().to_string();
+        if !raw_key.is_empty() && !raw_key.starts_with(SECRET_PREFIX) {
+            match encrypt_secret_string(&raw_key) {
+                Ok(enc) => disk_settings.hubcap_api_key = enc,
+                Err(e) => {
+                    log::warn!("Could not encrypt hubcap_api_key before saving settings: {}", e);
+                }
+            }
+        }
+        let Ok(json) = serde_json::to_string_pretty(&disk_settings) else {
             return false;
         };
         let tmp_path = self.config_path.with_extension("tmp");
-        if fs::write(&tmp_path, json).is_err() {
-            return false;
-        }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let Ok(mut f) = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp_path)
+            else {
+                return false;
+            };
+            if f.write_all(json.as_bytes()).is_err() || f.sync_all().is_err() {
+                let _ = fs::remove_file(&tmp_path);
+                return false;
+            }
         }
-        fs::rename(&tmp_path, &self.config_path).is_ok()
+        #[cfg(not(unix))]
+        {
+            if fs::write(&tmp_path, json).is_err() {
+                return false;
+            }
+        }
+        let ok = fs::rename(&tmp_path, &self.config_path).is_ok();
+        if ok && self.config_path == default_app_settings_path() {
+            DohResolver::configure_global(self.settings.doh_enabled, &self.settings.doh_endpoint);
+        }
+        ok
     }
 
     pub fn record_loaded_app(&mut self, app_id: u32) {
@@ -236,5 +298,31 @@ mod tests {
         assert!(svc.save());
         let mode = fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn test_hubcap_api_key_encrypted_at_rest_and_migrated_on_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("settings.json");
+
+        // 1. Seed a legacy plaintext settings.json
+        let plain_key = format!("smm_{}", "a1".repeat(48));
+        fs::write(
+            &cfg_path,
+            serde_json::json!({ "hubcap_api_key": plain_key }).to_string(),
+        )
+        .unwrap();
+
+        // 2. Loading transparently decrypts/preserves plaintext in memory AND migrates disk to enc:v1:
+        let svc = SettingsService::new(Some(cfg_path.clone()));
+        assert_eq!(svc.settings.hubcap_api_key, plain_key);
+
+        let on_disk = fs::read_to_string(&cfg_path).unwrap();
+        assert!(!on_disk.contains(&plain_key), "plaintext key must not remain on disk");
+        assert!(on_disk.contains(SECRET_PREFIX));
+
+        // 3. Reloading decrypts back to the exact original plaintext key
+        let svc2 = SettingsService::new(Some(cfg_path));
+        assert_eq!(svc2.settings.hubcap_api_key, plain_key);
     }
 }

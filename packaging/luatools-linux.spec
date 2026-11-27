@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           luatools-linux
-Version:        3.3.11
+Version:        4.0.0
 Release:        1%{?dist}
 Summary:        Native Rust workstation for Steam stplug-in lua manifests, depots, and fixes
 License:        GPL-3.0-or-later
@@ -32,8 +32,21 @@ mkdir -p %{buildroot}%{_datadir}/applications
 mkdir -p %{buildroot}%{_datadir}/icons/hicolor/scalable/apps
 
 install -m 0755 %{_sourcedir}/luatools %{buildroot}%{_bindir}/luatools
+if [ -f %{_sourcedir}/luatools-steam-launcher ]; then
+    install -m 0755 %{_sourcedir}/luatools-steam-launcher %{buildroot}%{_bindir}/luatools-steam-launcher
+fi
 if [ -f %{_sourcedir}/libsteam_integration.so ]; then
     install -m 0755 %{_sourcedir}/libsteam_integration.so %{buildroot}/usr/lib/luatools/libsteam_integration.so
+fi
+if [ -f %{_sourcedir}/libsteam_integration32.so ]; then
+    mkdir -p %{buildroot}/usr/lib/luatools/32
+    install -m 0755 %{_sourcedir}/libsteam_integration32.so %{buildroot}/usr/lib/luatools/libsteam_integration32.so
+    install -m 0755 %{_sourcedir}/libsteam_integration32.so %{buildroot}/usr/lib/luatools/32/libsteam_integration.so
+fi
+if [ -f %{_sourcedir}/libsteam_integration64.so ]; then
+    mkdir -p %{buildroot}/usr/lib/luatools/64
+    install -m 0755 %{_sourcedir}/libsteam_integration64.so %{buildroot}/usr/lib/luatools/libsteam_integration64.so
+    install -m 0755 %{_sourcedir}/libsteam_integration64.so %{buildroot}/usr/lib/luatools/64/libsteam_integration.so
 fi
 if [ -f %{_sourcedir}/libsteam_auto_patch_linux.so ]; then
     install -m 0755 %{_sourcedir}/libsteam_auto_patch_linux.so %{buildroot}/usr/lib/luatools/libsteam_auto_patch_linux.so
@@ -43,11 +56,14 @@ install -m 0644 %{_sourcedir}/luatools.desktop %{buildroot}%{_datadir}/applicati
 
 %files
 %{_bindir}/luatools
+%{_bindir}/luatools-steam-launcher
 /usr/lib/luatools
 %{_datadir}/applications/luatools.desktop
 %{_datadir}/icons/hicolor/scalable/apps/luatools.svg
 
 %changelog
+* Fri Nov 27 2026 LuaTools Linux Contributors <noreply@lua.tools> - 4.0.0-1
+- Major Release v4.0.0: Full audit closure, 32-bit & 64-bit dual-arch integration, LT-50 prebuilt release updater, stream compiler feed, unified ActionProgressModal, ELFCLASS32/SIGTRAP/BST-46 KV1/NetPacket/UserStats/CloudRedirect/LegacyCdKey/PersonaStateMsg LEB128 fixes, robust Steam PID detection & kill reliability, and full GPL-3.0 LICENSE
 * Thu Nov 26 2026 LuaTools Linux Contributors <noreply@lua.tools> - 3.3.11-1
 - Release v3.3.11: Fix memory patch safety & 32-bit JMP UB, sandbox mlua VM, fix Valve binary KV1 parser, fix headless keyring/LTSP/--silent/localization/timeout/bst:// URI bugs, and clean up repository
 * Wed Nov 25 2026 LuaTools Linux Contributors <noreply@lua.tools> - 3.2.3-1

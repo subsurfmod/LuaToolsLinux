@@ -60,6 +60,14 @@ impl SteamLibraryService {
         install_dir_override: Option<&str>,
         sls: &mut SlssteamService,
     ) -> Result<PathBuf, String> {
+        // LNX-05: Refuse to mutate Steam library manifests/VDF while Steam is running
+        if !cfg!(test) && crate::steam_bridge::preload_loader::find_steam_pid().is_some() {
+            return Err(
+                "Steam is running. Please close Steam before modifying library folders."
+                    .to_string(),
+            );
+        }
+
         let library = self.primary_library()?;
         let steamapps_dir = library.steamapps();
         fs::create_dir_all(&steamapps_dir)
@@ -75,6 +83,13 @@ impl SteamLibraryService {
         fs::create_dir_all(&game_common_dir)
             .map_err(|e| format!("Cannot create common/{}: {}", dir_name, e))?;
 
+        // LNX-05: Compute real SizeOnDisk from existing game files when present
+        let size_on_disk = compute_directory_size_bytes(&game_common_dir);
+        let last_updated = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
         let escaped_name = escape_vdf(game_name);
         let escaped_dir = escape_vdf(&dir_name);
 
@@ -87,8 +102,8 @@ impl SteamLibraryService {
              \t\"name\"\t\t\"{}\"\n\
              \t\"StateFlags\"\t\t\"4\"\n\
              \t\"installdir\"\t\t\"{}\"\n\
-             \t\"LastUpdated\"\t\t\"0\"\n\
-             \t\"SizeOnDisk\"\t\t\"0\"\n\
+             \t\"LastUpdated\"\t\t\"{}\"\n\
+             \t\"SizeOnDisk\"\t\t\"{}\"\n\
              \t\"StagingSize\"\t\t\"0\"\n\
              \t\"buildid\"\t\t\"0\"\n\
              \t\"LastOwner\"\t\t\"0\"\n\
@@ -102,7 +117,7 @@ impl SteamLibraryService {
              \t\"AllowOtherDownloadsWhileRunning\"\t\t\"0\"\n\
              \t\"ScheduledAutoUpdate\"\t\t\"0\"\n\
              }}\n",
-            app_id, escaped_name, escaped_dir
+            app_id, escaped_name, escaped_dir, last_updated, size_on_disk
         );
 
         fs::write(&manifest_path, manifest_content)
@@ -303,6 +318,21 @@ fn escape_vdf(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Computes total file size in bytes inside `dir` (non-symlink files) for `SizeOnDisk` (LNX-05).
+pub fn compute_directory_size_bytes(dir: &std::path::Path) -> u64 {
+    if !dir.is_dir() {
+        return 0;
+    }
+    walkdir::WalkDir::new(dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .fold(0u64, u64::saturating_add)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,13 +402,45 @@ mod tests {
 
     #[test]
     fn test_migrate_depotcache_dir() {
+        use crate::parsers::manifest_binary::MAGIC_V2;
+
+        let make_manifest = |depot_id: u32, gid: u64| -> Vec<u8> {
+            let mut buf = MAGIC_V2.to_le_bytes().to_vec();
+            let push_varint = |mut v: u64, out: &mut Vec<u8>| loop {
+                let mut b = (v & 0x7F) as u8;
+                v >>= 7;
+                if v != 0 {
+                    b |= 0x80;
+                }
+                out.push(b);
+                if v == 0 {
+                    break;
+                }
+            };
+            buf.push(0x08);
+            push_varint(u64::from(depot_id), &mut buf);
+            buf.push(0x10);
+            push_varint(gid, &mut buf);
+            buf.push(0x18);
+            buf.push(0x00);
+            buf
+        };
+
         let tmp = tempfile::tempdir().unwrap();
         let legacy = tmp.path().join("config/depotcache");
         let target = tmp.path().join("depotcache");
         fs::create_dir_all(&legacy).unwrap();
 
-        fs::write(legacy.join("1245621_11111111.manifest"), b"MANIFEST_1").unwrap();
-        fs::write(legacy.join("1245622_22222222.manifest"), b"MANIFEST_2").unwrap();
+        fs::write(
+            legacy.join("1245621_11111111.manifest"),
+            make_manifest(1245621, 11111111),
+        )
+        .unwrap();
+        fs::write(
+            legacy.join("1245622_22222222.manifest"),
+            make_manifest(1245622, 22222222),
+        )
+        .unwrap();
         fs::write(legacy.join("other.txt"), b"NOT_A_MANIFEST").unwrap();
 
         let res = SteamLibraryService::migrate_depotcache_dir(&legacy, &target).unwrap();
@@ -392,9 +454,38 @@ mod tests {
         assert!(!legacy.join("1245622_22222222.manifest").exists());
 
         // If duplicate manifests appear in legacy again, they are skipped
-        fs::write(legacy.join("1245621_11111111.manifest"), b"MANIFEST_1_DUP").unwrap();
+        fs::write(
+            legacy.join("1245621_11111111.manifest"),
+            make_manifest(1245621, 11111111),
+        )
+        .unwrap();
         let res2 = SteamLibraryService::migrate_depotcache_dir(&legacy, &target).unwrap();
         assert_eq!(res2.migrated_count, 0);
         assert_eq!(res2.skipped_count, 1);
+    }
+
+    #[test]
+    fn computes_real_size_on_disk_for_existing_install_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Steam");
+        let game_dir = root.join("steamapps/common/ELDEN RING");
+        fs::create_dir_all(&game_dir).unwrap();
+        fs::write(game_dir.join("game.bin"), vec![0u8; 4096]).unwrap();
+
+        let lib = SteamLibrary::new(root.clone());
+        let inst = SteamInstallation {
+            root: root.clone(),
+            libraries: vec![lib],
+            config_path: root.join("config"),
+            stplug_in_path: root.join("config/stplug-in"),
+        };
+        let mut sls = SlssteamService::new(Some(tmp.path().join("SLSsteam/config.yaml")));
+        let svc = SteamLibraryService::new(Some(inst));
+
+        let acf_path = svc
+            .add_game_to_library(1245620, "ELDEN RING", None, &mut sls)
+            .unwrap();
+        let acf_text = fs::read_to_string(&acf_path).unwrap();
+        assert!(acf_text.contains("\"SizeOnDisk\"\t\t\"4096\""));
     }
 }

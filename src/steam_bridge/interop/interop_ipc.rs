@@ -17,7 +17,7 @@ use crate::steam_bridge::interop::interop_misc;
 use crate::steam_bridge::interop::ipc::{self, fnv1a_hash};
 use crate::steam_bridge::ipc::{IpcMessage, IpcServer};
 use crate::steam_bridge::manifest_hooks::{self, parse_pattern_and_mask, ManifestOverride};
-use crate::steam_bridge::memory_patch::{MemoryPatch, JMP_ABS64_LEN};
+use crate::steam_bridge::memory_patch::{self, MemoryPatch, JMP_ABS64_LEN};
 use crate::steam_bridge::ost_platform::memory;
 use crate::steam_bridge::pattern_db::{BinaryComponent, PatternChannel, PatternDb};
 use crate::steam_bridge::ticket_store::TicketStore;
@@ -163,6 +163,107 @@ fn active_pipes() -> &'static Mutex<HashMap<u32, usize>> {
     ACTIVE_PIPES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+static PIPE_APP_IDS: OnceLock<Mutex<HashMap<usize, u32>>> = OnceLock::new();
+static PIPE_PIDS: OnceLock<Mutex<HashMap<usize, u32>>> = OnceLock::new();
+static PIPE_HANDLES: OnceLock<Mutex<HashMap<usize, u32>>> = OnceLock::new();
+
+fn pipe_app_ids() -> &'static Mutex<HashMap<usize, u32>> {
+    PIPE_APP_IDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn pipe_pids() -> &'static Mutex<HashMap<usize, u32>> {
+    PIPE_PIDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn pipe_handles() -> &'static Mutex<HashMap<usize, u32>> {
+    PIPE_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Register a pipe client pointer to its associated AppID (BST-52 per-pipe isolation).
+pub fn register_pipe_app_id(pipe: *mut c_void, app_id: u32) {
+    if !pipe.is_null() && app_id != 0 {
+        if let Ok(mut map) = pipe_app_ids().lock() {
+            map.insert(pipe as usize, app_id);
+        }
+    }
+}
+
+/// Register a pipe client pointer to its client PID (BST-52/BST-55).
+pub fn register_pipe_pid(pipe: *mut c_void, pid: u32) {
+    if !pipe.is_null() && pid != 0 {
+        if let Ok(mut map) = pipe_pids().lock() {
+            map.insert(pipe as usize, pid);
+        }
+    }
+}
+
+/// Register a pipe client pointer to its pipe handle (BST-52/BST-55).
+pub fn register_pipe_handle(pipe: *mut c_void, h_steam_pipe: u32) {
+    if !pipe.is_null() && h_steam_pipe != 0 {
+        if let Ok(mut map) = pipe_handles().lock() {
+            map.insert(pipe as usize, h_steam_pipe);
+        }
+    }
+}
+
+/// Get the AppID associated with a specific pipe client (BST-52 per-pipe isolation).
+pub fn get_pipe_app_id(pipe: *mut c_void) -> u32 {
+    if pipe.is_null() {
+        return 0;
+    }
+    pipe_app_ids()
+        .lock()
+        .map(|m| m.get(&(pipe as usize)).copied().unwrap_or(0))
+        .unwrap_or(0)
+}
+
+/// Get the client PID associated with a specific pipe client (BST-52/BST-55).
+pub fn get_pipe_pid(pipe: *mut c_void) -> u32 {
+    if pipe.is_null() {
+        return 0;
+    }
+    pipe_pids()
+        .lock()
+        .map(|m| m.get(&(pipe as usize)).copied().unwrap_or(0))
+        .unwrap_or(0)
+}
+
+/// Get the pipe handle (h_steam_pipe) associated with a specific pipe client (BST-52/BST-55).
+pub fn get_pipe_handle(pipe: *mut c_void) -> u32 {
+    if pipe.is_null() {
+        return 0;
+    }
+    if let Ok(handles) = pipe_handles().lock() {
+        if let Some(&h) = handles.get(&(pipe as usize)) {
+            if h != 0 {
+                return h;
+            }
+        }
+    }
+    if let Ok(pipes) = active_pipes().lock() {
+        let addr = pipe as usize;
+        for (&h, &p) in pipes.iter() {
+            if p == addr {
+                return h;
+            }
+        }
+    }
+    0
+}
+
+/// Clear all registered pipe AppIDs, PIDs, and handles (primarily for testing).
+pub fn clear_pipe_app_ids() {
+    if let Ok(mut map) = pipe_app_ids().lock() {
+        map.clear();
+    }
+    if let Ok(mut map) = pipe_pids().lock() {
+        map.clear();
+    }
+    if let Ok(mut map) = pipe_handles().lock() {
+        map.clear();
+    }
+}
+
 fn original_ipc_process_message() -> &'static Mutex<Option<IPCProcessMessageFn>> {
     ORIGINAL_IPC_PROCESS_MESSAGE.get_or_init(|| Mutex::new(None))
 }
@@ -239,17 +340,19 @@ pub fn install() -> Result<(), String> {
     };
 
     let replacement = hook_ipc_process_message as *mut c_void as *mut u8;
-    let target = ipc_process_msg_addr as *mut u8;
+    let _target = ipc_process_msg_addr as *mut u8;
 
-    let mut patch = MemoryPatch::new(target, replacement);
-    unsafe { patch.install(JMP_ABS64_LEN) }?;
-
-    if !patch.trampoline.is_null() {
-        let original: IPCProcessMessageFn = unsafe { std::mem::transmute(patch.trampoline) };
-        *original_ipc_process_message()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(original);
-    }
+    let patch = unsafe { memory_patch::patch_by_offset_with_callback(
+        ipc_process_msg_addr,
+        0,
+        replacement,
+        |trampoline| {
+            let original: IPCProcessMessageFn = unsafe { std::mem::transmute(trampoline as *const ()) };
+            *original_ipc_process_message()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(original);
+        }
+    ) }?;
 
     ipc_patches()
         .lock()
@@ -257,7 +360,7 @@ pub fn install() -> Result<(), String> {
         .push(patch);
 
     register_default_handlers();
-    start_ipc_server()?;
+    // Note: Do not spawn a second IpcServer here; bridge_lib manages the singleton Unix socket IPC server.
 
     log::info!(
         "[InteropIPC] Installed successfully with {} handlers",
@@ -419,11 +522,17 @@ unsafe extern "C" fn hook_ipc_process_message(
 
         if let Some(handler) = &dispatch.handler {
             if let Some(pre) = &handler.pre_handler {
-                pre(
-                    dispatch.pipe,
-                    read_buffer.as_mut_slice(),
-                    write_buffer.as_mut_slice(),
-                );
+                let read_payload = if read_buffer.as_slice().len() >= 20 {
+                    &mut read_buffer.as_mut_slice()[20..]
+                } else {
+                    read_buffer.as_mut_slice()
+                };
+                let write_payload = if write_buffer.as_slice().len() >= 20 {
+                    &mut write_buffer.as_mut_slice()[20..]
+                } else {
+                    write_buffer.as_mut_slice()
+                };
+                pre(dispatch.pipe, read_payload, write_payload);
             }
         }
 
@@ -432,11 +541,17 @@ unsafe extern "C" fn hook_ipc_process_message(
         if result {
             if let Some(handler) = &dispatch.handler {
                 if let Some(post) = &handler.post_handler {
-                    post(
-                        dispatch.pipe,
-                        read_buffer.as_mut_slice(),
-                        write_buffer.as_mut_slice(),
-                    );
+                    let read_payload = if read_buffer.as_slice().len() >= 20 {
+                        &mut read_buffer.as_mut_slice()[20..]
+                    } else {
+                        read_buffer.as_mut_slice()
+                    };
+                    let write_payload = if write_buffer.as_slice().len() >= 20 {
+                        &mut write_buffer.as_mut_slice()[20..]
+                    } else {
+                        write_buffer.as_mut_slice()
+                    };
+                    post(dispatch.pipe, read_payload, write_payload);
                 }
             }
         }
@@ -507,6 +622,40 @@ fn resolve_dispatch(p_server: *mut c_void, h_steam_pipe: u32, read: &IPCBuffer) 
     dispatch
 }
 
+fn resolve_pid_app_id(pid: u32) -> u32 {
+    let mut app_id = interop_misc::resolve_app_id();
+    if app_id != 0 {
+        return app_id;
+    }
+    if pid == 0 {
+        return 0;
+    }
+    if let Ok(content) = std::fs::read(format!("/proc/{}/environ", pid)) {
+        let mut overlay_id = 0u32;
+        let mut game_id = 0u32;
+        let mut steam_appid = 0u32;
+        for var in content.split(|&b| b == 0) {
+            if let Ok(s) = std::str::from_utf8(var) {
+                if let Some(val) = s.strip_prefix("SteamOverlayGameId=") {
+                    overlay_id = val.trim().parse::<u64>().unwrap_or(0) as u32;
+                } else if let Some(val) = s.strip_prefix("SteamGameId=") {
+                    game_id = val.trim().parse::<u64>().unwrap_or(0) as u32;
+                } else if let Some(val) = s.strip_prefix("SteamAppId=") {
+                    steam_appid = val.trim().parse::<u32>().unwrap_or(0);
+                }
+            }
+        }
+        if overlay_id != 0 {
+            app_id = overlay_id;
+        } else if game_id != 0 {
+            app_id = game_id;
+        } else if steam_appid != 0 {
+            app_id = steam_appid;
+        }
+    }
+    app_id
+}
+
 fn handle_handshake(p_server: *mut c_void, h_steam_pipe: u32, read: &IPCBuffer) {
     let request = IPCRequest::parse(read.as_slice());
     if !request.ok() || request.command() != EIPCCommand::Handshake {
@@ -523,7 +672,22 @@ fn handle_handshake(p_server: *mut c_void, h_steam_pipe: u32, read: &IPCBuffer) 
         return;
     }
 
-    log::debug!("[InteropIPC] Handshake from pid={}", handshake.pid());
+    let client_pid = handshake.pid();
+    log::debug!("[InteropIPC] Handshake from pid={}", client_pid);
+
+    register_pipe_pid(pipe, client_pid);
+    register_pipe_handle(pipe, h_steam_pipe);
+
+    let app_id = resolve_pid_app_id(client_pid);
+    if app_id != 0 {
+        register_pipe_app_id(pipe, app_id);
+    }
+
+    // BST-55: Register pipe handshake with DenuvoAuth state machine
+    crate::steam_bridge::denuvo_auth::on_pipe_handshake(h_steam_pipe, app_id, client_pid);
+
+    // BST-61: Evaluate and apply [[inject]] dynamic process injection rules
+    crate::steam_bridge::injection::apply_injection_rules(app_id, client_pid, true);
 }
 
 fn detect_networking_sockets(read: &IPCBuffer) {
@@ -553,8 +717,54 @@ struct IPCBuffer {
 
 impl IPCBuffer {
     fn from_raw(ptr: *mut c_void) -> Self {
-        let size = if ptr.is_null() { 0 } else { 4096 };
-        Self { ptr, size }
+        if ptr.is_null() {
+            return Self {
+                ptr: std::ptr::null_mut(),
+                size: 0,
+            };
+        }
+
+        // Check if ptr points to a Valve CUtlBuffer structure
+        if memory::is_readable(ptr, std::mem::size_of::<usize>() * 3) {
+            let p_memory = unsafe { *(ptr as *const *mut u8) };
+            if !p_memory.is_null() && memory::is_readable(p_memory as *const c_void, 1) {
+                #[cfg(target_arch = "x86")]
+                let (put_offset, alloc_offset) = (16, 4);
+                #[cfg(not(target_arch = "x86"))]
+                let (put_offset, alloc_offset) = (20, 8);
+
+                let m_put = unsafe { *((ptr as usize + put_offset) as *const i32) };
+                let m_alloc = unsafe { *((ptr as usize + alloc_offset) as *const i32) };
+
+                let buf_size = if m_put > 0 && m_alloc > 0 && m_put <= m_alloc {
+                    (m_put as usize).min(65536)
+                } else if m_alloc > 0 {
+                    (m_alloc as usize).min(65536)
+                } else {
+                    0
+                };
+                if buf_size > 0 && memory::is_readable(p_memory as *const c_void, buf_size) {
+                    return Self {
+                        ptr: p_memory as *mut c_void,
+                        size: buf_size,
+                    };
+                }
+            }
+        }
+
+        // Fallback for direct buffers (e.g. unit test buffers)
+        // Bound readable size to avoid reading past mapped memory
+        let mut actual_size = 0;
+        for sz in [4096, 2048, 1024, 512, 256, 128, 64, 32, 16] {
+            if memory::is_readable(ptr, sz) {
+                actual_size = sz;
+                break;
+            }
+        }
+        Self {
+            ptr,
+            size: actual_size,
+        }
     }
 
     fn as_slice(&self) -> &[u8] {
@@ -706,14 +916,27 @@ fn get_pipe_client(p_server: *mut c_void, h_steam_pipe: u32) -> *mut c_void {
     if p_server.is_null() || h_steam_pipe == 0 {
         return std::ptr::null_mut();
     }
-    if memory::is_readable(p_server, std::mem::size_of::<usize>()) {
-        if let Ok(mut pipes) = active_pipes().lock() {
-            pipes.insert(h_steam_pipe, p_server as usize);
-        }
+    if !memory::is_readable(p_server, std::mem::size_of::<usize>()) {
+        return std::ptr::null_mut();
+    }
+    let mut pipes = match active_pipes().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(&existing) = pipes.get(&h_steam_pipe) {
+        return existing as *mut c_void;
+    }
+    // If p_server is not yet assigned to any other pipe, use it.
+    // Otherwise, assign a distinct pipe client address to maintain per-pipe isolation.
+    let client_ptr = if !pipes.values().any(|&v| v == p_server as usize) {
         p_server
     } else {
-        std::ptr::null_mut()
-    }
+        (p_server as usize).wrapping_add((h_steam_pipe as usize) * 8) as *mut c_void
+    };
+    pipes.insert(h_steam_pipe, client_ptr as usize);
+    drop(pipes);
+    register_pipe_handle(client_ptr, h_steam_pipe);
+    client_ptr
 }
 
 fn start_ipc_server() -> Result<(), String> {

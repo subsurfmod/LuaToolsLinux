@@ -8,7 +8,10 @@ use eframe::egui::{self, Align, ComboBox, Layout, Margin, RichText, ScrollArea, 
 use crate::parsers::vdf_binary::LaunchEntry;
 use crate::services::game_process_injection_service::InjectionConfig;
 use crate::services::telemetry_service::TelemetryService;
-use crate::ui::app::LuaToolsApp;
+use crate::services::update_service::UpdateService;
+use crate::ui::app::{
+    ActionModalState, LuaToolsApp, PendingConfirmAction, UiInternalMsg, UpdateOutcomeState,
+};
 use crate::ui::lua_editor::validate_lua_text;
 use crate::ui::state::{ActiveView, AppMessage, SettingsSubTab, ToastKind};
 use crate::ui::theme::{
@@ -20,8 +23,13 @@ use crate::VERSION;
 
 impl LuaToolsApp {
     pub fn render_modals(&mut self, ctx: &egui::Context) {
-        let any_modal_open = !self.settings_service.settings.telemetry_consent_seen
-            || self.telemetry_modal_open
+        let show_first_run = (!self.settings_service.settings.telemetry_consent_seen
+            && !self.started_hidden_or_silent)
+            || self.telemetry_modal_open;
+        let any_modal_open = show_first_run
+            || self.confirm_modal.open
+            || self.updater_feed.modal_open
+            || self.action_modal.open
             || self.add_appid_modal.open
             || self.game_detail_modal.open
             || self.integration_modal.open
@@ -46,7 +54,16 @@ impl LuaToolsApp {
 
         let esc_pressed = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         if esc_pressed && any_modal_open {
-            if self.guide_zoom_screenshot.is_some() {
+            if self.confirm_modal.open {
+                self.confirm_modal.open = false;
+                self.confirm_modal.action = None;
+            } else if self.action_modal.open
+                && self.action_modal.state != ActionModalState::Running
+            {
+                self.action_modal.open = false;
+            } else if self.updater_feed.modal_open {
+                self.updater_feed.modal_open = false;
+            } else if self.guide_zoom_screenshot.is_some() {
                 self.guide_zoom_screenshot = None;
             } else if self.text_prompt_modal.open {
                 self.text_prompt_modal.open = false;
@@ -60,10 +77,19 @@ impl LuaToolsApp {
                 self.game_detail_modal.open = false;
             } else if self.launch_options_modal.open {
                 self.launch_options_modal.open = false;
+                self.launch_options_rebased_app = None;
             } else if self.integration_modal.open {
                 self.integration_modal.open = false;
             } else if self.overwrite_diff_modal.open {
+                if self.overwrite_diff_modal.cleanup_parent {
+                    if let Some(ref pkg) = self.overwrite_diff_modal.pending_package_path {
+                        if let Some(dir) = pkg.parent() {
+                            let _ = std::fs::remove_dir_all(dir);
+                        }
+                    }
+                }
                 self.overwrite_diff_modal.open = false;
+                self.advance_overwrite_diff_queue();
             } else if self.telemetry_modal_open
                 && self.settings_service.settings.telemetry_consent_seen
             {
@@ -81,11 +107,339 @@ impl LuaToolsApp {
         self.render_text_prompt_modal(ctx);
         self.render_about_modal(ctx);
         self.render_guide_zoom_modal(ctx);
+        self.render_confirm_action_modal(ctx);
+        self.render_update_progress_modal(ctx);
+        self.render_action_progress_modal(ctx);
+    }
+
+    fn render_update_progress_modal(&mut self, ctx: &egui::Context) {
+        if !self.updater_feed.modal_open {
+            return;
+        }
+        let mut do_close = false;
+        let mut do_retry = false;
+        let mut do_relaunch: Option<std::path::PathBuf> = None;
+
+        let is_running = self.updater_feed.is_running();
+        let (badge_txt, badge_tone) = match &self.updater_feed.outcome {
+            UpdateOutcomeState::Running => ("Compiling…", BadgeTone::Blue),
+            UpdateOutcomeState::Succeeded { .. } => ("Ready to Restart", BadgeTone::Ready),
+            UpdateOutcomeState::Failed { .. } => ("Build Failed", BadgeTone::Danger),
+            UpdateOutcomeState::Idle => ("Idle", BadgeTone::Muted),
+        };
+        let exe_to_relaunch = match &self.updater_feed.outcome {
+            UpdateOutcomeState::Succeeded { exe_path, .. } => Some(exe_path.clone()),
+            _ => None,
+        };
+        let is_failed = matches!(self.updater_feed.outcome, UpdateOutcomeState::Failed { .. });
+
+        egui::Window::new("LuaTools Self-Updater (Live Compiler Feed)")
+            .order(egui::Order::Foreground)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([680.0, 415.0])
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::Sides::new().show(
+                    ui,
+                    |ui| {
+                        ui.label(
+                            RichText::new("Git Pull & Native Rust Release Build")
+                                .font(display_font(17.5))
+                                .color(Palette::TEXT_PRIMARY),
+                        );
+                    },
+                    |ui| {
+                        status_badge(ui, badge_txt, badge_tone);
+                    },
+                );
+                ui.add_space(6.0);
+
+                self.render_updater_progress_panel(ui, ctx, "updater_modal_feed_scroll", 220.0);
+
+                ui.add_space(12.0);
+                egui::Sides::new().show(
+                    ui,
+                    |ui| {
+                        if is_running {
+                            ui.label(
+                                RichText::new(
+                                    "You can hide this window and re-open it anytime via the top-right % badge.",
+                                )
+                                .size(11.5)
+                                .color(Palette::TEXT_MUTED),
+                            );
+                        }
+                    },
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        if is_running {
+                            if ghost_button(ui, "Hide to Background").clicked() {
+                                do_close = true;
+                            }
+                        } else {
+                            if ghost_button(ui, "Close").clicked() {
+                                do_close = true;
+                            }
+                            if let Some(ref exe) = exe_to_relaunch {
+                                if primary_button(ui, "↻ Restart to Apply").clicked() {
+                                    do_relaunch = Some(exe.clone());
+                                }
+                            } else if is_failed && primary_button(ui, "Retry Update").clicked() {
+                                do_retry = true;
+                            }
+                        }
+                    },
+                );
+            });
+
+        if do_close {
+            self.updater_feed.modal_open = false;
+        }
+        if do_retry {
+            self.trigger_git_self_update(ctx);
+        }
+        if let Some(exe) = do_relaunch {
+            self.notify("Relaunching updated LuaTools…", ToastKind::Info);
+            match UpdateService::relaunch_binary(&exe) {
+                Ok(()) => self.request_quit(ctx),
+                Err(e) => self.notify(e, ToastKind::Warning),
+            }
+        }
+    }
+
+    fn render_action_progress_modal(&mut self, ctx: &egui::Context) {
+        if !self.action_modal.open {
+            return;
+        }
+        let state = self.action_modal.state;
+        let is_running = state == ActionModalState::Running;
+        if is_running {
+            ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        }
+
+        let title = if self.action_modal.title.is_empty() {
+            "Working…".to_string()
+        } else {
+            self.action_modal.title.clone()
+        };
+        let status = self.action_modal.status.clone();
+        let elapsed = self.action_modal.elapsed_mm_ss();
+        let progress_opt = self.action_modal.progress;
+        let lines: Vec<String> = self.action_modal.detail_lines.iter().cloned().collect();
+        let mut do_close = false;
+
+        egui::Window::new(title)
+            .id(egui::Id::new("unified_action_progress_modal"))
+            .order(egui::Order::Foreground)
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size([510.0, 255.0])
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::Sides::new().show(
+                    ui,
+                    |ui| {
+                        let status_col = match state {
+                            ActionModalState::Succeeded => Palette::GO_TEXT,
+                            ActionModalState::Failed => Palette::DANGER_TEXT,
+                            _ => Palette::TEXT_PRIMARY,
+                        };
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&status)
+                                    .font(semibold_font(13.0))
+                                    .color(status_col),
+                            )
+                            .wrap_mode(egui::TextWrapMode::Wrap),
+                        );
+                    },
+                    |ui| match state {
+                        ActionModalState::Running => {
+                            status_badge(ui, &format!("Running · {}", elapsed), BadgeTone::Blue);
+                        }
+                        ActionModalState::Succeeded => {
+                            status_badge(ui, &format!("Done · {}", elapsed), BadgeTone::Ready);
+                        }
+                        ActionModalState::Failed => {
+                            status_badge(ui, &format!("Failed · {}", elapsed), BadgeTone::Danger);
+                        }
+                        ActionModalState::Idle => {}
+                    },
+                );
+
+                ui.add_space(8.0);
+                if is_running {
+                    if let Some(p) = progress_opt {
+                        ui.add(
+                            egui::ProgressBar::new(p.clamp(0.0, 1.0))
+                                .show_percentage()
+                                .animate(true)
+                                .corner_radius(egui::CornerRadius::same(3)),
+                        );
+                    } else {
+                        let t = ctx.input(|i| i.time) as f32;
+                        let pulse = 0.25 + 0.55 * ((t * 1.4).sin() * 0.5 + 0.5);
+                        ui.add(
+                            egui::ProgressBar::new(pulse)
+                                .text("Working…")
+                                .animate(true)
+                                .corner_radius(egui::CornerRadius::same(3)),
+                        );
+                    }
+                } else if state == ActionModalState::Succeeded {
+                    ui.add(
+                        egui::ProgressBar::new(1.0)
+                            .text("100% — Complete")
+                            .corner_radius(egui::CornerRadius::same(3)),
+                    );
+                }
+
+                ui.add_space(8.0);
+                inset_paper_sheet(ui, Margin::same(8), |ui| {
+                    ui.set_width(ui.available_width());
+                    ScrollArea::vertical()
+                        .id_salt("action_progress_modal_log_scroll")
+                        .stick_to_bottom(true)
+                        .max_height(92.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            for ln in &lines {
+                                let col = if ln.starts_with("Failed:") {
+                                    Palette::DANGER_TEXT
+                                } else if ln.starts_with("Done:") {
+                                    Palette::GO_TEXT
+                                } else {
+                                    Palette::TEXT_SECONDARY
+                                };
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(ln)
+                                            .font(egui::FontId::new(
+                                                11.5,
+                                                egui::FontFamily::Monospace,
+                                            ))
+                                            .color(col),
+                                    )
+                                    .wrap_mode(egui::TextWrapMode::Wrap),
+                                );
+                            }
+                        });
+                });
+
+                ui.add_space(10.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if is_running {
+                        if ghost_button(ui, "Hide").clicked() {
+                            do_close = true;
+                        }
+                    } else if primary_button(ui, "Close").clicked() {
+                        do_close = true;
+                    }
+                });
+            });
+
+        if do_close {
+            self.action_modal.open = false;
+        }
+    }
+
+    fn render_confirm_action_modal(&mut self, ctx: &egui::Context) {
+        if !self.confirm_modal.open {
+            return;
+        }
+        let title = self.confirm_modal.title.clone();
+        let message = self.confirm_modal.message.clone();
+        let confirm_label = if self.confirm_modal.confirm_label.is_empty() {
+            "Confirm".to_string()
+        } else {
+            self.confirm_modal.confirm_label.clone()
+        };
+        let is_danger = self.confirm_modal.is_danger;
+        let mut do_confirm = false;
+        let mut do_cancel = false;
+
+        egui::Window::new(title)
+            .order(egui::Order::Foreground)
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size([460.0, 175.0])
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(message)
+                        .size(13.0)
+                        .color(Palette::TEXT_SECONDARY),
+                );
+                ui.add_space(16.0);
+                egui::Sides::new().show(
+                    ui,
+                    |ui| {
+                        if ghost_button(ui, "Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    },
+                    |ui| {
+                        let clicked = if is_danger {
+                            danger_button(ui, &confirm_label).clicked()
+                        } else {
+                            primary_button(ui, &confirm_label).clicked()
+                        };
+                        if clicked {
+                            do_confirm = true;
+                        }
+                    },
+                );
+            });
+
+        if do_confirm {
+            let action = self.confirm_modal.action.take();
+            self.confirm_modal.open = false;
+            if let Some(act) = action {
+                match act {
+                    PendingConfirmAction::KillSteam => {
+                        self.trigger_kill_steam(ctx);
+                    }
+                    PendingConfirmAction::RestartSteam => {
+                        self.trigger_restart_steam(ctx);
+                    }
+                    PendingConfirmAction::LaunchSteamWithBridge => {
+                        self.launch_steam_with_bridge(ctx);
+                    }
+                    PendingConfirmAction::RevertFix {
+                        app_id,
+                        fix_id,
+                        dir,
+                    } => {
+                        self.execute_revert_fix_async(app_id, fix_id, dir, ctx);
+                    }
+                    PendingConfirmAction::ReconcilePicsDrift { drifted_count } => {
+                        self.start_action_modal(
+                            "pics",
+                            "Rebase Steam Launch Options",
+                            format!(
+                                "Reconciling Steam PICS update for {} modified app(s)…",
+                                drifted_count
+                            ),
+                            None,
+                        );
+                        self.trigger_reconcile_pics_drift_async(ctx);
+                    }
+                }
+            }
+        } else if do_cancel {
+            self.confirm_modal.open = false;
+            self.confirm_modal.action = None;
+        }
     }
 
     fn render_telemetry_consent_modal(&mut self, ctx: &egui::Context) {
-        let should_show =
-            !self.settings_service.settings.telemetry_consent_seen || self.telemetry_modal_open;
+        // LT-09: Skip First-Run Quick Setup automatically on --minimized / --silent launches
+        let should_show = (!self.settings_service.settings.telemetry_consent_seen
+            && !self.started_hidden_or_silent)
+            || self.telemetry_modal_open;
         if !should_show {
             return;
         }
@@ -93,13 +447,15 @@ impl LuaToolsApp {
         let mut act_keep_enabled = false;
         let mut act_turn_off = false;
         let mut act_open_settings = false;
+        let sls_installed = self.wired_service.is_slssteam_installed();
+        let steam_running = crate::services::steam_service::SteamService::is_steam_running();
 
-        egui::Window::new("Telemetry & Diagnostic Privacy Notice")
+        egui::Window::new("First-Run Quick Setup & Privacy Notice")
             .order(egui::Order::Foreground)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .fixed_size([560.0, 355.0])
+            .fixed_size([580.0, 445.0])
             .show(ctx, |ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
@@ -108,13 +464,13 @@ impl LuaToolsApp {
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 3.0;
                         ui.label(
-                            RichText::new("Help Improve LuaTools Linux")
+                            RichText::new("Welcome to LuaTools Linux")
                                 .font(display_font(19.0))
                                 .color(Palette::TEXT_PRIMARY),
                         );
                         ui.label(
                             RichText::new(
-                                "LuaTools can record lightweight, scrubbed diagnostic telemetry to help diagnose bugs and crashes.",
+                                "Review diagnostic telemetry and choose your First-Run Quick Setup steps.",
                             )
                             .size(12.5)
                             .color(Palette::TEXT_SECONDARY),
@@ -123,22 +479,21 @@ impl LuaToolsApp {
                 });
 
                 ui.add_space(10.0);
-                inset_paper_sheet(ui, Margin::symmetric(14, 12), |ui| {
+                inset_paper_sheet(ui, Margin::symmetric(14, 10), |ui| {
                     ui.set_width(ui.available_width());
-                    ui.spacing_mut().item_spacing.y = 6.0;
+                    ui.spacing_mut().item_spacing.y = 5.0;
                     ui.label(
-                        RichText::new("• Collected when enabled:")
+                        RichText::new("• Diagnostic telemetry (when enabled):")
                             .font(semibold_font(12.5))
                             .color(Palette::BLUE_LIGHT),
                     );
                     ui.label(
                         RichText::new(
-                            "  App version, Linux distro & display server (Wayland/X11), scrubbed error codes (DepotDownloader, manifest, fix, or update failures), and panic file:line locations.",
+                            "  App version, Linux distro & display server (Wayland/X11), scrubbed error codes, and panic file:line locations.",
                         )
-                        .size(12.0)
+                        .size(11.5)
                         .color(Palette::TEXT_SECONDARY),
                     );
-                    ui.add_space(2.0);
                     ui.label(
                         RichText::new("• Strictly never collected:")
                             .font(semibold_font(12.5))
@@ -146,28 +501,69 @@ impl LuaToolsApp {
                     );
                     ui.label(
                         RichText::new(
-                            "  Steam usernames/passwords, Discord tokens, Hubcap API keys, 64-char depot decryption keys, emails, or personal home directory usernames (automatically scrubbed to '~').",
+                            "  Steam credentials, Discord tokens, Hubcap API keys, 64-char depot decryption keys, emails, or home usernames.",
                         )
-                        .size(12.0)
+                        .size(11.5)
                         .color(Palette::TEXT_SECONDARY),
                     );
                 });
 
                 ui.add_space(8.0);
-                ui.checkbox(
-                    &mut self.first_run_quick_setup,
-                    "Run Guided First-Time Setup (Register URI, Stage Store Plugin & Init SLSsteam)",
-                );
-                ui.add_space(4.0);
+                inset_paper_sheet(ui, Margin::symmetric(14, 10), |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 5.0;
+                    egui::Sides::new().show(
+                        ui,
+                        |ui| {
+                            ui.checkbox(
+                                &mut self.first_run_quick_setup,
+                                "Run Guided First-Time Setup (URI links, Store Plugin & SLSsteam)",
+                            );
+                        },
+                        |ui| {
+                            if sls_installed {
+                                status_badge(ui, "SLSsteam Ready", BadgeTone::Ready);
+                            } else {
+                                status_badge(ui, "SLSsteam Missing", BadgeTone::Warn);
+                            }
+                        },
+                    );
+                    ui.add_enabled_ui(self.first_run_quick_setup, |ui| {
+                        ui.indent("quick_setup_steps", |ui| {
+                            ui.checkbox(
+                                &mut self.first_run_install_slssteam,
+                                if sls_installed {
+                                    "Verify Steam Unlocker & download full LTSP Steam Store Plugin"
+                                } else {
+                                    "Install Steam Unlocker & download full LTSP Steam Store Plugin"
+                                },
+                            );
+                            ui.checkbox(
+                                &mut self.first_run_enable_fast_fetch,
+                                "Enable FastFetch (automatically pick fastest available manifest source)",
+                            );
+                            ui.checkbox(
+                                &mut self.first_run_restart_steam,
+                                if steam_running {
+                                    "Restart Steam after setup so SLSsteam & Store Plugin take effect"
+                                } else {
+                                    "Launch Steam via SLSsteam after setup"
+                                },
+                            );
+                        });
+                    });
+                });
+
+                ui.add_space(6.0);
                 ui.label(
                     RichText::new(
-                        "You can inspect every recorded event, clear stored logs, or turn telemetry off at any time in Settings › Telemetry & Logs.",
+                        "You can inspect every recorded event, clear stored logs, or change these options anytime in Settings.",
                     )
-                    .size(12.0)
+                    .size(11.5)
                     .color(Palette::TEXT_MUTED),
                 );
 
-                ui.add_space(14.0);
+                ui.add_space(12.0);
                 egui::Sides::new().show(
                     ui,
                     |ui| {
@@ -177,7 +573,7 @@ impl LuaToolsApp {
                     },
                     |ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
-                        if primary_button(ui, "Keep Enabled").clicked() {
+                        if primary_button(ui, "Keep Enabled & Continue").clicked() {
                             act_keep_enabled = true;
                         }
                         if ghost_button(ui, "Telemetry Settings ›").clicked() {
@@ -189,14 +585,55 @@ impl LuaToolsApp {
 
         if (act_turn_off || act_keep_enabled || act_open_settings) && self.first_run_quick_setup {
             let _ = crate::services::protocol_service::ProtocolService::register_desktop_handler();
-            let steam_root = self
+            self.settings_service.settings.fast_fetch = self.first_run_enable_fast_fetch;
+            let _ = self.slssteam_service.save();
+
+            let steam_root_owned = self
                 .steam_service
                 .installation
                 .as_ref()
-                .map(|i| i.root.as_path());
-            let plugin_svc = crate::services::plugin_installer_service::PluginInstallerService::new(None);
-            let _ = plugin_svc.ensure_luatools_js_installed(steam_root);
-            let _ = self.slssteam_service.save();
+                .map(|i| i.root.clone());
+            if self.first_run_install_slssteam {
+                if !sls_installed {
+                    self.trigger_wired_action("steam_unlocker", ctx);
+                }
+                let ui_tx = self.ui_tx.clone();
+                let ctx_c = ctx.clone();
+                thread::spawn(move || {
+                    let plugin_svc =
+                        crate::services::plugin_installer_service::PluginInstallerService::new(
+                            None,
+                        );
+                    let res = plugin_svc.download_and_install_ltsp(steam_root_owned.as_deref());
+                    let (ok, msg) = match res {
+                        Ok(p) => (
+                            true,
+                            format!("Quick Setup: Installed LTSP Store Plugin to {}", p.display()),
+                        ),
+                        Err(e) => {
+                            let _ = plugin_svc
+                                .ensure_luatools_js_installed(steam_root_owned.as_deref());
+                            (
+                                false,
+                                format!(
+                                    "Quick Setup: LTSP download fallback used ({})",
+                                    e
+                                ),
+                            )
+                        }
+                    };
+                    let _ = ui_tx.send(UiInternalMsg::FirstRunLtspFinished { ok, msg });
+                    ctx_c.request_repaint();
+                });
+            } else {
+                let plugin_svc =
+                    crate::services::plugin_installer_service::PluginInstallerService::new(None);
+                let _ = plugin_svc.ensure_luatools_js_installed(steam_root_owned.as_deref());
+            }
+
+            if self.first_run_restart_steam {
+                self.trigger_restart_steam(ctx);
+            }
         }
 
         if act_turn_off {
@@ -262,10 +699,17 @@ impl LuaToolsApp {
             app_id,
         );
 
-        egui::Window::new(format!(
-            "Confirm Overwrite — {} ({}.lua)",
-            gname, app_id
-        ))
+        let queued_remaining = self.pending_overwrite_diffs.len();
+        let win_title = if queued_remaining > 0 {
+            format!(
+                "Confirm Overwrite — {} ({}.lua)  [+{} more queued]",
+                gname, app_id, queued_remaining
+            )
+        } else {
+            format!("Confirm Overwrite — {} ({}.lua)", gname, app_id)
+        };
+
+        egui::Window::new(win_title)
         .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(true)
@@ -475,6 +919,7 @@ impl LuaToolsApp {
                 }
             }
             self.overwrite_diff_modal.open = false;
+            self.advance_overwrite_diff_queue();
         } else if do_cancel {
             if self.overwrite_diff_modal.cleanup_parent {
                 if let Some(ref pkg) = self.overwrite_diff_modal.pending_package_path {
@@ -483,7 +928,9 @@ impl LuaToolsApp {
                     }
                 }
             }
+            self.notify(format!("Skipped overwriting {}.lua.", app_id), ToastKind::Info);
             self.overwrite_diff_modal.open = false;
+            self.advance_overwrite_diff_queue();
         }
     }
 
@@ -676,11 +1123,15 @@ impl LuaToolsApp {
                             .clicked()
                         {
                             self.game_detail_modal.fake_id_input = "480".into();
+                            self.game_detail_modal.feedback =
+                                "Set FakeAppId to 480 — click Save .lua & Overrides to apply.".into();
                         }
                         if !self.game_detail_modal.fake_id_input.trim().is_empty()
                             && ghost_button(ui, "Clear").clicked()
                         {
                             self.game_detail_modal.fake_id_input.clear();
+                            self.game_detail_modal.feedback =
+                                "Cleared FakeAppId — click Save .lua & Overrides to apply.".into();
                         }
                     });
                     ui.end_row();
@@ -905,7 +1356,23 @@ impl LuaToolsApp {
 
     fn render_launch_options_modal(&mut self, ctx: &egui::Context) {
         if !self.launch_options_modal.open {
+            self.launch_options_rebased_app = None;
             return;
+        }
+        let app_id = self.launch_options_modal.app_id;
+        // LT-58: Run modal-open 3-way PICS baseline rebase once per modal open
+        if self.launch_options_rebased_app != Some(app_id) {
+            self.launch_options_rebased_app = Some(app_id);
+            if let Some(root) = self.steam_service.installation.as_ref().map(|i| i.root.clone()) {
+                let mut store = crate::services::launch_mod_store::LaunchModStore::new(None);
+                let (rebased_entries, was_rebased) = store.rebase_on_modal_open(&root, app_id);
+                if was_rebased && !rebased_entries.is_empty() {
+                    self.launch_options_modal.selected_idx = Some(0);
+                    self.launch_options_modal.entries = rebased_entries;
+                    self.launch_options_modal.feedback =
+                        "Rebased saved launch edits onto latest Steam PICS appinfo.vdf.".into();
+                }
+            }
         }
         let mut close = false;
         let mut do_save = false;
@@ -913,7 +1380,6 @@ impl LuaToolsApp {
 
         let steam_running = self.launch_options_modal.steam_running;
         let is_busy = self.launch_options_modal.busy;
-        let app_id = self.launch_options_modal.app_id;
         egui::Window::new(format!(
             "Launch Options — {} (#{})",
             self.launch_options_modal.game_name, app_id
@@ -966,6 +1432,8 @@ impl LuaToolsApp {
                             }
                         }
                     });
+                let mut added_entry_idx: Option<usize> = None;
+                let mut removed_entry_idx: Option<usize> = None;
                 cols[0].horizontal(|ui| {
                     if secondary_button(ui, "+ Add").clicked() {
                         let next = self.launch_options_modal.entries.len();
@@ -975,6 +1443,7 @@ impl LuaToolsApp {
                             ..Default::default()
                         });
                         self.launch_options_modal.selected_idx = Some(next);
+                        added_entry_idx = Some(next);
                     }
                     if let Some(sel) = self.launch_options_modal.selected_idx {
                         if sel < self.launch_options_modal.entries.len()
@@ -987,9 +1456,21 @@ impl LuaToolsApp {
                             let len = self.launch_options_modal.entries.len();
                             self.launch_options_modal.selected_idx =
                                 (len > 0).then(|| sel.min(len - 1));
+                            removed_entry_idx = Some(sel);
                         }
                     }
                 });
+                if let Some(idx) = added_entry_idx {
+                    self.launch_options_modal.feedback = format!(
+                        "Added launch entry [{}] — edit fields and click Save Launch Options.",
+                        idx
+                    );
+                } else if let Some(sel) = removed_entry_idx {
+                    self.launch_options_modal.feedback = format!(
+                        "Removed launch entry [{}] — click Save Launch Options to write.",
+                        sel
+                    );
+                }
 
                 if let Some(sel) = self.launch_options_modal.selected_idx {
                     if let Some(entry) = self.launch_options_modal.entries.get_mut(sel) {
@@ -1015,11 +1496,47 @@ impl LuaToolsApp {
                                         .hint_text("windows / linux"),
                                 );
                                 ui.end_row();
+                                ui.label("Beta Key:");
+                                let mut beta_buf = entry.beta_key.clone().unwrap_or_default();
+                                if ui
+                                    .add(
+                                        TextEdit::singleline(&mut beta_buf)
+                                            .hint_text("Optional BetaKey"),
+                                    )
+                                    .changed()
+                                {
+                                    let t = beta_buf.trim();
+                                    entry.beta_key = (!t.is_empty()).then(|| t.to_string());
+                                }
+                                ui.end_row();
+                                ui.label("Owns DLC:");
+                                let mut dlc_buf = entry.owns_dlc.clone().unwrap_or_default();
+                                if ui
+                                    .add(
+                                        TextEdit::singleline(&mut dlc_buf)
+                                            .hint_text("Optional ownsdlc AppID"),
+                                    )
+                                    .changed()
+                                {
+                                    let t = dlc_buf.trim();
+                                    entry.owns_dlc = (!t.is_empty()).then(|| t.to_string());
+                                }
+                                ui.end_row();
                             });
                     }
                 }
             });
 
+            if is_busy {
+                ctx.request_repaint_after(std::time::Duration::from_millis(120));
+                ui.add_space(6.0);
+                ui.add(
+                    egui::ProgressBar::new(0.55)
+                        .text("Updating Steam appinfo.vdf…")
+                        .animate(true)
+                        .corner_radius(egui::CornerRadius::same(3)),
+                );
+            }
             if !self.launch_options_modal.feedback.is_empty() {
                 ui.label(
                     RichText::new(&self.launch_options_modal.feedback)
@@ -1062,6 +1579,7 @@ impl LuaToolsApp {
                 self.launch_options_modal.busy = true;
                 self.launch_options_modal.feedback =
                     "Updating Steam launch options in background…".into();
+                self.notify("Updating Steam launch options…", ToastKind::Info);
                 let entries = self.launch_options_modal.entries.clone();
                 let tx = self.msg_tx.clone();
                 let ctx_c = ctx.clone();
@@ -1105,6 +1623,7 @@ impl LuaToolsApp {
                 self.launch_options_modal.busy = true;
                 self.launch_options_modal.feedback =
                     "Restoring backup launch options in background…".into();
+                self.notify("Restoring backup Steam launch options…", ToastKind::Info);
                 let tx = self.msg_tx.clone();
                 let ctx_c = ctx.clone();
                 thread::spawn(move || {
@@ -1142,6 +1661,7 @@ impl LuaToolsApp {
         }
         if close {
             self.launch_options_modal.open = false;
+            self.launch_options_rebased_app = None;
         }
     }
 
@@ -1329,6 +1849,12 @@ impl LuaToolsApp {
                         let auth = self.auth_service.clone();
                         let tx = self.msg_tx.clone();
                         let ctx_c = ctx.clone();
+                        self.start_action_modal(
+                            "auth",
+                            "Discord Bot Code Sign-In",
+                            "Redeeming 6-character Discord bot code…",
+                            None,
+                        );
                         self.notify("Redeeming 6-char Discord bot code…", ToastKind::Info);
                         thread::spawn(move || {
                             match auth.sign_in_with_code(&val) {
@@ -1517,6 +2043,8 @@ impl LuaToolsApp {
         let mut launch_proc = false;
         let mut run_steamless = false;
         let mut clean_legacy = false;
+        let mut open_folder_path: Option<std::path::PathBuf> = None;
+        let mut browse_so_started = false;
 
         let screen_h = ctx.screen_rect().height();
         let modal_h = (screen_h - 104.0).clamp(400.0, 585.0);
@@ -1580,7 +2108,7 @@ impl LuaToolsApp {
                             .on_hover_text("Open the local game installation folder in your file manager")
                             .clicked()
                         {
-                            let _ = std::process::Command::new("xdg-open").arg(p).spawn();
+                            open_folder_path = Some(p.clone());
                         }
                     }
                 });
@@ -1760,53 +2288,98 @@ impl LuaToolsApp {
                         });
                     });
 
-                    // 3. Steam Stat Overrides
+                    // 3. Steam Stat Overrides (LNX-10: clearly gated as bridge-only experimental)
                     inset_paper_sheet(ui, Margin::same(12), |ui| {
                         ui.set_width(ui.available_width());
-                        ui.label(
-                            RichText::new("3. Steam Stat / Achievement Overrides")
-                                .font(semibold_font(13.5))
-                                .color(Palette::TEXT_PRIMARY),
-                        );
-                        ui.horizontal(|ui| {
-                            ui.label("Stat:");
-                            ui.add_sized(
-                                [165.0, 28.0],
-                                TextEdit::singleline(&mut self.integration_modal.stat_name_input)
-                                    .hint_text("stat_name"),
-                            );
-                            ui.label("Value:");
-                            ui.add_sized(
-                                [165.0, 28.0],
-                                TextEdit::singleline(&mut self.integration_modal.stat_value_input)
-                                    .hint_text("value"),
-                            );
-                            if secondary_button(ui, "Set Stat").clicked() {
-                                set_stat = true;
-                            }
-                        });
-                        for (k, v) in &cur_stats {
-                            ui.horizontal(|ui| {
+                        egui::Sides::new().show(
+                            ui,
+                            |ui| {
                                 ui.label(
-                                    RichText::new(format!("- {} = {}", k, v))
-                                        .size(12.0)
-                                        .color(Palette::TEXT_SECONDARY),
+                                    RichText::new("3. Steam Stat / Achievement Overrides")
+                                        .font(semibold_font(13.5))
+                                        .color(Palette::TEXT_PRIMARY),
                                 );
-                                if ghost_button(ui, "Remove").clicked() {
-                                    rem_stat = Some(k.clone());
+                            },
+                            |ui| {
+                                status_badge(ui, "Experimental · Bridge Only", BadgeTone::Warn);
+                            },
+                        );
+                        ui.label(
+                            RichText::new(
+                                "Note: Stat overrides are stored for the experimental 64-bit bridge IPC store and are NOT read by 32-bit SLSsteam.so.",
+                            )
+                            .size(11.5)
+                            .color(Palette::WARN_TEXT),
+                        );
+                        ui.checkbox(
+                            &mut self.show_experimental_stat_overrides,
+                            "Enable experimental bridge stat override controls",
+                        );
+                        if self.show_experimental_stat_overrides {
+                            ui.horizontal(|ui| {
+                                ui.label("Stat:");
+                                ui.add_sized(
+                                    [165.0, 28.0],
+                                    TextEdit::singleline(&mut self.integration_modal.stat_name_input)
+                                        .hint_text("stat_name"),
+                                );
+                                ui.label("Value:");
+                                ui.add_sized(
+                                    [165.0, 28.0],
+                                    TextEdit::singleline(&mut self.integration_modal.stat_value_input)
+                                        .hint_text("value"),
+                                );
+                                if secondary_button(ui, "Set Stat").clicked() {
+                                    set_stat = true;
                                 }
                             });
+                            for (k, v) in &cur_stats {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!("- {} = {}", k, v))
+                                            .size(12.0)
+                                            .color(Palette::TEXT_SECONDARY),
+                                    );
+                                    if ghost_button(ui, "Remove").clicked() {
+                                        rem_stat = Some(k.clone());
+                                    }
+                                });
+                            }
                         }
                     });
 
-                    // 4. Game Process LD_PRELOAD Integration
+                    // 4. Game Process LD_PRELOAD Integration (LNX-10: verify actual .so presence on disk)
                     inset_paper_sheet(ui, Margin::same(12), |ui| {
                         ui.set_width(ui.available_width());
-                        ui.label(
-                            RichText::new("4. Game Process Integration (LD_PRELOAD)")
-                                .font(semibold_font(13.5))
-                                .color(Palette::TEXT_PRIMARY),
+                        let lib_trimmed = self.integration_modal.proc_lib_input.trim();
+                        let lib_exists = !lib_trimmed.is_empty()
+                            && std::path::Path::new(lib_trimmed).is_file();
+                        egui::Sides::new().show(
+                            ui,
+                            |ui| {
+                                ui.label(
+                                    RichText::new("4. Game Process Integration (LD_PRELOAD)")
+                                        .font(semibold_font(13.5))
+                                        .color(Palette::TEXT_PRIMARY),
+                                );
+                            },
+                            |ui| {
+                                if lib_exists {
+                                    status_badge(ui, "Library Found", BadgeTone::Ready);
+                                } else {
+                                    status_badge(ui, "Library Not Built / Missing", BadgeTone::Warn);
+                                }
+                            },
                         );
+                        if !lib_exists {
+                            ui.label(
+                                RichText::new(
+                                    "No compiled shared library (.so) was found at the path below (libgame_integration.so is not built by default). Point to an existing .so library before launching with LD_PRELOAD.",
+                                )
+                                .size(11.5)
+                                .color(Palette::WARN_TEXT),
+                            );
+                        }
                         ui.checkbox(
                             &mut self.integration_modal.proc_enabled,
                             "Enable per-app LD_PRELOAD shared library integration",
@@ -1820,6 +2393,7 @@ impl LuaToolsApp {
                                     .hint_text("~/.local/lib/luatools/libsteam_integration.so"),
                             );
                             if secondary_button(ui, "Browse…").clicked() {
+                                browse_so_started = true;
                                 let tx = self.msg_tx.clone();
                                 let ctx_c = ctx.clone();
                                 thread::spawn(move || {
@@ -1849,10 +2423,17 @@ impl LuaToolsApp {
                             if secondary_button(ui, "Save Process Config").clicked() {
                                 save_proc = true;
                             }
-                            if primary_button(ui, "Launch with Integration").clicked() {
-                                save_proc = true;
-                                launch_proc = true;
-                            }
+                            ui.add_enabled_ui(lib_exists, |ui| {
+                                if primary_button(ui, "Launch with Integration")
+                                    .on_disabled_hover_text(
+                                        "Shared library (.so) does not exist at the specified path",
+                                    )
+                                    .clicked()
+                                {
+                                    save_proc = true;
+                                    launch_proc = true;
+                                }
+                            });
                         });
                     });
                 });
@@ -1874,6 +2455,18 @@ impl LuaToolsApp {
             });
         });
 
+        if let Some(p) = open_folder_path {
+            match std::process::Command::new("xdg-open").arg(&p).spawn() {
+                Ok(_) => self.notify(format!("Opened folder {}", p.display()), ToastKind::Info),
+                Err(e) => self.notify(
+                    format!("Failed to open folder {}: {}", p.display(), e),
+                    ToastKind::Warning,
+                ),
+            }
+        }
+        if browse_so_started {
+            self.notify("Opened file picker for shared library (.so)…", ToastKind::Info);
+        }
         if let Some(enable) = toggle_redirect {
             if enable {
                 self.steam_bridge_service.add_redirect_app(app_id);
@@ -1882,6 +2475,7 @@ impl LuaToolsApp {
                     .enable_for_app(app_id, &mut self.slssteam_service);
                 self.integration_modal.feedback =
                     format!("Added AppID {} to play-unowned redirect set.", app_id);
+                self.notify(self.integration_modal.feedback.clone(), ToastKind::Success);
             } else {
                 self.steam_bridge_service.remove_redirect_app(app_id);
                 let _ = self
@@ -1889,6 +2483,7 @@ impl LuaToolsApp {
                     .disable_for_app(app_id, &mut self.slssteam_service);
                 self.integration_modal.feedback =
                     format!("Removed AppID {} from redirect set.", app_id);
+                self.notify(self.integration_modal.feedback.clone(), ToastKind::Info);
             }
             self.refresh_all_local_state();
         }
@@ -1901,10 +2496,12 @@ impl LuaToolsApp {
                     self.refresh_all_local_state();
                     self.integration_modal.feedback =
                         format!("Set AppID redirect {} → {}.", app_id, sid);
+                    self.notify(self.integration_modal.feedback.clone(), ToastKind::Success);
                 }
                 _ => {
                     self.integration_modal.feedback =
                         "Enter a valid positive numeric spoof AppID.".into();
+                    self.notify(self.integration_modal.feedback.clone(), ToastKind::Warning);
                 }
             }
         }
@@ -1914,6 +2511,7 @@ impl LuaToolsApp {
             let _ = self.slssteam_service.save();
             self.refresh_all_local_state();
             self.integration_modal.feedback = format!("Removed AppID redirect for {}.", app_id);
+            self.notify(self.integration_modal.feedback.clone(), ToastKind::Info);
         }
         if set_cdkey {
             let k = self.integration_modal.cd_key_input.trim().to_string();
@@ -1923,8 +2521,10 @@ impl LuaToolsApp {
                 let _ = self.slssteam_service.save();
                 self.integration_modal.feedback =
                     "Saved legacy CD key (Bridge + SLSsteam config.yaml).".into();
+                self.notify(self.integration_modal.feedback.clone(), ToastKind::Success);
             } else {
                 self.integration_modal.feedback = "Enter a CD key before saving.".into();
+                self.notify(self.integration_modal.feedback.clone(), ToastKind::Warning);
             }
         }
         if rem_cdkey {
@@ -1933,6 +2533,7 @@ impl LuaToolsApp {
             let _ = self.slssteam_service.save();
             self.integration_modal.cd_key_input.clear();
             self.integration_modal.feedback = "Removed legacy CD key.".into();
+            self.notify(self.integration_modal.feedback.clone(), ToastKind::Info);
         }
         if set_depot_key {
             let did_opt = self
@@ -1951,12 +2552,15 @@ impl LuaToolsApp {
                     self.integration_modal.depot_key_input.clear();
                     self.integration_modal.feedback =
                         format!("Stored decryption key for Depot {}.", did);
+                    self.notify(self.integration_modal.feedback.clone(), ToastKind::Success);
                 } else {
                     self.integration_modal.feedback =
                         "Depot key must be 64 hexadecimal characters.".into();
+                    self.notify(self.integration_modal.feedback.clone(), ToastKind::Warning);
                 }
             } else {
                 self.integration_modal.feedback = "Enter a valid positive numeric Depot ID.".into();
+                self.notify(self.integration_modal.feedback.clone(), ToastKind::Warning);
             }
         }
         if rem_depot_key {
@@ -1967,10 +2571,12 @@ impl LuaToolsApp {
                     let _ = self.slssteam_service.save();
                     self.integration_modal.feedback =
                         format!("Removed decryption key for Depot {}.", did);
+                    self.notify(self.integration_modal.feedback.clone(), ToastKind::Info);
                 }
                 _ => {
                     self.integration_modal.feedback =
                         "Enter a valid numeric Depot ID to remove.".into();
+                    self.notify(self.integration_modal.feedback.clone(), ToastKind::Warning);
                 }
             }
         }
@@ -1983,13 +2589,16 @@ impl LuaToolsApp {
                 self.integration_modal.stat_name_input.clear();
                 self.integration_modal.stat_value_input.clear();
                 self.integration_modal.feedback = format!("Set stat '{}'.", sname);
+                self.notify(self.integration_modal.feedback.clone(), ToastKind::Success);
             } else {
                 self.integration_modal.feedback = "Enter a stat name before saving.".into();
+                self.notify(self.integration_modal.feedback.clone(), ToastKind::Warning);
             }
         }
         if let Some(sname) = rem_stat {
             self.steam_bridge_service.remove_stat(app_id, &sname);
             self.integration_modal.feedback = format!("Removed stat '{}'.", sname);
+            self.notify(self.integration_modal.feedback.clone(), ToastKind::Info);
         }
         if launch_proc && !self.integration_modal.proc_lib_input.trim().is_empty() {
             self.integration_modal.proc_enabled = true;
@@ -2000,6 +2609,7 @@ impl LuaToolsApp {
                 if lib_trimmed.is_empty() {
                     self.integration_modal.feedback =
                         "Specify a shared library (.so) path before saving.".into();
+                    self.notify(self.integration_modal.feedback.clone(), ToastKind::Warning);
                     launch_proc = false;
                 } else {
                     let args: Vec<String> = self
@@ -2019,10 +2629,12 @@ impl LuaToolsApp {
                     );
                     self.integration_modal.feedback =
                         "Saved per-app LD_PRELOAD process integration config.".into();
+                    self.notify(self.integration_modal.feedback.clone(), ToastKind::Success);
                 }
             } else {
                 self.game_injection_service.unconfigure(app_id);
                 self.integration_modal.feedback = "Disabled per-app process integration.".into();
+                self.notify(self.integration_modal.feedback.clone(), ToastKind::Info);
             }
         }
         if launch_proc {

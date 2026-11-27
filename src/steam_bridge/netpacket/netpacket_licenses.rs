@@ -73,31 +73,32 @@ fn decode_varint(slice: &[u8]) -> Option<(u64, usize)> {
 
 /// Parse CMsgClientLicenseList protobuf body.
 ///
-/// CMsgClientLicenseList structure:
+/// Valve CMsgClientLicenseList structure (steam_messages.proto:272-295):
 ///   message CMsgClientLicenseList {
-///     repeated License licenses = 1;
+///     optional int32 eresult = 1 [default = 2];
+///     repeated License licenses = 2; // canonical field 2 (also accepts field 1)
 ///   }
 ///   message License {
-///     uint32 package_id = 1;
-///     uint64 access_token = 2;
+///     optional uint32 package_id = 1;
+///     optional fixed32 time_created = 2;
+///     ...
+///     optional uint64 access_token = 17; // canonical field 17 (tag 0x88 0x01)
 ///   }
-fn parse_client_license_list(body: &[u8]) -> Vec<License> {
+pub fn parse_client_license_list(body: &[u8]) -> Vec<License> {
     let mut licenses = Vec::new();
     let mut offset = 0;
 
     while offset < body.len() {
-        if offset >= body.len() {
+        let Some((tag, tag_bytes)) = decode_varint(&body[offset..]) else {
             break;
-        }
+        };
+        offset += tag_bytes;
 
-        let tag = body[offset];
-        let field_num = tag >> 3;
-        let wire_type = tag & 0x07;
+        let field_num = (tag >> 3) as u32;
+        let wire_type = (tag & 0x07) as u32;
 
-        // Field 1 (licenses) = wire type 2 (length-delimited)
-        if field_num == 1 && wire_type == 2 {
-            offset += 1;
-            // Read length
+        // Field 2 (canonical Valve licenses) or Field 1 (legacy/synthetic) = wire type 2 (length-delimited)
+        if (field_num == 2 || field_num == 1) && wire_type == 2 {
             let Some((len, len_bytes)) = decode_varint(&body[offset..]) else {
                 break;
             };
@@ -116,32 +117,31 @@ fn parse_client_license_list(body: &[u8]) -> Vec<License> {
             let mut access_token = 0u64;
 
             while license_offset < license_data.len() {
-                if license_offset >= license_data.len() {
+                let Some((inner_tag, inner_tag_bytes)) = decode_varint(&license_data[license_offset..]) else {
                     break;
-                }
-                let tag = license_data[license_offset];
-                let field_num = tag >> 3;
-                let wire_type = tag & 0x07;
+                };
+                license_offset += inner_tag_bytes;
 
-                license_offset += 1;
+                let inner_field = (inner_tag >> 3) as u32;
+                let inner_wire = (inner_tag & 0x07) as u32;
 
-                if field_num == 1 && wire_type == 0 {
+                if inner_field == 1 && inner_wire == 0 {
                     // package_id (varint)
                     let Some((val, bytes)) = decode_varint(&license_data[license_offset..]) else {
                         break;
                     };
                     package_id = val as u32;
                     license_offset += bytes;
-                } else if field_num == 2 && wire_type == 0 {
-                    // access_token (varint)
+                } else if (inner_field == 17 || inner_field == 2) && inner_wire == 0 {
+                    // access_token (varint - canonical field 17 or synthetic field 2)
                     let Some((val, bytes)) = decode_varint(&license_data[license_offset..]) else {
                         break;
                     };
                     access_token = val;
                     license_offset += bytes;
                 } else {
-                    // Skip unknown field
-                    match wire_type {
+                    // Skip unknown inner field
+                    match inner_wire {
                         0 => { // varint
                             if let Some((_, bytes)) = decode_varint(&license_data[license_offset..]) {
                                 license_offset += bytes;
@@ -152,17 +152,21 @@ fn parse_client_license_list(body: &[u8]) -> Vec<License> {
                         1 => { // 64-bit
                             if license_offset + 8 <= license_data.len() {
                                 license_offset += 8;
+                            } else {
+                                break;
                             }
                         }
                         2 => { // length-delimited
-                            let Some((len, len_bytes)) = decode_varint(&license_data[license_offset..]) else {
+                            let Some((l, l_bytes)) = decode_varint(&license_data[license_offset..]) else {
                                 break;
                             };
-                            license_offset += len_bytes + len as usize;
+                            license_offset += l_bytes + l as usize;
                         }
-                        5 => { // 32-bit
+                        5 => { // 32-bit (e.g. time_created = 2, fixed32)
                             if license_offset + 4 <= license_data.len() {
                                 license_offset += 4;
+                            } else {
+                                break;
                             }
                         }
                         _ => break,
@@ -177,7 +181,7 @@ fn parse_client_license_list(body: &[u8]) -> Vec<License> {
                 });
             }
         } else {
-            // Skip unknown top-level field
+            // Skip unknown top-level field (e.g. field 1 eresult varint)
             match wire_type {
                 0 => { // varint
                     if let Some((_, bytes)) = decode_varint(&body[offset..]) {
@@ -189,6 +193,8 @@ fn parse_client_license_list(body: &[u8]) -> Vec<License> {
                 1 => { // 64-bit
                     if offset + 8 <= body.len() {
                         offset += 8;
+                    } else {
+                        break;
                     }
                 }
                 2 => { // length-delimited
@@ -200,6 +206,8 @@ fn parse_client_license_list(body: &[u8]) -> Vec<License> {
                 5 => { // 32-bit
                     if offset + 4 <= body.len() {
                         offset += 4;
+                    } else {
+                        break;
                     }
                 }
                 _ => break,
@@ -474,6 +482,41 @@ mod tests {
 
         let licenses = parse_client_license_list(&body);
         assert!(licenses.is_empty());
+    }
+
+    #[test]
+    fn test_parse_client_license_list_valve_wire_format() {
+        // Build real Valve CMsgClientLicenseList:
+        // field 1 (eresult): tag 0x08, value 1 (k_EResultOK)
+        // field 2 (licenses): tag 0x12, length-delimited
+        //   Inside License:
+        //     field 1 (package_id): tag 0x08, varint 730 (0xDA, 0x05)
+        //     field 2 (time_created): tag 0x15, fixed32 (0x78, 0x56, 0x34, 0x12)
+        //     field 17 (access_token): tag (17<<3)|0 = 136 (0x88, 0x01), varint 0x112233445566
+        let mut license_bytes = Vec::new();
+        // package_id = 730
+        license_bytes.push(0x08);
+        encode_varint(730, &mut license_bytes);
+        // time_created = 0x12345678 (fixed32: 4 bytes)
+        license_bytes.push(0x15);
+        license_bytes.extend_from_slice(&0x12345678_u32.to_le_bytes());
+        // access_token = 0x112233445566
+        encode_varint((17 << 3) | 0, &mut license_bytes); // tag for field 17 varint
+        encode_varint(0x1122_3344_5566_u64, &mut license_bytes);
+
+        let mut body = Vec::new();
+        // eresult = 1
+        body.push(0x08);
+        body.push(0x01);
+        // licenses = 2 (length-delimited)
+        encode_varint((2 << 3) | 2, &mut body);
+        encode_varint(license_bytes.len() as u64, &mut body);
+        body.extend_from_slice(&license_bytes);
+
+        let licenses = parse_client_license_list(&body);
+        assert_eq!(licenses.len(), 1);
+        assert_eq!(licenses[0].package_id, 730);
+        assert_eq!(licenses[0].access_token, 0x1122_3344_5566_u64);
     }
 
     /// Helper to encode varint for tests

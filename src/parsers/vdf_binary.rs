@@ -37,8 +37,17 @@ pub enum VdfValue {
 #[derive(Debug, Clone)]
 pub struct VdfProperty {
     pub name: String,
+    pub raw_name: Option<Vec<u8>>,
     pub vtype: u8,
     pub value: VdfValue,
+}
+
+impl VdfProperty {
+    pub fn raw_name_bytes(&self) -> &[u8] {
+        self.raw_name
+            .as_deref()
+            .unwrap_or_else(|| self.name.as_bytes())
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -66,6 +75,13 @@ impl VdfTable {
         }
     }
 
+    pub fn get_table_mut(&mut self, name: &str) -> Option<&mut VdfTable> {
+        match &mut self.find_mut(name)?.value {
+            VdfValue::Table(t) => Some(t),
+            _ => None,
+        }
+    }
+
     pub fn ensure_table(&mut self, name: &str) -> &mut VdfTable {
         if let Some(idx) = self.items.iter().position(|p| {
             p.name.eq_ignore_ascii_case(name) && matches!(p.value, VdfValue::Table(_))
@@ -77,6 +93,7 @@ impl VdfTable {
         }
         self.items.push(VdfProperty {
             name: name.to_string(),
+            raw_name: None,
             vtype: TYPE_TABLE,
             value: VdfValue::Table(VdfTable::default()),
         });
@@ -111,6 +128,7 @@ impl VdfTable {
         } else {
             self.items.push(VdfProperty {
                 name: name.to_string(),
+                raw_name: None,
                 vtype: TYPE_STRING,
                 value: VdfValue::Bytes(raw),
             });
@@ -132,7 +150,16 @@ pub struct LaunchEntry {
     pub launch_type: String,
     pub oslist: String,
     pub osarch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beta_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owns_dlc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_index: Option<usize>,
 }
+
+/// Alias matching canonical LT-55 `LaunchOption` naming.
+pub type LaunchOption = LaunchEntry;
 
 fn read_u32_le<R: Read>(r: &mut R) -> Result<u32, String> {
     let mut b = [0u8; 4];
@@ -197,6 +224,7 @@ fn read_wstring_bytes<R: Read>(r: &mut R) -> Result<Vec<u8>, String> {
 fn read_vdf<R: Read>(
     r: &mut R,
     strings: &[String],
+    string_bytes: &[Vec<u8>],
     indexed_keys: bool,
 ) -> Result<VdfTable, String> {
     let mut table = VdfTable::default();
@@ -213,22 +241,25 @@ fn read_vdf<R: Read>(
             return Ok(table);
         }
 
-        let name = if indexed_keys {
+        let (name, raw_name) = if indexed_keys {
             let idx = read_u32_le(r)? as usize;
-            strings
+            let s = strings
                 .get(idx)
                 .cloned()
-                .ok_or_else(|| format!("VDF string index {} out of bounds", idx))?
+                .ok_or_else(|| format!("VDF string index {} out of bounds", idx))?;
+            let raw = string_bytes
+                .get(idx)
+                .cloned()
+                .ok_or_else(|| format!("VDF string bytes index {} out of bounds", idx))?;
+            (s, Some(raw))
         } else {
             let raw_key = read_cstring_bytes(r)?;
-            match String::from_utf8(raw_key.clone()) {
-                Ok(s) => s,
-                Err(_) => raw_key.iter().map(|&b| b as char).collect(),
-            }
+            let s = String::from_utf8_lossy(&raw_key).into_owned();
+            (s, Some(raw_key))
         };
 
         let value = match marker {
-            TYPE_TABLE => VdfValue::Table(read_vdf(r, strings, indexed_keys)?),
+            TYPE_TABLE => VdfValue::Table(read_vdf(r, strings, string_bytes, indexed_keys)?),
             TYPE_STRING => VdfValue::Bytes(read_cstring_bytes(r)?),
             TYPE_WSTRING => VdfValue::WBytes(read_wstring_bytes(r)?),
             TYPE_INT32 | TYPE_POINTER | TYPE_COLOR => VdfValue::Int32(read_i32_le(r)?),
@@ -240,6 +271,7 @@ fn read_vdf<R: Read>(
 
         table.items.push(VdfProperty {
             name,
+            raw_name,
             vtype: marker,
             value,
         });
@@ -248,14 +280,15 @@ fn read_vdf<R: Read>(
 
 fn write_vdf<F>(buf: &mut Vec<u8>, table: &VdfTable, intern_fn: &mut F, indexed_keys: bool)
 where
-    F: FnMut(&str) -> u32,
+    F: FnMut(&[u8]) -> u32,
 {
     for p in &table.items {
         buf.push(p.vtype);
+        let raw_key = p.raw_name_bytes();
         if indexed_keys {
-            buf.extend_from_slice(&intern_fn(&p.name).to_le_bytes());
+            buf.extend_from_slice(&intern_fn(raw_key).to_le_bytes());
         } else {
-            buf.extend_from_slice(p.name.as_bytes());
+            buf.extend_from_slice(raw_key);
             buf.push(0);
         }
 
@@ -276,6 +309,50 @@ where
         }
     }
     buf.push(TYPE_END);
+}
+
+fn non_empty_trimmed(s: String) -> Option<String> {
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+fn extract_launch_entries_from_table(launch: &VdfTable) -> Vec<LaunchEntry> {
+    let mut out = Vec::new();
+    for (slot_pos, prop) in launch.items.iter().enumerate() {
+        if let VdfValue::Table(t) = &prop.value {
+            let cfg = t.get_table("config");
+            let lt = t.get_text("type");
+            let beta_key = cfg
+                .and_then(|c| non_empty_trimmed(c.get_text("betakey")))
+                .or_else(|| non_empty_trimmed(t.get_text("BetaKey")));
+            let owns_dlc = cfg
+                .and_then(|c| non_empty_trimmed(c.get_text("ownsdlc")))
+                .or_else(|| non_empty_trimmed(t.get_text("ownsdlc")));
+            let source_index = prop.name.parse::<usize>().ok().or(Some(slot_pos));
+            out.push(LaunchEntry {
+                index: prop.name.clone(),
+                executable: t.get_text("executable"),
+                arguments: t.get_text("arguments"),
+                workingdir: t.get_text("workingdir"),
+                description: t.get_text("description"),
+                launch_type: if lt.is_empty() {
+                    "default".to_string()
+                } else {
+                    lt
+                },
+                oslist: cfg.map(|c| c.get_text("oslist")).unwrap_or_default(),
+                osarch: cfg.map(|c| c.get_text("osarch")).unwrap_or_default(),
+                beta_key,
+                owns_dlc,
+                source_index,
+            });
+        }
+    }
+    out
 }
 
 pub struct AppInfoFile {
@@ -414,29 +491,7 @@ impl AppInfoFile {
         let Some(launch) = config.get_table("launch") else {
             return Some(Vec::new());
         };
-
-        let mut out = Vec::new();
-        for prop in &launch.items {
-            if let VdfValue::Table(t) = &prop.value {
-                let cfg = t.get_table("config");
-                let lt = t.get_text("type");
-                out.push(LaunchEntry {
-                    index: prop.name.clone(),
-                    executable: t.get_text("executable"),
-                    arguments: t.get_text("arguments"),
-                    workingdir: t.get_text("workingdir"),
-                    description: t.get_text("description"),
-                    launch_type: if lt.is_empty() {
-                        "default".to_string()
-                    } else {
-                        lt
-                    },
-                    oslist: cfg.map(|c| c.get_text("oslist")).unwrap_or_default(),
-                    osarch: cfg.map(|c| c.get_text("osarch")).unwrap_or_default(),
-                });
-            }
-        }
-        Some(out)
+        Some(extract_launch_entries_from_table(launch))
     }
 
     pub fn read_app(&self, app_id: u32) -> Result<Option<VdfTable>, String> {
@@ -451,7 +506,7 @@ impl AppInfoFile {
         let mut buf = vec![0u8; payload_len];
         f.read_exact(&mut buf).map_err(|e| e.to_string())?;
         let mut cur = Cursor::new(buf);
-        let tbl = read_vdf(&mut cur, &self.strings, self.indexed_keys())?;
+        let tbl = read_vdf(&mut cur, &self.strings, &self.string_bytes, self.indexed_keys())?;
         Ok(Some(tbl))
     }
 
@@ -461,20 +516,21 @@ impl AppInfoFile {
         edits: &HashMap<u32, VdfTable>,
     ) -> Result<(), String> {
         let mut strings_bytes = self.string_bytes.clone();
-        let mut lookup: HashMap<String, u32> = self
-            .strings
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (s.clone(), i as u32))
-            .collect();
+        // LT-54: Key v29 string-pool lookup by exact raw bytes so distinct non-UTF-8 keys never
+        // collide or get lossily replaced with UTF-8 U+FFFD bytes on re-serialization.
+        let mut lookup: HashMap<Vec<u8>, u32> = HashMap::with_capacity(self.string_bytes.len());
+        for (i, raw) in self.string_bytes.iter().enumerate() {
+            lookup.entry(raw.clone()).or_insert(i as u32);
+        }
 
-        let mut intern = |key: &str| -> u32 {
-            if let Some(&idx) = lookup.get(key) {
+        let mut intern = |key_bytes: &[u8]| -> u32 {
+            if let Some(&idx) = lookup.get(key_bytes) {
                 return idx;
             }
             let idx = strings_bytes.len() as u32;
-            lookup.insert(key.to_string(), idx);
-            strings_bytes.push(key.as_bytes().to_vec());
+            let owned = key_bytes.to_vec();
+            lookup.insert(owned.clone(), idx);
+            strings_bytes.push(owned);
             idx
         };
 
@@ -588,28 +644,7 @@ impl LaunchOptionsService {
             return Vec::new();
         };
 
-        let mut out = Vec::new();
-        for prop in &launch.items {
-            if let VdfValue::Table(t) = &prop.value {
-                let cfg = t.get_table("config");
-                let lt = t.get_text("type");
-                out.push(LaunchEntry {
-                    index: prop.name.clone(),
-                    executable: t.get_text("executable"),
-                    arguments: t.get_text("arguments"),
-                    workingdir: t.get_text("workingdir"),
-                    description: t.get_text("description"),
-                    launch_type: if lt.is_empty() {
-                        "default".to_string()
-                    } else {
-                        lt
-                    },
-                    oslist: cfg.map(|c| c.get_text("oslist")).unwrap_or_default(),
-                    osarch: cfg.map(|c| c.get_text("osarch")).unwrap_or_default(),
-                });
-            }
-        }
-        out
+        extract_launch_entries_from_table(launch)
     }
 
     pub fn save_launch_entries(
@@ -636,49 +671,112 @@ impl LaunchOptionsService {
             let config = body.ensure_table("config");
             let launch = config.ensure_table("launch");
 
-            // LT-55: In-place update preserving unmodelled launch entry keys (BetaKey, ownsdlc, vacmodulefilename, description_loc)
-            for (idx, e) in entries.iter().enumerate() {
-                let key_str = idx.to_string();
-                let table_ref = match launch.items.iter_mut().find(|p| p.name == key_str) {
-                    Some(prop) => {
-                        if let VdfValue::Table(ref mut t) = prop.value {
-                            t
-                        } else {
-                            prop.value = VdfValue::Table(VdfTable::default());
-                            if let VdfValue::Table(ref mut t) = prop.value { t } else { unreachable!() }
-                        }
-                    }
-                    None => {
-                        launch.items.push(VdfProperty {
-                            name: key_str,
-                            vtype: TYPE_TABLE,
-                            value: VdfValue::Table(VdfTable::default()),
-                        });
-                        if let VdfValue::Table(ref mut t) = launch.items.last_mut().unwrap().value {
-                            t
-                        } else { unreachable!() }
-                    }
-                };
+            // LT-55: Snapshot existing launch slot tables keyed by original slot index so
+            // matching by `source_index` preserves unmodelled keys (`vacmodulefilename`,
+            // `description_loc`, etc.) accurately even across reorders and deletions without
+            // cross-contaminating adjacent slots.
+            let mut existing_tables: HashMap<usize, VdfTable> = HashMap::new();
+            for (pos, prop) in launch.items.iter().enumerate() {
+                if let VdfValue::Table(t) = &prop.value {
+                    let slot_idx = prop.name.parse::<usize>().unwrap_or(pos);
+                    existing_tables.insert(slot_idx, t.clone());
+                }
+            }
 
-                table_ref.set_text("executable", e.executable.trim());
-                table_ref.set_text("arguments", e.arguments.trim());
-                table_ref.set_text("workingdir", e.workingdir.trim());
-                table_ref.set_text("description", e.description.trim());
+            let mut new_items: Vec<VdfProperty> = Vec::with_capacity(entries.len());
+            for (idx, e) in entries.iter().enumerate() {
+                let mut slot_table = e
+                    .source_index
+                    .and_then(|src| existing_tables.get(&src).cloned())
+                    .unwrap_or_default();
+
+                slot_table.set_text("executable", e.executable.trim());
+                slot_table.set_text("arguments", e.arguments.trim());
+                slot_table.set_text("workingdir", e.workingdir.trim());
+                slot_table.set_text("description", e.description.trim());
                 let ltype = if e.launch_type.trim().is_empty() {
                     "default"
                 } else {
                     e.launch_type.trim()
                 };
-                table_ref.set_text("type", ltype);
-                if !e.oslist.trim().is_empty() || !e.osarch.trim().is_empty() {
-                    let cfg = table_ref.ensure_table("config");
-                    cfg.set_text("oslist", e.oslist.trim());
-                    cfg.set_text("osarch", e.osarch.trim());
+                slot_table.set_text("type", ltype);
+
+                // Explicitly update OR remove oslist / osarch when cleared
+                let oslist = e.oslist.trim();
+                let osarch = e.osarch.trim();
+                if !oslist.is_empty() || !osarch.is_empty() {
+                    let cfg = slot_table.ensure_table("config");
+                    cfg.set_text("oslist", oslist);
+                    cfg.set_text("osarch", osarch);
+                } else if let Some(cfg) = slot_table.get_table_mut("config") {
+                    cfg.remove("oslist");
+                    cfg.remove("osarch");
                 }
+
+                // BetaKey: preserve existing location (root vs config) or store in config; remove if cleared
+                let beta_key = e.beta_key.as_deref().map(str::trim).unwrap_or("");
+                if beta_key.is_empty() {
+                    slot_table.remove("BetaKey");
+                    if let Some(cfg) = slot_table.get_table_mut("config") {
+                        cfg.remove("betakey");
+                    }
+                } else if slot_table.find("BetaKey").is_some() {
+                    slot_table.set_text("BetaKey", beta_key);
+                } else {
+                    slot_table.ensure_table("config").set_text("betakey", beta_key);
+                }
+
+                // ownsdlc: preserve existing location & Int32 representation when applicable; remove if cleared
+                let owns_dlc = e.owns_dlc.as_deref().map(str::trim).unwrap_or("");
+                if owns_dlc.is_empty() {
+                    slot_table.remove("ownsdlc");
+                    if let Some(cfg) = slot_table.get_table_mut("config") {
+                        cfg.remove("ownsdlc");
+                    }
+                } else if let Some(prop) = slot_table.find_mut("ownsdlc") {
+                    if prop.vtype == TYPE_INT32 {
+                        if let Ok(v) = owns_dlc.parse::<i32>() {
+                            prop.value = VdfValue::Int32(v);
+                        } else {
+                            prop.vtype = TYPE_STRING;
+                            prop.value = VdfValue::Bytes(owns_dlc.as_bytes().to_vec());
+                        }
+                    } else {
+                        prop.vtype = TYPE_STRING;
+                        prop.value = VdfValue::Bytes(owns_dlc.as_bytes().to_vec());
+                    }
+                } else {
+                    let cfg = slot_table.ensure_table("config");
+                    if let Some(prop) = cfg.find_mut("ownsdlc") {
+                        if prop.vtype == TYPE_INT32 {
+                            if let Ok(v) = owns_dlc.parse::<i32>() {
+                                prop.value = VdfValue::Int32(v);
+                            } else {
+                                prop.vtype = TYPE_STRING;
+                                prop.value = VdfValue::Bytes(owns_dlc.as_bytes().to_vec());
+                            }
+                        } else {
+                            prop.vtype = TYPE_STRING;
+                            prop.value = VdfValue::Bytes(owns_dlc.as_bytes().to_vec());
+                        }
+                    } else {
+                        cfg.set_text("ownsdlc", owns_dlc);
+                    }
+                }
+
+                // Remove empty `config` subtable if all its properties were cleared
+                if slot_table.get_table("config").is_some_and(|c| c.items.is_empty()) {
+                    slot_table.remove("config");
+                }
+
+                new_items.push(VdfProperty {
+                    name: idx.to_string(),
+                    raw_name: None,
+                    vtype: TYPE_TABLE,
+                    value: VdfValue::Table(slot_table),
+                });
             }
-            if launch.items.len() > entries.len() {
-                launch.items.truncate(entries.len());
-            }
+            launch.items = new_items;
         }
 
         // LT-56: Check 2x free disk space before writing
@@ -699,7 +797,39 @@ impl LaunchOptionsService {
 
         let bkp = self.backup_path();
         if !bkp.exists() {
-            let _ = fs::copy(&appinfo, &bkp);
+            fs::copy(&appinfo, &bkp)
+                .map_err(|e| format!("Failed to create initial appinfo.vdf backup: {}", e))?;
+        } else {
+            // Keep timestamped rotating backup (retain last 3, excluding original .bak) before overwriting appinfo.vdf
+            let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f");
+            let rot = appinfo.with_extension(format!("vdf.luatools.{}.bak", ts));
+            fs::copy(&appinfo, &rot)
+                .map_err(|e| format!("Failed to create rotating appinfo.vdf backup: {}", e))?;
+            if let Some(parent) = appinfo.parent() {
+                if let Ok(rd) = fs::read_dir(parent) {
+                    let mut backups: Vec<PathBuf> = rd
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| {
+                            p.file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|n| {
+                                    n != "appinfo.vdf.luatools.bak"
+                                        && n.starts_with("appinfo.vdf.luatools.")
+                                        && n.ends_with(".bak")
+                                })
+                                .unwrap_or(false)
+                        })
+                        .collect();
+                    backups.sort();
+                    while backups.len() > 3 {
+                        if let Some(oldest) = backups.first().cloned() {
+                            let _ = fs::remove_file(&oldest);
+                            backups.remove(0);
+                        }
+                    }
+                }
+            }
         }
 
         let tmp = appinfo.with_extension("vdf.tmp");
@@ -789,12 +919,19 @@ mod tests {
             launch_type: "option1".into(),
             oslist: "windows".into(),
             osarch: String::new(),
+            beta_key: Some("beta_branch".into()),
+            owns_dlc: Some("2778580".into()),
+            source_index: None,
         });
         svc.save_launch_entries(1245620, &entries).unwrap();
 
         let reloaded = svc.get_launch_entries(1245620);
         assert_eq!(reloaded.len(), 2);
         assert_eq!(reloaded[1].arguments, "-eac-nop-loaded");
+        assert_eq!(reloaded[1].beta_key.as_deref(), Some("beta_branch"));
+        assert_eq!(reloaded[1].owns_dlc.as_deref(), Some("2778580"));
+        assert_eq!(reloaded[0].source_index, Some(0));
+        assert_eq!(reloaded[1].source_index, Some(1));
     }
 
     #[test]
@@ -901,6 +1038,230 @@ mod tests {
         assert_eq!(slot0.get_text("ownsdlc"), "12345");
         assert_eq!(slot0.get_text("vacmodulefilename"), "vac_game.dll");
         assert_eq!(slot0.get_text("description_loc"), "#Launch_Description");
+    }
+
+    #[test]
+    fn test_lt54_roundtrips_non_utf8_keys_losslessly_in_v29_and_v27() {
+        // 1. v29 string pool with two distinct non-UTF-8 byte sequences that both decode to U+FFFD
+        let dir = tempfile::tempdir().unwrap();
+        let vdf_path = dir.path().join("appinfo_v29.vdf");
+        let raw_strings: Vec<Vec<u8>> = vec![
+            b"appinfo".to_vec(),
+            b"bad_\xFE_key".to_vec(),
+            b"bad_\xFF_key".to_vec(),
+        ];
+        let mut blob = Vec::new();
+        blob.push(TYPE_TABLE);
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        blob.push(TYPE_STRING);
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.extend_from_slice(b"val_fe\0");
+        blob.push(TYPE_STRING);
+        blob.extend_from_slice(&2u32.to_le_bytes());
+        blob.extend_from_slice(b"val_ff\0");
+        blob.extend_from_slice(&[TYPE_END, TYPE_END]);
+
+        let meta = vec![0u8; 60];
+        let entry_size = (meta.len() + blob.len()) as u32;
+        let mut file_bytes = Vec::new();
+        file_bytes.extend_from_slice(&MAGIC_29.to_le_bytes());
+        file_bytes.extend_from_slice(&1u32.to_le_bytes());
+        file_bytes.extend_from_slice(&0i64.to_le_bytes());
+        file_bytes.extend_from_slice(&480u32.to_le_bytes());
+        file_bytes.extend_from_slice(&entry_size.to_le_bytes());
+        file_bytes.extend_from_slice(&meta);
+        file_bytes.extend_from_slice(&blob);
+        file_bytes.extend_from_slice(&0u32.to_le_bytes());
+        let table_pos = file_bytes.len() as i64;
+        file_bytes.extend_from_slice(&(raw_strings.len() as u32).to_le_bytes());
+        for s in &raw_strings {
+            file_bytes.extend_from_slice(s);
+            file_bytes.push(0);
+        }
+        file_bytes[8..16].copy_from_slice(&table_pos.to_le_bytes());
+        fs::write(&vdf_path, &file_bytes).unwrap();
+
+        let af = AppInfoFile::open(&vdf_path).unwrap();
+        let root = af.read_app(480).unwrap().unwrap();
+        let out_path = dir.path().join("appinfo_v29_out.vdf");
+        let mut edits = HashMap::new();
+        edits.insert(480, root);
+        af.save_with_edits(&out_path, &edits).unwrap();
+
+        let af2 = AppInfoFile::open(&out_path).unwrap();
+        let root2 = af2.read_app(480).unwrap().unwrap();
+        let body2 = root2.get_table("appinfo").unwrap();
+        assert_eq!(body2.items.len(), 2);
+        assert_eq!(body2.items[0].raw_name_bytes(), b"bad_\xFE_key");
+        assert_eq!(body2.items[1].raw_name_bytes(), b"bad_\xFF_key");
+
+        // 2. v27 inline non-UTF-8 key round-trip
+        let v27_path = dir.path().join("appinfo_v27.vdf");
+        let mut blob27 = Vec::new();
+        blob27.push(TYPE_STRING);
+        blob27.extend_from_slice(b"legacy_\xFF_key\0");
+        blob27.extend_from_slice(b"hello\0");
+        blob27.push(TYPE_END);
+        let meta27 = vec![0u8; 40];
+        let sz27 = (meta27.len() + blob27.len()) as u32;
+        let mut bytes27 = Vec::new();
+        bytes27.extend_from_slice(&MAGIC_27.to_le_bytes());
+        bytes27.extend_from_slice(&1u32.to_le_bytes());
+        bytes27.extend_from_slice(&480u32.to_le_bytes());
+        bytes27.extend_from_slice(&sz27.to_le_bytes());
+        bytes27.extend_from_slice(&meta27);
+        bytes27.extend_from_slice(&blob27);
+        bytes27.extend_from_slice(&0u32.to_le_bytes());
+        fs::write(&v27_path, &bytes27).unwrap();
+
+        let af27 = AppInfoFile::open(&v27_path).unwrap();
+        let root27 = af27.read_app(480).unwrap().unwrap();
+        let out27 = dir.path().join("appinfo_v27_out.vdf");
+        let mut edits27 = HashMap::new();
+        edits27.insert(480, root27);
+        af27.save_with_edits(&out27, &edits27).unwrap();
+
+        let af27_re = AppInfoFile::open(&out27).unwrap();
+        let root27_re = af27_re.read_app(480).unwrap().unwrap();
+        assert_eq!(root27_re.items[0].raw_name_bytes(), b"legacy_\xFF_key");
+    }
+
+    #[test]
+    fn test_lt55_lt56_source_index_reorder_oslist_clear_and_backup_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let appcache = dir.path().join("appcache");
+        fs::create_dir_all(&appcache).unwrap();
+        let vdf_path = appcache.join("appinfo.vdf");
+
+        let strings = [
+            "appinfo",
+            "config",
+            "launch",
+            "0",
+            "1",
+            "executable",
+            "type",
+            "oslist",
+            "osarch",
+            "vacmodulefilename",
+            "description_loc",
+        ];
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&[TYPE_TABLE]);
+        blob.extend_from_slice(&0u32.to_le_bytes()); // appinfo
+        blob.extend_from_slice(&[TYPE_TABLE]);
+        blob.extend_from_slice(&1u32.to_le_bytes()); // config
+        blob.extend_from_slice(&[TYPE_TABLE]);
+        blob.extend_from_slice(&2u32.to_le_bytes()); // launch
+
+        // Slot 0 with vacmodulefilename + config/oslist + config/osarch
+        blob.push(TYPE_TABLE);
+        blob.extend_from_slice(&3u32.to_le_bytes());
+        blob.push(TYPE_STRING);
+        blob.extend_from_slice(&5u32.to_le_bytes());
+        blob.extend_from_slice(b"slot0.exe\0");
+        blob.push(TYPE_STRING);
+        blob.extend_from_slice(&9u32.to_le_bytes());
+        blob.extend_from_slice(b"vac_slot0.dll\0");
+        blob.push(TYPE_TABLE);
+        blob.extend_from_slice(&1u32.to_le_bytes()); // config
+        blob.push(TYPE_STRING);
+        blob.extend_from_slice(&7u32.to_le_bytes());
+        blob.extend_from_slice(b"windows\0");
+        blob.push(TYPE_STRING);
+        blob.extend_from_slice(&8u32.to_le_bytes());
+        blob.extend_from_slice(b"64\0");
+        blob.push(TYPE_END); // end config
+        blob.push(TYPE_END); // end slot 0
+
+        // Slot 1 with description_loc (no vacmodulefilename)
+        blob.push(TYPE_TABLE);
+        blob.extend_from_slice(&4u32.to_le_bytes());
+        blob.push(TYPE_STRING);
+        blob.extend_from_slice(&5u32.to_le_bytes());
+        blob.extend_from_slice(b"slot1.exe\0");
+        blob.push(TYPE_STRING);
+        blob.extend_from_slice(&10u32.to_le_bytes());
+        blob.extend_from_slice(b"#Slot1_Loc\0");
+        blob.push(TYPE_END); // end slot 1
+
+        blob.extend_from_slice(&[TYPE_END, TYPE_END, TYPE_END, TYPE_END]);
+
+        let meta = vec![0u8; 60];
+        let entry_size = (meta.len() + blob.len()) as u32;
+        let mut file_bytes = Vec::new();
+        file_bytes.extend_from_slice(&MAGIC_29.to_le_bytes());
+        file_bytes.extend_from_slice(&1u32.to_le_bytes());
+        file_bytes.extend_from_slice(&0i64.to_le_bytes());
+        file_bytes.extend_from_slice(&480u32.to_le_bytes());
+        file_bytes.extend_from_slice(&entry_size.to_le_bytes());
+        file_bytes.extend_from_slice(&meta);
+        file_bytes.extend_from_slice(&blob);
+        file_bytes.extend_from_slice(&0u32.to_le_bytes());
+        let table_pos = file_bytes.len() as i64;
+        file_bytes.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+        for s in &strings {
+            file_bytes.extend_from_slice(s.as_bytes());
+            file_bytes.push(0);
+        }
+        file_bytes[8..16].copy_from_slice(&table_pos.to_le_bytes());
+        fs::write(&vdf_path, &file_bytes).unwrap();
+
+        let svc = LaunchOptionsService::new(dir.path().to_path_buf());
+        let mut entries = svc.get_launch_entries(480);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].source_index, Some(0));
+        assert_eq!(entries[1].source_index, Some(1));
+
+        // Clear oslist/osarch on slot 0, then swap slot 0 and slot 1
+        entries[0].oslist.clear();
+        entries[0].osarch.clear();
+        entries.swap(0, 1);
+        svc.save_launch_entries(480, &entries).unwrap();
+
+        let af = AppInfoFile::open(&vdf_path).unwrap();
+        let root = af.read_app(480).unwrap().unwrap();
+        let launch = root
+            .get_table("appinfo")
+            .unwrap()
+            .get_table("config")
+            .unwrap()
+            .get_table("launch")
+            .unwrap();
+        // New slot "0" came from source_index 1 -> has description_loc, NOT vac_slot0.dll
+        let new_slot0 = launch.get_table("0").unwrap();
+        assert_eq!(new_slot0.get_text("executable"), "slot1.exe");
+        assert_eq!(new_slot0.get_text("description_loc"), "#Slot1_Loc");
+        assert!(new_slot0.find("vacmodulefilename").is_none());
+
+        // New slot "1" came from source_index 0 -> kept vac_slot0.dll, cleared oslist/osarch
+        let new_slot1 = launch.get_table("1").unwrap();
+        assert_eq!(new_slot1.get_text("executable"), "slot0.exe");
+        assert_eq!(new_slot1.get_text("vacmodulefilename"), "vac_slot0.dll");
+        assert!(new_slot1.get_table("config").is_none());
+
+        // LT-56: Trigger 5 saves and verify base .bak is preserved plus at most 3 rotated backups
+        for _ in 0..4 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let cur = svc.get_launch_entries(480);
+            svc.save_launch_entries(480, &cur).unwrap();
+        }
+        assert!(svc.backup_path().is_file());
+        let rotated_count = fs::read_dir(&appcache)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|n| {
+                        n != "appinfo.vdf.luatools.bak"
+                            && n.starts_with("appinfo.vdf.luatools.")
+                            && n.ends_with(".bak")
+                    })
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(rotated_count, 3);
     }
 }
 

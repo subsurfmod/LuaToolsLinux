@@ -50,7 +50,7 @@ pub fn is_protected<P: AsRef<Path>>(exe_path: P) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     #[test]
     fn test_unpacker_module_compiles() {

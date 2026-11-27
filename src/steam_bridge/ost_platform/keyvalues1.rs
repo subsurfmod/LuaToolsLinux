@@ -13,9 +13,10 @@
 //! - `0x0A`: Int64 (NUL-terminated UTF-8 key, 8-byte LE `i64`)
 //! - `0x0B`: Alternate end of subtable `TYPE_ALTEND` (bare byte, NO key)
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Kv1Value {
@@ -317,6 +318,50 @@ fn write_kv1_node(
     Ok(())
 }
 
+thread_local! {
+    /// Caches the most recently auto-discovered `UserGameStatsSchema_<app_id>.bin`
+    /// paired with the exact `UserGameStats` `Kv1Value` loaded via `parse_kv1_file`,
+    /// allowing `extract_achievements_kv1(&kv1)` callers to resolve real schema names.
+    static LAST_STATS_FILE_SCHEMA: RefCell<Option<(Kv1Value, Kv1Value)>> = const { RefCell::new(None) };
+}
+
+fn parse_kv1_file_raw(path: &Path) -> Result<Kv1Value, Kv1Error> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = Kv1Reader::new(BufReader::new(file));
+    reader.parse()
+}
+
+fn infer_app_id_from_stats_filename(path: &Path) -> Option<u32> {
+    let fname = path.file_name()?.to_str()?;
+    if !fname.starts_with("UserGameStats_") || fname.starts_with("UserGameStatsSchema_") {
+        return None;
+    }
+    let stem = fname.strip_prefix("UserGameStats_")?.strip_suffix(".bin")?;
+    let app_str = stem.rsplit('_').next()?;
+    app_str.parse::<u32>().ok().filter(|&id| id != 0)
+}
+
+fn infer_app_id_from_kv1_tree(kv1: &Kv1Value) -> Option<u32> {
+    let Kv1Value::Object(root) = kv1 else {
+        return None;
+    };
+    for key in ["appid", "app_id", "AppID", "GameID", "gameid"] {
+        if let Some(val) = root.get(key) {
+            let parsed = match val {
+                Kv1Value::Int32(n) if *n > 0 => Some(*n as u32),
+                Kv1Value::UInt64(n) if *n > 0 => u32::try_from(*n).ok(),
+                Kv1Value::Int64(n) if *n > 0 => u32::try_from(*n).ok(),
+                Kv1Value::String(s) => s.trim().parse::<u32>().ok(),
+                _ => None,
+            };
+            if let Some(id) = parsed.filter(|&id| id != 0) {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
 /// Parse a Valve KV1 buffer in memory.
 pub fn parse_kv1_bytes(data: &[u8]) -> Result<Kv1Value, Kv1Error> {
     let mut reader = Kv1Reader::new(Cursor::new(data));
@@ -324,10 +369,23 @@ pub fn parse_kv1_bytes(data: &[u8]) -> Result<Kv1Value, Kv1Error> {
 }
 
 /// Parse a Valve KV1 file from disk.
+/// When `path` is a `UserGameStats_<account>_<app>.bin` (or `UserGameStats_<app>.bin`) file,
+/// automatically checks for a sibling `UserGameStatsSchema_<app>.bin` in `<steam_root>/appcache/stats/`
+/// so subsequent `extract_achievements_kv1(&kv1)` calls resolve canonical achievement API names.
 pub fn parse_kv1_file<P: AsRef<Path>>(path: P) -> Result<Kv1Value, Kv1Error> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = Kv1Reader::new(BufReader::new(file));
-    reader.parse()
+    let path_ref = path.as_ref();
+    let parsed = parse_kv1_file_raw(path_ref)?;
+
+    if let Some(app_id) = infer_app_id_from_stats_filename(path_ref) {
+        let search_base = path_ref.parent().unwrap_or_else(|| Path::new("."));
+        let discovered_schema = find_user_game_stats_schema_file(search_base, app_id)
+            .and_then(|sp| parse_kv1_file_raw(&sp).ok());
+        LAST_STATS_FILE_SCHEMA.with(|slot| {
+            *slot.borrow_mut() = discovered_schema.map(|schema| (parsed.clone(), schema));
+        });
+    }
+
+    Ok(parsed)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -339,12 +397,55 @@ pub struct AchievementData {
     pub max_progress: Option<i32>,
 }
 
+/// Parse a `UserGameStats_*.bin` file from disk, auto-discovering any sibling
+/// `UserGameStatsSchema_<app_id>.bin` in `<steam_root>/appcache/stats/`.
+pub fn extract_achievements_from_stats_file<P: AsRef<Path>>(
+    stats_path: P,
+) -> Result<BTreeMap<String, AchievementData>, Kv1Error> {
+    let path_ref = stats_path.as_ref();
+    let kv1 = parse_kv1_file_raw(path_ref)?;
+    let schema = infer_app_id_from_stats_filename(path_ref)
+        .or_else(|| infer_app_id_from_kv1_tree(&kv1))
+        .and_then(|app_id| {
+            let base = path_ref.parent().unwrap_or_else(|| Path::new("."));
+            find_user_game_stats_schema_file(base, app_id)
+        })
+        .and_then(|sp| parse_kv1_file_raw(&sp).ok());
+    Ok(extract_achievements_with_schema(&kv1, schema.as_ref()))
+}
+
 /// Extract achievements from a parsed Steam `UserGameStats` KV1 tree.
 ///
-/// Supports both:
-/// 1. Real Steam `UserGameStats_<account>_<app>.bin` layout (`AchievementTimes` subtable + stat-ID bitmasks)
-/// 2. Named `{ "name", "unlocked", "unlockTime", "progress", "maxProgress" }` objects
+/// Automatically resolves `(stat_id, bit)` pairs via sibling `UserGameStatsSchema_<app>.bin`
+/// when `kv1` was loaded through `parse_kv1_file` (or carries an `appid`/`GameID` field matching
+/// an installed Steam `appcache/stats` schema).
 pub fn extract_achievements_kv1(kv1: &Kv1Value) -> BTreeMap<String, AchievementData> {
+    let cached_schema = LAST_STATS_FILE_SCHEMA.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|(stats_kv, schema_kv)| (stats_kv == kv1).then(|| schema_kv.clone()))
+    });
+    if let Some(ref schema) = cached_schema {
+        return extract_achievements_with_schema(kv1, Some(schema));
+    }
+
+    if let Some(app_id) = infer_app_id_from_kv1_tree(kv1) {
+        if let Some(home) = dirs::home_dir() {
+            let roots = [
+                home.join(".local/share/Steam"),
+                home.join(".steam/steam"),
+                home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam"),
+            ];
+            for root in &roots {
+                if let Some(sp) = find_user_game_stats_schema_file(root, app_id) {
+                    if let Ok(schema) = parse_kv1_file_raw(&sp) {
+                        return extract_achievements_with_schema(kv1, Some(&schema));
+                    }
+                }
+            }
+        }
+    }
+
     extract_achievements_with_schema(kv1, None)
 }
 
@@ -521,27 +622,60 @@ fn extract_achievements_recursive(
     }
 }
 
-/// Find the Steam stats file for a given app/account.
+/// Find the Steam `UserGameStatsSchema_<app_id>.bin` file for a given app.
+///
+/// Accepts `<steam_root>`, `<steam_root>/config`, `<steam_root>/userdata/<id>/config`,
+/// or a direct `appcache/stats` directory and checks `<steam_root>/appcache/stats/`
+/// as well as sibling directories.
+pub fn find_user_game_stats_schema_file(steam_root: &Path, app_id: u32) -> Option<PathBuf> {
+    if app_id == 0 {
+        return None;
+    }
+    let fname = format!("UserGameStatsSchema_{}.bin", app_id);
+    let mut candidates = Vec::with_capacity(8);
+
+    candidates.push(steam_root.join("appcache").join("stats").join(&fname));
+    candidates.push(steam_root.join(&fname));
+    candidates.push(steam_root.join("stats").join(&fname));
+
+    let mut anc = steam_root.parent();
+    for _ in 0..4 {
+        let Some(p) = anc else {
+            break;
+        };
+        candidates.push(p.join("appcache").join("stats").join(&fname));
+        candidates.push(p.join(&fname));
+        anc = p.parent();
+    }
+
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+/// Find the Steam stats file (`UserGameStats_<account_id>_<app_id>.bin`) for a given app/account.
 pub fn find_user_game_stats_file(
     steam_config_dir: &Path,
     account_id: u32,
     app_id: u32,
-) -> Option<std::path::PathBuf> {
+) -> Option<PathBuf> {
+    if account_id == 0 || app_id == 0 {
+        return None;
+    }
     let pattern = format!("UserGameStats_{}_{}.bin", account_id, app_id);
+    let mut candidates = Vec::with_capacity(8);
+
+    candidates.push(steam_config_dir.join("appcache").join("stats").join(&pattern));
     if let Some(parent) = steam_config_dir.parent() {
-        let appcache_stats = parent.join("appcache").join("stats").join(&pattern);
-        if appcache_stats.is_file() {
-            return Some(appcache_stats);
+        candidates.push(parent.join("appcache").join("stats").join(&pattern));
+        if let Some(gp) = parent.parent() {
+            if let Some(ggp) = gp.parent() {
+                candidates.push(ggp.join("appcache").join("stats").join(&pattern));
+            }
         }
     }
-    let stats_dir = steam_config_dir.join("stats");
-    if stats_dir.is_dir() {
-        let path = stats_dir.join(&pattern);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    None
+    candidates.push(steam_config_dir.join("stats").join(&pattern));
+    candidates.push(steam_config_dir.join(&pattern));
+
+    candidates.into_iter().find(|p| p.is_file())
 }
 
 #[cfg(test)]
@@ -731,5 +865,76 @@ mod tests {
             find_user_game_stats_file(&config_dir, 123, 456),
             Some(stats_file)
         );
+    }
+
+    #[test]
+    fn test_extract_achievements_kv1_auto_discovers_sibling_schema_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let steam_root = tmp.path().join("Steam");
+        let stats_dir = steam_root.join("appcache").join("stats");
+        std::fs::create_dir_all(&stats_dir).unwrap();
+
+        // Schema defines two achievements in stat "1":
+        // bit 0 -> "ACH_TIMED" (present in AchievementTimes + bitmask)
+        // bit 1 -> "ACH_BITMASK_ONLY" (present ONLY in numeric stat "1" bitmask, no AchievementTimes entry!)
+        // bit 2 -> "ACH_STILL_LOCKED" (bit 2 == 0)
+        let mut b0 = BTreeMap::new();
+        b0.insert("name".into(), Kv1Value::String("ACH_TIMED".into()));
+        let mut b1 = BTreeMap::new();
+        b1.insert("name".into(), Kv1Value::String("ACH_BITMASK_ONLY".into()));
+        let mut b2 = BTreeMap::new();
+        b2.insert("name".into(), Kv1Value::String("ACH_STILL_LOCKED".into()));
+        let mut bits = BTreeMap::new();
+        bits.insert("0".into(), Kv1Value::Object(b0));
+        bits.insert("1".into(), Kv1Value::Object(b1));
+        bits.insert("2".into(), Kv1Value::Object(b2));
+        let mut stat1 = BTreeMap::new();
+        stat1.insert("bits".into(), Kv1Value::Object(bits));
+        let mut schema_stats = BTreeMap::new();
+        schema_stats.insert("1".into(), Kv1Value::Object(stat1));
+        let mut schema_root = BTreeMap::new();
+        schema_root.insert("stats".into(), Kv1Value::Object(schema_stats));
+
+        let schema_path = stats_dir.join("UserGameStatsSchema_480.bin");
+        std::fs::write(
+            &schema_path,
+            write_kv1("480", &Kv1Value::Object(schema_root)).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            find_user_game_stats_schema_file(&steam_root, 480),
+            Some(schema_path.clone())
+        );
+
+        let mut times_stat1 = BTreeMap::new();
+        times_stat1.insert("0".into(), Kv1Value::Int32(1_700_000_555));
+        let mut ach_times = BTreeMap::new();
+        ach_times.insert("1".into(), Kv1Value::Object(times_stat1));
+
+        let mut user_root = BTreeMap::new();
+        user_root.insert("1".into(), Kv1Value::Int32(0b011)); // bits 0 & 1 unlocked, bit 2 locked
+        user_root.insert("AchievementTimes".into(), Kv1Value::Object(ach_times));
+
+        let user_stats_path = stats_dir.join("UserGameStats_99999_480.bin");
+        std::fs::write(
+            &user_stats_path,
+            write_kv1("UserGameStats", &Kv1Value::Object(user_root)).unwrap(),
+        )
+        .unwrap();
+
+        // Callers using parse_kv1_file + extract_achievements_kv1 must auto-discover UserGameStatsSchema_480.bin!
+        let parsed = parse_kv1_file(&user_stats_path).unwrap();
+        let extracted = extract_achievements_kv1(&parsed);
+        assert_eq!(extracted.len(), 3);
+        assert!(!extracted.contains_key("STAT_1_BIT_0"));
+        assert!(extracted["ACH_TIMED"].unlocked);
+        assert_eq!(extracted["ACH_TIMED"].unlock_time, Some(1_700_000_555));
+        assert!(extracted["ACH_BITMASK_ONLY"].unlocked);
+        assert!(!extracted["ACH_STILL_LOCKED"].unlocked);
+
+        let via_helper = extract_achievements_from_stats_file(&user_stats_path).unwrap();
+        assert_eq!(via_helper.len(), 3);
+        assert!(via_helper["ACH_BITMASK_ONLY"].unlocked);
     }
 }

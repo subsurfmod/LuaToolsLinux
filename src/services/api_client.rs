@@ -14,9 +14,9 @@ use serde_json::Value;
 
 use crate::services::auth_service::{AuthService, API_BASE_URL, SUPABASE_ANON_KEY, SUPABASE_URL};
 use crate::services::doh_resolver::DohResolver;
-use crate::services::github_proxy::GithubProxy;
+use crate::services::proxied_file_downloader::ProxiedFileDownloader;
 
-pub const MANIFEST_BACKEND_URL: &str = "http://167.235.229.108";
+pub const MANIFEST_BACKEND_URL: &str = "https://167.235.229.108";
 pub const MANIFEST_BACKEND_UA: &str = "secretgoonpoon";
 pub const HUBCAP_BASE_URL: &str = "https://hubcapmanifest.com";
 pub const DAILY_DOWNLOAD_LIMIT: u32 = 25;
@@ -98,10 +98,17 @@ impl HubcapService {
     }
 
     fn agent() -> ureq::Agent {
-        ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(10))
-            .timeout(Duration::from_secs(120))
-            .build()
+        Self::doh_agent_with_timeouts(Duration::from_secs(10), Duration::from_secs(120))
+    }
+
+    fn doh_agent_with_timeouts(connect: Duration, overall: Duration) -> ureq::Agent {
+        let mut builder = ureq::AgentBuilder::new()
+            .timeout_connect(connect)
+            .timeout(overall);
+        if let Some(resolver) = DohResolver::active_global_resolver() {
+            builder = builder.resolver(resolver);
+        }
+        builder.build()
     }
 
     pub fn get_stats(&self, key: &str) -> Option<HubcapStats> {
@@ -222,17 +229,32 @@ impl HubcapService {
             }
         }
 
-        // 2. Secondary fallback: direct backend IP
-        let primary_url = format!(
-            "{}/api/givemethemanifestpunk?depotid={}&gid={}",
-            MANIFEST_BACKEND_URL, depot_id, gid
+        // 2. Secondary fallback: backend endpoint (HTTPS preferred with HTTP fallback)
+        let https_primary = format!(
+            "https://167.235.229.108/api/givemethemanifestpunk?depotid={}&gid={}",
+            depot_id, gid
         );
-        let mut req_primary = agent
-            .get(&primary_url)
+        let mut req_https = agent
+            .get(&https_primary)
             .set("User-Agent", MANIFEST_BACKEND_UA);
         if let Some(ref token) = auth_token {
-            req_primary = req_primary.set("Authorization", &format!("Bearer {}", token));
+            req_https = req_https.set("Authorization", &format!("Bearer {}", token));
         }
+        if let Ok(resp) = req_https.call() {
+            let mut bytes = Vec::new();
+            if resp.into_reader().take(64 * 1024 * 1024).read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
+                return Ok(bytes);
+            }
+        }
+
+        // 1b. Fallback to unencrypted HTTP if HTTPS fails, but NEVER send Bearer token over plaintext HTTP
+        let fallback_http_url = format!(
+            "http://167.235.229.108/api/givemethemanifestpunk?depotid={}&gid={}",
+            depot_id, gid
+        );
+        let req_primary = agent
+            .get(&fallback_http_url)
+            .set("User-Agent", MANIFEST_BACKEND_UA);
         if let Ok(resp) = req_primary.call() {
             let mut bytes = Vec::new();
             if resp.into_reader().take(64 * 1024 * 1024).read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
@@ -277,6 +299,87 @@ impl HubcapService {
         ))
     }
 
+    /// Download raw manifest binary to a file on disk, decode & log protobuf metadata (LT-44, LT-60, LT-61),
+    /// reject/remove corrupt or mismatched depot manifests, and optionally verify an AES-256 depot key (LT-62).
+    pub fn download_raw_manifest_to_file_verified(
+        depot_id: u32,
+        gid: u64,
+        dest_path: &Path,
+        hubcap_api_key: Option<&str>,
+        depot_aes_hex_key: Option<&str>,
+    ) -> Result<crate::parsers::manifest_binary::ManifestMetadata, String> {
+        let bytes = Self::fetch_raw_manifest(depot_id, gid, hubcap_api_key)?;
+        if let Some(parent) = dest_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        fs::write(dest_path, &bytes).map_err(|e| format!("Failed to write manifest: {}", e))?;
+
+        let meta = match crate::parsers::manifest_binary::read_manifest_file(dest_path) {
+            Ok(m) => m,
+            Err(e) => {
+                let _ = fs::remove_file(dest_path);
+                return Err(format!(
+                    "Downloaded manifest for depot {} gid {} failed binary decode validation: {}",
+                    depot_id, gid, e
+                ));
+            }
+        };
+
+        if meta.depot_id != 0 && meta.depot_id != depot_id {
+            let _ = fs::remove_file(dest_path);
+            return Err(format!(
+                "Downloaded manifest depot_id mismatch: expected {}, got {}",
+                depot_id, meta.depot_id
+            ));
+        }
+        if meta.manifest_gid != 0 && meta.manifest_gid != gid {
+            log::warn!(
+                "Manifest GID note for depot {}: requested {}, header reports {}",
+                depot_id,
+                gid,
+                meta.manifest_gid
+            );
+        }
+        log::info!(
+            "Verified manifest {} (depot={}, gid={}, files={}, size={} bytes, encrypted_names={})",
+            dest_path.display(),
+            meta.depot_id,
+            meta.manifest_gid,
+            meta.file_count,
+            meta.total_size,
+            meta.filenames_encrypted
+        );
+
+        // LT-62: Validate AES-256 depot decryption key when provided for encrypted manifests
+        if let Some(hex_key) = depot_aes_hex_key.map(str::trim).filter(|k| !k.is_empty()) {
+            let key_bytes = hex::decode(hex_key)
+                .map_err(|e| format!("Invalid hex AES key for depot {}: {}", depot_id, e))?;
+            if key_bytes.len() != 32 {
+                let _ = fs::remove_file(dest_path);
+                return Err(format!(
+                    "Invalid AES-256 key length for depot {}: expected 32 bytes, got {}",
+                    depot_id,
+                    key_bytes.len()
+                ));
+            }
+            let mut key_arr = [0u8; 32];
+            key_arr.copy_from_slice(&key_bytes);
+            if meta.filenames_encrypted {
+                let valid = crate::parsers::manifest_binary::validate_aes_key(dest_path, &key_arr)
+                    .unwrap_or(false);
+                if !valid {
+                    let _ = fs::remove_file(dest_path);
+                    return Err(format!(
+                        "AES-256 depot key failed filename decryption check against manifest {}_{}.manifest",
+                        depot_id, gid
+                    ));
+                }
+            }
+        }
+
+        Ok(meta)
+    }
+
     /// Download raw manifest binary to a file on disk (LT-44).
     pub fn download_raw_manifest_to_file(
         depot_id: u32,
@@ -284,61 +387,34 @@ impl HubcapService {
         dest_path: &Path,
         hubcap_api_key: Option<&str>,
     ) -> Result<PathBuf, String> {
-        let bytes = Self::fetch_raw_manifest(depot_id, gid, hubcap_api_key)?;
-        if let Some(parent) = dest_path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        fs::write(dest_path, &bytes).map_err(|e| format!("Failed to write manifest: {}", e))?;
-        if let Err(e) = crate::parsers::manifest_binary::read_manifest_file(dest_path) {
-            log::warn!(
-                "Downloaded raw manifest for depot {} gid {} failed binary decode check: {}",
-                depot_id, gid, e
-            );
-        }
+        let _meta = Self::download_raw_manifest_to_file_verified(
+            depot_id,
+            gid,
+            dest_path,
+            hubcap_api_key,
+            None,
+        )?;
         Ok(dest_path.to_path_buf())
     }
 
-    /// Resolve domain via DNS-over-HTTPS (LT-47).
+    /// Resolve domain via DNS-over-HTTPS using active configured endpoint or Cloudflare default (LT-47).
     pub fn resolve_steam_domain_doh(domain: &str) -> Option<Vec<String>> {
-        let resolver = DohResolver::default();
+        let resolver = DohResolver::active_global_resolver().unwrap_or_default();
         let records = resolver.resolve(domain)?;
         Some(records.into_iter().map(|r| r.value).collect())
     }
 
-    /// Build an HTTP agent with DoH-assisted domain resolution fallback (LT-47).
+    /// Build an HTTP agent wired to `DohResolver` when `doh_enabled` is true in settings (LT-47).
     pub fn doh_agent() -> ureq::Agent {
-        ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(10))
-            .timeout(Duration::from_secs(60))
-            .build()
+        Self::doh_agent_with_timeouts(Duration::from_secs(10), Duration::from_secs(60))
     }
 
-    /// Download with GitHub proxy and mirror fallback (LT-48).
+    /// Download with GitHub proxy and mirror fallback via `ProxiedFileDownloader` (LT-48).
     pub fn download_proxied(url: &str, dest_path: &Path) -> Result<(), String> {
-        let proxy = GithubProxy::default();
-        if GithubProxy::is_github(url) {
-            for candidate in proxy.candidates(url) {
-                if let Ok(resp) = Self::agent().get(&candidate).call() {
-                    if let Some(parent) = dest_path.parent() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-                    if let Ok(mut f) = fs::File::create(dest_path) {
-                        if std::io::copy(&mut resp.into_reader(), &mut f).is_ok() {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-            Err("All GitHub proxy mirrors failed".into())
-        } else {
-            let resp = Self::agent().get(&url).call().map_err(|e| e.to_string())?;
-            if let Some(parent) = dest_path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            let mut f = fs::File::create(dest_path).map_err(|e| e.to_string())?;
-            std::io::copy(&mut resp.into_reader(), &mut f).map_err(|e| e.to_string())?;
-            Ok(())
-        }
+        ProxiedFileDownloader::new()
+            .with_timeout(Duration::from_secs(60))
+            .download_file_sync(url, dest_path, None)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -384,10 +460,7 @@ impl LuaToolsApiClient {
     }
 
     fn agent() -> ureq::Agent {
-        ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(10))
-            .timeout(Duration::from_secs(60))
-            .build()
+        HubcapService::doh_agent()
     }
 
     pub fn search_store(&self, query: &str) -> Result<Vec<SteamSearchItem>, String> {
@@ -543,12 +616,19 @@ impl LuaToolsApiClient {
     }
 
     pub fn check_sources(&self, app_id: u32) -> BTreeMap<String, String> {
-        let url = format!("{}/check_apis?appid={}", MANIFEST_BACKEND_URL, app_id);
-        let Ok(resp) = Self::agent()
-            .get(&url)
+        let https_url = format!("https://167.235.229.108/check_apis?appid={}", app_id);
+        let resp = Self::agent()
+            .get(&https_url)
             .set("User-Agent", MANIFEST_BACKEND_UA)
             .call()
-        else {
+            .or_else(|_| {
+                let url = format!("{}/check_apis?appid={}", MANIFEST_BACKEND_URL, app_id);
+                Self::agent()
+                    .get(&url)
+                    .set("User-Agent", MANIFEST_BACKEND_UA)
+                    .call()
+            });
+        let Ok(resp) = resp else {
             return BTreeMap::new();
         };
         let Ok(Value::Object(map)) = resp.into_json::<Value>() else {

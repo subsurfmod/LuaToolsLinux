@@ -92,25 +92,39 @@ impl WiredService {
         self.share_dir.join("SLSsteam")
     }
 
+    /// Resolves the active `SLSsteam` directory, taking Flatpak Steam installations into account (LNX-04, LT-65).
+    pub fn active_slssteam_dir(&self) -> PathBuf {
+        let primary = self.slssteam_dir();
+        if primary.join("SLSsteam.so").is_file() {
+            return primary;
+        }
+        if let Some(ref root) = self.steam_root {
+            if crate::services::steam_service::SteamService::is_flatpak_steam_root(root) {
+                if let Some(fp_share) = root.parent().map(|p| p.join("SLSsteam")) {
+                    if fp_share.join("SLSsteam.so").is_file() {
+                        return fp_share;
+                    }
+                }
+            }
+        }
+        if self.uses_system_home {
+            if let Some(home) = dirs::home_dir() {
+                let fp_dir = home.join(".var/app/com.valvesoftware.Steam/.local/share/SLSsteam");
+                if fp_dir.join("SLSsteam.so").is_file() {
+                    return fp_dir;
+                }
+            }
+        }
+        primary
+    }
+
     pub fn is_accela_installed(&self) -> bool {
         dir_has_entries(&self.accela_dir())
     }
 
+    /// Verifies `SLSsteam.so` exists and computes a valid non-empty SHA-256 digest (LT-65).
     pub fn is_slssteam_installed(&self) -> bool {
-        if self.slssteam_dir().join("SLSsteam.so").is_file() {
-            return true;
-        }
-        if self.uses_system_home {
-            if let Some(home) = dirs::home_dir() {
-                if home
-                    .join(".var/app/com.valvesoftware.Steam/.local/share/SLSsteam/SLSsteam.so")
-                    .is_file()
-                {
-                    return true;
-                }
-            }
-        }
-        false
+        self.slssteam_sha256().is_some()
     }
 
     pub fn is_fully_installed(&self) -> bool {
@@ -157,24 +171,27 @@ impl WiredService {
 
     /// Computes the SHA-256 hash of the installed `SLSsteam.so` unlocker binary (LT-65).
     pub fn slssteam_sha256(&self) -> Option<String> {
-        let p = self.slssteam_dir().join("SLSsteam.so");
-        Self::cached_sha256(&p, "SLSsteam.so")
+        let p = self.active_slssteam_dir().join("SLSsteam.so");
+        Self::cached_sha256(&p, "SLSsteam.so").filter(|h| !h.is_empty())
     }
 
     /// Computes the SHA-256 hash of the installed `library-inject.so` bridge library (LT-65).
     pub fn library_inject_sha256(&self) -> Option<String> {
-        let p = self.slssteam_dir().join("library-inject.so");
-        Self::cached_sha256(&p, "library-inject.so")
+        let p = self.active_slssteam_dir().join("library-inject.so");
+        Self::cached_sha256(&p, "library-inject.so").filter(|h| !h.is_empty())
     }
 
     pub fn status(&self) -> WiredStatus {
+        let active_sls_dir = self.active_slssteam_dir();
+        let sls_sha = self.slssteam_sha256();
+        let inj_sha = self.library_inject_sha256();
         WiredStatus {
             accela_installed: self.is_accela_installed(),
-            slssteam_installed: self.is_slssteam_installed(),
+            slssteam_installed: sls_sha.is_some(),
             accela_dir: self.accela_dir(),
-            slssteam_dir: self.slssteam_dir(),
-            slssteam_sha256: self.slssteam_sha256(),
-            library_inject_sha256: self.library_inject_sha256(),
+            slssteam_dir: active_sls_dir,
+            slssteam_sha256: sls_sha,
+            library_inject_sha256: inj_sha,
         }
     }
 
@@ -211,6 +228,7 @@ impl WiredService {
         );
         let mut chosen_url = ACCELA_FALLBACK_URL.to_string();
         let mut chosen_name = "deps.tar.gz".to_string();
+        let mut chosen_digest: Option<String> = None;
         let mut tag = "latest".to_string();
 
         if let Ok(resp) = agent.get(&api_url).set("User-Agent", &ua).call() {
@@ -237,6 +255,10 @@ impl WiredService {
                         if let Some(n) = asset.get("name").and_then(|v| v.as_str()) {
                             chosen_name = n.to_string();
                         }
+                        chosen_digest = asset
+                            .get("digest")
+                            .and_then(|v| v.as_str())
+                            .map(ToString::to_string);
                     }
                 }
             }
@@ -262,6 +284,15 @@ impl WiredService {
         }) {
             let _ = fs::remove_dir_all(&tmp_dir);
             return Err(e);
+        }
+
+        // LT-49: Verify GitHub release asset SHA-256 digest when provided
+        if let Some(ref digest) = chosen_digest {
+            let fhs = FileHashService::new();
+            if let Err(e) = fhs.verify_sha256_digest(&archive_path, &chosen_name, digest) {
+                let _ = fs::remove_dir_all(&tmp_dir);
+                return Err(format!("ACCELA integrity verification failed: {}", e));
+            }
         }
 
         progress_cb(
@@ -386,6 +417,10 @@ impl WiredService {
             .get("name")
             .and_then(|v| v.as_str())
             .unwrap_or("SLSsteam-release.tar.zst");
+        let expected_digest = chosen
+            .get("digest")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string);
 
         let tmp_dir =
             std::env::temp_dir().join(format!("luatools_slssteam_{}", std::process::id()));
@@ -411,6 +446,15 @@ impl WiredService {
         }) {
             let _ = fs::remove_dir_all(&tmp_dir);
             return Err(e);
+        }
+
+        // LT-49: Verify GitHub release asset SHA-256 digest before extracting SLSsteam
+        if let Some(ref digest) = expected_digest {
+            let fhs = FileHashService::new();
+            if let Err(e) = fhs.verify_sha256_digest(&archive_path, file_name, digest) {
+                let _ = fs::remove_dir_all(&tmp_dir);
+                return Err(format!("SLSsteam archive SHA-256 check failed: {}", e));
+            }
         }
 
         progress_cb(
@@ -445,12 +489,20 @@ impl WiredService {
         let _ = fs::set_permissions(&target_so, fs::Permissions::from_mode(0o755));
         // LT-49 & LT-65: Cryptographic SHA-256 active unlocker verification
         let fhs = FileHashService::new();
-        let _ = fhs.hash_file(&target_so, "SLSsteam.so");
+        let so_hash = fhs.hash_file(&target_so, "SLSsteam.so");
+        if so_hash.sha256.is_empty() || so_hash.file_size == 0 {
+            return Err("Installed SLSsteam.so failed SHA-256 integrity check (empty/unreadable).".into());
+        }
+        log::info!("Installed SLSsteam.so SHA-256: {}", so_hash.sha256);
 
         if let Some(inj) = find_file_recursive(&extract_dir, "library-inject.so") {
             let target_inj = sls_dir.join("library-inject.so");
             if fs::copy(&inj, &target_inj).is_ok() {
                 let _ = fs::set_permissions(&target_inj, fs::Permissions::from_mode(0o755));
+                let inj_hash = fhs.hash_file(&target_inj, "library-inject.so");
+                if !inj_hash.sha256.is_empty() {
+                    log::info!("Installed library-inject.so SHA-256: {}", inj_hash.sha256);
+                }
             }
         }
 
@@ -503,11 +555,18 @@ impl WiredService {
         let integration_lib_str = integration_lib.display().to_string();
         let script = format!(
             "#!/usr/bin/env bash\n\
-             # Auto-start LuaTools companion in background minimized to tray if available (LT-20)\n\
-             if command -v luatools >/dev/null 2>&1; then\n\
-                 luatools --minimized --tray-locked &\n\
-             elif [ -x \"$HOME/.local/bin/luatools\" ]; then\n\
-                 \"$HOME/.local/bin/luatools\" --minimized --tray-locked &\n\
+             # Auto-start LuaTools companion in background minimized to tray unless opted out (LT-20)\n\
+             # Opt out via LUATOOLS_NO_AUTOLAUNCH=1 or creating ~/.config/luatools/no-autolaunch\n\
+             if [ \"${{LUATOOLS_NO_AUTOLAUNCH:-0}}\" != \"1\" ] && [ ! -f \"${{XDG_CONFIG_HOME:-$HOME/.config}}/luatools/no-autolaunch\" ]; then\n\
+                 if command -v luatools >/dev/null 2>&1; then\n\
+                     if ! pgrep -x luatools >/dev/null 2>&1; then\n\
+                         luatools --minimized --tray-locked &\n\
+                     fi\n\
+                 elif [ -x \"$HOME/.local/bin/luatools\" ]; then\n\
+                     if ! pgrep -x luatools >/dev/null 2>&1; then\n\
+                         \"$HOME/.local/bin/luatools\" --minimized --tray-locked &\n\
+                     fi\n\
+                 fi\n\
              fi\n\
              # Set target platform for LuaTools depot filtering (auto-detect or override via env)\n\
              export LUATOOLS_TARGET_OS=\"${{LUATOOLS_TARGET_OS:-linux}}\"\n\
@@ -647,6 +706,45 @@ pub fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
         return Ok(());
     }
     if lower.ends_with(".tar.zst") || lower.ends_with(".tar.xz") || lower.ends_with(".tar.bz2") {
+        // Pre-screen tar archive listing for path traversal or absolute paths before extraction
+        let mut list_cmd = Command::new("tar");
+        if lower.ends_with(".tar.zst") {
+            list_cmd.arg("--zstd");
+        }
+        let list_out = list_cmd
+            .arg("-tf")
+            .arg(archive)
+            .output()
+            .map_err(|e| format!("Failed to inspect {} archive: {}", lower, e))?;
+        if !list_out.status.success() {
+            return Err(format!(
+                "tar failed to pre-screen {} archive before extraction: {}",
+                lower,
+                String::from_utf8_lossy(&list_out.stderr).trim()
+            ));
+        }
+        let listing = String::from_utf8_lossy(&list_out.stdout);
+        for line in listing.lines() {
+            let entry_path = line.trim();
+            if entry_path.is_empty() {
+                continue;
+            }
+            let p = Path::new(entry_path);
+            let is_unsafe = entry_path.starts_with('/')
+                || entry_path.starts_with('\\')
+                || p.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir | std::path::Component::RootDir
+                    )
+                });
+            if is_unsafe {
+                return Err(format!(
+                    "Rejected unsafe path-traversal entry in {}: {}",
+                    lower, entry_path
+                ));
+            }
+        }
         let mut cmd = Command::new("tar");
         if lower.ends_with(".tar.zst") {
             cmd.arg("--zstd");
@@ -680,28 +778,32 @@ pub fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
             .arg(archive)
             .output()
             .map_err(|e| format!("Failed to inspect 7z archive: {}", e))?;
-        if list_out.status.success() {
-            let listing = String::from_utf8_lossy(&list_out.stdout);
-            // Parse 7z -slt output which has "Path = filename" lines
-            for line in listing.lines() {
-                let trimmed = line.trim();
-                if trimmed.starts_with("Path = ") {
-                    let file_path = &trimmed[7..];
-                    // Check for actual path traversal patterns
-                    let is_traversal = file_path.starts_with('/')
-                        || file_path.starts_with('\\')
-                        || file_path.starts_with("../")
-                        || file_path.starts_with("..\\")
-                        || file_path.contains("/../")
-                        || file_path.contains("\\..\\")
-                        || file_path.ends_with("/..")
-                        || file_path.ends_with("\\..")
-                        || file_path == ".."
-                        || file_path == "../"
-                        || file_path == "..\\";
-                    if is_traversal {
-                        return Err(format!("Rejected unsafe path-traversal entry in 7z: {}", file_path));
-                    }
+        if !list_out.status.success() {
+            return Err(format!(
+                "7z failed to pre-screen archive before extraction: {}",
+                String::from_utf8_lossy(&list_out.stderr).trim()
+            ));
+        }
+        let listing = String::from_utf8_lossy(&list_out.stdout);
+        // Parse 7z -slt output which has "Path = filename" lines
+        for line in listing.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("Path = ") {
+                let file_path = &trimmed[7..];
+                // Check for actual path traversal patterns
+                let is_traversal = file_path.starts_with('/')
+                    || file_path.starts_with('\\')
+                    || file_path.starts_with("../")
+                    || file_path.starts_with("..\\")
+                    || file_path.contains("/../")
+                    || file_path.contains("\\..\\")
+                    || file_path.ends_with("/..")
+                    || file_path.ends_with("\\..")
+                    || file_path == ".."
+                    || file_path == "../"
+                    || file_path == "..\\";
+                if is_traversal {
+                    return Err(format!("Rejected unsafe path-traversal entry in 7z: {}", file_path));
                 }
             }
         }

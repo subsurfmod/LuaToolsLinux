@@ -2,15 +2,15 @@
 //! installer, Fedora/.NET runtime crash hardening (`stdin=null`, `W^X=0`, `RLIMIT_CORE=0`),
 //! optional `-remember-password` / `-qr` Steam session login, and streaming depot downloads.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -21,9 +21,11 @@ use zip::ZipArchive;
 use crate::models::config::default_luatools_data_dir;
 use crate::models::steam::SteamInstallation;
 use crate::parsers::lua_parser::LuaFileParser;
-use crate::services::donate_keys::DonateKeysService;
+use crate::parsers::manifest_binary::{read_manifest_file, ManifestFile, ManifestMetadata};
 use crate::services::api_client::HubcapService;
-use crate::services::api_client::stream_response_to_file;
+use crate::services::donate_keys::DonateKeysService;
+use crate::services::file_hash::FileHashService;
+use crate::services::proxied_file_downloader::ProxiedFileDownloader;
 use crate::services::slssteam_service::SlssteamService;
 
 static KEYS_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -89,6 +91,7 @@ impl DepotDownloadOptions {
     }
 }
 
+const DEPOTDOWNLOADER_MOD_REPO: &str = "SteamAutoCracks/DepotDownloaderMod";
 const DEPOTDOWNLOADER_REPO: &str = "SteamRE/DepotDownloader";
 const TOOL_CHECK_INTERVAL_SECS: u64 = 6 * 3600;
 
@@ -397,7 +400,7 @@ impl DepotDownloaderService {
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    if repo == DEPOTDOWNLOADER_REPO
+                    if (repo == DEPOTDOWNLOADER_MOD_REPO || repo == DEPOTDOWNLOADER_REPO)
                         && now.saturating_sub(last) < TOOL_CHECK_INTERVAL_SECS
                     {
                         return Some(existing);
@@ -417,97 +420,128 @@ impl DepotDownloaderService {
         F: FnMut(f32, String),
     {
         let _ = fs::create_dir_all(&self.tool_dir);
-        progress_cb(
-            5.0,
-            "Checking GitHub for official SteamRE/DepotDownloader release...".into(),
-        );
-
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(60))
-            .build();
-
-        let url = format!(
-            "https://api.github.com/repos/{}/releases/latest",
-            DEPOTDOWNLOADER_REPO
-        );
-        let resp = agent
-            .get(&url)
-            .set("User-Agent", "LuaToolsLinux/2.1")
-            .call()
-            .ok()?;
-        let rel = resp.into_json::<Value>().ok()?;
-        let tag = rel
-            .get("tag_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("latest");
-        let assets = rel.get("assets").and_then(|v| v.as_array())?;
-
+        let downloader = ProxiedFileDownloader::new().with_timeout(Duration::from_secs(90));
         let has_system_dotnet = which_in_path("dotnet").is_some();
-        let chosen = if has_system_dotnet {
-            assets
-                .iter()
-                .find(|a| {
-                    let n = a
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_ascii_lowercase();
-                    n.ends_with(".zip") && n.contains("framework")
-                })
-                .or_else(|| Self::pick_linux_x64_asset(assets))
-        } else {
-            Self::pick_linux_x64_asset(assets)
-        };
 
-        let asset = chosen?;
-        let dl_url = asset.get("browser_download_url").and_then(|v| v.as_str())?;
-        let raw_aname = asset
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("depotdownloader.zip");
-        let safe_aname = Path::new(raw_aname)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .filter(|s| !s.is_empty() && *s != "." && *s != "..")
-            .unwrap_or("depotdownloader.zip");
-        let zip_path = self.tool_dir.join(safe_aname);
+        // LT-67: Prefer DepotDownloaderMod first (supports -manifestfile & -depotkeys), falling back to SteamRE/DepotDownloader
+        for repo in [DEPOTDOWNLOADER_MOD_REPO, DEPOTDOWNLOADER_REPO] {
+            progress_cb(
+                5.0,
+                format!("Checking GitHub for {} release...", repo),
+            );
+            let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
+            let Ok(rel_txt) = downloader.download_string_sync(&url) else {
+                continue;
+            };
+            let Ok(rel) = serde_json::from_str::<Value>(&rel_txt) else {
+                continue;
+            };
+            let tag = rel
+                .get("tag_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("latest");
+            let Some(assets) = rel.get("assets").and_then(|v| v.as_array()) else {
+                continue;
+            };
 
-        progress_cb(10.0, format!("Downloading DepotDownloader {}...", tag));
-        let dl_resp = agent.get(dl_url).call().ok()?;
-        stream_response_to_file(dl_resp, &zip_path, &mut |frac, msg| {
-            progress_cb((10.0 + frac * 80.0).clamp(10.0, 90.0), msg);
-        })
-        .ok()?;
+            let chosen = if has_system_dotnet {
+                assets
+                    .iter()
+                    .find(|a| {
+                        let n = a
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        n.ends_with(".zip") && n.contains("framework")
+                    })
+                    .or_else(|| Self::pick_linux_x64_asset(assets))
+            } else {
+                Self::pick_linux_x64_asset(assets)
+            };
 
-        progress_cb(92.0, "Extracting archive...".into());
-        let extract_ok = File::open(&zip_path)
-            .ok()
-            .and_then(|zf| ZipArchive::new(zf).ok())
-            .and_then(|mut archive| archive.extract(&self.tool_dir).ok())
-            .is_some();
-        let _ = fs::remove_file(&zip_path);
-        if !extract_ok {
-            return None;
+            let Some(asset) = chosen else {
+                continue;
+            };
+            let Some(dl_url) = asset.get("browser_download_url").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let raw_aname = asset
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("depotdownloader.zip");
+            let safe_aname = Path::new(raw_aname)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+                .unwrap_or("depotdownloader.zip");
+            let zip_path = self.tool_dir.join(safe_aname);
+
+            progress_cb(10.0, format!("Downloading {} {}...", repo, tag));
+            let dl_label = format!("Downloading {} {}...", repo, tag);
+            let mut dl_cb = |frac: f64| {
+                progress_cb((10.0 + (frac as f32) * 80.0).clamp(10.0, 90.0), dl_label.clone());
+            };
+            if downloader
+                .download_file_sync(dl_url, &zip_path, Some(&mut dl_cb))
+                .is_err()
+            {
+                let _ = fs::remove_file(&zip_path);
+                continue;
+            }
+
+            // LT-67 / LT-49: Verify GitHub release asset SHA-256 digest when provided
+            if let Some(digest) = asset.get("digest").and_then(|v| v.as_str()) {
+                let fhs = FileHashService::new();
+                if let Err(e) = fhs.verify_sha256_digest(&zip_path, safe_aname, digest) {
+                    log::warn!("DepotDownloader asset digest check failed ({}): {}", repo, e);
+                    let _ = fs::remove_file(&zip_path);
+                    continue;
+                }
+            }
+
+            progress_cb(92.0, "Extracting archive...".into());
+            let extract_ok = File::open(&zip_path)
+                .ok()
+                .and_then(|zf| ZipArchive::new(zf).ok())
+                .and_then(|mut archive| archive.extract(&self.tool_dir).ok())
+                .is_some();
+            let _ = fs::remove_file(&zip_path);
+            if !extract_ok {
+                continue;
+            }
+
+            let Some(exe) = Self::scan_dir_for_bin(&self.tool_dir) else {
+                continue;
+            };
+            let _ = Self::build_invocation(&exe);
+            let fhs = FileHashService::new();
+            let exe_sha = fhs
+                .hash_file(
+                    &exe,
+                    exe.file_name().and_then(|s| s.to_str()).unwrap_or("DepotDownloader"),
+                )
+                .sha256;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = fs::write(
+                self.tool_dir.join("meta.json"),
+                serde_json::to_string_pretty(&json!({
+                    "version": tag,
+                    "repo": repo,
+                    "last_check": now,
+                    "exe_path": exe,
+                    "sha256": exe_sha,
+                }))
+                .unwrap_or_default(),
+            );
+            progress_cb(100.0, format!("{} {} ready", repo, tag));
+            return Some(exe);
         }
 
-        let exe = Self::scan_dir_for_bin(&self.tool_dir)?;
-        let _ = Self::build_invocation(&exe);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let _ = fs::write(
-            self.tool_dir.join("meta.json"),
-            serde_json::to_string_pretty(&json!({
-                "version": tag,
-                "repo": DEPOTDOWNLOADER_REPO,
-                "last_check": now,
-                "exe_path": exe,
-            }))
-            .unwrap_or_default(),
-        );
-        progress_cb(100.0, format!("DepotDownloader {} ready", tag));
-        Some(exe)
+        None
     }
 
     fn pick_linux_x64_asset(assets: &[Value]) -> Option<&Value> {
@@ -625,7 +659,14 @@ impl DepotDownloaderService {
         }
     }
 
-    /// Resolves or downloads the manifest for a depot (LT-44).
+    /// Reads and decodes real `ManifestMetadata` from a local binary `.manifest` file (LT-60, LT-61).
+    pub fn inspect_manifest(manifest_path: &Path) -> Option<ManifestMetadata> {
+        read_manifest_file(manifest_path)
+            .ok()
+            .or_else(|| ManifestFile::try_read(manifest_path))
+    }
+
+    /// Resolves or downloads the manifest for a depot, consuming & verifying decoded `ManifestMetadata` (LT-44, LT-60, LT-61).
     pub fn resolve_manifests(
         steam_inst: Option<&SteamInstallation>,
         depot_id: u32,
@@ -633,33 +674,76 @@ impl DepotDownloaderService {
         hubcap_api_key: Option<&str>,
     ) -> Option<PathBuf> {
         if let Some(existing) = Self::resolve_manifest_path(steam_inst, depot_id, manifest_id) {
-            let _ = crate::parsers::manifest_binary::read_manifest_file(&existing);
-            return Some(existing);
+            if let Some(meta) = Self::inspect_manifest(&existing) {
+                if meta.depot_id == 0 || meta.depot_id == depot_id {
+                    log::info!(
+                        "Using cached manifest {} (depot={}, gid={}, files={}, size={} bytes)",
+                        existing.display(),
+                        meta.depot_id,
+                        meta.manifest_gid,
+                        meta.file_count,
+                        meta.total_size
+                    );
+                    return Some(existing);
+                }
+                log::warn!(
+                    "Cached manifest {} has mismatched depot_id {} (expected {}); re-downloading",
+                    existing.display(),
+                    meta.depot_id,
+                    depot_id
+                );
+            } else {
+                log::warn!(
+                    "Cached manifest {} failed binary protobuf decode; removing and re-downloading",
+                    existing.display()
+                );
+            }
+            let _ = fs::remove_file(&existing);
         }
         let inst = steam_inst?;
         let clean_gid = manifest_id.trim();
         let gid: u64 = clean_gid.parse().ok()?;
         let target_dir = inst.root.join("depotcache");
         let dest = target_dir.join(format!("{}_{}.manifest", depot_id, clean_gid));
-        if HubcapService::download_raw_manifest_to_file(depot_id, gid, &dest, hubcap_api_key).is_ok() {
-            let _ = crate::parsers::manifest_binary::read_manifest_file(&dest);
-            Some(dest)
-        } else {
-            None
+        match HubcapService::download_raw_manifest_to_file_verified(
+            depot_id,
+            gid,
+            &dest,
+            hubcap_api_key,
+            None,
+        ) {
+            Ok(meta) => {
+                log::info!(
+                    "Downloaded verified manifest {} (depot={}, gid={}, files={}, size={} bytes)",
+                    dest.display(),
+                    meta.depot_id,
+                    meta.manifest_gid,
+                    meta.file_count,
+                    meta.total_size
+                );
+                Some(dest)
+            }
+            Err(e) => {
+                log::warn!("Manifest download/validation failed for {}_{}: {}", depot_id, clean_gid, e);
+                None
+            }
         }
     }
 
-    /// Validate AES decryption key against manifest binary (LT-62).
+    /// Validate AES-256 decryption key against encrypted filenames in a manifest binary (LT-62).
     pub fn validate_depot_aes_key(manifest_path: &Path, hex_key: &str) -> bool {
-        if let Ok(bytes) = hex::decode(hex_key.trim()) {
-            if bytes.len() == 32 {
-                let mut key_arr = [0u8; 32];
-                key_arr.copy_from_slice(&bytes);
-                return crate::parsers::manifest_binary::validate_aes_key(manifest_path, &key_arr)
-                    .unwrap_or(true);
-            }
+        let Ok(bytes) = hex::decode(hex_key.trim()) else {
+            return false;
+        };
+        if bytes.len() != 32 {
+            return false;
         }
-        false
+        let mut key_arr = [0u8; 32];
+        key_arr.copy_from_slice(&bytes);
+        match crate::parsers::manifest_binary::validate_aes_key(manifest_path, &key_arr) {
+            Ok(valid) => valid,
+            Err(_) => ManifestFile::key_looks_valid(manifest_path, &key_arr),
+        }
     }
 
     pub fn resolve_manifest_path(
@@ -686,7 +770,22 @@ impl DepotDownloaderService {
             .find(|p| p.is_file())
     }
 
-    /// Opens an interactive terminal window running `DepotDownloader -qr -remember-password`
+    /// Builds interactive Steam login flags for `DepotDownloader` (LT-68).
+    /// Omits `-remember-password` on QR-only login when no username is set.
+    pub fn build_interactive_login_args(steam_username: &str) -> Vec<String> {
+        let clean_user = steam_username.trim();
+        if !clean_user.is_empty() && !clean_user.eq_ignore_ascii_case("anonymous") {
+            vec![
+                "-username".to_string(),
+                clean_user.to_string(),
+                "-remember-password".to_string(),
+            ]
+        } else {
+            vec!["-qr".to_string()]
+        }
+    }
+
+    /// Opens an interactive terminal window running `DepotDownloader -qr`
     /// (or `-username <user> -remember-password`) so the user can authenticate their Steam
     /// session once and reuse cached credentials during background downloads.
     pub fn launch_interactive_login(
@@ -704,16 +803,9 @@ impl DepotDownloaderService {
             .map(|s| shell_quote(s))
             .collect::<Vec<_>>()
             .join(" ");
-        let clean_user = steam_username.trim();
-        if !clean_user.is_empty() && !clean_user.eq_ignore_ascii_case("anonymous") {
-            shell_cmd.push_str(&format!(
-                " -username {} -remember-password",
-                shell_quote(clean_user)
-            ));
-        } else {
-            // Only use -remember-password with -qr if we have a username or QR code
-            // DepotDownloader requires -username or -qr when using -remember-password
-            shell_cmd.push_str(" -qr -remember-password");
+        for arg in Self::build_interactive_login_args(steam_username) {
+            shell_cmd.push(' ');
+            shell_cmd.push_str(&shell_quote(&arg));
         }
         let full_script = format!(
             "DOTNET_EnableWriteXorExecute=0 DOTNET_EnableDiagnostics=0 {} ; echo ''; read -rp 'Press Enter to close...' _",
@@ -751,17 +843,120 @@ impl DepotDownloaderService {
         ))
     }
 
+    /// Downloads multiple depots with bounded concurrency (`opts.max_concurrent()`) and cooperative
+    /// `Arc<AtomicBool>` cancellation (LT-68). Results preserve the input order of `selections`.
+    pub fn download_depots_batch<F>(
+        &self,
+        app_id: u32,
+        selections: &[DepotSelection],
+        dest_root: &Path,
+        opts: &DepotDownloadOptions,
+        cancel: Option<Arc<AtomicBool>>,
+        progress_cb: F,
+    ) -> Vec<DepotRunResult>
+    where
+        F: Fn(u32, f32, String) + Send + Sync,
+    {
+        if selections.is_empty() {
+            return Vec::new();
+        }
+        let concurrency = opts.max_concurrent().max(1).min(selections.len());
+        let queue: Mutex<VecDeque<(usize, DepotSelection)>> = Mutex::new(
+            selections
+                .iter()
+                .cloned()
+                .enumerate()
+                .collect(),
+        );
+        let results: Mutex<Vec<Option<DepotRunResult>>> =
+            Mutex::new(vec![None; selections.len()]);
+        let progress_ref = &progress_cb;
+
+        thread::scope(|scope| {
+            for _ in 0..concurrency {
+                let q = &queue;
+                let res_out = &results;
+                let cancel_clone = cancel.clone();
+                scope.spawn(move || loop {
+                    let next_item = {
+                        let mut guard = q.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.pop_front()
+                    };
+                    let Some((idx, sel)) = next_item else {
+                        break;
+                    };
+                    let depot_id = sel.depot_id;
+                    let sub_dir = dest_root.join(format!("depot_{}", depot_id));
+                    let run_res = self.download_depot_cancellable(
+                        app_id,
+                        &sel,
+                        &sub_dir,
+                        opts,
+                        cancel_clone.clone(),
+                        |pct, msg| progress_ref(depot_id, pct, msg),
+                    );
+                    let mut out = res_out.lock().unwrap_or_else(|e| e.into_inner());
+                    out[idx] = Some(run_res);
+                });
+            }
+        });
+
+        results
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner())
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| {
+                r.unwrap_or_else(|| DepotRunResult {
+                    depot_id: selections[i].depot_id,
+                    ok: false,
+                    error: Some("Depot download worker exited unexpectedly".into()),
+                })
+            })
+            .collect()
+    }
+
     pub fn download_depot<F>(
         &self,
         app_id: u32,
         selection: &DepotSelection,
         download_dir: &Path,
         opts: &DepotDownloadOptions,
+        progress_cb: F,
+    ) -> DepotRunResult
+    where
+        F: FnMut(f32, String),
+    {
+        self.download_depot_cancellable(app_id, selection, download_dir, opts, None, progress_cb)
+    }
+
+    /// Downloads a single depot with manifest protobuf metadata inspection (LT-60/61),
+    /// AES-256 key pre-validation (LT-62), timeout watchdog, and cooperative cancellation +
+    /// partial temp cleanup (LT-68).
+    pub fn download_depot_cancellable<F>(
+        &self,
+        app_id: u32,
+        selection: &DepotSelection,
+        download_dir: &Path,
+        opts: &DepotDownloadOptions,
+        cancel: Option<Arc<AtomicBool>>,
         mut progress_cb: F,
     ) -> DepotRunResult
     where
         F: FnMut(f32, String),
     {
+        if cancel
+            .as_deref()
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(false)
+        {
+            return DepotRunResult {
+                depot_id: selection.depot_id,
+                ok: false,
+                error: Some("Download cancelled".into()),
+            };
+        }
+
         let custom_opt = opts.custom_tool_path.trim();
         let Some(exe) = self.ensure_tool(
             (!custom_opt.is_empty()).then_some(custom_opt),
@@ -819,6 +1014,45 @@ impl DepotDownloaderService {
             )
             // `bridge` mutex guard is dropped immediately here before spawning the child process
         };
+
+        // LT-60 / LT-61 / LT-62: Consume decoded manifest metadata & validate AES-256 depot key before spawning
+        if let Some(ref mp) = effective_selection.manifest_path {
+            if let Some(meta) = Self::inspect_manifest(mp) {
+                if meta.depot_id != 0 && meta.depot_id != effective_selection.depot_id {
+                    return DepotRunResult {
+                        depot_id: selection.depot_id,
+                        ok: false,
+                        error: Some(format!(
+                            "Local manifest {} belongs to depot {}, not {}",
+                            mp.display(),
+                            meta.depot_id,
+                            effective_selection.depot_id
+                        )),
+                    };
+                }
+                progress_cb(
+                    0.0,
+                    format!(
+                        "Verified manifest GID {} ({} file(s), {} bytes)",
+                        meta.manifest_gid, meta.file_count, meta.total_size
+                    ),
+                );
+                if let Some(hex_key) = depot_keys.get(&effective_selection.depot_id) {
+                    if !Self::validate_depot_aes_key(mp, hex_key) {
+                        return DepotRunResult {
+                            depot_id: selection.depot_id,
+                            ok: false,
+                            error: Some(format!(
+                                "Depot {} decryption key failed AES-256 validation against encrypted manifest {}",
+                                effective_selection.depot_id,
+                                mp.display()
+                            )),
+                        };
+                    }
+                }
+            }
+        }
+
         let keys_guard = Self::write_depot_keys_file(&depot_keys).map(TempFileGuard);
 
         let is_mod = Self::is_mod_binary(&exe);
@@ -914,9 +1148,23 @@ impl DepotDownloaderService {
             match child.try_wait() {
                 Ok(Some(status)) => break Ok(status),
                 Ok(None) => {
+                    if cancel
+                        .as_deref()
+                        .map(|c| c.load(Ordering::Relaxed))
+                        .unwrap_or(false)
+                    {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        cleanup_partial_depot_temp(download_dir);
+                        break Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "Download cancelled",
+                        ));
+                    }
                     if start.elapsed() >= timeout {
                         let _ = child.kill();
                         let _ = child.wait();
+                        cleanup_partial_depot_temp(download_dir);
                         break Err(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
                             format!("Download timed out after {} seconds", timeout.as_secs()),
@@ -1051,6 +1299,25 @@ fn summarize_depotdownloader_failure(
         format!("Exited with code {}", exit_code.unwrap_or(1))
     } else {
         meaningful_err
+    }
+}
+
+fn cleanup_partial_depot_temp(download_dir: &Path) {
+    let staging = download_dir.join(".DepotDownloader");
+    if staging.is_dir() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    if let Ok(entries) = fs::read_dir(download_dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_file() {
+                if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                    if name.ends_with(".tmp") || name.ends_with(".part") {
+                        let _ = fs::remove_file(&p);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1207,5 +1474,46 @@ mod tests {
             "../../etc/passwd"
         )
         .is_none());
+    }
+
+    #[test]
+    fn interactive_login_args_omit_remember_password_for_qr_and_batch_respects_cancel() {
+        let qr_args = DepotDownloaderService::build_interactive_login_args("");
+        assert_eq!(qr_args, vec!["-qr"]);
+        assert!(!qr_args.iter().any(|a| a == "-remember-password"));
+
+        let user_args = DepotDownloaderService::build_interactive_login_args("alice");
+        assert_eq!(user_args, vec!["-username", "alice", "-remember-password"]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = DepotDownloaderService::new(Some(tmp.path().join("dd")));
+        let cancel = Arc::new(AtomicBool::new(true));
+        let sel = DepotSelection {
+            depot_id: 731,
+            manifest_id: None,
+            manifest_path: None,
+            size: 0,
+            from_app_id: None,
+            language: None,
+            os: None,
+            arch: None,
+            is_shared: false,
+            is_dlc: false,
+        };
+        let opts = DepotDownloadOptions {
+            max_concurrent_downloads: Some(2),
+            ..Default::default()
+        };
+        let res = svc.download_depots_batch(
+            730,
+            &[sel],
+            tmp.path(),
+            &opts,
+            Some(cancel),
+            |_, _, _| {},
+        );
+        assert_eq!(res.len(), 1);
+        assert!(!res[0].ok);
+        assert_eq!(res[0].error.as_deref(), Some("Download cancelled"));
     }
 }

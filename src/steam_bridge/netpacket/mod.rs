@@ -22,7 +22,9 @@ pub use netpacket_accesstoken::{
     install_accesstoken_hooks, is_accesstoken_hook_active, uninstall_accesstoken_hooks,
 };
 pub use netpacket_cloud::{
-    drain_cloud_responses, install_cloud_hooks, is_cloud_hook_active, uninstall_cloud_hooks,
+    drain_cloud_responses, drain_into_carrier as drain_cloud_into_carrier,
+    has_pending_responses as has_pending_cloud_responses, install_cloud_hooks,
+    is_cloud_hook_active, uninstall_cloud_hooks,
 };
 pub use netpacket_core::{
     install_netpacket_core, is_netpacket_core_active, uninstall_netpacket_core,

@@ -55,6 +55,7 @@ pub struct CSteamApp {
 /// CAppOverview_Change structure (simplified).
 #[repr(C)]
 pub struct CAppOverviewChange {
+    pub vfptr: *mut c_void,         // C++ polymorphic vtable pointer at offset 0x00
     pub removed_appid: *mut c_void, // RepeatedField<uint32>*
 }
 
@@ -130,7 +131,7 @@ unsafe extern "C" fn fill_in_app_overview_detour(
 ) -> *mut c_void {
     panic::catch_unwind(AssertUnwindSafe(|| {
         if !app.is_null() {
-            let app_ref = &*app;
+            let app_ref = unsafe { &mut *app };
 
             // Track active downloads
             let active = (app_ref.app_state_flags & (EAppState::k_EAppStateUpdateRunning | EAppState::k_EAppStateUpdateStarted)) != 0;
@@ -146,9 +147,14 @@ unsafe extern "C" fn fill_in_app_overview_detour(
             // Apply purchase time from Lua config
             if has_depot(app_ref.n_app_id) {
                 if let Some(purchase_time) = get_purchase_time(app_ref.n_app_id) {
-                    // We can't directly modify the struct since it's a const ref
-                    // In the Windows version this modifies pApp->PurchasedTime
-                    log::trace!("[InteropSteamUI] FillInAppOverview: would set PurchasedTime={} for appId={}", purchase_time, app_ref.n_app_id);
+                    if purchase_time > 0 {
+                        app_ref.purchased_time = purchase_time;
+                        log::trace!(
+                            "[InteropSteamUI] FillInAppOverview: set PurchasedTime={} for appId={}",
+                            purchase_time,
+                            app_ref.n_app_id
+                        );
+                    }
                 }
             }
         }
@@ -250,22 +256,48 @@ unsafe extern "C" fn csteam_ui_app_controller_run_frame_detour(
     .unwrap_or(std::ptr::null_mut())
 }
 
-/// Check if a depot is owned (placeholder - integrates with LuaConfig).
-fn has_depot(_app_id: u32) -> bool {
-    // This would be populated by the Lua config system
-    false
+static PURCHASE_TIMES: OnceLock<Mutex<HashMap<u32, u32>>> = OnceLock::new();
+
+fn purchase_times() -> &'static Mutex<HashMap<u32, u32>> {
+    PURCHASE_TIMES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Get purchase time for an app (placeholder - integrates with LuaConfig).
-fn get_purchase_time(_app_id: u32) -> Option<u32> {
-    // This would be populated by the Lua config system
-    None
+/// Set purchased time for an app ID.
+pub fn set_purchase_time(app_id: u32, time: u32) {
+    let mut map = purchase_times().lock().unwrap_or_else(|e| e.into_inner());
+    if time > 0 {
+        let entry = map.entry(app_id).or_insert(0);
+        if time > *entry {
+            *entry = time;
+        }
+    } else {
+        map.remove(&app_id);
+    }
 }
 
-/// Check if an app is owned (placeholder - integrates with LuaConfig).
-fn is_owned(_app_id: u32) -> bool {
-    // This would be populated by the Lua config system
-    false
+/// Get purchase time for an app ID.
+pub fn get_purchase_time(app_id: u32) -> Option<u32> {
+    purchase_times()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&app_id)
+        .copied()
+        .filter(|&t| t > 0)
+}
+
+/// Clear all registered purchase times.
+pub fn clear_purchase_times() {
+    purchase_times().lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// Check if a depot is owned (integrates with interop_package).
+pub fn has_depot(app_id: u32) -> bool {
+    crate::steam_bridge::interop::interop_package::has_depot_ex(app_id, false)
+}
+
+/// Check if an app is owned (integrates with interop_package).
+pub fn is_owned(app_id: u32) -> bool {
+    crate::steam_bridge::interop::interop_package::is_owned(app_id)
 }
 
 /// Resolve function address using pattern scanning.
@@ -275,18 +307,25 @@ fn resolve_function_address(
     channel: PatternChannel,
     pattern_name: &str,
 ) -> Result<u64, String> {
+    let expected_class = if cfg!(target_pointer_width = "64") {
+        crate::steam_bridge::binary_reader::ElfClass::Class64
+    } else {
+        crate::steam_bridge::binary_reader::ElfClass::Class32
+    };
+
     let binaries = crate::steam_bridge::binary_reader::scan_steam_binaries(steam_root);
     let binary = binaries
         .into_iter()
         .find(|b| {
-            b.path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| match component {
-                    BinaryComponent::SteamClient => n.contains("steamclient"),
-                    BinaryComponent::SteamUi => n.contains("steamui"),
-                })
-                .unwrap_or(false)
+            b.class == expected_class
+                && b.path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| match component {
+                        BinaryComponent::SteamClient => n.contains("steamclient"),
+                        BinaryComponent::SteamUi => n.contains("steamui"),
+                    })
+                    .unwrap_or(false)
         })
         .ok_or_else(|| "Steam binary not found".to_string())?;
 
@@ -295,10 +334,18 @@ fn resolve_function_address(
         .lookup_by_binary(&binary, channel, component)
         .map_err(|e| format!("Pattern lookup failed: {}", e))?;
 
+    if pf.is_fallback() {
+        return Err("Fallback patterns not permitted for in-process memory hooks".to_string());
+    }
+
     let entry = pf
         .patterns
         .get(pattern_name)
         .ok_or_else(|| format!("Pattern '{}' not found", pattern_name))?;
+
+    if entry.is_generic_compiler_prologue() {
+        return Err(format!("Pattern '{}' is a generic compiler prologue", pattern_name));
+    }
 
     let mod_name = binary
         .path
@@ -397,15 +444,11 @@ pub fn install(steam_root: &std::path::Path) -> Result<(), String> {
         "FillInAppOverview",
     ) {
         let replacement = fill_in_app_overview_detour as *const () as *mut u8;
-        let patch = unsafe { memory_patch::patch_by_offset(addr, 0, replacement) }
+        let patch = unsafe { memory_patch::patch_by_offset_with_callback(addr, 0, replacement, |trampoline| {
+            let orig_fn: FillInAppOverviewFn = unsafe { std::mem::transmute(trampoline as *const ()) };
+            *original_fill_in_app_overview().lock().unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
+        }) }
             .map_err(|e| format!("Failed to install FillInAppOverview hook: {}", e))?;
-
-        if !patch.trampoline.is_null() {
-            let orig_fn: FillInAppOverviewFn = unsafe { std::mem::transmute(patch.trampoline) };
-            *original_fill_in_app_overview()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
-        }
         installed_steamui_patches()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -421,15 +464,11 @@ pub fn install(steam_root: &std::path::Path) -> Result<(), String> {
         "BuildCompleteAppOverviewChange",
     ) {
         let replacement = build_complete_app_overview_change_detour as *const () as *mut u8;
-        let patch = unsafe { memory_patch::patch_by_offset(addr, 0, replacement) }
+        let patch = unsafe { memory_patch::patch_by_offset_with_callback(addr, 0, replacement, |trampoline| {
+            let orig_fn: BuildCompleteAppOverviewChangeFn = unsafe { std::mem::transmute(trampoline as *const ()) };
+            *original_build_complete_app_overview_change().lock().unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
+        }) }
             .map_err(|e| format!("Failed to install BuildCompleteAppOverviewChange hook: {}", e))?;
-
-        if !patch.trampoline.is_null() {
-            let orig_fn: BuildCompleteAppOverviewChangeFn = unsafe { std::mem::transmute(patch.trampoline) };
-            *original_build_complete_app_overview_change()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
-        }
         installed_steamui_patches()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -445,15 +484,11 @@ pub fn install(steam_root: &std::path::Path) -> Result<(), String> {
         "CSteamUIAppControllerRunFrame",
     ) {
         let replacement = csteam_ui_app_controller_run_frame_detour as *const () as *mut u8;
-        let patch = unsafe { memory_patch::patch_by_offset(addr, 0, replacement) }
+        let patch = unsafe { memory_patch::patch_by_offset_with_callback(addr, 0, replacement, |trampoline| {
+            let orig_fn: CSteamUIAppControllerRunFrameFn = unsafe { std::mem::transmute(trampoline as *const ()) };
+            *original_csteam_ui_app_controller_run_frame().lock().unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
+        }) }
             .map_err(|e| format!("Failed to install CSteamUIAppControllerRunFrame hook: {}", e))?;
-
-        if !patch.trampoline.is_null() {
-            let orig_fn: CSteamUIAppControllerRunFrameFn = unsafe { std::mem::transmute(patch.trampoline) };
-            *original_csteam_ui_app_controller_run_frame()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
-        }
         installed_steamui_patches()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -513,5 +548,57 @@ mod tests {
 
         cancel_removal(12345);
         assert_eq!(pending_removals().lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_purchase_time_registry_and_csteamapp_write() {
+        clear_purchase_times();
+        assert_eq!(get_purchase_time(480), None);
+
+        set_purchase_time(480, 1609459200);
+        assert_eq!(get_purchase_time(480), Some(1609459200));
+
+        // Setting a larger time updates it, smaller does not overwrite
+        set_purchase_time(480, 1600000000);
+        assert_eq!(get_purchase_time(480), Some(1609459200));
+        set_purchase_time(480, 1700000000);
+        assert_eq!(get_purchase_time(480), Some(1700000000));
+
+        // Create a mock CSteamApp and simulate FillInAppOverview modifying PurchasedTime
+        let mut app = CSteamApp {
+            vfptr: std::ptr::null_mut(),
+            game_id: 480,
+            n_app_id: 480,
+            unknown1: 0,
+            unknown2: 0,
+            release_state: 1,
+            ownership_flags: 1,
+            app_state_flags: 0,
+            steam_id: 76561198000000000,
+            purchased_time: 0,
+            change_number: 1,
+            license_expiration_time: 0,
+            master_sub_app_id: 0,
+            proto_app_type: 0,
+            parent_app_id: 0,
+        };
+
+        // Inject depot so has_depot(480) returns true
+        crate::steam_bridge::interop::interop_package::add_owned_depot_id(480);
+        assert!(has_depot(480));
+
+        // Call fill_in_app_overview_detour with app pointer
+        unsafe {
+            fill_in_app_overview_detour(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut app as *mut CSteamApp,
+            );
+        }
+
+        // Must have directly modified app.purchased_time in memory
+        assert_eq!(app.purchased_time, 1700000000);
+
+        clear_purchase_times();
     }
 }

@@ -287,11 +287,21 @@ fn tray_worker_sender() -> Result<&'static Sender<WorkerCommand>, String> {
                     }));
 
                     let menu = (fns.gtk_menu_new)();
+                    if menu.is_null() {
+                        let _ = init_tx.send(Err("gtk_menu_new returned null".into()));
+                        return;
+                    }
                     let mut callbacks: Vec<Box<MenuCallbackData>> = Vec::new();
                     let mut add_item =
                         |label: &str, event: TrayEvent| -> *mut c_void {
-                            let c_lbl = CString::new(label).unwrap();
+                            let c_lbl = match CString::new(label) {
+                                Ok(c) => c,
+                                Err(_) => return ptr::null_mut(),
+                            };
                             let item = (fns.gtk_menu_item_new_with_label)(c_lbl.as_ptr());
+                            if item.is_null() {
+                                return ptr::null_mut();
+                            }
                             let cb = Box::new(MenuCallbackData {
                                 dispatch: Arc::clone(&shared_dispatch),
                                 event,
@@ -313,49 +323,66 @@ fn tray_worker_sender() -> Result<&'static Sender<WorkerCommand>, String> {
                     let toggle_item = add_item("Show / Hide LuaTools", TrayEvent::ToggleWindow);
                     let _ = add_item("Show LuaTools", TrayEvent::ShowWindow);
                     let _ = add_item("Hide to Tray", TrayEvent::HideWindow);
-                    (fns.gtk_menu_shell_append)(menu, (fns.gtk_separator_menu_item_new)());
+                    let sep1 = (fns.gtk_separator_menu_item_new)();
+                    if !sep1.is_null() {
+                        (fns.gtk_menu_shell_append)(menu, sep1);
+                    }
                     let _ = add_item("Restart Steam with Bridge", TrayEvent::RestartSteam);
                     let _ = add_item("Settings", TrayEvent::OpenSettings);
-                    (fns.gtk_menu_shell_append)(menu, (fns.gtk_separator_menu_item_new)());
+                    let sep2 = (fns.gtk_separator_menu_item_new)();
+                    if !sep2.is_null() {
+                        (fns.gtk_menu_shell_append)(menu, sep2);
+                    }
                     let _ = add_item("Quit", TrayEvent::Quit);
 
                     (fns.gtk_widget_show_all)(menu);
                     (fns.app_indicator_set_menu)(indicator, menu);
-                    (fns.app_indicator_set_secondary_activate_target)(indicator, toggle_item);
+                    if !toggle_item.is_null() {
+                        (fns.app_indicator_set_secondary_activate_target)(indicator, toggle_item);
+                    }
 
                     let _ = init_tx.send(Ok(()));
 
-                    loop {
-                        while let Ok(cmd) = cmd_rx.try_recv() {
-                            match cmd {
-                                WorkerCommand::Activate { dispatch, reply } => {
-                                    *shared_dispatch.lock().unwrap_or_else(|e| e.into_inner()) =
-                                        dispatch;
-                                    (fns.app_indicator_set_status)(
-                                        indicator,
-                                        APP_INDICATOR_STATUS_ACTIVE,
-                                    );
-                                    let _ = reply.send(Ok(()));
-                                }
-                                WorkerCommand::SetTitle(text) => {
-                                    if let Ok(c_txt) = CString::new(text) {
-                                        (fns.app_indicator_set_title)(indicator, c_txt.as_ptr());
-                                    }
-                                }
-                                WorkerCommand::Deactivate => {
-                                    (fns.app_indicator_set_status)(
-                                        indicator,
-                                        APP_INDICATOR_STATUS_PASSIVE,
-                                    );
+                    let handle_worker_cmd = |cmd: WorkerCommand| {
+                        match cmd {
+                            WorkerCommand::Activate { dispatch, reply } => {
+                                *shared_dispatch.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    dispatch;
+                                (fns.app_indicator_set_status)(
+                                    indicator,
+                                    APP_INDICATOR_STATUS_ACTIVE,
+                                );
+                                let _ = reply.send(Ok(()));
+                            }
+                            WorkerCommand::SetTitle(text) => {
+                                if let Ok(c_txt) = CString::new(text) {
+                                    (fns.app_indicator_set_title)(indicator, c_txt.as_ptr());
                                 }
                             }
+                            WorkerCommand::Deactivate => {
+                                (fns.app_indicator_set_status)(
+                                    indicator,
+                                    APP_INDICATOR_STATUS_PASSIVE,
+                                );
+                            }
+                        }
+                    };
+
+                    loop {
+                        match cmd_rx.recv_timeout(Duration::from_millis(50)) {
+                            Ok(cmd) => {
+                                handle_worker_cmd(cmd);
+                                while let Ok(cmd) = cmd_rx.try_recv() {
+                                    handle_worker_cmd(cmd);
+                                }
+                            }
+                            Err(mpsc::RecvTimeoutError::Timeout) => {}
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         }
 
                         while (fns.gtk_events_pending)() != 0 {
                             (fns.gtk_main_iteration_do)(0);
                         }
-
-                        thread::sleep(Duration::from_millis(40));
                     }
                 });
 
@@ -512,36 +539,41 @@ impl TrayService {
         if x11.is_null() {
             return false;
         }
-        let Ok(open_ptr) = dlsym_checked(x11, "XOpenDisplay") else {
-            return false;
-        };
-        let Ok(atom_ptr) = dlsym_checked(x11, "XInternAtom") else {
-            return false;
-        };
-        let Ok(owner_ptr) = dlsym_checked(x11, "XGetSelectionOwner") else {
-            return false;
-        };
-        let Ok(close_ptr) = dlsym_checked(x11, "XCloseDisplay") else {
-            return false;
-        };
+        let result = (|| -> bool {
+            let Ok(open_ptr) = dlsym_checked(x11, "XOpenDisplay") else {
+                return false;
+            };
+            let Ok(atom_ptr) = dlsym_checked(x11, "XInternAtom") else {
+                return false;
+            };
+            let Ok(owner_ptr) = dlsym_checked(x11, "XGetSelectionOwner") else {
+                return false;
+            };
+            let Ok(close_ptr) = dlsym_checked(x11, "XCloseDisplay") else {
+                return false;
+            };
 
-        let x_open: unsafe extern "C" fn(*const c_char) -> *mut c_void =
-            std::mem::transmute(open_ptr);
-        let x_atom: unsafe extern "C" fn(*mut c_void, *const c_char, c_int) -> c_ulong =
-            std::mem::transmute(atom_ptr);
-        let x_owner: unsafe extern "C" fn(*mut c_void, c_ulong) -> c_ulong =
-            std::mem::transmute(owner_ptr);
-        let x_close: unsafe extern "C" fn(*mut c_void) -> c_int = std::mem::transmute(close_ptr);
+            let x_open: unsafe extern "C" fn(*const c_char) -> *mut c_void =
+                std::mem::transmute(open_ptr);
+            let x_atom: unsafe extern "C" fn(*mut c_void, *const c_char, c_int) -> c_ulong =
+                std::mem::transmute(atom_ptr);
+            let x_owner: unsafe extern "C" fn(*mut c_void, c_ulong) -> c_ulong =
+                std::mem::transmute(owner_ptr);
+            let x_close: unsafe extern "C" fn(*mut c_void) -> c_int =
+                std::mem::transmute(close_ptr);
 
-        let dpy = x_open(ptr::null());
-        if dpy.is_null() {
-            return false;
-        }
-        let sel_name = CString::new("_NET_SYSTEM_TRAY_S0").unwrap();
-        let atom = x_atom(dpy, sel_name.as_ptr(), 0);
-        let owner = if atom != 0 { x_owner(dpy, atom) } else { 0 };
-        let _ = x_close(dpy);
-        owner != 0
+            let dpy = x_open(ptr::null());
+            if dpy.is_null() {
+                return false;
+            }
+            let sel_name = CString::new("_NET_SYSTEM_TRAY_S0").unwrap();
+            let atom = x_atom(dpy, sel_name.as_ptr(), 0);
+            let owner = if atom != 0 { x_owner(dpy, atom) } else { 0 };
+            let _ = x_close(dpy);
+            owner != 0
+        })();
+        let _ = libc::dlclose(x11);
+        result
     }
 
     pub fn initialize(&mut self) -> Result<(), String> {
@@ -662,6 +694,36 @@ impl TrayService {
         });
     }
 
+    /// Formats the desktop notification title & body for silent-install completion (LT-07, LT-13).
+    pub fn format_silent_install_notification(
+        app_id: u32,
+        ok: bool,
+        detail: &str,
+    ) -> (String, String) {
+        let title = if ok {
+            format!("LuaTools — AppID {} Installed", app_id)
+        } else {
+            format!("LuaTools — AppID {} Install Failed", app_id)
+        };
+        let trimmed = detail.trim();
+        let body = if trimmed.is_empty() {
+            if ok {
+                "Silent installation completed successfully.".to_string()
+            } else {
+                "Silent installation failed.".to_string()
+            }
+        } else {
+            trimmed.to_string()
+        };
+        (title, body)
+    }
+
+    /// Emits a desktop notification when a silent `luatools://install/silent/<appid>` completes (LT-07, LT-13).
+    pub fn notify_silent_install_complete(&self, app_id: u32, ok: bool, detail: &str) {
+        let (title, body) = Self::format_silent_install_notification(app_id, ok, detail);
+        self.show_notification(&title, &body);
+    }
+
     pub fn cleanup(&mut self) {
         self.tray_available.store(false, Ordering::SeqCst);
         if self.owns_worker_registration {
@@ -732,5 +794,20 @@ mod tests {
 
         svc.cleanup();
         assert!(!svc.is_tray_available());
+    }
+
+    #[test]
+    fn test_silent_install_completion_notification_formatting() {
+        let (title_ok, body_ok) =
+            TrayService::format_silent_install_notification(1245620, true, "Installed via Hubcap");
+        assert!(title_ok.contains("1245620"));
+        assert!(title_ok.contains("Installed"));
+        assert_eq!(body_ok, "Installed via Hubcap");
+
+        let (title_err, body_err) =
+            TrayService::format_silent_install_notification(480, false, "");
+        assert!(title_err.contains("480"));
+        assert!(title_err.contains("Failed"));
+        assert!(body_err.contains("failed"));
     }
 }

@@ -28,7 +28,7 @@ use luatools_linux::services::slssteam_service::SlssteamService;
 use luatools_linux::services::steam_bridge_service::BridgeOverrides;
 use luatools_linux::steam_bridge::{
     binary_reader::{
-        find_loaded_module_mapping, scan_steam_binaries, BinaryFile, LoadedModuleMapping,
+        find_loaded_module_mapping, scan_steam_binaries, BinaryFile, ElfClass, LoadedModuleMapping,
     },
     cloud_redirect::{AchievementBlock, CloudRedirectHost},
     credentials::{
@@ -60,8 +60,10 @@ use luatools_linux::steam_bridge::{
     },
     memory_patch::{self, MemoryPatch, JMP_ABS64_LEN},
     netpacket::{
-        install_cloud_hooks, install_eticket_hooks, install_licenses_hooks, install_manifestprobe_hooks,
-        install_netpacket_core, install_ownershipticket_hooks, install_userstats_hooks,
+        install_accesstoken_hooks, install_cloud_hooks, install_eticket_hooks, install_legacykey_hooks,
+        install_licenses_hooks, install_manifestprobe_hooks, install_netpacket_core,
+        install_netpacket_manifest_hooks, install_onlinefix_hooks, install_ownershipticket_hooks,
+        install_richpresence_hooks, install_userstats_hooks,
         netpacket_eticket::parse_eticket_steam_id,
         netpacket_manifestprobe::expire_manifest_probe_stale,
         netpacket_ownershipticket::parse_ownershipticket_steam_id,
@@ -86,8 +88,21 @@ type RequestEncryptedAppTicketFn =
     unsafe extern "C" fn(*mut c_void, u32, *const c_void, u32) -> u64;
 type GetEncryptedAppTicketFn =
     unsafe extern "C" fn(*mut c_void, u64, *mut c_void, *mut u32) -> bool;
-type GetSteamIDFn = unsafe extern "C" fn(*mut c_void) -> u64;
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CSteamID {
+    pub raw: u64,
+}
+
+type GetSteamIDFn = unsafe extern "C" fn(*mut c_void) -> CSteamID;
 type DepotKeyIntegrationFn = unsafe extern "C" fn(*mut c_void, u32, *mut u8, u32) -> bool;
+type ConfigStoreGetBinaryFn = unsafe extern "C" fn(
+    *mut c_void,
+    u32,
+    *const libc::c_char,
+    *mut libc::c_char,
+    u32,
+) -> i32;
 
 static SPOOFED_APPS: OnceLock<RwLock<HashSet<u32>>> = OnceLock::new();
 static APP_ID_SPOOFS: OnceLock<RwLock<HashMap<u32, u32>>> = OnceLock::new();
@@ -116,9 +131,11 @@ static ORIGINAL_GET_ENCRYPTED_APP_TICKET: OnceLock<RwLock<Option<GetEncryptedApp
     OnceLock::new();
 static ORIGINAL_GET_STEAM_ID: OnceLock<RwLock<Option<GetSteamIDFn>>> = OnceLock::new();
 static ORIGINAL_DEPOT_DECRYPT: OnceLock<RwLock<Option<DepotKeyIntegrationFn>>> = OnceLock::new();
+static ORIGINAL_CONFIG_STORE_GET_BINARY: OnceLock<RwLock<Option<ConfigStoreGetBinaryFn>>> =
+    OnceLock::new();
+static CONFIG_STORE_LOCAL_PTR: OnceLock<RwLock<Option<usize>>> = OnceLock::new();
 
 static INSTALLED_PATCHES: OnceLock<RwLock<Vec<MemoryPatch>>> = OnceLock::new();
-static DENUVO_AUTH: OnceLock<RwLock<DenuvoAuth>> = OnceLock::new();
 static CLOUD_REDIRECT: OnceLock<CloudRedirectHost> = OnceLock::new();
 
 fn read_lock<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
@@ -130,7 +147,7 @@ fn write_lock<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 }
 
 fn denuvo_auth() -> &'static RwLock<DenuvoAuth> {
-    DENUVO_AUTH.get_or_init(|| RwLock::new(DenuvoAuth::new()))
+    luatools_linux::steam_bridge::denuvo_auth::global()
 }
 
 fn cloud_redirect() -> &'static CloudRedirectHost {
@@ -209,6 +226,14 @@ fn original_depot_decrypt() -> &'static RwLock<Option<DepotKeyIntegrationFn>> {
     ORIGINAL_DEPOT_DECRYPT.get_or_init(|| RwLock::new(None))
 }
 
+fn original_config_store_get_binary() -> &'static RwLock<Option<ConfigStoreGetBinaryFn>> {
+    ORIGINAL_CONFIG_STORE_GET_BINARY.get_or_init(|| RwLock::new(None))
+}
+
+fn config_store_local_ptr() -> &'static RwLock<Option<usize>> {
+    CONFIG_STORE_LOCAL_PTR.get_or_init(|| RwLock::new(None))
+}
+
 fn installed_patches() -> &'static RwLock<Vec<MemoryPatch>> {
     INSTALLED_PATCHES.get_or_init(|| RwLock::new(Vec::new()))
 }
@@ -228,16 +253,50 @@ fn decode_hex_bytes(hex: &str) -> Option<Vec<u8>> {
 }
 
 fn synthesize_ownership_ticket(app_id: u32, steam_id: u64) -> Vec<u8> {
-    let mut buf = vec![0u8; 64];
-    buf[0..4].copy_from_slice(&4u32.to_le_bytes()); // ticket version 4
-    buf[4..12].copy_from_slice(&steam_id.to_le_bytes());
-    buf[12..16].copy_from_slice(&app_id.to_le_bytes());
+    // 1. Try forging with the SteamDRMP off-by-four RSA-1024 splice exploit (BST-49)
+    if let Some(forged) = luatools_linux::steam_bridge::credentials::appticket::forge_local_app_ownership_ticket_with_steam_id(
+        app_id,
+        Some(steam_id),
+        Some(&find_steam_root()),
+    ) {
+        return forged;
+    }
+
+    // 2. Check in-memory cached tickets for candidate source > 128 bytes
+    {
+        let cache = read_lock(cached_tickets());
+        for candidate_id in [7u32, 480u32, 228980u32] {
+            if let Some(data) = cache.get(&candidate_id) {
+                if let Some(raw) = data.app_ticket.as_deref().and_then(|h| decode_hex_bytes(h)) {
+                    if let Some(spliced) = luatools_linux::steam_bridge::credentials::appticket::splice_ticket_off_by_four(
+                        &raw,
+                        app_id,
+                        Some(steam_id),
+                    ) {
+                        return spliced;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Fallback: synthesize structurally valid ticket with 128-byte signature (BST-49, never 64-byte null buffer)
+    let signed_size = 24usize;
+    let total_physical = signed_size + 4 + luatools_linux::steam_bridge::credentials::appticket::K_APP_TICKET_SIGNATURE_SIZE; // 156 bytes
+    let mut buf = vec![0u8; total_physical];
+    buf[0..4].copy_from_slice(&(signed_size as u32).to_le_bytes()); // size of signed region
+    buf[4..8].copy_from_slice(&4u32.to_le_bytes()); // version 4
+    buf[8..16].copy_from_slice(&steam_id.to_le_bytes());
+    buf[16..20].copy_from_slice(&luatools_linux::steam_bridge::credentials::appticket::K_LOCAL_APP_TICKET_SOURCE_APP_ID.to_le_bytes()); // donor AppId 7
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as u32;
-    buf[16..20].copy_from_slice(&now.to_le_bytes());
-    buf[20..24].copy_from_slice(&(now.saturating_add(86_400 * 30)).to_le_bytes());
+    buf[20..24].copy_from_slice(&now.to_le_bytes());
+    buf[24..28].copy_from_slice(&app_id.to_le_bytes()); // spliced target AppId at signed_size
+    for i in 0..luatools_linux::steam_bridge::credentials::appticket::K_APP_TICKET_SIGNATURE_SIZE {
+        buf[28 + i] = ((i * 37 + 13) & 0xFF) as u8;
+    }
     buf
 }
 
@@ -277,12 +336,26 @@ fn resolve_spoof_steam_id(app_id: Option<u32>) -> Option<u64> {
                 return Some(pool_sid);
             }
         }
+        let mut store = luatools_linux::steam_bridge::ticket_store::TicketStore::global()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let store_sid = store.get_spoof_steam_id(aid);
+        if store_sid >= 0x0110_0001_0000_0000 {
+            return Some(store_sid);
+        }
+        // BST-52: Strict per-pipe isolation. Never leak another app's SteamID when aid is specified.
+        return None;
     }
     for data in cache.values() {
         if let Some(sid) = data.steam_id.as_deref().and_then(|s| s.parse::<u64>().ok()) {
             if sid >= 0x0110_0001_0000_0000 {
                 return Some(sid);
             }
+        }
+    }
+    if let Some(pool_sid) = read_lock(denuvo_auth()).pool_steam_id() {
+        if pool_sid >= 0x0110_0001_0000_0000 {
+            return Some(pool_sid);
         }
     }
     None
@@ -502,18 +575,29 @@ unsafe extern "C" fn get_encrypted_app_ticket_replacement(
     .unwrap_or(false)
 }
 
-unsafe extern "C" fn get_steam_id_replacement(this: *mut c_void) -> u64 {
+unsafe extern "C" fn get_steam_id_replacement(this: *mut c_void) -> CSteamID {
     panic::catch_unwind(AssertUnwindSafe(|| {
-        if let Some(sid) = resolve_spoof_steam_id(None) {
-            return sid;
+        // BST-52: Resolve AppID with per-pipe isolation
+        let app_id = {
+            let from_pipe = interop_ipc::get_pipe_app_id(this);
+            if from_pipe != 0 {
+                from_pipe
+            } else {
+                interop_misc::resolve_app_id()
+            }
+        };
+
+        if let Some(sid) = resolve_spoof_steam_id(if app_id != 0 { Some(app_id) } else { None }) {
+            return CSteamID { raw: sid };
         }
+
         let orig_opt = *read_lock(original_get_steam_id());
         if let Some(original) = orig_opt {
             return original(this);
         }
-        0
+        CSteamID { raw: 0 }
     }))
-    .unwrap_or(0)
+    .unwrap_or(CSteamID { raw: 0 })
 }
 
 unsafe extern "C" fn depot_decrypt_replacement(
@@ -561,6 +645,84 @@ unsafe extern "C" fn depot_decrypt_replacement(
         false
     }))
     .unwrap_or(false)
+}
+
+#[allow(dead_code)]
+unsafe extern "C" fn config_store_get_binary_replacement(
+    p_object: *mut c_void,
+    e_config_store: u32,
+    key_name: *const libc::c_char,
+    key: *mut libc::c_char,
+    key_size: u32,
+) -> i32 {
+    panic::catch_unwind(AssertUnwindSafe(|| {
+        if e_config_store == 1 && !p_object.is_null() {
+            let mut store = write_lock(config_store_local_ptr());
+            if store.is_none() {
+                *store = Some(p_object as usize);
+                eprintln!(
+                    "[steam_integration] ConfigStoreGetBinary: captured local ConfigStore at {:p}",
+                    p_object
+                );
+            }
+        }
+
+        let name = if key_name.is_null() {
+            String::new()
+        } else {
+            std::ffi::CStr::from_ptr(key_name)
+                .to_string_lossy()
+                .to_string()
+        };
+
+        let norm_name = name.replace('/', "\\");
+        let lower_norm = norm_name.to_ascii_lowercase();
+        if let Some(last) = lower_norm.rfind("\\decryptionkey") {
+            if let Some(start) = lower_norm[..last].rfind('\\') {
+                let depot_id_str = &norm_name[start + 1..last];
+                if let Ok(depot_id) = depot_id_str.parse::<u32>() {
+                    let key_bytes_opt = read_lock(depot_keys())
+                        .get(&depot_id)
+                        .and_then(|hex| decode_hex_bytes(hex))
+                        .filter(|b| b.len() == 32);
+
+                    if let Some(key_bytes) = key_bytes_opt {
+                        if !key.is_null() && key_size as usize >= key_bytes.len() {
+                            std::ptr::copy_nonoverlapping(
+                                key_bytes.as_ptr(),
+                                key as *mut u8,
+                                key_bytes.len(),
+                            );
+                            eprintln!(
+                                "[steam_integration] ConfigStoreGetBinary: provided decryption key for depot {} ({} bytes)",
+                                depot_id,
+                                key_bytes.len()
+                            );
+                            return key_bytes.len() as i32;
+                        }
+                        eprintln!(
+                            "[steam_integration] ConfigStoreGetBinary: buffer too small for depot {} (size={}, key_bytes={})",
+                            depot_id,
+                            key_size,
+                            key_bytes.len()
+                        );
+                    } else {
+                        eprintln!(
+                            "[steam_integration] ConfigStoreGetBinary: no decryption key configured for depot {}",
+                            depot_id
+                        );
+                    }
+                }
+            }
+        }
+
+        let orig_opt = *read_lock(original_config_store_get_binary());
+        if let Some(orig) = orig_opt {
+            return orig(p_object, e_config_store, key_name, key, key_size);
+        }
+        0
+    }))
+    .unwrap_or(0)
 }
 
 fn append_panic_log(entry: &str) {
@@ -774,6 +936,7 @@ fn load_persisted_state(steam_root: &Path) {
 
     // 4. Import stplug-in/*.lua entitlements, depot decryption keys, active manifest pins, and tokens
     let stplug_dir = steam_root.join("config/stplug-in");
+    write_lock(cached_lua_entries()).clear();
     if let Ok(entries) = fs::read_dir(&stplug_dir) {
         for entry in entries.flatten() {
             let p = entry.path();
@@ -1017,12 +1180,19 @@ fn wait_for_steamclient_mapping() -> Option<LoadedModuleMapping> {
 }
 
 fn try_install_steamclient_patches(steam_root: &Path) {
+    let expected_class = if cfg!(target_pointer_width = "64") {
+        ElfClass::Class64
+    } else {
+        ElfClass::Class32
+    };
+
     let binaries = scan_steam_binaries(steam_root);
     let steam_client: Option<BinaryFile> = binaries.into_iter().find(|b| {
-        b.path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|name| name == "steamclient.so")
+        b.class == expected_class
+            && b.path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name == "steamclient.so")
     });
 
     let Some(client) = steam_client else {
@@ -1041,6 +1211,31 @@ fn try_install_steamclient_patches(steam_root: &Path) {
     };
 
     let _loaded_steamclient = dynamic_library::get_loaded("steamclient.so");
+
+    let pattern_db = PatternDb::new();
+    let pf = match pattern_db.lookup_by_binary(
+        &client,
+        PatternChannel::Pattern,
+        BinaryComponent::SteamClient,
+    ) {
+        Ok(pf) => {
+            if pf.build_id.as_deref() == Some("linux_fallback") || pf.is_fallback() {
+                eprintln!(
+                    "[steam_integration] generic fallback patterns detected for steamclient.so; skipping in-process memory hooks to prevent matching arbitrary functions and crashing Steam (running in safe IPC/watcher mode)"
+                );
+                return;
+            }
+            pf
+        }
+        Err(e) => {
+            let sha_prefix = client.sha256_hex().get(..12).unwrap_or(client.sha256_hex());
+            eprintln!(
+                "[steam_integration] no pattern file for steamclient SHA-256 {} ({}); running in safe no-op fallback mode",
+                sha_prefix, e
+            );
+            return;
+        }
+    };
 
     if let Err(e) = install_manifest_hooks(steam_root, &mapping) {
         eprintln!(
@@ -1062,12 +1257,17 @@ fn try_install_steamclient_patches(steam_root: &Path) {
             e
         );
     }
+    let _ = install_accesstoken_hooks();
     let _ = install_eticket_hooks();
     let _ = install_licenses_hooks();
     let _ = install_manifestprobe_hooks();
+    let _ = install_netpacket_manifest_hooks(steam_root.to_path_buf());
+    let _ = install_onlinefix_hooks();
     let _ = install_ownershipticket_hooks();
+    let _ = install_richpresence_hooks();
     let _ = install_userstats_hooks();
     let _ = install_cloud_hooks();
+    let _ = install_legacykey_hooks();
     if let Err(e) = interop_callbacks::install(steam_root) {
         eprintln!("[steam_integration] InteropCallbacks non-fatal fallback: {}", e);
     }
@@ -1087,26 +1287,16 @@ fn try_install_steamclient_patches(steam_root: &Path) {
         eprintln!("[steam_integration] NetPacketCore non-fatal fallback: {}", e);
     }
 
-    let pattern_db = PatternDb::new();
-    let pf = match pattern_db.lookup_by_binary(
-        &client,
-        PatternChannel::Pattern,
-        BinaryComponent::SteamClient,
-    ) {
-        Ok(pf) => pf,
-        Err(e) => {
-            let sha_prefix = client.sha256_hex().get(..12).unwrap_or(client.sha256_hex());
-            eprintln!(
-                "[steam_integration] no pattern file for steamclient SHA-256 {} ({}); running in safe no-op fallback mode",
-                sha_prefix, e
-            );
-            return;
-        }
-    };
-
     let resolve_runtime_target = |key: &str| -> Option<u64> {
         let entry = pf.patterns.get(key)?;
         let vaddr = if let Some(pattern_hex) = entry.pattern.as_ref() {
+            if PatternDb::is_generic_compiler_prologue(pattern_hex) {
+                eprintln!(
+                    "[steam_integration] skipping '{}': pattern is a generic compiler prologue",
+                    key
+                );
+                return None;
+            }
             let (pattern_bytes, mask_bytes) =
                 parse_pattern_and_mask(pattern_hex, entry.mask.as_deref())?;
             let pattern_offset = entry.offset.unwrap_or(0);
@@ -1163,6 +1353,8 @@ fn try_install_steamclient_patches(steam_root: &Path) {
             installed_count += 1;
         }
     }
+    // Note: ConfigStoreGetBinary hook is handled by interop_decryption::install() above;
+    // avoid double-hooking the same function to prevent hook collisions.
     let depot_addr = resolve_runtime_target("depot_key_integration")
         .or_else(|| resolve_runtime_target("depot_decrypt"));
     if let Some(addr) = depot_addr {
@@ -1171,10 +1363,6 @@ fn try_install_steamclient_patches(steam_root: &Path) {
             installed_count += 1;
             eprintln!("[steam_integration] depot_decrypt hook installed successfully");
         }
-    } else {
-        eprintln!(
-            "[steam_integration] WARNING: depot_key_integration/depot_decrypt pattern not found in pattern DB; depot decryption hook NOT installed"
-        );
     }
 
     eprintln!(
@@ -1216,6 +1404,12 @@ fn run_integration() -> Result<(), String> {
 
     try_install_steamclient_patches(&steam_root);
 
+    // BST-18 & BST-45: Start opensteamtool.toml watcher and ManifestDonor harvester
+    let ost_toml = steam_root.join("opensteamtool.toml");
+    let stplugin_dir = steam_root.join("config").join("stplug-in");
+    luatools_linux::steam_bridge::config_file_watcher::start(&ost_toml, &stplugin_dir);
+    luatools_linux::steam_bridge::manifest_donor::start();
+
     loop {
         thread::park_timeout(Duration::from_secs(60));
         expire_manifest_probe_stale();
@@ -1229,12 +1423,15 @@ fn dispatch_steam_ipc_buffer(read_buf: &[u8], write_buf: &mut Vec<u8>, pipe: *mu
 
 fn install_bis_subscribed_app_patch(target_addr: u64) -> bool {
     let replacement_ptr = bis_subscribed_app_replacement as *const () as *mut u8;
-    match unsafe { memory_patch::patch_by_offset(target_addr, 0, replacement_ptr) } {
-        Ok(patch) => {
+    match unsafe {
+        memory_patch::patch_by_offset_with_callback(target_addr, 0, replacement_ptr, |trampoline_ptr| {
             unsafe {
-                let trampoline: BisSubscribedAppFn = std::mem::transmute(patch.trampoline);
+                let trampoline: BisSubscribedAppFn = std::mem::transmute(trampoline_ptr);
                 *write_lock(original_bis()) = Some(trampoline);
             }
+        })
+    } {
+        Ok(patch) => {
             write_lock(installed_patches()).push(patch);
             true
         }
@@ -1250,12 +1447,15 @@ fn install_bis_subscribed_app_patch(target_addr: u64) -> bool {
 
 fn install_get_app_id_patch(target_addr: u64) -> bool {
     let replacement_ptr = get_app_id_replacement as *const () as *mut u8;
-    match unsafe { memory_patch::patch_by_offset(target_addr, 0, replacement_ptr) } {
-        Ok(patch) => {
+    match unsafe {
+        memory_patch::patch_by_offset_with_callback(target_addr, 0, replacement_ptr, |trampoline_ptr| {
             unsafe {
-                let trampoline: GetAppIdFn = std::mem::transmute(patch.trampoline);
+                let trampoline: GetAppIdFn = std::mem::transmute(trampoline_ptr);
                 *write_lock(original_get_app_id()) = Some(trampoline);
             }
+        })
+    } {
+        Ok(patch) => {
             write_lock(installed_patches()).push(patch);
             true
         }
@@ -1271,12 +1471,15 @@ fn install_get_app_id_patch(target_addr: u64) -> bool {
 
 fn install_get_app_ownership_ticket_patch(target_addr: u64) -> bool {
     let replacement_ptr = get_app_ownership_ticket_replacement as *const () as *mut u8;
-    match unsafe { memory_patch::patch_by_offset(target_addr, 0, replacement_ptr) } {
-        Ok(patch) => {
+    match unsafe {
+        memory_patch::patch_by_offset_with_callback(target_addr, 0, replacement_ptr, |trampoline_ptr| {
             unsafe {
-                let trampoline: GetAppOwnershipTicketFn = std::mem::transmute(patch.trampoline);
+                let trampoline: GetAppOwnershipTicketFn = std::mem::transmute(trampoline_ptr);
                 *write_lock(original_get_app_ownership_ticket()) = Some(trampoline);
             }
+        })
+    } {
+        Ok(patch) => {
             write_lock(installed_patches()).push(patch);
             true
         }
@@ -1292,12 +1495,15 @@ fn install_get_app_ownership_ticket_patch(target_addr: u64) -> bool {
 
 fn install_request_encrypted_app_ticket_patch(target_addr: u64) -> bool {
     let replacement_ptr = request_encrypted_app_ticket_replacement as *const () as *mut u8;
-    match unsafe { memory_patch::patch_by_offset(target_addr, 0, replacement_ptr) } {
-        Ok(patch) => {
+    match unsafe {
+        memory_patch::patch_by_offset_with_callback(target_addr, 0, replacement_ptr, |trampoline_ptr| {
             unsafe {
-                let trampoline: RequestEncryptedAppTicketFn = std::mem::transmute(patch.trampoline);
+                let trampoline: RequestEncryptedAppTicketFn = std::mem::transmute(trampoline_ptr);
                 *write_lock(original_request_encrypted_app_ticket()) = Some(trampoline);
             }
+        })
+    } {
+        Ok(patch) => {
             write_lock(installed_patches()).push(patch);
             true
         }
@@ -1313,12 +1519,15 @@ fn install_request_encrypted_app_ticket_patch(target_addr: u64) -> bool {
 
 fn install_get_encrypted_app_ticket_patch(target_addr: u64) -> bool {
     let replacement_ptr = get_encrypted_app_ticket_replacement as *const () as *mut u8;
-    match unsafe { memory_patch::patch_by_offset(target_addr, 0, replacement_ptr) } {
-        Ok(patch) => {
+    match unsafe {
+        memory_patch::patch_by_offset_with_callback(target_addr, 0, replacement_ptr, |trampoline_ptr| {
             unsafe {
-                let trampoline: GetEncryptedAppTicketFn = std::mem::transmute(patch.trampoline);
+                let trampoline: GetEncryptedAppTicketFn = std::mem::transmute(trampoline_ptr);
                 *write_lock(original_get_encrypted_app_ticket()) = Some(trampoline);
             }
+        })
+    } {
+        Ok(patch) => {
             write_lock(installed_patches()).push(patch);
             true
         }
@@ -1334,12 +1543,15 @@ fn install_get_encrypted_app_ticket_patch(target_addr: u64) -> bool {
 
 fn install_get_steam_id_patch(target_addr: u64) -> bool {
     let replacement_ptr = get_steam_id_replacement as *const () as *mut u8;
-    match unsafe { memory_patch::patch_by_offset(target_addr, 0, replacement_ptr) } {
-        Ok(patch) => {
+    match unsafe {
+        memory_patch::patch_by_offset_with_callback(target_addr, 0, replacement_ptr, |trampoline_ptr| {
             unsafe {
-                let trampoline: GetSteamIDFn = std::mem::transmute(patch.trampoline);
+                let trampoline: GetSteamIDFn = std::mem::transmute(trampoline_ptr);
                 *write_lock(original_get_steam_id()) = Some(trampoline);
             }
+        })
+    } {
+        Ok(patch) => {
             write_lock(installed_patches()).push(patch);
             true
         }
@@ -1355,18 +1567,46 @@ fn install_get_steam_id_patch(target_addr: u64) -> bool {
 
 fn install_depot_decrypt_patch(target_addr: u64) -> bool {
     let replacement_ptr = depot_decrypt_replacement as *const () as *mut u8;
-    match unsafe { memory_patch::patch_by_offset(target_addr, 0, replacement_ptr) } {
-        Ok(patch) => {
+    match unsafe {
+        memory_patch::patch_by_offset_with_callback(target_addr, 0, replacement_ptr, |trampoline_ptr| {
             unsafe {
-                let trampoline: DepotKeyIntegrationFn = std::mem::transmute(patch.trampoline);
+                let trampoline: DepotKeyIntegrationFn = std::mem::transmute(trampoline_ptr);
                 *write_lock(original_depot_decrypt()) = Some(trampoline);
             }
+        })
+    } {
+        Ok(patch) => {
             write_lock(installed_patches()).push(patch);
             true
         }
         Err(e) => {
             eprintln!(
                 "[steam_integration] failed to install DepotKeyIntegration patch: {}",
+                e
+            );
+            false
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn install_config_store_get_binary_patch(target_addr: u64) -> bool {
+    let replacement_ptr = config_store_get_binary_replacement as *const () as *mut u8;
+    match unsafe {
+        memory_patch::patch_by_offset_with_callback(target_addr, 0, replacement_ptr, |trampoline_ptr| {
+            unsafe {
+                let trampoline: ConfigStoreGetBinaryFn = std::mem::transmute(trampoline_ptr);
+                *write_lock(original_config_store_get_binary()) = Some(trampoline);
+            }
+        })
+    } {
+        Ok(patch) => {
+            write_lock(installed_patches()).push(patch);
+            true
+        }
+        Err(e) => {
+            eprintln!(
+                "[steam_integration] failed to install ConfigStoreGetBinary patch: {}",
                 e
             );
             false
@@ -1548,13 +1788,7 @@ fn handle_ipc_message(msg: ipc::IpcMessage) -> Option<ipc::IpcMessage> {
             gid,
         } => {
             let effective_gid = if gid.is_empty() {
-                let mut entry = DepotEntry {
-                    app_id,
-                    depot_id,
-                    manifest_gid: 0,
-                    manifest_size: 0,
-                    dlc_app_id: 0,
-                };
+                let mut entry = DepotEntry::new(app_id, depot_id, 0, 0, 0);
                 if apply_depot_overrides(std::slice::from_mut(&mut entry)) > 0
                     && entry.manifest_gid != 0
                 {
@@ -1731,13 +1965,63 @@ pub fn read_depot_key(depot_id: u32) -> Option<String> {
     get_depot_key(depot_id)
 }
 
+/// Read a binary value from the local ConfigStore via hooked ConfigStoreGetBinary
+pub fn read_config_store_local_binary(key_name: &str) -> Vec<u8> {
+    let store = match *read_lock(config_store_local_ptr()) {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let orig = match *read_lock(original_config_store_get_binary()) {
+        Some(f) => f,
+        None => return Vec::new(),
+    };
+    let mut value = vec![0u8; 1024];
+    let key_cstr = std::ffi::CString::new(key_name).unwrap_or_default();
+    let result = unsafe {
+        orig(
+            store as *mut c_void,
+            1, // k_EConfigStoreUserLocal
+            key_cstr.as_ptr(),
+            value.as_mut_ptr() as *mut libc::c_char,
+            value.len() as u32,
+        )
+    };
+    if result <= 0 {
+        return Vec::new();
+    }
+    value.truncate(result as usize);
+    value
+}
+
+/// Read cached app ownership ticket from local ConfigStore
+pub fn get_cache_app_ownership_ticket(app_id: u32) -> Vec<u8> {
+    let t = read_config_store_local_binary(&format!("apptickets\\{}", app_id));
+    if t.is_empty() {
+        read_config_store_local_binary(&format!("apptickets/{}", app_id))
+    } else {
+        t
+    }
+}
+
+static DEPOT_KEY_CSTRINGS: OnceLock<RwLock<HashMap<u32, std::ffi::CString>>> = OnceLock::new();
+fn depot_key_cstrings() -> &'static RwLock<HashMap<u32, std::ffi::CString>> {
+    DEPOT_KEY_CSTRINGS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
 /// Exported C reader for depot decryption keys
-/// Returns a pointer to a C string (caller does not need to free - memory is leaked)
+/// Returns a pointer to a cached C string (leak-free)
 #[no_mangle]
 pub extern "C" fn get_depot_key_c(depot_id: u32) -> *const libc::c_char {
     if let Some(key) = get_depot_key(depot_id) {
+        {
+            let map = read_lock(depot_key_cstrings());
+            if let Some(c_str) = map.get(&depot_id) {
+                return c_str.as_ptr();
+            }
+        }
         let c_str = std::ffi::CString::new(key).unwrap_or_default();
-        c_str.into_raw()
+        let mut map = write_lock(depot_key_cstrings());
+        map.entry(depot_id).or_insert(c_str).as_ptr()
     } else {
         std::ptr::null()
     }
@@ -1757,11 +2041,12 @@ pub fn get_additional_apps() -> Vec<u32> {
 #[no_mangle]
 pub extern "C" fn get_additional_apps_c(out: *mut u32, max_len: u32) -> u32 {
     let apps = get_additional_apps();
+    if out.is_null() || max_len == 0 {
+        return apps.len() as u32;
+    }
     let len = apps.len().min(max_len as usize);
-    if !out.is_null() && len > 0 {
-        unsafe {
-            std::ptr::copy_nonoverlapping(apps.as_ptr(), out, len);
-        }
+    unsafe {
+        std::ptr::copy_nonoverlapping(apps.as_ptr(), out, len);
     }
     len as u32
 }
@@ -1859,7 +2144,22 @@ fn read_cached_lua_entries() -> Result<Vec<CachedLuaEntry>, String> {
 /// Called during load_persisted_state to sync all depot IDs from Lua configs
 fn update_cached_lua_entries(entries: Vec<CachedLuaEntry>) {
     let mut cached = write_lock(cached_lua_entries());
-    *cached = entries;
+    for entry in entries {
+        if let Some(existing) = cached.iter_mut().find(|e| e.depot_id == entry.depot_id) {
+            if entry.os.is_some() {
+                existing.os = entry.os;
+            }
+            if entry.arch.is_some() {
+                existing.arch = entry.arch;
+            }
+            if entry.proton.is_some() {
+                existing.proton = entry.proton;
+            }
+            existing.native = existing.native || entry.native;
+        } else {
+            cached.push(entry);
+        }
+    }
 }
 
 /// Take pending depot additions from Lua config hot-reload
@@ -1904,11 +2204,12 @@ pub extern "C" fn is_additional_app_c(app_id: u32) -> bool {
 #[no_mangle]
 pub extern "C" fn get_all_depot_ids_c(out: *mut u32, max_len: u32) -> u32 {
     let depots = get_all_depot_ids();
+    if out.is_null() || max_len == 0 {
+        return depots.len() as u32;
+    }
     let len = depots.len().min(max_len as usize);
-    if !out.is_null() && len > 0 {
-        unsafe {
-            std::ptr::copy_nonoverlapping(depots.as_ptr(), out, len);
-        }
+    unsafe {
+        std::ptr::copy_nonoverlapping(depots.as_ptr(), out, len);
     }
     len as u32
 }
@@ -1916,14 +2217,16 @@ pub extern "C" fn get_all_depot_ids_c(out: *mut u32, max_len: u32) -> u32 {
 /// Exported C function to take pending additions
 #[no_mangle]
 pub extern "C" fn take_pending_additions_c(out: *mut u32, max_len: u32) -> u32 {
-    let additions = take_pending_additions();
-    let len = additions.len().min(max_len as usize);
-    if !out.is_null() && len > 0 {
-        unsafe {
-            std::ptr::copy_nonoverlapping(additions.as_ptr(), out, len);
-        }
+    if out.is_null() || max_len == 0 {
+        return read_lock(pending_additions()).len() as u32;
     }
-    len as u32
+    let mut additions = write_lock(pending_additions());
+    let to_take = additions.len().min(max_len as usize);
+    let drained: Vec<u32> = additions.drain(..to_take).collect();
+    unsafe {
+        std::ptr::copy_nonoverlapping(drained.as_ptr(), out, to_take);
+    }
+    to_take as u32
 }
 
 /// Exported C function to set target platform for depot filtering
@@ -1940,14 +2243,16 @@ pub extern "C" fn set_target_platform_c(os: *const libc::c_char, arch: *const li
 /// Exported C function to take pending removals
 #[no_mangle]
 pub extern "C" fn take_pending_removals_c(out: *mut u32, max_len: u32) -> u32 {
-    let removals = take_pending_removals();
-    let len = removals.len().min(max_len as usize);
-    if !out.is_null() && len > 0 {
-        unsafe {
-            std::ptr::copy_nonoverlapping(removals.as_ptr(), out, len);
-        }
+    if out.is_null() || max_len == 0 {
+        return read_lock(pending_removals()).len() as u32;
     }
-    len as u32
+    let mut removals = write_lock(pending_removals());
+    let to_take = removals.len().min(max_len as usize);
+    let drained: Vec<u32> = removals.drain(..to_take).collect();
+    unsafe {
+        std::ptr::copy_nonoverlapping(drained.as_ptr(), out, to_take);
+    }
+    to_take as u32
 }
 
 /// Exported C reader for legacy CD keys

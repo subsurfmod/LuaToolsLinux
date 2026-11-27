@@ -304,6 +304,9 @@ pub fn get_system_directory_path() -> String {
 struct LinkMap {
     l_addr: usize,
     l_name: *const libc::c_char,
+    l_ld: *const libc::c_void,
+    l_next: *mut LinkMap,
+    l_prev: *mut LinkMap,
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -312,58 +315,119 @@ pub fn get_module_directory(module: ModuleHandle) -> PathBuf {
         return PathBuf::new();
     }
 
-    // 1. Prefer dlinfo(RTLD_DI_LINKMAP) for dlopen() handles on Linux glibc
-    let mut link_map: *mut LinkMap = ptr::null_mut();
-    let dlinfo_res = unsafe {
-        libc::dlinfo(
-            module,
-            libc::RTLD_DI_LINKMAP,
-            (&mut link_map as *mut *mut LinkMap).cast::<libc::c_void>(),
-        )
+    // 1. Call dladdr first: safe on arbitrary pointers, code addresses, symbols or dlopen handles
+    let (dladdr_path, dladdr_ok) = unsafe {
+        let mut info: libc::Dl_info = std::mem::zeroed();
+        let result = libc::dladdr(module as *const _, &mut info);
+        if result != 0 {
+            if !info.dli_fname.is_null() {
+                let s = CStr::from_ptr(info.dli_fname).to_string_lossy().into_owned();
+                if !s.is_empty() {
+                    (Some(s), true)
+                } else {
+                    (None, true)
+                }
+            } else {
+                (None, true)
+            }
+        } else {
+            (None, false)
+        }
     };
-    if dlinfo_res == 0 && !link_map.is_null() {
-        let name_ptr = unsafe { (*link_map).l_name };
-        if !name_ptr.is_null() {
-            let name = unsafe { CStr::from_ptr(name_ptr) }
-                .to_string_lossy()
-                .into_owned();
-            if !name.is_empty() {
-                if let Some(parent) = Path::new(&name).parent() {
-                    if !parent.as_os_str().is_empty() {
-                        return parent.to_path_buf();
-                    }
+    if let Some(name) = dladdr_path {
+        if let Some(parent) = Path::new(&name).parent() {
+            if !parent.as_os_str().is_empty() {
+                return parent.to_path_buf();
+            }
+        }
+    }
+
+    // 2. Fallback to verifying link_map from dlopen(NULL) safely if dladdr did not resolve a path.
+    // NEVER call dlinfo directly on an unverified pointer!
+    let link_map_path = unsafe {
+        let self_handle = libc::dlopen(ptr::null(), libc::RTLD_LAZY);
+        let mut found_path = None;
+        if !self_handle.is_null() {
+            let mut map: *mut LinkMap = ptr::null_mut();
+            if libc::dlinfo(
+                self_handle,
+                libc::RTLD_DI_LINKMAP,
+                (&mut map as *mut *mut LinkMap).cast::<libc::c_void>(),
+            ) == 0
+                && !map.is_null()
+            {
+                let mut cur = map;
+                while !(*cur).l_prev.is_null() {
+                    cur = (*cur).l_prev;
                 }
-                if let Some(resolved) = find_module_path_in_maps(&name) {
-                    if let Some(parent) = resolved.parent() {
-                        if !parent.as_os_str().is_empty() {
-                            return parent.to_path_buf();
+                while !cur.is_null() {
+                    if cur as *mut std::ffi::c_void == module {
+                        let name_ptr = (*cur).l_name;
+                        if !name_ptr.is_null() {
+                            let name = CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
+                            if !name.is_empty() {
+                                found_path = Some(name);
+                            } else if let Ok(exe) = fs::read_link("/proc/self/exe") {
+                                found_path = Some(exe.to_string_lossy().into_owned());
+                            }
                         }
+                        break;
                     }
+                    cur = (*cur).l_next;
                 }
-            } else if let Ok(exe) = fs::read_link("/proc/self/exe") {
-                if let Some(parent) = exe.parent() {
+            }
+            libc::dlclose(self_handle);
+        }
+        found_path
+    };
+
+    if let Some(name) = link_map_path {
+        if let Some(parent) = Path::new(&name).parent() {
+            if !parent.as_os_str().is_empty() {
+                return parent.to_path_buf();
+            }
+        }
+        if let Some(resolved) = find_module_path_in_maps(&name) {
+            if let Some(parent) = resolved.parent() {
+                if !parent.as_os_str().is_empty() {
                     return parent.to_path_buf();
                 }
             }
         }
     }
 
-    // 2. Fallback to dladdr when module is a symbol/code address inside a loaded DSO
-    let path = unsafe {
-        let mut info: libc::Dl_info = std::mem::zeroed();
-        let result = libc::dladdr(module as *const _, &mut info);
-
-        if result == 0 || info.dli_fname.is_null() {
-            return PathBuf::new();
+    // 3. Fallback: resolve module directory via /proc/self/maps safely
+    if let Some(path) = find_address_in_maps(module as usize) {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                return parent.to_path_buf();
+            }
         }
+    }
 
-        CStr::from_ptr(info.dli_fname)
-            .to_string_lossy()
-            .into_owned()
-    };
+    PathBuf::new()
+}
 
-    let path = Path::new(&path);
-    path.parent().map(|p| p.to_path_buf()).unwrap_or_default()
+fn find_address_in_maps(addr: usize) -> Option<PathBuf> {
+    let maps = fs::read_to_string("/proc/self/maps").ok()?;
+    for line in maps.lines() {
+        let mut parts = line.split_whitespace();
+        let range = parts.next()?;
+        let _perms = parts.next()?;
+        let _offset = parts.next()?;
+        let _dev = parts.next()?;
+        let _inode = parts.next()?;
+        let path = parts.next()?;
+        let (start_str, end_str) = range.split_once('-')?;
+        let start = usize::from_str_radix(start_str, 16).ok()?;
+        let end = usize::from_str_radix(end_str, 16).ok()?;
+        if addr >= start && addr < end {
+            if !path.starts_with('[') {
+                return Some(PathBuf::from(path));
+            }
+        }
+    }
+    None
 }
 
 /// Get the path of the main executable.

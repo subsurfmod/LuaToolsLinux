@@ -206,7 +206,7 @@ impl LuaToolsApp {
                                         },
                                     )
                                     .on_hover_text(
-                                        "Click to open Settings › Steam Setup (1-click SLSsteam installer, Play Unowned & Cloud Save Redirect)",
+                                        "Click to open Settings › Steam Setup (1-click Steam Unlocker installer, Play Unowned & Cloud Save Redirect)",
                                     )
                                     .clicked()
                                     {

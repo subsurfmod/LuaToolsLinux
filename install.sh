@@ -7,7 +7,7 @@
 set -euo pipefail
 
 APP_NAME="luatools"
-APP_VERSION="3.3.11"
+APP_VERSION="4.0.0"
 REPO_URL="https://github.com/subsurfmod/LuaToolsLinux.git"
 SCRIPT_DIR=""
 if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
@@ -40,6 +40,10 @@ Options:
   --rebuild       Force compiling a fresh release binary from Rust source
   --with-wine     Also install Wine + .NET runtime for optional Windows tools (Steamless/SteamAutoCrack)
   -h, --help      Show this help message
+
+Optional Desktop Tray & Notification Packages (checked/installed automatically):
+  - libayatana-appindicator3 / libappindicator3 (system tray indicator icon)
+  - libnotify / notify-send (desktop completion & tray notifications)
 EOF
             exit 0
             ;;
@@ -84,39 +88,86 @@ check_missing_runtime_libs() {
     echo "$missing"
 }
 
+check_optional_tray_deps() {
+    local missing_tray=0
+    local missing_notify=0
+    if ! ldconfig -p 2>/dev/null | grep -Eq 'lib(ayatana-)?appindicator3\.so\.1' \
+        && [ ! -e "/usr/lib64/libayatana-appindicator3.so.1" ] \
+        && [ ! -e "/usr/lib64/libappindicator3.so.1" ] \
+        && [ ! -e "/usr/lib/libayatana-appindicator3.so.1" ] \
+        && [ ! -e "/usr/lib/libappindicator3.so.1" ] \
+        && [ ! -e "/usr/lib/x86_64-linux-gnu/libayatana-appindicator3.so.1" ] \
+        && [ ! -e "/usr/lib/x86_64-linux-gnu/libappindicator3.so.1" ]; then
+        missing_tray=1
+    fi
+    if ! command -v notify-send >/dev/null 2>&1; then
+        missing_notify=1
+    fi
+    echo "${missing_tray}:${missing_notify}"
+}
+
 install_system_dependencies() {
+    local tray_status missing_tray missing_notify
+    tray_status="$(check_optional_tray_deps)"
+    missing_tray="${tray_status%%:*}"
+    missing_notify="${tray_status##*:}"
+
     if [ "$SKIP_SYS_DEPS" -eq 1 ]; then
         info "Skipping system package manager check (--skip-deps)."
+        if [ "$missing_tray" -eq 1 ] || [ "$missing_notify" -eq 1 ]; then
+            warn "Optional tray/notification deps missing (libayatana-appindicator3/libappindicator3 or libnotify/notify-send). System tray icon or desktop toasts may be disabled."
+        fi
         return 0
     fi
 
     local need_install
     need_install="$(check_missing_runtime_libs)"
-    if [ "$need_install" -eq 0 ] && [ "$WITH_WINE" -eq 0 ]; then
-        ok "All required Linux graphics, linker, and XDG runtime libraries are already present."
+    if [ "$need_install" -eq 0 ] && [ "$WITH_WINE" -eq 0 ] && [ "$missing_tray" -eq 0 ] && [ "$missing_notify" -eq 0 ]; then
+        ok "All required Linux graphics, tray/notification, linker, and XDG runtime libraries are already present."
         return 0
     fi
 
     info "Installing missing system dependencies via native package manager..."
     if command -v dnf >/dev/null 2>&1; then
-        local pkgs=(gcc git mesa-libEGL mesa-libGL libwayland-client libxkbcommon libX11 libXcursor libXi libXrandr fontconfig xdg-utils zenity curl zstd bzip2 p7zip p7zip-plugins)
+        local pkgs=(gcc glibc-devel.i686 git mesa-libEGL mesa-libGL libwayland-client libxkbcommon libX11 libXcursor libXi libXrandr fontconfig xdg-utils zenity curl zstd bzip2 p7zip p7zip-plugins libnotify)
         [ "$WITH_WINE" -eq 1 ] && pkgs+=(wine dotnet-runtime-8.0)
-        run_privileged dnf install -y "${pkgs[@]}"
+        run_privileged dnf install -y "${pkgs[@]}" 2>/dev/null || run_privileged dnf install -y gcc git mesa-libEGL mesa-libGL libwayland-client libxkbcommon libX11 libXcursor libXi libXrandr fontconfig xdg-utils zenity curl zstd bzip2 p7zip p7zip-plugins libnotify
+        # Optional system tray indicator library (AppIndicator3)
+        if [ "$missing_tray" -eq 1 ]; then
+            run_privileged dnf install -y libayatana-appindicator-gtk3 2>/dev/null \
+                || run_privileged dnf install -y libappindicator-gtk3 2>/dev/null \
+                || warn "Optional AppIndicator3 tray library not found in dnf repos; tray will fall back gracefully."
+        fi
     elif command -v apt-get >/dev/null 2>&1; then
-        local pkgs=(build-essential git libegl1 libgl1 libwayland-client0 libxkbcommon0 libx11-6 libxcursor1 libxi6 libxrandr2 libfontconfig1 xdg-utils zenity curl ca-certificates zstd bzip2 p7zip-full)
+        local pkgs=(build-essential gcc-multilib libc6-dev-i386 git libegl1 libgl1 libwayland-client0 libxkbcommon0 libx11-6 libxcursor1 libxi6 libxrandr2 libfontconfig1 xdg-utils zenity curl ca-certificates zstd bzip2 p7zip-full libnotify-bin)
         [ "$WITH_WINE" -eq 1 ] && pkgs+=(wine)
         run_privileged apt-get update
-        run_privileged apt-get install -y "${pkgs[@]}"
+        run_privileged apt-get install -y "${pkgs[@]}" 2>/dev/null || run_privileged apt-get install -y build-essential git libegl1 libgl1 libwayland-client0 libxkbcommon0 libx11-6 libxcursor1 libxi6 libxrandr2 libfontconfig1 xdg-utils zenity curl ca-certificates zstd bzip2 p7zip-full libnotify-bin
+        if [ "$missing_tray" -eq 1 ]; then
+            run_privileged apt-get install -y libayatana-appindicator3-1 2>/dev/null \
+                || run_privileged apt-get install -y libappindicator3-1 2>/dev/null \
+                || warn "Optional AppIndicator3 tray library not found in apt repos; tray will fall back gracefully."
+        fi
     elif command -v pacman >/dev/null 2>&1; then
-        local pkgs=(base-devel git mesa wayland libxkbcommon libx11 libxcursor libxi libxrandr fontconfig xdg-utils zenity curl zstd bzip2 7zip)
+        local pkgs=(base-devel lib32-glibc git mesa wayland libxkbcommon libx11 libxcursor libxi libxrandr fontconfig xdg-utils zenity curl zstd bzip2 7zip libnotify)
         [ "$WITH_WINE" -eq 1 ] && pkgs+=(wine dotnet-runtime)
-        run_privileged pacman -Sy --needed --noconfirm "${pkgs[@]}"
+        run_privileged pacman -Sy --needed --noconfirm "${pkgs[@]}" 2>/dev/null || run_privileged pacman -Sy --needed --noconfirm base-devel git mesa wayland libxkbcommon libx11 libxcursor libxi libxrandr fontconfig xdg-utils zenity curl zstd bzip2 7zip libnotify
+        if [ "$missing_tray" -eq 1 ]; then
+            run_privileged pacman -S --needed --noconfirm libayatana-appindicator 2>/dev/null \
+                || run_privileged pacman -S --needed --noconfirm libappindicator-gtk3 2>/dev/null \
+                || warn "Optional AppIndicator3 tray library not found in pacman repos; tray will fall back gracefully."
+        fi
     elif command -v zypper >/dev/null 2>&1; then
-        local pkgs=(gcc git Mesa-libEGL1 Mesa-libGL1 libwayland-client0 libxkbcommon0 libX11-6 fontconfig xdg-utils zenity curl zstd bzip2 7zip)
+        local pkgs=(gcc glibc-devel-32bit gcc-32bit git Mesa-libEGL1 Mesa-libGL1 libwayland-client0 libxkbcommon0 libX11-6 fontconfig xdg-utils zenity curl zstd bzip2 7zip libnotify-tools)
         [ "$WITH_WINE" -eq 1 ] && pkgs+=(wine)
-        run_privileged zypper --non-interactive install "${pkgs[@]}"
+        run_privileged zypper --non-interactive install "${pkgs[@]}" 2>/dev/null || run_privileged zypper --non-interactive install gcc git Mesa-libEGL1 Mesa-libGL1 libwayland-client0 libxkbcommon0 libX11-6 fontconfig xdg-utils zenity curl zstd bzip2 7zip libnotify-tools
+        if [ "$missing_tray" -eq 1 ]; then
+            run_privileged zypper --non-interactive install libayatana-appindicator3-1 2>/dev/null \
+                || run_privileged zypper --non-interactive install libappindicator3-1 2>/dev/null \
+                || warn "Optional AppIndicator3 tray library not found in zypper repos; tray will fall back gracefully."
+        fi
     else
-        warn "Unrecognized package manager. Ensure git, libEGL, libGL, libwayland-client/libX11, libxkbcommon, and gcc are installed."
+        warn "Unrecognized package manager. Ensure git, libEGL, libGL, libwayland-client/libX11, libxkbcommon, gcc, and optional libappindicator3 + libnotify (notify-send) are installed."
     fi
     ok "System dependencies verified."
 }
@@ -172,17 +223,43 @@ ensure_binary() {
     fi
 
     ok "Rust toolchain ready: $(rustc --version)"
-    info "Compiling optimized native binary + Steam integration library (LuaTools Linux v${APP_VERSION})..."
+    if command -v rustup >/dev/null 2>&1; then
+        if ! rustup target list 2>/dev/null | grep -q "i686-unknown-linux-gnu (installed)"; then
+            info "Adding Rust target i686-unknown-linux-gnu for native 32-bit Steam integration..."
+            rustup target add i686-unknown-linux-gnu 2>/dev/null || warn "Could not add i686-unknown-linux-gnu target via rustup"
+        fi
+    fi
+
+    info "Compiling optimized native binary + 64-bit Steam integration library (LuaTools Linux v${APP_VERSION})..."
     (cd "${SCRIPT_DIR}" && cargo build --workspace --release -j "${CARGO_BUILD_JOBS:-2}")
     (cd "${SCRIPT_DIR}" && cargo build --profile debug-debug -p bridge_lib -j "${CARGO_BUILD_JOBS:-2}" || true)
+
+    info "Compiling native 32-bit i686 Steam integration library (ubuntu12_32/steam LD_PRELOAD)..."
+    (cd "${SCRIPT_DIR}" && cargo build --manifest-path bridge_lib/Cargo.toml --target i686-unknown-linux-gnu --release -j "${CARGO_BUILD_JOBS:-2}") || warn "Could not compile 32-bit i686 bridge_lib; falling back to 64-bit"
+
     BIN_SOURCE="${SCRIPT_DIR}/target/release/${APP_NAME}"
-    mkdir -p "${SCRIPT_DIR}/dist"
+    mkdir -p "${SCRIPT_DIR}/dist" "${SCRIPT_DIR}/dist/32" "${SCRIPT_DIR}/dist/64"
     install -m 0755 "${BIN_SOURCE}" "${SCRIPT_DIR}/dist/${APP_NAME}"
-    local bridge_so="${SCRIPT_DIR}/target/debug-debug/libsteam_integration.so"
-    [ -f "$bridge_so" ] || bridge_so="${SCRIPT_DIR}/target/release/libsteam_integration.so"
-    if [ -f "$bridge_so" ]; then
-        install -m 0755 "$bridge_so" "${SCRIPT_DIR}/dist/libsteam_integration.so"
+
+    local bridge_32="${SCRIPT_DIR}/target/i686-unknown-linux-gnu/release/libsteam_integration.so"
+    local bridge_64="${SCRIPT_DIR}/target/release/libsteam_integration.so"
+    [ -f "$bridge_64" ] || bridge_64="${SCRIPT_DIR}/target/debug-debug/libsteam_integration.so"
+
+    if [ -f "$bridge_32" ]; then
+        install -m 0755 "$bridge_32" "${SCRIPT_DIR}/dist/libsteam_integration.so"
+        install -m 0755 "$bridge_32" "${SCRIPT_DIR}/dist/libsteam_integration32.so"
+        install -m 0755 "$bridge_32" "${SCRIPT_DIR}/dist/32/libsteam_integration.so"
+        ok "Staged 32-bit i686 Steam integration library -> dist/libsteam_integration.so"
+    elif [ -f "$bridge_64" ]; then
+        install -m 0755 "$bridge_64" "${SCRIPT_DIR}/dist/libsteam_integration.so"
     fi
+
+    if [ -f "$bridge_64" ]; then
+        install -m 0755 "$bridge_64" "${SCRIPT_DIR}/dist/libsteam_integration64.so"
+        install -m 0755 "$bridge_64" "${SCRIPT_DIR}/dist/64/libsteam_integration.so"
+        ok "Staged 64-bit x86_64 Steam integration library -> dist/libsteam_integration64.so"
+    fi
+
     if [ -f "${SCRIPT_DIR}/target/release/libsteam_auto_patch_linux.so" ]; then
         install -m 0755 "${SCRIPT_DIR}/target/release/libsteam_auto_patch_linux.so" "${SCRIPT_DIR}/dist/libsteam_auto_patch_linux.so"
     fi
@@ -193,14 +270,42 @@ ensure_binary() {
 # 3. Install Binary, Shared Libraries, Vector Icon, Desktop Launcher & URI Handler
 # ------------------------------------------------------------------------------
 install_files() {
-    local bridge_src=""
+    local bridge_32=""
     for candidate in \
-        "${SCRIPT_DIR}/dist/libsteam_integration.so" \
-        "${SCRIPT_DIR}/target/debug-debug/libsteam_integration.so" \
-        "${SCRIPT_DIR}/target/release/libsteam_integration.so"; do
+        "${SCRIPT_DIR}/target/i686-unknown-linux-gnu/release/libsteam_integration.so" \
+        "${SCRIPT_DIR}/dist/32/libsteam_integration.so" \
+        "${SCRIPT_DIR}/dist/libsteam_integration32.so" \
+        "${SCRIPT_DIR}/dist/libsteam_integration.so"; do
         if [ -f "$candidate" ]; then
-            bridge_src="$candidate"
-            break
+            if command -v file >/dev/null 2>&1; then
+                if file -L "$candidate" | grep -q "ELF 32-bit"; then
+                    bridge_32="$candidate"
+                    break
+                fi
+            else
+                bridge_32="$candidate"
+                break
+            fi
+        fi
+    done
+
+    local bridge_64=""
+    for candidate in \
+        "${SCRIPT_DIR}/target/release/libsteam_integration.so" \
+        "${SCRIPT_DIR}/target/debug-debug/libsteam_integration.so" \
+        "${SCRIPT_DIR}/dist/64/libsteam_integration.so" \
+        "${SCRIPT_DIR}/dist/libsteam_integration64.so" \
+        "${SCRIPT_DIR}/dist/libsteam_integration.so"; do
+        if [ -f "$candidate" ]; then
+            if command -v file >/dev/null 2>&1; then
+                if file -L "$candidate" | grep -q "ELF 64-bit"; then
+                    bridge_64="$candidate"
+                    break
+                fi
+            else
+                bridge_64="$candidate"
+                break
+            fi
         fi
     done
 
@@ -224,7 +329,22 @@ install_files() {
         run_privileged install -m 0755 "$BIN_SOURCE" "${bin_dir}/${APP_NAME}"
         local launcher_src="${SCRIPT_DIR}/assets/luatools-steam-launcher"
         [ -f "$launcher_src" ] && run_privileged install -m 0755 "$launcher_src" "${bin_dir}/luatools-steam-launcher"
-        [ -n "$bridge_src" ] && run_privileged install -m 0755 "$bridge_src" "${lib_dir}/libsteam_integration.so"
+
+        # Shared libraries (32-bit primary for Steam + 64-bit for multilib/$LIB)
+        if [ -n "$bridge_32" ]; then
+            run_privileged mkdir -p "${lib_dir}/32"
+            run_privileged install -m 0755 "$bridge_32" "${lib_dir}/libsteam_integration.so"
+            run_privileged install -m 0755 "$bridge_32" "${lib_dir}/libsteam_integration32.so"
+            run_privileged install -m 0755 "$bridge_32" "${lib_dir}/32/libsteam_integration.so"
+        elif [ -n "$bridge_64" ]; then
+            run_privileged install -m 0755 "$bridge_64" "${lib_dir}/libsteam_integration.so"
+        fi
+        if [ -n "$bridge_64" ]; then
+            run_privileged mkdir -p "${lib_dir}/64"
+            run_privileged install -m 0755 "$bridge_64" "${lib_dir}/libsteam_integration64.so"
+            run_privileged install -m 0755 "$bridge_64" "${lib_dir}/64/libsteam_integration.so"
+        fi
+
         [ -n "$patch_src" ] && run_privileged install -m 0755 "$patch_src" "${lib_dir}/libsteam_auto_patch_linux.so"
         run_privileged install -m 0644 "${SCRIPT_DIR}/assets/luatools.svg" "${icon_dir}/luatools.svg"
 
@@ -259,7 +379,22 @@ install_files() {
         install -m 0755 "$BIN_SOURCE" "${bin_dir}/${APP_NAME}"
         local launcher_src="${SCRIPT_DIR}/assets/luatools-steam-launcher"
         [ -f "$launcher_src" ] && install -m 0755 "$launcher_src" "${bin_dir}/luatools-steam-launcher"
-        [ -n "$bridge_src" ] && install -m 0755 "$bridge_src" "${lib_dir}/libsteam_integration.so"
+
+        # Shared libraries (32-bit primary for Steam + 64-bit for multilib/$LIB)
+        if [ -n "$bridge_32" ]; then
+            mkdir -p "${lib_dir}/32"
+            install -m 0755 "$bridge_32" "${lib_dir}/libsteam_integration.so"
+            install -m 0755 "$bridge_32" "${lib_dir}/libsteam_integration32.so"
+            install -m 0755 "$bridge_32" "${lib_dir}/32/libsteam_integration.so"
+        elif [ -n "$bridge_64" ]; then
+            install -m 0755 "$bridge_64" "${lib_dir}/libsteam_integration.so"
+        fi
+        if [ -n "$bridge_64" ]; then
+            mkdir -p "${lib_dir}/64"
+            install -m 0755 "$bridge_64" "${lib_dir}/libsteam_integration64.so"
+            install -m 0755 "$bridge_64" "${lib_dir}/64/libsteam_integration.so"
+        fi
+
         [ -n "$patch_src" ] && install -m 0755 "$patch_src" "${lib_dir}/libsteam_auto_patch_linux.so"
         install -m 0644 "${SCRIPT_DIR}/assets/luatools.svg" "${icon_dir}/luatools.svg"
         sed "s|@EXEC_PATH@|${bin_dir}/${APP_NAME}|g" "${SCRIPT_DIR}/assets/luatools.desktop.in" > "${apps_dir}/luatools.desktop"

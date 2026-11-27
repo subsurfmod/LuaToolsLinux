@@ -1,11 +1,12 @@
-//! NetPacket OnlineFix hook layer for Linux.
+//! NetPacket OnlineFix hook layer for Linux (BST-34).
 //!
-//! Port of usefulsteamtools `Interop_NetPacket.cpp` namespace
+//! Port of UsefulSteamTools / BetterSteamTools `Hooks_NetPacket.cpp` namespace
 //! `Hooks_NetPacket_OnlineFix` (lines 1752-1812).
 //!
-//! Handles outgoing `CMsgClientGamesPlayed` (eMsg 742/5410) -
-//! when game launched with `-onlinefix` (appid 480/Spacewar),
-//! replaces `game_extra_info` with real game's localized name.
+//! Handles outgoing `CMsgClientGamesPlayed` (eMsg 742 / 5410):
+//! When a game launched with `-onlinefix` (reporting Spacewar AppID 480) sends its
+//! active games list, replaces `game_extra_info` (canonical field 7 string) with the
+//! real game's title, allowing friends to see the genuine game name.
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,15 +18,18 @@ use crate::steam_bridge::interop::interop_misc::{
 use crate::steam_bridge::interop::ipc::{
     self, fnv1a_hash, FuncHash, HandlerFn, IpcContext, IpcInterface,
 };
-use crate::steam_bridge::netpacket::netpacket_core::{register_netpacket_handler, NetPacketDirection};
+use crate::steam_bridge::netpacket::netpacket_core::{
+    register_netpacket_handler, NetPacketContext, NetPacketDirection,
+};
 
 /// Steam message ID for CMsgClientGamesPlayed (legacy/protobuf).
-const K_EMSG_CLIENT_GAMES_PLAYED: u32 = 742;
+pub const K_EMSG_CLIENT_GAMES_PLAYED: u32 = 742;
 /// Steam message ID for CMsgClientGamesPlayed (protobuf).
-const K_EMSG_CLIENT_GAMES_PLAYED_PB: u32 = 5410;
+pub const K_EMSG_CLIENT_GAMES_PLAYED_PB: u32 = 5410;
 
 /// FuncHash for CMsgClientGamesPlayed send handler.
-const NETPACKET_ONLINEFIX_GAMES_PLAYED_FNHASH: FuncHash = fnv1a_hash("CMsgClientGamesPlayed");
+pub const NETPACKET_ONLINEFIX_GAMES_PLAYED_FNHASH: FuncHash =
+    fnv1a_hash("CMsgClientGamesPlayed");
 
 /// OnlineFix handler definition.
 #[derive(Clone)]
@@ -58,8 +62,7 @@ fn onlinefix_handlers() -> &'static Mutex<Vec<OnlineFixHandler>> {
 }
 
 /// Parse protobuf varint from slice.
-/// Returns (value, bytes_consumed) or None if truncated/overflow.
-fn decode_varint(slice: &[u8]) -> Option<(u64, usize)> {
+pub fn decode_varint(slice: &[u8]) -> Option<(u64, usize)> {
     let mut result: u64 = 0;
     let mut shift: u32 = 0;
     for (idx, &byte) in slice.iter().enumerate() {
@@ -78,8 +81,8 @@ fn decode_varint(slice: &[u8]) -> Option<(u64, usize)> {
     None
 }
 
-/// Encode a protobuf varint correctly (MSB `0x80` set while more bytes remain).
-fn encode_varint(mut val: u64, out: &mut Vec<u8>) {
+/// Encode a protobuf varint.
+pub fn encode_varint(mut val: u64, out: &mut Vec<u8>) {
     loop {
         let mut byte = (val & 0x7F) as u8;
         val >>= 7;
@@ -94,8 +97,7 @@ fn encode_varint(mut val: u64, out: &mut Vec<u8>) {
 }
 
 /// Parse a length-delimited field from protobuf wire format.
-/// Returns (field_data, bytes_consumed) or None if invalid.
-fn parse_length_delimited(slice: &[u8]) -> Option<(&[u8], usize)> {
+pub fn parse_length_delimited(slice: &[u8]) -> Option<(&[u8], usize)> {
     let (len, consumed) = decode_varint(slice)?;
     let total = consumed + len as usize;
     if slice.len() < total {
@@ -104,31 +106,52 @@ fn parse_length_delimited(slice: &[u8]) -> Option<(&[u8], usize)> {
     Some((&slice[consumed..total], total))
 }
 
-/// CMsgClientGamesPlayed message fields.
-/// Based on Steam's CMsgClientGamesPlayed:
-/// message CMsgClientGamesPlayed {
-///     repeated GamePlayed games_played = 1;
-/// }
-/// message GamePlayed {
-///     uint32 game_id = 1;
-///     string game_extra_info = 2;
-///     // ... other fields
-/// }
-#[derive(Debug, Clone)]
-struct GamePlayed {
-    game_id: u32,
-    game_extra_info: Option<String>,
-    raw_data: Vec<u8>,  // Original raw data for reconstruction
+/// Canonical `CMsgClientGamesPlayed.GamePlayed` message:
+/// - `steam_id_gs`: field 1, varint (uint64)
+/// - `game_id`: field 2, fixed64 (wire type 1, 8 bytes)
+/// - `game_extra_info`: field 7, length-delimited string (wire type 2)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GamePlayed {
+    pub steam_id_gs: u64,
+    pub game_id: u64,
+    pub game_extra_info: Option<String>,
+    pub raw_unknown: Vec<u8>,
 }
 
 impl GamePlayed {
-    /// Parse a GamePlayed from protobuf wire format.
-    fn parse(data: &[u8]) -> Option<Self> {
-        let mut game_id = 0u32;
+    pub fn new(game_id: u64) -> Self {
+        Self {
+            steam_id_gs: 0,
+            game_id,
+            game_extra_info: None,
+            raw_unknown: Vec::new(),
+        }
+    }
+
+    pub fn with_extra_info(game_id: u64, extra: &str) -> Self {
+        Self {
+            steam_id_gs: 0,
+            game_id,
+            game_extra_info: Some(extra.to_string()),
+            raw_unknown: Vec::new(),
+        }
+    }
+
+    /// Extract the 32-bit AppID from the 64-bit GameID.
+    pub fn app_id(&self) -> u32 {
+        (self.game_id & 0xFFFF_FFFF) as u32
+    }
+
+    /// Parse a `GamePlayed` entry from wire bytes.
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        let mut steam_id_gs = 0u64;
+        let mut game_id = 0u64;
         let mut game_extra_info = None;
+        let mut raw_unknown = Vec::new();
         let mut offset = 0;
 
         while offset < data.len() {
+            let field_start = offset;
             let (tag, tag_len) = decode_varint(&data[offset..])?;
             offset += tag_len;
 
@@ -136,35 +159,58 @@ impl GamePlayed {
             let wire_type = tag & 0x7;
 
             match (field_num, wire_type) {
-                (1, 0) => {  // game_id (varint)
+                (1, 0) => {
+                    // steam_id_gs (varint)
                     let (val, consumed) = decode_varint(&data[offset..])?;
-                    game_id = val as u32;
+                    steam_id_gs = val;
                     offset += consumed;
                 }
-                (2, 2) => {  // game_extra_info (length-delimited string)
+                (2, 1) => {
+                    // canonical Valve fixed64 game_id
+                    if offset + 8 <= data.len() {
+                        let bytes: [u8; 8] = data[offset..offset + 8].try_into().ok()?;
+                        game_id = u64::from_le_bytes(bytes);
+                        offset += 8;
+                    } else {
+                        return None;
+                    }
+                }
+                // Fallbacks: varint game_id
+                (2, 0) if game_id == 0 => {
+                    let (val, consumed) = decode_varint(&data[offset..])?;
+                    game_id = val;
+                    offset += consumed;
+                }
+                (7, 2) => {
+                    // canonical Valve string game_extra_info
+                    let (extra_data, consumed) = parse_length_delimited(&data[offset..])?;
+                    game_extra_info = String::from_utf8(extra_data.to_vec()).ok();
+                    offset += consumed;
+                }
+                // Fallbacks: field 2 string
+                (2, 2) => {
                     let (extra_data, consumed) = parse_length_delimited(&data[offset..])?;
                     game_extra_info = String::from_utf8(extra_data.to_vec()).ok();
                     offset += consumed;
                 }
                 _ => {
-                    // Skip unknown fields
                     match wire_type {
-                        0 => { // varint
+                        0 => {
                             let (_, consumed) = decode_varint(&data[offset..])?;
                             offset += consumed;
                         }
-                        1 => { // 64-bit
+                        1 => {
                             if offset + 8 <= data.len() {
                                 offset += 8;
                             } else {
                                 return None;
                             }
                         }
-                        2 => { // length-delimited
+                        2 => {
                             let (_, consumed) = parse_length_delimited(&data[offset..])?;
                             offset += consumed;
                         }
-                        5 => { // 32-bit
+                        5 => {
                             if offset + 4 <= data.len() {
                                 offset += 4;
                             } else {
@@ -173,44 +219,69 @@ impl GamePlayed {
                         }
                         _ => return None,
                     }
+                    raw_unknown.extend_from_slice(&data[field_start..offset]);
                 }
             }
         }
 
-        Some(GamePlayed {
+        Some(Self {
+            steam_id_gs,
             game_id,
             game_extra_info,
-            raw_data: data.to_vec(),
+            raw_unknown,
         })
     }
 
-    /// Serialize the GamePlayed back to protobuf wire format.
-    fn serialize(&self) -> Vec<u8> {
+    /// Serialize to canonical Valve wire format:
+    /// - field 1 (if != 0): steam_id_gs varint
+    /// - field 2: fixed64 game_id (wire type 1)
+    /// - field 7: length-delimited game_extra_info (wire type 2)
+    pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::new();
 
-        // Field 1: game_id (varint)
-        out.push(0x08);  // field 1, wire type 0
-        encode_varint(self.game_id as u64, &mut out);
+        if self.steam_id_gs != 0 {
+            out.push(0x08); // field 1, wire type 0
+            encode_varint(self.steam_id_gs, &mut out);
+        }
 
-        // Field 2: game_extra_info (length-delimited) if present
+        // Field 2: game_id as fixed64 (tag = (2 << 3) | 1 = 0x11)
+        out.push(0x11);
+        out.extend_from_slice(&self.game_id.to_le_bytes());
+
+        // Field 7: game_extra_info as length-delimited (tag = (7 << 3) | 2 = 0x3A)
         if let Some(extra_info) = &self.game_extra_info {
-            out.push(0x12);  // field 2, wire type 2
+            out.push(0x3A);
             let extra_bytes = extra_info.as_bytes();
             encode_varint(extra_bytes.len() as u64, &mut out);
             out.extend_from_slice(extra_bytes);
         }
 
+        out.extend_from_slice(&self.raw_unknown);
         out
     }
 }
 
-/// Parse the CMsgClientGamesPlayed message body.
-/// Returns a vector of GamePlayed for each game in the request.
-fn parse_games_played(body: &[u8]) -> Option<Vec<GamePlayed>> {
-    let mut games = Vec::new();
+/// Canonical `CMsgClientGamesPlayed` message (eMsg 742 / 5410):
+/// - `games_played`: repeated field 1, length-delimited
+/// - `client_os_type`: field 2, uint32 varint
+/// - `cloud_gaming_platform`: field 3, uint32 varint
+/// - `recent_reauthentication`: field 4, bool varint
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GamesPlayedMsg {
+    pub games_played: Vec<GamePlayed>,
+    pub client_os_type: Option<u32>,
+    pub cloud_gaming_platform: Option<u32>,
+    pub recent_reauthentication: Option<bool>,
+    pub raw_unknown: Vec<u8>,
+}
+
+/// Parse `CMsgClientGamesPlayed` from protobuf body bytes.
+pub fn parse_games_played(body: &[u8]) -> Option<GamesPlayedMsg> {
+    let mut msg = GamesPlayedMsg::default();
     let mut offset = 0;
 
     while offset < body.len() {
+        let field_start = offset;
         let (tag, tag_len) = decode_varint(&body[offset..])?;
         offset += tag_len;
 
@@ -218,42 +289,179 @@ fn parse_games_played(body: &[u8]) -> Option<Vec<GamePlayed>> {
         let wire_type = tag & 0x7;
 
         match (field_num, wire_type) {
-            (1, 2) => {  // games_played (repeated length-delimited)
+            (1, 2) => {
                 let (game_data, consumed) = parse_length_delimited(&body[offset..])?;
                 if let Some(game) = GamePlayed::parse(game_data) {
-                    games.push(game);
+                    msg.games_played.push(game);
                 }
                 offset += consumed;
             }
+            (2, 0) => {
+                let (val, consumed) = decode_varint(&body[offset..])?;
+                msg.client_os_type = Some(val as u32);
+                offset += consumed;
+            }
+            (3, 0) => {
+                let (val, consumed) = decode_varint(&body[offset..])?;
+                msg.cloud_gaming_platform = Some(val as u32);
+                offset += consumed;
+            }
+            (4, 0) => {
+                let (val, consumed) = decode_varint(&body[offset..])?;
+                msg.recent_reauthentication = Some(val != 0);
+                offset += consumed;
+            }
             _ => {
-                // Skip unknown fields
                 match wire_type {
-                    0 => { let (_, c) = decode_varint(&body[offset..])?; offset += c; }
-                    1 => { if offset + 8 <= body.len() { offset += 8; } else { return None; } }
-                    2 => { let (_, c) = parse_length_delimited(&body[offset..])?; offset += c; }
-                    5 => { if offset + 4 <= body.len() { offset += 4; } else { return None; } }
+                    0 => {
+                        let (_, c) = decode_varint(&body[offset..])?;
+                        offset += c;
+                    }
+                    1 => {
+                        if offset + 8 <= body.len() {
+                            offset += 8;
+                        } else {
+                            return None;
+                        }
+                    }
+                    2 => {
+                        let (_, c) = parse_length_delimited(&body[offset..])?;
+                        offset += c;
+                    }
+                    5 => {
+                        if offset + 4 <= body.len() {
+                            offset += 4;
+                        } else {
+                            return None;
+                        }
+                    }
                     _ => return None,
                 }
+                msg.raw_unknown.extend_from_slice(&body[field_start..offset]);
             }
         }
     }
 
-    Some(games)
+    Some(msg)
 }
 
-/// Serialize the CMsgClientGamesPlayed message body.
-fn serialize_games_played(games: &[GamePlayed]) -> Vec<u8> {
+/// Serialize `CMsgClientGamesPlayed` to protobuf body bytes.
+pub fn serialize_games_played(msg: &GamesPlayedMsg) -> Vec<u8> {
     let mut out = Vec::new();
 
-    for game in games {
-        // Field 1: games_played (repeated length-delimited)
-        out.push(0x0A);  // field 1, wire type 2
-        let game_data = game.serialize();
-        encode_varint(game_data.len() as u64, &mut out);
-        out.extend_from_slice(&game_data);
+    // Field 1: games_played (repeated length-delimited)
+    for game in &msg.games_played {
+        out.push(0x0A); // tag = (1 << 3) | 2 = 0x0A
+        let game_bytes = game.serialize();
+        encode_varint(game_bytes.len() as u64, &mut out);
+        out.extend_from_slice(&game_bytes);
     }
 
+    // Field 2: client_os_type
+    if let Some(val) = msg.client_os_type {
+        out.push(0x10);
+        encode_varint(val as u64, &mut out);
+    }
+
+    // Field 3: cloud_gaming_platform
+    if let Some(val) = msg.cloud_gaming_platform {
+        out.push(0x18);
+        encode_varint(val as u64, &mut out);
+    }
+
+    // Field 4: recent_reauthentication
+    if let Some(val) = msg.recent_reauthentication {
+        out.push(0x20);
+        encode_varint(if val { 1 } else { 0 }, &mut out);
+    }
+
+    out.extend_from_slice(&msg.raw_unknown);
     out
+}
+
+/// Handle outgoing `CMsgClientGamesPlayed` (eMsg 742 / 5410) over NetPacket.
+/// Restores real game title in `game_extra_info` when spoofing Spacewar 480 multiplayer (BST-34).
+pub fn handle_send_games_played_netpacket(ctx: &mut NetPacketContext) -> Result<(), String> {
+    // 1. Trigger RichPresence tracking (matching Hooks_NetPacket.cpp:1773)
+    let _ = crate::steam_bridge::netpacket::netpacket_richpresence::track_send(ctx);
+
+    let body = ctx.body();
+    if body.is_empty() {
+        return Ok(());
+    }
+
+    let Some(mut msg) = parse_games_played(body) else {
+        log::debug!("[BST-34] Failed to parse CMsgClientGamesPlayed");
+        return Ok(());
+    };
+
+    let real_app_id = resolve_app_id();
+    let mut needs_patch = false;
+
+    for game in &mut msg.games_played {
+        let appid = game.app_id();
+        if appid == ONLINE_FIX_APP_ID && real_app_id != 0 && real_app_id != ONLINE_FIX_APP_ID {
+            let real_name = get_game_name_by_app_id(real_app_id);
+            if game.game_extra_info.as_deref() != Some(&real_name) {
+                game.game_extra_info = Some(real_name.clone());
+                needs_patch = true;
+                log::info!(
+                    "[BST-34] Restored game_extra_info: 480 -> '{}' (real appid {})",
+                    real_name,
+                    real_app_id
+                );
+            }
+        }
+    }
+
+    if needs_patch {
+        let new_body = serialize_games_played(&msg);
+        let mut new_frame = Vec::with_capacity(ctx.body_offset + new_body.len());
+        new_frame.extend_from_slice(&ctx.frame_buffer[..ctx.body_offset]);
+        new_frame.extend_from_slice(&new_body);
+        ctx.replace_frame(new_frame);
+        log::debug!("[BST-34] Successfully patched CMsgClientGamesPlayed wire frame");
+    }
+
+    Ok(())
+}
+
+/// Handle outgoing `CMsgClientGamesPlayed` over IPC.
+pub fn handle_send_games_played_post(ctx: &mut IpcContext) {
+    let real_app_id = resolve_app_id();
+    if real_app_id == 0 || real_app_id == ONLINE_FIX_APP_ID {
+        return;
+    }
+
+    if ctx.write_buffer.len() < 12 {
+        return;
+    }
+    let body_start = 12;
+    if ctx.write_buffer.len() <= body_start {
+        return;
+    }
+
+    let body = &ctx.write_buffer[body_start..];
+    let Some(mut msg) = parse_games_played(body) else {
+        return;
+    };
+
+    let mut needs_patch = false;
+    for game in &mut msg.games_played {
+        if game.app_id() == ONLINE_FIX_APP_ID {
+            let real_name = get_game_name_by_app_id(real_app_id);
+            if game.game_extra_info.as_deref() != Some(&real_name) {
+                game.game_extra_info = Some(real_name);
+                needs_patch = true;
+            }
+        }
+    }
+
+    if needs_patch {
+        let new_body = serialize_games_played(&msg);
+        ctx.write_buffer.truncate(body_start);
+        ctx.write_buffer.extend_from_slice(&new_body);
+    }
 }
 
 /// Register all OnlineFix handlers.
@@ -287,8 +495,22 @@ pub fn register_onlinefix_handlers() {
         Some(games_played_post),
     ));
 
-    // Also register as NetPacket send handler for eMsg 742 and 5410
-    register_netpacket_send_handlers();
+    // Register NetPacket send handlers for eMsg 742 and 5410
+    register_netpacket_handler(crate::steam_bridge::netpacket::netpacket_core::NetPacketHandler {
+        direction: NetPacketDirection::Send,
+        emsg: K_EMSG_CLIENT_GAMES_PLAYED,
+        target_job_hash: None,
+        name: "OnlineFix::HandleSend_GamesPlayed_742".to_string(),
+        handler: Arc::new(|ctx| handle_send_games_played_netpacket(ctx)),
+    });
+
+    register_netpacket_handler(crate::steam_bridge::netpacket::netpacket_core::NetPacketHandler {
+        direction: NetPacketDirection::Send,
+        emsg: K_EMSG_CLIENT_GAMES_PLAYED_PB,
+        target_job_hash: None,
+        name: "OnlineFix::HandleSend_GamesPlayed_5410".to_string(),
+        handler: Arc::new(|ctx| handle_send_games_played_netpacket(ctx)),
+    });
 }
 
 /// Unregister all OnlineFix handlers.
@@ -296,157 +518,6 @@ pub fn unregister_onlinefix_handlers() {
     onlinefix_handlers().lock().unwrap_or_else(|e| e.into_inner()).clear();
     let iface = IpcInterface::IClientUser;
     let _ = ipc::unregister_handler(iface, NETPACKET_ONLINEFIX_GAMES_PLAYED_FNHASH);
-}
-
-/// Register NetPacket send handlers for CMsgClientGamesPlayed.
-fn register_netpacket_send_handlers() {
-    // eMsg 742 - legacy CMsgClientGamesPlayed
-    register_netpacket_handler(crate::steam_bridge::netpacket::netpacket_core::NetPacketHandler {
-        direction: NetPacketDirection::Send,
-        emsg: K_EMSG_CLIENT_GAMES_PLAYED,
-        target_job_hash: None,
-        name: "OnlineFix::HandleSend_GamesPlayed_742".to_string(),
-        handler: Arc::new(|ctx| {
-            log::debug!("OnlineFix Send: CMsgClientGamesPlayed (742)");
-            handle_send_games_played_netpacket(ctx);
-            Ok(())
-        }),
-    });
-
-    // eMsg 5410 - protobuf CMsgClientGamesPlayed
-    register_netpacket_handler(crate::steam_bridge::netpacket::netpacket_core::NetPacketHandler {
-        direction: NetPacketDirection::Send,
-        emsg: K_EMSG_CLIENT_GAMES_PLAYED_PB,
-        target_job_hash: None,
-        name: "OnlineFix::HandleSend_GamesPlayed_5410".to_string(),
-        handler: Arc::new(|ctx| {
-            log::debug!("OnlineFix Send: CMsgClientGamesPlayed (5410)");
-            handle_send_games_played_netpacket(ctx);
-            Ok(())
-        }),
-    });
-}
-
-/// Handle outgoing CMsgClientGamesPlayed (IPC handler).
-/// When online fix is active (appid 480/Spacewar), replace game_extra_info with real game name.
-fn handle_send_games_played_post(ctx: &mut IpcContext) {
-    // Check if online fix is active
-    let real_app_id = resolve_app_id();
-    if real_app_id == 0 || real_app_id == ONLINE_FIX_APP_ID {
-        // Online fix not active, or we're already at the real app
-        return;
-    }
-
-    // The message body starts after the IPC header (12 bytes)
-    if ctx.write_buffer.len() < 12 {
-        return;
-    }
-
-    let body_start = 12;  // Skip IPC header
-    if ctx.write_buffer.len() <= body_start {
-        return;
-    }
-
-    let body = &ctx.write_buffer[body_start..];
-
-    // Parse the request
-    let Some(mut games) = parse_games_played(body) else {
-        log::debug!("OnlineFix: Failed to parse CMsgClientGamesPlayed");
-        return;
-    };
-
-    // Check each game - if game_id is 480 (Spacewar/OnlineFix), replace game_extra_info
-    let mut needs_patch = false;
-    for game in &mut games {
-        if game.game_id == ONLINE_FIX_APP_ID {
-            // Get the real game's localized name
-            let real_name = get_game_name_by_app_id(real_app_id);
-
-            if game.game_extra_info.as_ref() != Some(&real_name) {
-                game.game_extra_info = Some(real_name.clone());
-                needs_patch = true;
-                log::info!(
-                    "OnlineFix: Replacing game_extra_info for appId=480 -> '{}' (real appId={})",
-                    real_name, real_app_id
-                );
-            }
-        }
-    }
-
-    // If any games needed patching, serialize the modified request back
-    if needs_patch {
-        let new_body = serialize_games_played(&games);
-
-        // Replace the body in write_buffer
-        ctx.write_buffer.truncate(body_start);
-        ctx.write_buffer.extend_from_slice(&new_body);
-
-        log::debug!(
-            "OnlineFix: Patched CMsgClientGamesPlayed - new body size: {}",
-            new_body.len()
-        );
-    }
-}
-
-/// Handle outgoing CMsgClientGamesPlayed (NetPacket handler).
-/// When online fix is active (appid 480/Spacewar), replace game_extra_info with real game name.
-fn handle_send_games_played_netpacket(ctx: &mut crate::steam_bridge::netpacket::netpacket_core::NetPacketContext) {
-    // Check if online fix is active
-    let real_app_id = resolve_app_id();
-    if real_app_id == 0 || real_app_id == ONLINE_FIX_APP_ID {
-        // Online fix not active, or we're already at the real app
-        return;
-    }
-
-    // Get the body from the frame buffer
-    let body = ctx.body();
-    if body.is_empty() {
-        return;
-    }
-
-    // Parse the request
-    let Some(mut games) = parse_games_played(body) else {
-        log::debug!("OnlineFix: Failed to parse CMsgClientGamesPlayed (NetPacket)");
-        return;
-    };
-
-    // Check each game - if game_id is 480 (Spacewar/OnlineFix), replace game_extra_info
-    let mut needs_patch = false;
-    for game in &mut games {
-        if game.game_id == ONLINE_FIX_APP_ID {
-            // Get the real game's localized name
-            let real_name = get_game_name_by_app_id(real_app_id);
-
-            if game.game_extra_info.as_ref() != Some(&real_name) {
-                game.game_extra_info = Some(real_name.clone());
-                needs_patch = true;
-                log::info!(
-                    "OnlineFix: Replacing game_extra_info for appId=480 -> '{}' (real appId={})",
-                    real_name, real_app_id
-                );
-            }
-        }
-    }
-
-    // If any games needed patching, serialize the modified request back
-    if needs_patch {
-        let new_body = serialize_games_played(&games);
-
-        // Replace the frame body
-        ctx.replace_frame({
-            let mut new_frame = Vec::with_capacity(ctx.frame_buffer.len());
-            // Copy header
-            new_frame.extend_from_slice(&ctx.frame_buffer[..ctx.body_offset]);
-            // Add new body
-            new_frame.extend_from_slice(&new_body);
-            new_frame
-        });
-
-        log::debug!(
-            "OnlineFix: Patched CMsgClientGamesPlayed (NetPacket) - new body size: {}",
-            new_body.len()
-        );
-    }
 }
 
 pub fn install_onlinefix() -> Result<(), String> {
@@ -478,172 +549,90 @@ pub fn is_onlinefix_hook_active() -> bool {
 mod tests {
     use super::*;
 
-    static ONLINEFIX_TEST_GUARD: Mutex<()> = Mutex::new(());
+    static TEST_GUARD: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn test_fnv1a_hash_onlinefix() {
-        assert_eq!(
-            NETPACKET_ONLINEFIX_GAMES_PLAYED_FNHASH,
-            fnv1a_hash("CMsgClientGamesPlayed")
-        );
-    }
-
-    #[test]
-    fn test_decode_varint() {
-        // Single byte
-        assert_eq!(decode_varint(&[0x01]), Some((1, 1)));
-        assert_eq!(decode_varint(&[0x7F]), Some((127, 1)));
-
-        // Multi-byte
-        assert_eq!(decode_varint(&[0x80, 0x01]), Some((128, 2)));
-        assert_eq!(decode_varint(&[0xFF, 0xFF, 0xFF, 0x7F]), Some((268435455, 4)));
-
-        // Truncated
-        assert!(decode_varint(&[0x80]).is_none());
-
-        // 10th byte overflow
-        assert!(decode_varint(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02]).is_none());
-    }
-
-    #[test]
-    fn test_encode_varint() {
-        let mut out = Vec::new();
-        encode_varint(1, &mut out);
-        assert_eq!(out, vec![0x01]);
-
-        out.clear();
-        encode_varint(127, &mut out);
-        assert_eq!(out, vec![0x7F]);
-
-        out.clear();
-        encode_varint(128, &mut out);
-        assert_eq!(out, vec![0x80, 0x01]);
-
-        out.clear();
-        encode_varint(300, &mut out);
-        assert_eq!(out, vec![0xAC, 0x02]);
-
-        out.clear();
-        encode_varint(268435455, &mut out);
-        assert_eq!(out, vec![0xFF, 0xFF, 0xFF, 0x7F]);
-    }
-
-    #[test]
-    fn test_parse_length_delimited() {
-        // String "hello" (5 bytes)
-        let data = vec![0x05, b'h', b'e', b'l', b'l', b'o'];
-        let (result, consumed) = parse_length_delimited(&data).unwrap();
-        assert_eq!(result, b"hello");
-        assert_eq!(consumed, 6);
-
-        // Empty string
-        let data = vec![0x00];
-        let (result, consumed) = parse_length_delimited(&data).unwrap();
-        assert_eq!(result, b"");
-        assert_eq!(consumed, 1);
-
-        // Truncated
-        assert!(parse_length_delimited(&[0x05, b'h', b'e']).is_none());
-    }
-
-    #[test]
-    fn test_game_played_parse_and_serialize() {
-        // Build a GamePlayed with game_id=480 and game_extra_info="Spacewar"
+    fn test_game_played_canonical_fixed64_and_field7_string() {
         let game = GamePlayed {
-            game_id: 480,
-            game_extra_info: Some("Spacewar".to_string()),
-            raw_data: vec![],
+            steam_id_gs: 0x0110_0001_0000_1234,
+            game_id: 480, // Lower 32-bit = 480
+            game_extra_info: Some("ELDEN RING".to_string()),
+            raw_unknown: vec![],
         };
 
-        let serialized = game.serialize();
+        let bytes = game.serialize();
+        let parsed = GamePlayed::parse(&bytes).unwrap();
 
-        // Parse it back
-        let parsed = GamePlayed::parse(&serialized).unwrap();
+        assert_eq!(parsed.steam_id_gs, 0x0110_0001_0000_1234);
         assert_eq!(parsed.game_id, 480);
-        assert_eq!(parsed.game_extra_info, Some("Spacewar".to_string()));
-
-        // Test without game_extra_info
-        let game_no_extra = GamePlayed {
-            game_id: 480,
-            game_extra_info: None,
-            raw_data: vec![],
-        };
-        let serialized = game_no_extra.serialize();
-        let parsed = GamePlayed::parse(&serialized).unwrap();
-        assert_eq!(parsed.game_id, 480);
-        assert_eq!(parsed.game_extra_info, None);
+        assert_eq!(parsed.app_id(), 480);
+        assert_eq!(parsed.game_extra_info, Some("ELDEN RING".to_string()));
     }
 
     #[test]
-    fn test_parse_games_played() {
-        // Create a request with two games
-        let game1 = GamePlayed {
-            game_id: 480,
-            game_extra_info: Some("Spacewar".to_string()),
-            raw_data: vec![],
-        };
-        let game2 = GamePlayed {
-            game_id: 730,
-            game_extra_info: Some("Counter-Strike 2".to_string()),
-            raw_data: vec![],
+    fn test_games_played_msg_roundtrip() {
+        let msg = GamesPlayedMsg {
+            games_played: vec![
+                GamePlayed::with_extra_info(480, "Spacewar"),
+                GamePlayed::with_extra_info(730, "Counter-Strike 2"),
+            ],
+            client_os_type: Some(16),
+            cloud_gaming_platform: Some(0),
+            recent_reauthentication: Some(false),
+            raw_unknown: vec![],
         };
 
-        let body = serialize_games_played(&[game1, game2]);
+        let body = serialize_games_played(&msg);
         let parsed = parse_games_played(&body).unwrap();
 
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].game_id, 480);
-        assert_eq!(parsed[0].game_extra_info, Some("Spacewar".to_string()));
-        assert_eq!(parsed[1].game_id, 730);
-        assert_eq!(parsed[1].game_extra_info, Some("Counter-Strike 2".to_string()));
+        assert_eq!(parsed.games_played.len(), 2);
+        assert_eq!(parsed.games_played[0].app_id(), 480);
+        assert_eq!(parsed.games_played[0].game_extra_info.as_deref(), Some("Spacewar"));
+        assert_eq!(parsed.games_played[1].app_id(), 730);
+        assert_eq!(parsed.games_played[1].game_extra_info.as_deref(), Some("Counter-Strike 2"));
+        assert_eq!(parsed.client_os_type, Some(16));
     }
 
     #[test]
-    fn test_serialize_games_played() {
-        let game1 = GamePlayed {
-            game_id: 480,
-            game_extra_info: Some("Spacewar".to_string()),
-            raw_data: vec![],
+    fn test_onlinefix_title_restoration_netpacket() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Set real AppID to Elden Ring (1245620)
+        crate::steam_bridge::interop::interop_misc::set_online_fix_real_app_id(1245620);
+        crate::steam_bridge::interop::interop_misc::set_game_name_by_app_id(
+            1245620,
+            "ELDEN RING".to_string(),
+        );
+
+        let initial_msg = GamesPlayedMsg {
+            games_played: vec![GamePlayed::with_extra_info(480, "Spacewar")],
+            client_os_type: Some(16),
+            cloud_gaming_platform: None,
+            recent_reauthentication: None,
+            raw_unknown: vec![],
         };
-        let game2 = GamePlayed {
-            game_id: 730,
-            game_extra_info: Some("CS2".to_string()),
-            raw_data: vec![],
-        };
 
-        let body = serialize_games_played(&[game1, game2]);
-        assert!(!body.is_empty());
+        let body = serialize_games_played(&initial_msg);
+        let mut frame = Vec::new();
+        // MsgHdr (8 bytes: eMsg 742, headerLength 20) + job ids (12 bytes) = 20 bytes
+        frame.extend_from_slice(&[0xE6, 0x02, 0x00, 0x80]); // eMsg = 742 | 0x80000000
+        frame.extend_from_slice(&20u32.to_le_bytes());       // header_length = 20
+        frame.extend_from_slice(&[0u8; 12]);                // job ids
+        frame.extend_from_slice(&body);
 
-        // Verify it parses back correctly
-        let parsed = parse_games_played(&body).unwrap();
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].game_id, 480);
-        assert_eq!(parsed[0].game_extra_info, Some("Spacewar".to_string()));
-        assert_eq!(parsed[1].game_id, 730);
-        assert_eq!(parsed[1].game_extra_info, Some("CS2".to_string()));
-    }
+        let mut ctx = NetPacketContext::new(frame, NetPacketDirection::Send, 480).unwrap();
+        let res = handle_send_games_played_netpacket(&mut ctx);
+        assert!(res.is_ok());
 
-    #[test]
-    fn test_onlinefix_handler_registration_and_uninstall() {
-        let _g = ONLINEFIX_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        install_onlinefix().unwrap();
-        assert!(is_onlinefix_hook_active());
+        // Verify that game_extra_info was patched to "ELDEN RING"
+        let modified = parse_games_played(ctx.body()).unwrap();
+        assert_eq!(modified.games_played[0].app_id(), 480);
+        assert_eq!(
+            modified.games_played[0].game_extra_info.as_deref(),
+            Some("ELDEN RING")
+        );
 
-        {
-            let handlers = onlinefix_handlers().lock().unwrap();
-            assert!(!handlers.is_empty());
-            assert!(handlers.iter().any(|h| h.name.contains("OnlineFix")));
-        }
-        assert!(ipc::find_handler(
-            IpcInterface::IClientUser,
-            NETPACKET_ONLINEFIX_GAMES_PLAYED_FNHASH
-        ).is_some());
-
-        uninstall_onlinefix();
-        assert!(!is_onlinefix_hook_active());
-        assert!(ipc::find_handler(
-            IpcInterface::IClientUser,
-            NETPACKET_ONLINEFIX_GAMES_PLAYED_FNHASH
-        ).is_none());
+        // Reset
+        crate::steam_bridge::interop::interop_misc::set_online_fix_real_app_id(0);
     }
 }

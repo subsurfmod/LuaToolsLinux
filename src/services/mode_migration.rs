@@ -121,6 +121,55 @@ impl ModeMigration {
         matches!(stored.map(str::trim), Some(s) if !s.is_empty() && UnlockerMode::try_from(s).is_err())
     }
 
+    /// Startup hook (LT-63): inspects `settings_path` (`settings.json`) for any legacy `mode` /
+    /// `unlocker_mode` field, runs `needs_migration` + `migrate` + `apply`, and rewrites the
+    /// normalized value cleanly. Returns `Some(MigrationResult)` when a migration was applied.
+    pub fn migrate_settings_file_on_startup(settings_path: &Path) -> Option<MigrationResult> {
+        let raw = fs::read_to_string(settings_path).ok()?;
+        let mut val: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        let obj = val.as_object_mut()?;
+
+        let stored_key = if obj.contains_key("mode") {
+            "mode"
+        } else if obj.contains_key("unlocker_mode") {
+            "unlocker_mode"
+        } else {
+            return None;
+        };
+
+        let stored_str = obj
+            .get(stored_key)
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string);
+
+        if !Self::needs_migration(stored_str.as_deref()) {
+            return None;
+        }
+
+        let mut new_mode = UnlockerMode::None;
+        let reset_onboarding =
+            Self::new().apply(stored_str.as_deref(), |m| new_mode = m);
+        let normalized = match new_mode {
+            UnlockerMode::SteamTools => "SteamTools",
+            UnlockerMode::Bst => "Bst",
+            UnlockerMode::Custom => "Custom",
+            UnlockerMode::None => "None",
+        };
+
+        obj.remove("mode");
+        obj.insert(
+            "unlocker_mode".to_string(),
+            serde_json::Value::String(normalized.to_string()),
+        );
+        if let Ok(updated) = serde_json::to_string_pretty(&val) {
+            let tmp = settings_path.with_extension("migrate.tmp");
+            if fs::write(&tmp, updated).is_ok() {
+                let _ = fs::rename(&tmp, settings_path);
+            }
+        }
+        Some(MigrationResult::new(new_mode, reset_onboarding))
+    }
+
     /// Scans a game directory for legacy SmokeAPI, GreenLuma, and BST / SteamTools unlocker files.
     pub fn scan_game_for_legacy_unlockers(game_dir: &Path) -> Vec<LegacyUnlockerFile> {
         let mut results = Vec::new();

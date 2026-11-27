@@ -3,21 +3,115 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::time::Duration;
-
-use regex::Regex;
 
 use crate::models::config::default_luatools_cache_dir;
 
-const DONATE_ENDPOINT: &str = "http://167.235.229.108/donatekeys/send";
+const DONATE_ENDPOINT: &str = "https://167.235.229.108/donatekeys/send";
 const DONATE_USER_AGENT: &str = "discord(dot)gg/luatools";
 
-fn depot_key_block_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r#"(?is)"(\d+)"\s*\{\s*[^}]*?"DecryptionKey"\s+"([0-9a-fA-F]{64})""#).unwrap()
-    })
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VdfToken {
+    Str(String),
+    LBrace,
+    RBrace,
+}
+
+fn tokenize_vdf(raw: &str) -> Vec<VdfToken> {
+    let mut tokens = Vec::new();
+    let bytes = raw.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        let b = bytes[i];
+        // Skip ASCII whitespace
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        // Skip // line comments outside quotes
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'{' {
+            tokens.push(VdfToken::LBrace);
+            i += 1;
+            continue;
+        }
+        if b == b'}' {
+            tokens.push(VdfToken::RBrace);
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            i += 1;
+            let mut s = String::new();
+            while i < len {
+                let c = bytes[i];
+                if c == b'\\' {
+                    i += 1;
+                    if i < len {
+                        let next_ch = match raw[i..].chars().next() {
+                            Some(ch) => ch,
+                            None => break,
+                        };
+                        match next_ch {
+                            '"' => s.push('"'),
+                            '\\' => s.push('\\'),
+                            'n' => s.push('\n'),
+                            't' => s.push('\t'),
+                            other => {
+                                s.push('\\');
+                                s.push(other);
+                            }
+                        }
+                        i += next_ch.len_utf8();
+                    } else {
+                        s.push('\\');
+                    }
+                    continue;
+                }
+                if c == b'"' {
+                    i += 1;
+                    break;
+                }
+                // Preserve valid UTF-8 characters inside quoted strings
+                let ch = match raw[i..].chars().next() {
+                    Some(ch) => ch,
+                    None => break,
+                };
+                s.push(ch);
+                i += ch.len_utf8();
+            }
+            tokens.push(VdfToken::Str(s));
+            continue;
+        }
+        // Bare unquoted token
+        let start = i;
+        while i < len
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'{'
+            && bytes[i] != b'}'
+            && bytes[i] != b'"'
+        {
+            if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+                break;
+            }
+            i += 1;
+        }
+        if i > start {
+            tokens.push(VdfToken::Str(raw[start..i].to_string()));
+        } else {
+            i += 1;
+        }
+    }
+
+    tokens
 }
 
 #[derive(Debug, Clone)]
@@ -39,28 +133,78 @@ impl DonateKeysService {
         }
     }
 
-    pub fn extract_keys_from_vdf(vdf_path: &Path) -> BTreeMap<String, String> {
+    /// Brace-depth-aware VDF `"depots"` scanner (LT-45).
+    /// Accurately extracts `"DecryptionKey"` even when nested `{ ... }` sub-blocks appear
+    /// before `"DecryptionKey"` inside a depot section.
+    pub fn extract_keys_from_vdf_text(raw: &str) -> BTreeMap<String, String> {
         let mut out = BTreeMap::new();
-        let Ok(raw) = fs::read_to_string(vdf_path) else {
-            return out;
-        };
-        let block_re = depot_key_block_re();
-        for cap in block_re.captures_iter(&raw) {
-            if let (Some(did), Some(key)) = (cap.get(1), cap.get(2)) {
-                let Ok(depot_id) = did.as_str().parse::<u32>() else {
-                    continue;
-                };
-                if depot_id == 0 {
-                    continue;
+        let tokens = tokenize_vdf(raw);
+        let mut stack: Vec<String> = Vec::new();
+        let mut i = 0;
+
+        while i < tokens.len() {
+            match &tokens[i] {
+                VdfToken::RBrace => {
+                    stack.pop();
+                    i += 1;
                 }
-                let lowered = key.as_str().to_ascii_lowercase();
-                if lowered.bytes().all(|b| b == b'0') {
-                    continue;
+                VdfToken::LBrace => {
+                    // Orphaned opening brace; push anonymous sentinel to keep depth balanced
+                    stack.push(String::new());
+                    i += 1;
                 }
-                out.insert(depot_id.to_string(), lowered);
+                VdfToken::Str(key) => {
+                    if i + 1 < tokens.len() {
+                        match &tokens[i + 1] {
+                            VdfToken::LBrace => {
+                                stack.push(key.clone());
+                                i += 2;
+                            }
+                            VdfToken::Str(val) => {
+                                if key.eq_ignore_ascii_case("DecryptionKey")
+                                    && val.len() == 64
+                                    && val.bytes().all(|b| b.is_ascii_hexdigit())
+                                {
+                                    // Accept when directly inside "depots" -> "<depot_id>",
+                                    // or inside a standalone top-level "<depot_id>" snippet.
+                                    let valid_depot_context = match stack.len() {
+                                        1 => true,
+                                        n if n >= 2 => stack[n - 2].eq_ignore_ascii_case("depots"),
+                                        _ => false,
+                                    };
+                                    if valid_depot_context {
+                                        if let Some(depot_str) = stack.last() {
+                                            if let Ok(depot_id) = depot_str.parse::<u32>() {
+                                                let lowered = val.to_ascii_lowercase();
+                                                if depot_id > 0 && !lowered.bytes().all(|b| b == b'0') {
+                                                    out.insert(depot_id.to_string(), lowered);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                i += 2;
+                            }
+                            VdfToken::RBrace => {
+                                // Malformed dangling key before closing brace; skip key only
+                                i += 1;
+                            }
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
             }
         }
+
         out
+    }
+
+    pub fn extract_keys_from_vdf(vdf_path: &Path) -> BTreeMap<String, String> {
+        let Ok(raw) = fs::read_to_string(vdf_path) else {
+            return BTreeMap::new();
+        };
+        Self::extract_keys_from_vdf_text(&raw)
     }
 
     pub fn donate_new_keys(&self) -> usize {
@@ -68,6 +212,14 @@ impl DonateKeysService {
     }
 
     fn donate_new_keys_to(&self, endpoint: &str) -> usize {
+        // Enforce HTTPS or loopback to prevent plaintext leakage of sensitive depot keys
+        if !endpoint.starts_with("https://") {
+            let is_loopback = endpoint.starts_with("http://127.0.0.1")
+                || endpoint.starts_with("http://localhost");
+            if !is_loopback {
+                return 0;
+            }
+        }
         let vdf = self.steam_root.join("config").join("config.vdf");
         let found = Self::extract_keys_from_vdf(&vdf);
         if found.is_empty() {
@@ -190,5 +342,76 @@ mod tests {
 
         // Second call finds no new keys and does not hit network
         assert_eq!(svc.donate_new_keys_to("http://127.0.0.1:1/unreachable"), 0);
+    }
+
+    #[test]
+    fn extracts_keys_across_nested_braces_in_config_vdf() {
+        let dir = tempdir().unwrap();
+        let vdf = dir.path().join("config.vdf");
+        let key1 = "1a".repeat(32);
+        let key2 = "2b".repeat(32);
+        let key_outside = "3c".repeat(32);
+        let content = format!(
+            r#""InstallConfigStore"
+{{
+    "Software"
+    {{
+        "Valve"
+        {{
+            "Steam"
+            {{
+                "apps"
+                {{
+                    "999999"
+                    {{
+                        "DecryptionKey" "{key_outside}"
+                    }}
+                }}
+                "depots"
+                {{
+                    "1245621"
+                    {{
+                        // Nested config and mounts before DecryptionKey used to break [^}}]*? regex
+                        "config"
+                        {{
+                            "oslist" "windows"
+                            "note" "escaped quote \" and brace }} inside string"
+                            "nested"
+                            {{
+                                "flag" "1"
+                            }}
+                        }}
+                        "DecryptionKey" "{key1}"
+                    }}
+                    "1245622"
+                    {{
+                        "manifest" {{ "gid" "12345" }}
+                        "DecryptionKey" "{key2}"
+                    }}
+                }}
+            }}
+        }}
+    }}
+}}"#
+        );
+        fs::write(&vdf, content).unwrap();
+
+        let keys = DonateKeysService::extract_keys_from_vdf(&vdf);
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys.get("1245621").map(String::as_str), Some(key1.as_str()));
+        assert_eq!(keys.get("1245622").map(String::as_str), Some(key2.as_str()));
+        assert!(!keys.contains_key("999999"));
+    }
+
+    #[test]
+    fn test_tokenize_vdf_escapes_with_multibyte_utf8() {
+        let input = r#""test" "hello \u00e4 \世界 \"escaped\" \\ \n normal""#;
+        let tokens = tokenize_vdf(input);
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0], VdfToken::Str("test".into()));
+        assert_eq!(
+            tokens[1],
+            VdfToken::Str("hello \\u00e4 \\世界 \"escaped\" \\ \n normal".into())
+        );
     }
 }

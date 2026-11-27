@@ -61,13 +61,18 @@ impl AppliedFixIndexService {
     }
 
     fn load_from(path: &Path) -> BTreeMap<u32, Vec<AppliedFixRecord>> {
-        if !path.exists() {
-            return BTreeMap::new();
+        for candidate in [path.to_path_buf(), path.with_extension("json.bak")] {
+            if !candidate.exists() {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(&candidate) else {
+                continue;
+            };
+            if let Ok(records) = serde_json::from_str::<BTreeMap<u32, Vec<AppliedFixRecord>>>(&content) {
+                return records;
+            }
         }
-        let Ok(content) = fs::read_to_string(path) else {
-            return BTreeMap::new();
-        };
-        serde_json::from_str(&content).unwrap_or_default()
+        BTreeMap::new()
     }
 
     pub fn save(&self) -> bool {
@@ -78,16 +83,23 @@ impl AppliedFixIndexService {
         }
         let tmp = self.path.with_extension("json.tmp");
         if let Ok(content) = serde_json::to_string_pretty(&self.records) {
-            if fs::write(&tmp, content).is_ok() && fs::rename(&tmp, &self.path).is_ok() {
-                return true;
+            if fs::write(&tmp, content).is_ok() {
+                if self.path.exists() {
+                    let _ = fs::copy(&self.path, self.path.with_extension("json.bak"));
+                }
+                if fs::rename(&tmp, &self.path).is_ok() {
+                    return true;
+                }
             }
         }
         false
     }
 
-    /// Adds a new applied fix record to the index.
+    /// Adds or replaces an applied fix record in the index (deduplicated by `(app_id, fix_id)`).
     pub fn add_fix(&mut self, record: AppliedFixRecord) {
-        self.records.entry(record.app_id).or_default().push(record);
+        let entries = self.records.entry(record.app_id).or_default();
+        entries.retain(|r| r.fix_id != record.fix_id);
+        entries.push(record);
         let _ = self.save();
     }
 
@@ -108,12 +120,17 @@ impl AppliedFixIndexService {
 
     /// Removes a fix record from the index (e.g., after unfix).
     pub fn remove_fix(&mut self, app_id: u32, fix_id: &str) -> bool {
-        let Some(entries) = self.records.get_mut(&app_id) else {
-            return false;
+        let (removed, is_empty) = {
+            let Some(entries) = self.records.get_mut(&app_id) else {
+                return false;
+            };
+            let len_before = entries.len();
+            entries.retain(|r| r.fix_id != fix_id);
+            (entries.len() < len_before, entries.is_empty())
         };
-        let len_before = entries.len();
-        entries.retain(|r| r.fix_id != fix_id);
-        let removed = entries.len() < len_before;
+        if is_empty {
+            self.records.remove(&app_id);
+        }
         if removed {
             let _ = self.save();
         }
@@ -129,7 +146,7 @@ impl AppliedFixIndexService {
         removed
     }
 
-    /// Rebuilds the index by scanning all library folders for .luatools-fix/ directories.
+    /// Rebuilds the index by scanning all library folders for `.luatools-fix/` directories.
     pub fn rebuild_index(&mut self, steam_service: &SteamService) -> usize {
         let mut new_records: BTreeMap<u32, Vec<AppliedFixRecord>> = BTreeMap::new();
         let mut count = 0;
@@ -162,9 +179,15 @@ impl AppliedFixIndexService {
                         }
 
                         if let Ok(content) = fs::read_to_string(&p) {
-                            if let Ok(record) = serde_json::from_str::<AppliedFixRecord>(&content) {
-                                new_records.entry(record.app_id).or_default().push(record);
-                                count += 1;
+                            if let Ok(mut record) = serde_json::from_str::<AppliedFixRecord>(&content) {
+                                if record.game_dir.is_none() {
+                                    record.game_dir = fix_dir.parent().map(Path::to_path_buf);
+                                }
+                                let list = new_records.entry(record.app_id).or_default();
+                                if !list.iter().any(|r| r.fix_id == record.fix_id) {
+                                    list.push(record);
+                                    count += 1;
+                                }
                             }
                         }
                     }
@@ -181,6 +204,39 @@ impl AppliedFixIndexService {
     pub fn all_fixes(&self) -> Vec<&AppliedFixRecord> {
         self.records.values().flatten().collect()
     }
+
+    /// Returns only fixes whose `.luatools-fix/<fix_id>.json` record still exists on disk,
+    /// pruning stale entries from the central index.
+    pub fn list_verified_fixes(&mut self) -> Vec<AppliedFixRecord> {
+        let mut changed = false;
+        let mut verified = Vec::new();
+        let app_ids: Vec<u32> = self.records.keys().copied().collect();
+
+        for app_id in app_ids {
+            let mut remove_empty = false;
+            if let Some(entries) = self.records.get_mut(&app_id) {
+                let before = entries.len();
+                entries.retain(|r| match &r.game_dir {
+                    Some(dir) => crate::services::fixes_service::FixesService::is_fix_applied(dir, &r.fix_id),
+                    None => true,
+                });
+                if entries.len() != before {
+                    changed = true;
+                }
+                verified.extend(entries.iter().cloned());
+                remove_empty = entries.is_empty();
+            }
+            if remove_empty {
+                self.records.remove(&app_id);
+                changed = true;
+            }
+        }
+
+        if changed {
+            let _ = self.save();
+        }
+        verified
+    }
 }
 
 #[cfg(test)]
@@ -192,22 +248,43 @@ mod tests {
     #[test]
     fn test_applied_fix_index() {
         let dir = tempdir().unwrap();
-        let mut idx = AppliedFixIndexService::new(Some(dir.path().join("applied_fixes.json")));
+        let idx_path = dir.path().join("applied-fixes.json");
+        let mut idx = AppliedFixIndexService::new(Some(idx_path.clone()));
 
         let record = AppliedFixRecord {
             app_id: 123,
             fix_id: "online-fix:abc123".into(),
             applied_at: chrono::Utc::now().to_rfc3339(),
             game_dir: Some(PathBuf::from("/home/user/games/123")),
-            files: vec![],
-            wine_dll_overrides: None,
+            files: vec![AppliedFixFileEntry {
+                relative_path: "winmm.dll".into(),
+                action: "modified".into(),
+                backup_path: Some("backups/online-fix_abc123/winmm.dll".into()),
+                hash_before: Some("aaaa".into()),
+                hash_after: "bbbb".into(),
+            }],
+            wine_dll_overrides: Some("winmm=n,b".into()),
         };
 
         idx.add_fix(record.clone());
+        // Adding same (app_id, fix_id) replaces instead of duplicating
+        idx.add_fix(record.clone());
         assert!(idx.is_fix_applied(123, "online-fix:abc123"));
         assert_eq!(idx.get_fixes(123).unwrap().len(), 1);
+        let stored = idx.get_fix(123, "online-fix:abc123").unwrap();
+        assert_eq!(stored.files.len(), 1);
+        assert_eq!(stored.files[0].hash_before.as_deref(), Some("aaaa"));
+        assert_eq!(stored.files[0].hash_after, "bbbb");
+        assert_eq!(stored.wine_dll_overrides.as_deref(), Some("winmm=n,b"));
+
+        // Corrupt primary file recovers cleanly from .json.bak
+        let _ = idx.save();
+        fs::write(&idx_path, "{corrupt json").unwrap();
+        let recovered = AppliedFixIndexService::new(Some(idx_path));
+        assert!(recovered.is_fix_applied(123, "online-fix:abc123"));
 
         idx.remove_fix(123, "online-fix:abc123");
         assert!(!idx.is_fix_applied(123, "online-fix:abc123"));
+        assert!(idx.get_fixes(123).is_none());
     }
 }

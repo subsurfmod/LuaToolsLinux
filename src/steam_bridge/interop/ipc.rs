@@ -232,21 +232,28 @@ pub fn resolve_ipc_function(
     pattern_name: &str,
     steam_root: &std::path::Path,
 ) -> Result<u64, String> {
-    use crate::steam_bridge::binary_reader::{find_loaded_module_mapping, scan_steam_binaries};
+    use crate::steam_bridge::binary_reader::{find_loaded_module_mapping, scan_steam_binaries, ElfClass};
     use crate::steam_bridge::pattern_db::PatternDb;
+
+    let expected_class = if cfg!(target_pointer_width = "64") {
+        ElfClass::Class64
+    } else {
+        ElfClass::Class32
+    };
 
     let binaries = scan_steam_binaries(steam_root);
     let binary = binaries
         .into_iter()
         .find(|b| {
-            b.path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| match component {
-                    BinaryComponent::SteamClient => n.contains("steamclient"),
-                    BinaryComponent::SteamUi => n.contains("steamui"),
-                })
-                .unwrap_or(false)
+            b.class == expected_class
+                && b.path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| match component {
+                        BinaryComponent::SteamClient => n.contains("steamclient"),
+                        BinaryComponent::SteamUi => n.contains("steamui"),
+                    })
+                    .unwrap_or(false)
         })
         .ok_or_else(|| "Steam binary not found".to_string())?;
 
@@ -255,10 +262,18 @@ pub fn resolve_ipc_function(
         .lookup_by_binary(&binary, channel, component)
         .map_err(|e| format!("Pattern lookup failed: {}", e))?;
 
+    if pf.is_fallback() {
+        return Err("Fallback patterns not permitted for in-process memory hooks".to_string());
+    }
+
     let entry = pf
         .patterns
         .get(pattern_name)
         .ok_or_else(|| format!("Pattern '{}' not found", pattern_name))?;
+
+    if entry.is_generic_compiler_prologue() {
+        return Err(format!("Pattern '{}' is a generic compiler prologue", pattern_name));
+    }
 
     let mod_name = binary
         .path

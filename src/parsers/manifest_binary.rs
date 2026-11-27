@@ -168,8 +168,17 @@ impl ManifestFile {
             }
             2 => {
                 if let Some(len) = Self::read_varint(d, o) {
-                    *o += len as usize;
-                    *o <= d.len()
+                    let len_usize = match usize::try_from(len) {
+                        Ok(l) => l,
+                        Err(_) => return false,
+                    };
+                    match o.checked_add(len_usize) {
+                        Some(new_o) if new_o <= d.len() => {
+                            *o = new_o;
+                            true
+                        }
+                        _ => false,
+                    }
                 } else {
                     false
                 }

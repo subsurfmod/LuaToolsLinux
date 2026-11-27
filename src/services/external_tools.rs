@@ -353,6 +353,17 @@ impl ExternalToolsManager {
                     break;
                 }
 
+                // LT-49: Verify GitHub release asset SHA-256 digest when provided
+                if let Some(digest) = asset.get("digest").and_then(|v| v.as_str()) {
+                    let fhs = FileHashService::new();
+                    if let Err(e) = fhs.verify_sha256_digest(&archive_path, safe_aname, digest) {
+                        let _ = fs::remove_file(&archive_path);
+                        last_err = Some(format!("Integrity check failed ({}): {}", repo, e));
+                        dl_failed = true;
+                        break;
+                    }
+                }
+
                 progress_cb(0.85 + (idx as f32) * 0.05, format!("Extracting {}...", safe_aname));
                 if key == "goldberg" && safe_aname.ends_with(".7z") && find_7z_bin().is_none() {
                     let err_msg = "7-Zip ('7z' or 'p7zip') is not installed. Goldberg Windows DLLs (.dll) for Proton games cannot be extracted. Please install p7zip / 7zip.".to_string();
@@ -386,17 +397,20 @@ impl ExternalToolsManager {
                 continue;
             }
 
-            // LT-49: Record file integrity hash using FileHashService
-            if let Some(exe_found) = self.inspect_tool(key).exe_path {
-                let fhs = FileHashService::new();
-                let _ = fhs.hash_file(&exe_found, exe_found.file_name().and_then(|s| s.to_str()).unwrap_or("tool"));
-            }
             if key == "goldberg" {
                 stage_goldberg_layout(&tool_dir, &self.goldberg_root());
             }
 
             let info = self.inspect_tool(key);
             if let Some(exe) = info.exe_path {
+                // LT-49: Compute and persist verified SHA-256 hash into meta.json
+                let fhs = FileHashService::new();
+                let exe_name = exe.file_name().and_then(|s| s.to_str()).unwrap_or("tool");
+                let exe_hash = fhs.hash_file(&exe, exe_name);
+                if exe_hash.sha256.is_empty() {
+                    last_err = Some(format!("Installed binary {} could not be hashed", exe.display()));
+                    continue;
+                }
                 if key != "goldberg" {
                     let _ = DepotDownloaderService::build_invocation(&exe);
                 }
@@ -409,6 +423,7 @@ impl ExternalToolsManager {
                     "repo": repo,
                     "last_check": now,
                     "exe_path": exe,
+                    "sha256": exe_hash.sha256,
                 }))
                 .unwrap_or_default();
                 let _ = fs::write(tool_dir.join("meta.json"), &meta_json);

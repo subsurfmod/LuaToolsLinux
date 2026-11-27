@@ -1,9 +1,10 @@
-//! ELF binary reading and pattern scanning for Steam Linux binaries.
+//! ELF binary reading and pattern scanning for Steam Linux binaries (32-bit `ELFCLASS32` & 64-bit `ELFCLASS64`).
 //!
 //! Reads ELF headers, program headers, section headers, symbol tables, and dynamic
-//! symbols from Steam Linux binaries (`steamclient.so`, `steamui.so`, `steam`) so that
-//! integration points can be located, ASLR runtime addresses resolved via `/proc/self/maps`,
-//! and Steam build compatibility verified via SHA-256 pattern matching.
+//! symbols from Steam Linux binaries (`steamclient.so`, `steamui.so`, `steam` across both
+//! `ubuntu12_32` and `linux64`/`ubuntu12_64`) so that integration points can be located,
+//! ASLR runtime addresses resolved via `/proc/self/maps`, and Steam build compatibility
+//! verified via SHA-256 pattern matching.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
@@ -14,10 +15,16 @@ use sha2::{Digest, Sha256};
 
 use crate::steam_bridge::ost_platform::{byte_search, hash};
 
+const ELF32_HEADER_LEN: usize = 52;
+const ELF32_PHDR_MIN_LEN: usize = 32;
+const ELF32_SHDR_MIN_LEN: usize = 40;
+const ELF32_SYM_MIN_LEN: usize = 16;
+
 const ELF64_HEADER_LEN: usize = 64;
 const ELF64_PHDR_MIN_LEN: usize = 56;
 const ELF64_SHDR_MIN_LEN: usize = 64;
 const ELF64_SYM_MIN_LEN: usize = 24;
+
 const PT_LOAD: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
 const SHT_NOBITS: u32 = 8;
@@ -63,6 +70,16 @@ pub struct BinaryHeader64 {
     pub phnum: u16,
     pub shnum: u16,
     pub shstrndx: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProgramHeader64 {
+    pub r#type: u32,
+    pub flags: u32,
+    pub offset: u64,
+    pub vaddr: u64,
+    pub filesz: u64,
+    pub memsz: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +136,7 @@ pub struct BinaryFile {
     pub class: ElfClass,
     pub data: ElfData,
     pub header: BinaryHeader64,
+    pub program_headers: Vec<ProgramHeader64>,
     pub min_load_vaddr: u64,
     pub sections: Vec<SectionHeader64>,
     pub section_names: Vec<String>,
@@ -127,6 +145,9 @@ pub struct BinaryFile {
     pub raw_bytes: Vec<u8>,
     pub sha256: String,
 }
+
+/// Unified ELF binary image alias supporting both `ELFCLASS32` and `ELFCLASS64`.
+pub type BinaryImage = BinaryFile;
 
 fn read_u16_le(raw: &[u8], off: usize) -> Result<u16, BinaryError> {
     let end = off
@@ -192,85 +213,157 @@ impl BinaryFile {
             d => return Err(BinaryError::UnsupportedData(d)),
         };
 
-        if class != ElfClass::Class64 {
-            return Err(BinaryError::UnsupportedClass(raw[4]));
-        }
         if data != ElfData::Lsb {
             return Err(BinaryError::UnsupportedData(raw[5]));
         }
-        if raw.len() < ELF64_HEADER_LEN {
-            return Err(BinaryError::Parse("ELF64 header truncated".into()));
-        }
 
-        // Standard Elf64_Ehdr byte layout (little-endian):
-        //   24..32: e_entry
-        //   32..40: e_phoff
-        //   40..48: e_shoff
-        //   54..56: e_phentsize
-        //   56..58: e_phnum
-        //   58..60: e_shentsize
-        //   60..62: e_shnum
-        //   62..64: e_shstrndx
-        let entry = read_u64_le(&raw, 24)?;
-        let phoff = read_u64_le(&raw, 32)?;
-        let shoff = read_u64_le(&raw, 40)?;
-        let phentsize = read_u16_le(&raw, 54)? as usize;
-        let phnum = read_u16_le(&raw, 56)?;
-        let shentsize = read_u16_le(&raw, 58)? as usize;
-        let shnum = read_u16_le(&raw, 60)?;
-        let shstrndx = read_u16_le(&raw, 62)?;
-
-        let header = BinaryHeader64 {
-            entry,
-            phoff,
-            shoff,
-            phnum,
-            shnum,
-            shstrndx,
+        let (header, phentsize, shentsize) = match class {
+            ElfClass::Class32 => {
+                if raw.len() < ELF32_HEADER_LEN {
+                    return Err(BinaryError::Parse("ELF32 header truncated".into()));
+                }
+                // Standard Elf32_Ehdr byte layout (little-endian, 52 bytes):
+                //   24..28: e_entry (u32)
+                //   28..32: e_phoff (u32)
+                //   32..36: e_shoff (u32)
+                //   42..44: e_phentsize (u16)
+                //   44..46: e_phnum (u16)
+                //   46..48: e_shentsize (u16)
+                //   48..50: e_shnum (u16)
+                //   50..52: e_shstrndx (u16)
+                let entry = read_u32_le(&raw, 24)? as u64;
+                let phoff = read_u32_le(&raw, 28)? as u64;
+                let shoff = read_u32_le(&raw, 32)? as u64;
+                let phentsize = read_u16_le(&raw, 42)? as usize;
+                let phnum = read_u16_le(&raw, 44)?;
+                let shentsize = read_u16_le(&raw, 46)? as usize;
+                let shnum = read_u16_le(&raw, 48)?;
+                let shstrndx = read_u16_le(&raw, 50)?;
+                (
+                    BinaryHeader64 {
+                        entry,
+                        phoff,
+                        shoff,
+                        phnum,
+                        shnum,
+                        shstrndx,
+                    },
+                    phentsize,
+                    shentsize,
+                )
+            }
+            ElfClass::Class64 => {
+                if raw.len() < ELF64_HEADER_LEN {
+                    return Err(BinaryError::Parse("ELF64 header truncated".into()));
+                }
+                // Standard Elf64_Ehdr byte layout (little-endian, 64 bytes):
+                //   24..32: e_entry (u64)
+                //   32..40: e_phoff (u64)
+                //   40..48: e_shoff (u64)
+                //   54..56: e_phentsize (u16)
+                //   56..58: e_phnum (u16)
+                //   58..60: e_shentsize (u16)
+                //   60..62: e_shnum (u16)
+                //   62..64: e_shstrndx (u16)
+                let entry = read_u64_le(&raw, 24)?;
+                let phoff = read_u64_le(&raw, 32)?;
+                let shoff = read_u64_le(&raw, 40)?;
+                let phentsize = read_u16_le(&raw, 54)? as usize;
+                let phnum = read_u16_le(&raw, 56)?;
+                let shentsize = read_u16_le(&raw, 58)? as usize;
+                let shnum = read_u16_le(&raw, 60)?;
+                let shstrndx = read_u16_le(&raw, 62)?;
+                (
+                    BinaryHeader64 {
+                        entry,
+                        phoff,
+                        shoff,
+                        phnum,
+                        shnum,
+                        shstrndx,
+                    },
+                    phentsize,
+                    shentsize,
+                )
+            }
         };
 
-        // Determine the lowest PT_LOAD p_vaddr so relative virtual addresses translate cleanly
-        // to live ASLR runtime addresses (0 for PIE/DSOs such as steamclient.so).
+        // Parse program headers (`Elf32_Phdr` 32B / `Elf64_Phdr` 56B) and determine lowest PT_LOAD p_vaddr
+        // so relative virtual addresses translate cleanly to live ASLR runtime addresses.
+        let min_phdr_len = match class {
+            ElfClass::Class32 => ELF32_PHDR_MIN_LEN,
+            ElfClass::Class64 => ELF64_PHDR_MIN_LEN,
+        };
+        let mut program_headers = Vec::new();
         let mut min_load_vaddr: Option<u64> = None;
-        if phnum > 0 && phentsize >= ELF64_PHDR_MIN_LEN {
-            if let Ok(phoff_usize) = usize::try_from(phoff) {
-                for i in 0..(phnum as usize) {
+        if header.phnum > 0 && phentsize >= min_phdr_len {
+            if let Ok(phoff_usize) = usize::try_from(header.phoff) {
+                for i in 0..(header.phnum as usize) {
                     let Some(delta) = i.checked_mul(phentsize) else {
                         break;
                     };
                     let Some(off) = phoff_usize.checked_add(delta) else {
                         break;
                     };
-                    let Some(end) = off.checked_add(ELF64_PHDR_MIN_LEN) else {
+                    let Some(end) = off.checked_add(min_phdr_len) else {
                         break;
                     };
                     if end > raw.len() {
                         break;
                     }
-                    let p_type = read_u32_le(&raw, off)?;
-                    if p_type == PT_LOAD {
-                        let p_vaddr = read_u64_le(&raw, off + 16)?;
+                    let phdr = match class {
+                        ElfClass::Class32 => {
+                            // Elf32_Phdr: p_type @0, p_offset @4, p_vaddr @8, p_paddr @12,
+                            //             p_filesz @16, p_memsz @20, p_flags @24, p_align @28
+                            ProgramHeader64 {
+                                r#type: read_u32_le(&raw, off)?,
+                                offset: read_u32_le(&raw, off + 4)? as u64,
+                                vaddr: read_u32_le(&raw, off + 8)? as u64,
+                                filesz: read_u32_le(&raw, off + 16)? as u64,
+                                memsz: read_u32_le(&raw, off + 20)? as u64,
+                                flags: read_u32_le(&raw, off + 24)?,
+                            }
+                        }
+                        ElfClass::Class64 => {
+                            // Elf64_Phdr: p_type @0, p_flags @4, p_offset @8, p_vaddr @16,
+                            //             p_paddr @24, p_filesz @32, p_memsz @40
+                            ProgramHeader64 {
+                                r#type: read_u32_le(&raw, off)?,
+                                flags: read_u32_le(&raw, off + 4)?,
+                                offset: read_u64_le(&raw, off + 8)?,
+                                vaddr: read_u64_le(&raw, off + 16)?,
+                                filesz: read_u64_le(&raw, off + 32)?,
+                                memsz: read_u64_le(&raw, off + 40)?,
+                            }
+                        }
+                    };
+                    if phdr.r#type == PT_LOAD {
                         min_load_vaddr = Some(match min_load_vaddr {
-                            Some(cur) => cur.min(p_vaddr),
-                            None => p_vaddr,
+                            Some(cur) => cur.min(phdr.vaddr),
+                            None => phdr.vaddr,
                         });
                     }
+                    program_headers.push(phdr);
                 }
             }
         }
         let min_load_vaddr = min_load_vaddr.unwrap_or(0);
 
+        let min_shdr_len = match class {
+            ElfClass::Class32 => ELF32_SHDR_MIN_LEN,
+            ElfClass::Class64 => ELF64_SHDR_MIN_LEN,
+        };
         let mut sections = Vec::new();
-        if shnum > 0 {
-            if shentsize < ELF64_SHDR_MIN_LEN {
+        if header.shnum > 0 {
+            if shentsize < min_shdr_len {
                 return Err(BinaryError::Parse(format!(
-                    "invalid ELF64 section header entry size: {}",
-                    shentsize
+                    "invalid {:?} section header entry size: {}",
+                    class, shentsize
                 )));
             }
-            let shoff_usize = usize::try_from(shoff)
+            let shoff_usize = usize::try_from(header.shoff)
                 .map_err(|_| BinaryError::Parse("section header table offset overflow".into()))?;
-            let table_bytes = (shnum as usize)
+            let table_bytes = (header.shnum as usize)
                 .checked_mul(shentsize)
                 .ok_or_else(|| BinaryError::Parse("section header table size overflow".into()))?;
             let table_end = shoff_usize
@@ -280,21 +373,41 @@ impl BinaryFile {
                 return Err(BinaryError::Parse("section header truncated".into()));
             }
 
-            sections.reserve(shnum as usize);
-            for i in 0..(shnum as usize) {
+            sections.reserve(header.shnum as usize);
+            for i in 0..(header.shnum as usize) {
                 let off = shoff_usize + i * shentsize;
-                sections.push(SectionHeader64 {
-                    name_offset: read_u32_le(&raw, off)?,
-                    r#type: read_u32_le(&raw, off + 4)?,
-                    flags: read_u64_le(&raw, off + 8)?,
-                    addr: read_u64_le(&raw, off + 16)?,
-                    offset: read_u64_le(&raw, off + 24)?,
-                    size: read_u64_le(&raw, off + 32)?,
-                    link: read_u32_le(&raw, off + 40)?,
-                    info: read_u32_le(&raw, off + 44)?,
-                    align: read_u64_le(&raw, off + 48)?,
-                    entsize: read_u64_le(&raw, off + 56)?,
-                });
+                let shdr = match class {
+                    ElfClass::Class32 => {
+                        // Elf32_Shdr (40 bytes):
+                        //   0..4 name, 4..8 type, 8..12 flags, 12..16 addr, 16..20 offset,
+                        //   20..24 size, 24..28 link, 28..32 info, 32..36 addralign, 36..40 entsize
+                        SectionHeader64 {
+                            name_offset: read_u32_le(&raw, off)?,
+                            r#type: read_u32_le(&raw, off + 4)?,
+                            flags: read_u32_le(&raw, off + 8)? as u64,
+                            addr: read_u32_le(&raw, off + 12)? as u64,
+                            offset: read_u32_le(&raw, off + 16)? as u64,
+                            size: read_u32_le(&raw, off + 20)? as u64,
+                            link: read_u32_le(&raw, off + 24)?,
+                            info: read_u32_le(&raw, off + 28)?,
+                            align: read_u32_le(&raw, off + 32)? as u64,
+                            entsize: read_u32_le(&raw, off + 36)? as u64,
+                        }
+                    }
+                    ElfClass::Class64 => SectionHeader64 {
+                        name_offset: read_u32_le(&raw, off)?,
+                        r#type: read_u32_le(&raw, off + 4)?,
+                        flags: read_u64_le(&raw, off + 8)?,
+                        addr: read_u64_le(&raw, off + 16)?,
+                        offset: read_u64_le(&raw, off + 24)?,
+                        size: read_u64_le(&raw, off + 32)?,
+                        link: read_u32_le(&raw, off + 40)?,
+                        info: read_u32_le(&raw, off + 44)?,
+                        align: read_u64_le(&raw, off + 48)?,
+                        entsize: read_u64_le(&raw, off + 56)?,
+                    },
+                };
+                sections.push(shdr);
             }
         }
 
@@ -305,6 +418,10 @@ impl BinaryFile {
             Vec::new()
         };
 
+        let min_sym_len = match class {
+            ElfClass::Class32 => ELF32_SYM_MIN_LEN,
+            ElfClass::Class64 => ELF64_SYM_MIN_LEN,
+        };
         let mut symbols = BTreeMap::new();
         let mut dyn_symbols = BTreeMap::new();
 
@@ -313,7 +430,7 @@ impl BinaryFile {
                 continue;
             }
             // Guard against malformed or zero entsize (which previously caused unbounded loops).
-            if sec.entsize < ELF64_SYM_MIN_LEN as u64 {
+            if sec.entsize < min_sym_len as u64 {
                 continue;
             }
             let Ok(sec_off) = usize::try_from(sec.offset) else {
@@ -342,38 +459,69 @@ impl BinaryFile {
                 let Some(off) = sec_off.checked_add(delta) else {
                     break;
                 };
-                let Some(end) = off.checked_add(ELF64_SYM_MIN_LEN) else {
+                let Some(end) = off.checked_add(min_sym_len) else {
                     break;
                 };
                 if end > raw.len() {
                     break;
                 }
 
-                let Ok(name_offset) = read_u32_le(&raw, off) else {
-                    break;
-                };
-                let info = raw[off + 4];
-                let other = raw[off + 5];
-                let Ok(shndx) = read_u16_le(&raw, off + 6) else {
-                    break;
-                };
-                let Ok(value) = read_u64_le(&raw, off + 8) else {
-                    break;
-                };
-                let Ok(size) = read_u64_le(&raw, off + 16) else {
-                    break;
+                let sym = match class {
+                    ElfClass::Class32 => {
+                        // Elf32_Sym (16 bytes):
+                        //   st_name (u32 @0), st_value (u32 @4), st_size (u32 @8),
+                        //   st_info (u8 @12), st_other (u8 @13), st_shndx (u16 @14)
+                        let Ok(name_offset) = read_u32_le(&raw, off) else {
+                            break;
+                        };
+                        let Ok(value) = read_u32_le(&raw, off + 4) else {
+                            break;
+                        };
+                        let Ok(size) = read_u32_le(&raw, off + 8) else {
+                            break;
+                        };
+                        let info = raw[off + 12];
+                        let other = raw[off + 13];
+                        let Ok(shndx) = read_u16_le(&raw, off + 14) else {
+                            break;
+                        };
+                        Symbol64 {
+                            name_offset,
+                            info,
+                            other,
+                            shndx,
+                            value: value as u64,
+                            size: size as u64,
+                        }
+                    }
+                    ElfClass::Class64 => {
+                        let Ok(name_offset) = read_u32_le(&raw, off) else {
+                            break;
+                        };
+                        let info = raw[off + 4];
+                        let other = raw[off + 5];
+                        let Ok(shndx) = read_u16_le(&raw, off + 6) else {
+                            break;
+                        };
+                        let Ok(value) = read_u64_le(&raw, off + 8) else {
+                            break;
+                        };
+                        let Ok(size) = read_u64_le(&raw, off + 16) else {
+                            break;
+                        };
+                        Symbol64 {
+                            name_offset,
+                            info,
+                            other,
+                            shndx,
+                            value,
+                            size,
+                        }
+                    }
                 };
 
-                let name = Self::read_null_str(strtab_data, name_offset as usize);
+                let name = Self::read_null_str(strtab_data, sym.name_offset as usize);
                 if !name.is_empty() {
-                    let sym = Symbol64 {
-                        name_offset,
-                        info,
-                        other,
-                        shndx,
-                        value,
-                        size,
-                    };
                     if sec.r#type == SHT_DYNSYM {
                         dyn_symbols.insert(name, sym);
                     } else {
@@ -388,6 +536,7 @@ impl BinaryFile {
             class,
             data,
             header,
+            program_headers,
             min_load_vaddr,
             sections,
             section_names,
@@ -559,6 +708,19 @@ impl BinaryFile {
                 return sec.addr.checked_add(delta);
             }
         }
+        // Fallback to PT_LOAD segments for stripped ELFs lacking section headers
+        for ph in &self.program_headers {
+            if ph.r#type != PT_LOAD || ph.filesz == 0 {
+                continue;
+            }
+            let Some(seg_end) = ph.offset.checked_add(ph.filesz) else {
+                continue;
+            };
+            if foff >= ph.offset && foff < seg_end {
+                let delta = foff - ph.offset;
+                return ph.vaddr.checked_add(delta);
+            }
+        }
         None
     }
 
@@ -647,14 +809,27 @@ pub fn scan_steam_binaries(steam_root: &Path) -> Vec<BinaryFile> {
     let mut out = Vec::new();
     let mut seen_paths: HashSet<PathBuf> = HashSet::new();
     let target_names = ["steamclient.so", "steamui.so", "steam"];
-    let search_dirs = [
-        steam_root.join("linux64"),
-        steam_root.join("ubuntu12_64"),
-        steam_root.join("steamrt64"),
-        steam_root.join("ubuntu12_32"),
-        steam_root.join("bin"),
-        steam_root.to_path_buf(),
-    ];
+    let search_dirs = if cfg!(target_arch = "x86") {
+        vec![
+            steam_root.join("ubuntu12_32"),
+            steam_root.join("linux32"),
+            steam_root.join("linux64"),
+            steam_root.join("ubuntu12_64"),
+            steam_root.join("steamrt64"),
+            steam_root.join("bin"),
+            steam_root.to_path_buf(),
+        ]
+    } else {
+        vec![
+            steam_root.join("linux64"),
+            steam_root.join("ubuntu12_64"),
+            steam_root.join("steamrt64"),
+            steam_root.join("ubuntu12_32"),
+            steam_root.join("linux32"),
+            steam_root.join("bin"),
+            steam_root.to_path_buf(),
+        ]
+    };
 
     for dir in &search_dirs {
         for name in &target_names {
@@ -808,6 +983,180 @@ mod tests {
         buf
     }
 
+    /// Constructs a valid minimal 32-bit `ELFCLASS32` shared object containing `.text`, `.rodata`,
+    /// `.dynsym`, `.dynstr`, and `.shstrtab`, plus a 32-byte `PT_LOAD` program header.
+    fn build_synthetic_elf32(text_bytes: &[u8], rodata_bytes: &[u8]) -> Vec<u8> {
+        let load_base_vaddr: u32 = 0x0001_0000;
+        let text_off: u32 = 0x1000;
+        let text_vaddr: u32 = load_base_vaddr + text_off;
+        let rodata_off: u32 = 0x1080;
+        let rodata_vaddr: u32 = load_base_vaddr + rodata_off;
+        let dynsym_off: u32 = 0x1100;
+        let dynstr_off: u32 = 0x1140;
+        let shstr_off: u32 = 0x1180;
+        let shoff: u32 = 0x1200;
+        let phoff: u32 = 52; // Immediately after 52-byte Elf32_Ehdr
+
+        // Offsets in shstrtab:
+        // 0: ""
+        // 1: ".text"
+        // 7: ".rodata"
+        // 15: ".dynsym"
+        // 23: ".dynstr"
+        // 31: ".shstrtab"
+        let shstrtab: &[u8] = b"\0.text\0.rodata\0.dynsym\0.dynstr\0.shstrtab\0";
+        // Offsets in dynstr:
+        // 0: ""
+        // 1: "CreateInterface"
+        // 17: "SteamUI_Main"
+        let dynstr: &[u8] = b"\0CreateInterface\0SteamUI_Main\0";
+
+        let mut buf = vec![0u8; 0x1400];
+        // Elf32_Ehdr (52 bytes)
+        buf[0..4].copy_from_slice(b"\x7fELF");
+        buf[4] = 1; // ELFCLASS32
+        buf[5] = 1; // ELFDATA2LSB
+        buf[6] = 1; // EV_CURRENT
+        buf[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        buf[18..20].copy_from_slice(&3u16.to_le_bytes()); // EM_386
+        buf[20..24].copy_from_slice(&1u32.to_le_bytes()); // EV_CURRENT
+        buf[24..28].copy_from_slice(&text_vaddr.to_le_bytes()); // e_entry @24
+        buf[28..32].copy_from_slice(&phoff.to_le_bytes()); // e_phoff @28
+        buf[32..36].copy_from_slice(&shoff.to_le_bytes()); // e_shoff @32
+        buf[40..42].copy_from_slice(&52u16.to_le_bytes()); // e_ehsize @40
+        buf[42..44].copy_from_slice(&32u16.to_le_bytes()); // e_phentsize @42
+        buf[44..46].copy_from_slice(&1u16.to_le_bytes()); // e_phnum @44
+        buf[46..48].copy_from_slice(&40u16.to_le_bytes()); // e_shentsize @46
+        buf[48..50].copy_from_slice(&6u16.to_le_bytes()); // e_shnum @48
+        buf[50..52].copy_from_slice(&5u16.to_le_bytes()); // e_shstrndx @50
+
+        // Elf32_Phdr (32 bytes): p_type @0, p_offset @4, p_vaddr @8, p_paddr @12,
+        //                        p_filesz @16, p_memsz @20, p_flags @24, p_align @28
+        let ph = phoff as usize;
+        buf[ph..ph + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        buf[ph + 4..ph + 8].copy_from_slice(&0u32.to_le_bytes()); // p_offset
+        buf[ph + 8..ph + 12].copy_from_slice(&load_base_vaddr.to_le_bytes()); // p_vaddr
+        buf[ph + 12..ph + 16].copy_from_slice(&load_base_vaddr.to_le_bytes()); // p_paddr
+        buf[ph + 16..ph + 20].copy_from_slice(&0x1400u32.to_le_bytes()); // p_filesz
+        buf[ph + 20..ph + 24].copy_from_slice(&0x1400u32.to_le_bytes()); // p_memsz
+        buf[ph + 24..ph + 28].copy_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
+        buf[ph + 28..ph + 32].copy_from_slice(&0x1000u32.to_le_bytes()); // p_align
+
+        // Populate section payloads
+        buf[text_off as usize..text_off as usize + text_bytes.len()].copy_from_slice(text_bytes);
+        buf[rodata_off as usize..rodata_off as usize + rodata_bytes.len()]
+            .copy_from_slice(rodata_bytes);
+        buf[dynstr_off as usize..dynstr_off as usize + dynstr.len()].copy_from_slice(dynstr);
+        buf[shstr_off as usize..shstr_off as usize + shstrtab.len()].copy_from_slice(shstrtab);
+
+        // Populate .dynsym (3 entries * 16 bytes = 48 bytes; entry 0 is STN_UNDEF)
+        // Elf32_Sym: st_name @0, st_value @4, st_size @8, st_info @12, st_other @13, st_shndx @14
+        let s1 = (dynsym_off + 16) as usize;
+        buf[s1..s1 + 4].copy_from_slice(&1u32.to_le_bytes()); // "CreateInterface"
+        buf[s1 + 4..s1 + 8].copy_from_slice(&text_vaddr.to_le_bytes());
+        buf[s1 + 8..s1 + 12].copy_from_slice(&(text_bytes.len() as u32).to_le_bytes());
+        buf[s1 + 12] = 0x12; // STB_GLOBAL | STT_FUNC
+        buf[s1 + 14..s1 + 16].copy_from_slice(&1u16.to_le_bytes()); // .text
+
+        let s2 = (dynsym_off + 32) as usize;
+        buf[s2..s2 + 4].copy_from_slice(&17u32.to_le_bytes()); // "SteamUI_Main"
+        buf[s2 + 4..s2 + 8].copy_from_slice(&(text_vaddr + 4).to_le_bytes());
+        buf[s2 + 8..s2 + 12].copy_from_slice(&8u32.to_le_bytes());
+        buf[s2 + 12] = 0x12;
+        buf[s2 + 14..s2 + 16].copy_from_slice(&1u16.to_le_bytes());
+
+        let write_shdr32 = |buf: &mut [u8],
+                            idx: usize,
+                            name: u32,
+                            ty: u32,
+                            flags: u32,
+                            addr: u32,
+                            off: u32,
+                            size: u32,
+                            link: u32,
+                            entsize: u32| {
+            let o = shoff as usize + idx * 40;
+            buf[o..o + 4].copy_from_slice(&name.to_le_bytes());
+            buf[o + 4..o + 8].copy_from_slice(&ty.to_le_bytes());
+            buf[o + 8..o + 12].copy_from_slice(&flags.to_le_bytes());
+            buf[o + 12..o + 16].copy_from_slice(&addr.to_le_bytes());
+            buf[o + 16..o + 20].copy_from_slice(&off.to_le_bytes());
+            buf[o + 20..o + 24].copy_from_slice(&size.to_le_bytes());
+            buf[o + 24..o + 28].copy_from_slice(&link.to_le_bytes());
+            buf[o + 36..o + 40].copy_from_slice(&entsize.to_le_bytes());
+        };
+
+        // 0: SHT_NULL
+        write_shdr32(&mut buf, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        // 1: .text
+        write_shdr32(
+            &mut buf,
+            1,
+            1,
+            1, // SHT_PROGBITS
+            (SHF_ALLOC as u32) | 0x4,
+            text_vaddr,
+            text_off,
+            text_bytes.len() as u32,
+            0,
+            0,
+        );
+        // 2: .rodata
+        write_shdr32(
+            &mut buf,
+            2,
+            7,
+            1, // SHT_PROGBITS
+            SHF_ALLOC as u32,
+            rodata_vaddr,
+            rodata_off,
+            rodata_bytes.len() as u32,
+            0,
+            0,
+        );
+        // 3: .dynsym (link = 4 -> .dynstr, entsize = 16)
+        write_shdr32(
+            &mut buf,
+            3,
+            15,
+            SHT_DYNSYM,
+            SHF_ALLOC as u32,
+            load_base_vaddr + dynsym_off,
+            dynsym_off,
+            48,
+            4,
+            16,
+        );
+        // 4: .dynstr
+        write_shdr32(
+            &mut buf,
+            4,
+            23,
+            3, // SHT_STRTAB
+            SHF_ALLOC as u32,
+            load_base_vaddr + dynstr_off,
+            dynstr_off,
+            dynstr.len() as u32,
+            0,
+            0,
+        );
+        // 5: .shstrtab
+        write_shdr32(
+            &mut buf,
+            5,
+            31,
+            3, // SHT_STRTAB
+            0,
+            0,
+            shstr_off,
+            shstrtab.len() as u32,
+            0,
+            0,
+        );
+
+        buf
+    }
+
     #[test]
     fn sha256_is_deterministic() {
         let data = b"hello world";
@@ -841,6 +1190,80 @@ mod tests {
 
         // Short mask must return None instead of panicking
         assert_eq!(bin.scan_range(&code, &pat, Some(&[0xFF, 0xFF])), None);
+    }
+
+    #[test]
+    fn parses_elf32_headers_sections_rodata_dynsym_rva_and_patterns() {
+        // IA-32 function prologue + body (`push ebp; mov ebp, esp; sub esp, 0x18; mov eax, 42; leave; ret`)
+        let code32 = [
+            0x55, 0x89, 0xE5, 0x83, 0xEC, 0x18, 0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC9, 0xC3,
+        ];
+        let rodata32 = b"SteamClient021\0ubuntu12_32\0";
+        let raw = build_synthetic_elf32(&code32, rodata32);
+
+        let bin = BinaryImage::from_bytes(PathBuf::from("ubuntu12_32/steamclient.so"), raw).unwrap();
+        assert_eq!(bin.class, ElfClass::Class32);
+        assert_eq!(bin.data, ElfData::Lsb);
+        assert_eq!(bin.header.entry, 0x0001_1000);
+        assert_eq!(bin.header.phnum, 1);
+        assert_eq!(bin.header.shnum, 6);
+        assert_eq!(bin.min_load_vaddr, 0x0001_0000);
+
+        // Verify sections (.text, .rodata, .dynsym)
+        assert_eq!(bin.section_names.get(1).map(String::as_str), Some(".text"));
+        assert_eq!(
+            bin.section_names.get(2).map(String::as_str),
+            Some(".rodata")
+        );
+        assert_eq!(
+            bin.section_names.get(3).map(String::as_str),
+            Some(".dynsym")
+        );
+
+        // Verify file offset -> ELF vaddr & ASLR runtime RVA translation
+        assert_eq!(bin.file_offset_to_vaddr(0x1000), Some(0x0001_1000));
+        assert_eq!(bin.file_offset_to_vaddr(0x1080), Some(0x0001_1080));
+
+        let mapping32 = LoadedModuleMapping {
+            base_addr: 0xf710_0000,
+            exec_ranges: vec![(0xf710_1000, 0xf715_0000)],
+        };
+        assert_eq!(
+            bin.vaddr_to_runtime_addr(0x0001_1000, &mapping32, 6),
+            Some(0xf710_1000)
+        );
+
+        // Verify pattern lookup in .text (with wildcard mask) and .rodata
+        let pat = [0x55, 0x89, 0xE5, 0x83, 0x00, 0x18, 0xB8];
+        let mask = [0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0xFF, 0xFF];
+        assert_eq!(
+            bin.resolve_pattern_address(&pat, Some(&mask), 0, Some(".text")),
+            Some(0x0001_1000)
+        );
+        assert_eq!(
+            bin.scan_section(".rodata", b"SteamClient021", None),
+            Some(0x1080)
+        );
+        assert_eq!(
+            bin.resolve_pattern_address(b"ubuntu12_32", None, 0, Some(".rodata")),
+            Some(0x0001_1080 + 15)
+        );
+
+        // Verify .dynsym Elf32_Sym lookup
+        assert_eq!(bin.symbol_address("CreateInterface"), Some(0x0001_1000));
+        assert_eq!(
+            bin.symbol_size("CreateInterface"),
+            Some(code32.len() as u64)
+        );
+        assert_eq!(bin.symbol_address("SteamUI_Main"), Some(0x0001_1004));
+        assert_eq!(bin.symbol_size("SteamUI_Main"), Some(8));
+
+        // Truncated ELF32 (< 52 bytes) must be rejected cleanly
+        let mut trunc32 = vec![0u8; 36];
+        trunc32[0..4].copy_from_slice(b"\x7fELF");
+        trunc32[4] = 1;
+        trunc32[5] = 1;
+        assert!(BinaryImage::from_bytes(PathBuf::from("trunc32.so"), trunc32).is_err());
     }
 
     #[test]

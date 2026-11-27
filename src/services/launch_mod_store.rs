@@ -64,32 +64,72 @@ impl LaunchModStore {
         Self { path, records }
     }
 
+    fn quarantine_corrupt_file(path: &Path) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let Some(fname) = path.file_name() else {
+            return;
+        };
+        let mut qname = fname.to_os_string();
+        qname.push(format!(".corrupt.{}", ts));
+        let mut quarantine_path = path.with_file_name(qname);
+        if quarantine_path.exists() {
+            let mut qname_pid = fname.to_os_string();
+            qname_pid.push(format!(".corrupt.{}.{}", ts, std::process::id()));
+            quarantine_path = path.with_file_name(qname_pid);
+        }
+        if fs::rename(path, &quarantine_path).is_ok() {
+            eprintln!(
+                "Warning: quarantined corrupt launch mods file to {}",
+                quarantine_path.display()
+            );
+        }
+    }
+
+    fn parse_records_text(content: &str) -> Option<BTreeMap<u32, Vec<LaunchModRecord>>> {
+        if let Ok(map) = serde_json::from_str::<BTreeMap<u32, Vec<LaunchModRecord>>>(content) {
+            return Some(map);
+        }
+        // Support legacy Vec<LaunchMod> format
+        if let Ok(legacy_list) = serde_json::from_str::<Vec<LaunchMod>>(content) {
+            let mut migrated: BTreeMap<u32, Vec<LaunchModRecord>> = BTreeMap::new();
+            for m in legacy_list {
+                migrated.entry(m.app_id).or_default().push(LaunchModRecord {
+                    app_id: m.app_id,
+                    change_number: m.change_number as u64,
+                    original_launch_options: m.original,
+                    modified_launch_options: m.desired,
+                    applied_at: m.saved_at,
+                    rebased_from: None,
+                });
+            }
+            return Some(migrated);
+        }
+        None
+    }
+
     fn load_from(path: &Path) -> BTreeMap<u32, Vec<LaunchModRecord>> {
-        let candidate_paths = [path.to_path_buf(), path.with_extension("json.bak")];
-        for p in &candidate_paths {
-            if !p.exists() {
-                continue;
-            }
-            let Ok(content) = fs::read_to_string(p) else {
-                continue;
-            };
-            if let Ok(map) = serde_json::from_str::<BTreeMap<u32, Vec<LaunchModRecord>>>(&content) {
-                return map;
-            }
-            // Support legacy Vec<LaunchMod> format
-            if let Ok(legacy_list) = serde_json::from_str::<Vec<LaunchMod>>(&content) {
-                let mut migrated: BTreeMap<u32, Vec<LaunchModRecord>> = BTreeMap::new();
-                for m in legacy_list {
-                    migrated.entry(m.app_id).or_default().push(LaunchModRecord {
-                        app_id: m.app_id,
-                        change_number: m.change_number as u64,
-                        original_launch_options: m.original,
-                        modified_launch_options: m.desired,
-                        applied_at: m.saved_at,
-                        rebased_from: None,
-                    });
+        if path.exists() {
+            match fs::read_to_string(path)
+                .ok()
+                .and_then(|c| Self::parse_records_text(&c))
+            {
+                Some(map) => return map,
+                None => {
+                    // LT-58: Quarantine corrupt launch mods file before attempting backup recovery
+                    Self::quarantine_corrupt_file(path);
                 }
-                return migrated;
+            }
+        }
+        let bak = path.with_extension("json.bak");
+        if bak.exists() {
+            if let Some(map) = fs::read_to_string(&bak)
+                .ok()
+                .and_then(|c| Self::parse_records_text(&c))
+            {
+                return map;
             }
         }
         BTreeMap::new()
@@ -229,6 +269,43 @@ impl LaunchModStore {
 
         Some(rebased)
     }
+
+    /// Rebases stored user launch modifications against the current `appinfo.vdf` baseline
+    /// when opening the Launch Options modal (LT-58).
+    /// Returns `(entries_to_display, was_rebased)` without writing `appinfo.vdf` until the user saves.
+    pub fn rebase_on_modal_open(
+        &mut self,
+        steam_root: &Path,
+        app_id: u32,
+    ) -> (Vec<LaunchEntry>, bool) {
+        let appinfo_path = steam_root.join("appcache").join("appinfo.vdf");
+        if !appinfo_path.exists() {
+            return (Vec::new(), false);
+        }
+        let Some(live_entries) = AppInfoFile::extract_launch_options(&appinfo_path, app_id) else {
+            return (Vec::new(), false);
+        };
+        let Some(record) = self.get_latest(app_id).cloned() else {
+            return (live_entries, false);
+        };
+
+        if launch_options_match(&live_entries, &record.modified_launch_options) {
+            return (live_entries, false);
+        }
+
+        let current_change_number =
+            AppInfoFile::extract_app_change_number(&appinfo_path, app_id).unwrap_or(record.change_number);
+
+        if current_change_number != record.change_number {
+            if let Some(rebased) = self.rebase(app_id, current_change_number, live_entries.clone()) {
+                return (rebased, true);
+            }
+        } else if let Some(rebased) = self.preview_rebase(app_id, &live_entries) {
+            return (rebased, true);
+        }
+
+        (live_entries, false)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -249,6 +326,10 @@ fn normalized_launch_type(t: &str) -> &str {
     }
 }
 
+fn normalized_opt_str(v: &Option<String>) -> Option<&str> {
+    v.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
 pub fn launch_entry_semantic_eq(a: &LaunchEntry, b: &LaunchEntry) -> bool {
     a.executable.trim() == b.executable.trim()
         && a.arguments.trim() == b.arguments.trim()
@@ -257,6 +338,8 @@ pub fn launch_entry_semantic_eq(a: &LaunchEntry, b: &LaunchEntry) -> bool {
         && normalized_launch_type(&a.launch_type) == normalized_launch_type(&b.launch_type)
         && a.oslist.trim() == b.oslist.trim()
         && a.osarch.trim() == b.osarch.trim()
+        && normalized_opt_str(&a.beta_key) == normalized_opt_str(&b.beta_key)
+        && normalized_opt_str(&a.owns_dlc) == normalized_opt_str(&b.owns_dlc)
 }
 
 pub fn launch_options_match(a: &[LaunchEntry], b: &[LaunchEntry]) -> bool {
@@ -272,7 +355,20 @@ fn find_matching_entry_index(
     target: &LaunchEntry,
     candidates: &[LaunchEntry],
     claimed: &[bool],
+    prefer_source_index: bool,
 ) -> Option<usize> {
+    if prefer_source_index {
+        if let Some(src_idx) = target.source_index {
+            if let Some(i) = candidates.iter().enumerate().position(|(i, c)| {
+                !claimed[i]
+                    && (c.source_index == Some(src_idx)
+                        || c.index.trim().parse::<usize>().ok() == Some(src_idx))
+            }) {
+                return Some(i);
+            }
+        }
+    }
+
     let t_exe = target.executable.trim();
     let t_desc = target.description.trim();
     let t_idx = target.index.trim();
@@ -350,6 +446,20 @@ fn merge_launch_entry(
         }
     };
 
+    let pick_opt = |old_v: &Option<String>,
+                    mod_v: &Option<String>,
+                    new_v: &Option<String>|
+     -> Option<String> {
+        let o = normalized_opt_str(old_v);
+        let m = normalized_opt_str(mod_v);
+        let n = normalized_opt_str(new_v);
+        if m != o {
+            m.map(str::to_string)
+        } else {
+            n.map(str::to_string)
+        }
+    };
+
     let launch_type = if normalized_launch_type(&modified.launch_type)
         != normalized_launch_type(&old_orig.launch_type)
     {
@@ -367,6 +477,9 @@ fn merge_launch_entry(
         launch_type,
         oslist: pick(&old_orig.oslist, &modified.oslist, &new_orig.oslist),
         osarch: pick(&old_orig.osarch, &modified.osarch, &new_orig.osarch),
+        beta_key: pick_opt(&old_orig.beta_key, &modified.beta_key, &new_orig.beta_key),
+        owns_dlc: pick_opt(&old_orig.owns_dlc, &modified.owns_dlc, &new_orig.owns_dlc),
+        source_index: new_orig.source_index,
     }
 }
 
@@ -384,7 +497,7 @@ pub fn apply_launch_diff(
 
     for (m_idx, mod_entry) in modified.iter().enumerate() {
         if let Some(o_idx) =
-            find_matching_entry_index(mod_entry, old_original, &old_claimed_by_mod)
+            find_matching_entry_index(mod_entry, old_original, &old_claimed_by_mod, true)
         {
             old_claimed_by_mod[o_idx] = true;
             mod_to_old.push(Some(o_idx));
@@ -400,7 +513,7 @@ pub fn apply_launch_diff(
 
     for (o_idx, old_entry) in old_original.iter().enumerate() {
         if let Some(n_idx) =
-            find_matching_entry_index(old_entry, new_original, &new_claimed_by_old)
+            find_matching_entry_index(old_entry, new_original, &new_claimed_by_old, false)
         {
             new_claimed_by_old[n_idx] = true;
             old_to_new[o_idx] = Some(n_idx);
@@ -482,6 +595,54 @@ pub trait SteamProcessController {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemSteamProcessController;
 
+impl SystemSteamProcessController {
+    /// Attempts a graceful `steam -shutdown` before escalating to signals (LT-57).
+    fn try_graceful_steam_shutdown() -> bool {
+        use std::process::{Command, Stdio};
+
+        let mut spawned = Command::new("steam")
+            .arg("-shutdown")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok();
+
+        if !spawned {
+            if let Some(home) = dirs::home_dir() {
+                let native_sh = home.join(".local/share/Steam/steam.sh");
+                if native_sh.is_file() {
+                    spawned = Command::new(&native_sh)
+                        .arg("-shutdown")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .is_ok();
+                }
+            }
+        }
+
+        if !spawned {
+            // Flatpak Steam graceful shutdown fallback
+            let flatpak_dir = dirs::home_dir()
+                .map(|h| h.join(".var/app/com.valvesoftware.Steam"))
+                .filter(|p| p.is_dir());
+            if flatpak_dir.is_some() {
+                spawned = Command::new("flatpak")
+                    .args(["run", "com.valvesoftware.Steam", "-shutdown"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .is_ok();
+            }
+        }
+
+        spawned
+    }
+}
+
 impl SteamProcessController for SystemSteamProcessController {
     fn is_running(&self) -> bool {
         SteamService::is_steam_running()
@@ -489,6 +650,20 @@ impl SteamProcessController for SystemSteamProcessController {
     }
 
     fn shutdown(&self) -> Result<usize, String> {
+        let initial_pids = crate::steam_bridge::preload_loader::find_all_steam_pids().len();
+
+        // LT-57: Request graceful `steam -shutdown` first and wait up to 8 seconds
+        if Self::try_graceful_steam_shutdown() {
+            for _ in 0..40 {
+                if !self.is_running() {
+                    std::thread::sleep(Duration::from_millis(150));
+                    return Ok(initial_pids.max(1));
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+
+        // Fall back to SIGTERM -> SIGKILL if Steam did not exit gracefully within ~8s
         let terminated = SteamService::terminate_steam_instances()?;
         for _ in 0..10 {
             if !self.is_running() {
@@ -784,6 +959,9 @@ mod tests {
             launch_type: "default".into(),
             oslist: String::new(),
             osarch: String::new(),
+            beta_key: None,
+            owns_dlc: None,
+            source_index: idx.parse::<usize>().ok(),
         }
     }
 
@@ -1234,5 +1412,63 @@ mod tests {
         assert_eq!(latest.change_number, 250);
         assert_eq!(latest.rebased_from, Some(100));
         assert!(store.check_drift(&steam_svc, 1245620).is_none());
+    }
+
+    #[test]
+    fn test_lt58_corrupt_quarantine_modal_open_rebase_and_betakey_ownsdlc_merge() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("launch_mods.json");
+
+        // 1. Corrupt launch_mods.json must be quarantined to launch_mods.json.corrupt.<ts>
+        fs::write(&store_path, "{ not valid json !!!").unwrap();
+        let store_after_corrupt = LaunchModStore::new(Some(store_path.clone()));
+        assert!(store_after_corrupt.records.is_empty());
+        assert!(!store_path.exists());
+        let quarantined = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .any(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|n| n.starts_with("launch_mods.json.corrupt."))
+                    .unwrap_or(false)
+            });
+        assert!(quarantined, "Corrupt launch_mods.json must be quarantined");
+
+        // 2. 3-way rebase preserves beta_key, owns_dlc, and source_index
+        let mut old0 = make_entry("0", "game.exe", "", "Default");
+        old0.beta_key = Some("public".into());
+        old0.owns_dlc = Some("1001".into());
+        let mut mod0 = old0.clone();
+        mod0.beta_key = Some("experimental".into()); // user customized beta_key
+        let mut new0 = old0.clone();
+        new0.owns_dlc = Some("2002".into()); // Valve updated owns_dlc in PICS
+        new0.source_index = Some(0);
+
+        let merged = apply_launch_diff(&[old0], &[mod0], &[new0]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].beta_key.as_deref(), Some("experimental"));
+        assert_eq!(merged[0].owns_dlc.as_deref(), Some("2002"));
+        assert_eq!(merged[0].source_index, Some(0));
+
+        // 3. Modal-open baseline rebase updates against newer PICS change_number
+        let steam_root = dir.path().join("Steam");
+        let mut store = LaunchModStore::new(Some(dir.path().join("launchmods_modal.json")));
+        let orig_v1 = vec![make_entry("0", "game.exe", "", "Play")];
+        let mod_v1 = vec![make_entry("0", "game.exe", "-novid", "Play")];
+        write_synthetic_appinfo_v29(&steam_root, 480, 10, &orig_v1);
+        store.record_modification(480, 10, orig_v1, mod_v1);
+
+        // PICS advances to change_number 20 with new executable
+        let pics_v2 = vec![make_entry("0", "game_v2.exe", "", "Play")];
+        write_synthetic_appinfo_v29(&steam_root, 480, 20, &pics_v2);
+
+        let (entries, was_rebased) = store.rebase_on_modal_open(&steam_root, 480);
+        assert!(was_rebased);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].executable, "game_v2.exe");
+        assert_eq!(entries[0].arguments, "-novid");
+        assert_eq!(store.get_latest(480).unwrap().change_number, 20);
+        assert_eq!(store.get_latest(480).unwrap().rebased_from, Some(10));
     }
 }

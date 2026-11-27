@@ -5,7 +5,38 @@
 use crate::steamflatline::pe::{PeFile, Architecture};
 use crate::steamflatline::crypto::{steam_xor, xtea_decrypt_pass1, aes256_cbc_decrypt, find_pattern};
 use crate::steamflatline::error::{SteamFlatlineError, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+struct TempPeGuard(PathBuf);
+
+impl TempPeGuard {
+    fn create(data: &[u8]) -> Result<Self> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "steamflatline_{}_{}_{}.exe",
+            std::process::id(),
+            stamp,
+            count
+        ));
+        std::fs::write(&path, data)?;
+        Ok(Self(path))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempPeGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 
 /// Trait for variant-specific unpackers
 pub trait Unpacker: Send + Sync {
@@ -98,11 +129,9 @@ impl Unpacker for StubVariant30x64 {
     }
 
     fn process(&self, data: &[u8], output_path: &Path) -> Result<()> {
-        // Write to temp file and parse with PeFile
-        let temp_path = std::env::temp_dir().join(format!("steamflatline_{}.exe", std::process::id()));
-        std::fs::write(&temp_path, data)?;
-
-        let mut pe = PeFile::parse(&temp_path)?;
+        // Write to unique temp file and parse with PeFile (auto-cleaned up on drop)
+        let temp_guard = TempPeGuard::create(data)?;
+        let mut pe = PeFile::parse(temp_guard.path())?;
 
         if !matches!(pe.architecture, Architecture::Pe64) {
             return Err(SteamFlatlineError::UnsupportedArchitecture);
@@ -120,7 +149,7 @@ impl Unpacker for StubVariant30x64 {
         // Read the dword at entry - 4
         let mut sig_bytes = [0u8; 4];
         // We need to read from the file data
-        let file_data = std::fs::read(&temp_path)?;
+        let file_data = data;
         if entry_offset as usize + 4 > file_data.len() {
             return Err(SteamFlatlineError::InvalidStubFormat);
         }
@@ -190,11 +219,12 @@ impl Unpacker for StubVariant30x64 {
             .ok_or(SteamFlatlineError::MissingSection("Payload".into()))?;
 
         // Read and decrypt payload
-        let mut payload = vec![0u8; payload_size as usize];
-        if payload_offset as usize + payload_size as usize > file_data.len() {
+        let p_offset = payload_offset as usize;
+        let p_size = payload_size as usize;
+        if p_offset.checked_add(p_size).map_or(true, |end| end > file_data.len()) {
             return Err(SteamFlatlineError::PayloadDecryptionFailed("Payload exceeds file size".into()));
         }
-        payload.copy_from_slice(&file_data[payload_offset as usize..payload_offset as usize + payload_size as usize]);
+        let mut payload = file_data[p_offset..p_offset + p_size].to_vec();
 
         // XOR decrypt payload
         steam_xor(&mut payload, xor_key);
@@ -203,7 +233,7 @@ impl Unpacker for StubVariant30x64 {
         let drmp_offset = drmp_dll_offset as usize;
         let drmp_size = drmp_dll_size as usize;
 
-        if drmp_offset + drmp_size > payload.len() {
+        if drmp_offset.checked_add(drmp_size).map_or(true, |end| end > payload.len()) {
             return Err(SteamFlatlineError::DrmpDecryptionFailed("DRMP data exceeds payload".into()));
         }
 
@@ -224,15 +254,14 @@ impl Unpacker for StubVariant30x64 {
 
         let code_data = if is_encrypted {
             // Read encrypted section data
-            let encrypted_size = code_section_raw_size;
-            let mut encrypted_data = vec![0u8; (encrypted_size + 16) as usize];
-            encrypted_data[0..16].copy_from_slice(&stolen_data);
-
+            let encrypted_size = code_section_raw_size as usize;
             let section_file_offset = code_section.pointer_to_raw_data as usize;
-            if section_file_offset + encrypted_size as usize > file_data.len() {
+            if section_file_offset.checked_add(encrypted_size).map_or(true, |end| end > file_data.len()) {
                 return Err(SteamFlatlineError::AesDecryptionFailed("Code section exceeds file".into()));
             }
-            encrypted_data[16..].copy_from_slice(&file_data[section_file_offset..section_file_offset + encrypted_size as usize]);
+            let mut encrypted_data = vec![0u8; encrypted_size + 16];
+            encrypted_data[0..16].copy_from_slice(&stolen_data);
+            encrypted_data[16..].copy_from_slice(&file_data[section_file_offset..section_file_offset + encrypted_size]);
 
             // AES decrypt (IV is modified during RebuildIv)
             aes256_cbc_decrypt(&mut encrypted_data, &aes_key, &mut aes_iv)?;
@@ -241,6 +270,9 @@ impl Unpacker for StubVariant30x64 {
             // Not encrypted, read as-is
             let section_file_offset = code_section.pointer_to_raw_data as usize;
             let section_size = code_section.size_of_raw_data as usize;
+            if section_file_offset.checked_add(section_size).map_or(true, |end| end > file_data.len()) {
+                return Err(SteamFlatlineError::InvalidPeFormat("Code section exceeds file".into()));
+            }
             file_data[section_file_offset..section_file_offset + section_size].to_vec()
         };
 
@@ -302,9 +334,6 @@ impl Unpacker for StubVariant30x64 {
         // Write unpacked file
         pe.write(output_path)?;
 
-        // Clean up temp
-        let _ = std::fs::remove_file(&temp_path);
-
         Ok(())
     }
 }
@@ -353,15 +382,18 @@ impl Unpacker for StubVariant30x86 {
             return false;
         }
 
-        data.windows(5).any(|w| w == b".bind")
+        if !data.windows(5).any(|w| w == b".bind") {
+            return false;
+        }
+
+        // Check for v3.0 signature 0xC0DEC0DE
+        data.windows(4).any(|w| w == &[0xDE, 0xC0, 0xDE, 0xC0])
     }
 
     fn process(&self, data: &[u8], output_path: &Path) -> Result<()> {
-        // Write to temp file and parse with PeFile
-        let temp_path = std::env::temp_dir().join(format!("steamflatline_{}.exe", std::process::id()));
-        std::fs::write(&temp_path, data)?;
-
-        let mut pe = PeFile::parse(&temp_path)?;
+        // Write to unique temp file and parse with PeFile (auto-cleaned up on drop)
+        let temp_guard = TempPeGuard::create(data)?;
+        let mut pe = PeFile::parse(temp_guard.path())?;
 
         if !matches!(pe.architecture, Architecture::Pe32) {
             return Err(SteamFlatlineError::UnsupportedArchitecture);
@@ -378,7 +410,7 @@ impl Unpacker for StubVariant30x86 {
 
         // Read the dword at entry - 4
         let mut sig_bytes = [0u8; 4];
-        let file_data = std::fs::read(&temp_path)?;
+        let file_data = data;
         if entry_offset as usize + 4 > file_data.len() {
             return Err(SteamFlatlineError::InvalidStubFormat);
         }
@@ -446,11 +478,12 @@ impl Unpacker for StubVariant30x86 {
             .ok_or(SteamFlatlineError::MissingSection("Payload".into()))?;
 
         // Read and decrypt payload
-        let mut payload = vec![0u8; payload_size as usize];
-        if payload_offset as usize + payload_size as usize > file_data.len() {
+        let p_offset = payload_offset as usize;
+        let p_size = payload_size as usize;
+        if p_offset.checked_add(p_size).map_or(true, |end| end > file_data.len()) {
             return Err(SteamFlatlineError::PayloadDecryptionFailed("Payload exceeds file size".into()));
         }
-        payload.copy_from_slice(&file_data[payload_offset as usize..payload_offset as usize + payload_size as usize]);
+        let mut payload = file_data[p_offset..p_offset + p_size].to_vec();
 
         // XOR decrypt payload
         steam_xor(&mut payload, xor_key);
@@ -459,7 +492,7 @@ impl Unpacker for StubVariant30x86 {
         let drmp_offset = drmp_dll_offset as usize;
         let drmp_size = drmp_dll_size as usize;
 
-        if drmp_offset + drmp_size > payload.len() {
+        if drmp_offset.checked_add(drmp_size).map_or(true, |end| end > payload.len()) {
             return Err(SteamFlatlineError::DrmpDecryptionFailed("DRMP data exceeds payload".into()));
         }
 
@@ -480,15 +513,14 @@ impl Unpacker for StubVariant30x86 {
 
         let code_data = if is_encrypted {
             // Read encrypted section data
-            let encrypted_size = code_section_raw_size;
-            let mut encrypted_data = vec![0u8; (encrypted_size + 16) as usize];
-            encrypted_data[0..16].copy_from_slice(&stolen_data);
-
+            let encrypted_size = code_section_raw_size as usize;
             let section_file_offset = code_section.pointer_to_raw_data as usize;
-            if section_file_offset + encrypted_size as usize > file_data.len() {
+            if section_file_offset.checked_add(encrypted_size).map_or(true, |end| end > file_data.len()) {
                 return Err(SteamFlatlineError::AesDecryptionFailed("Code section exceeds file".into()));
             }
-            encrypted_data[16..].copy_from_slice(&file_data[section_file_offset..section_file_offset + encrypted_size as usize]);
+            let mut encrypted_data = vec![0u8; encrypted_size + 16];
+            encrypted_data[0..16].copy_from_slice(&stolen_data);
+            encrypted_data[16..].copy_from_slice(&file_data[section_file_offset..section_file_offset + encrypted_size]);
 
             // AES decrypt
             aes256_cbc_decrypt(&mut encrypted_data, &aes_key, &mut aes_iv)?;
@@ -497,6 +529,9 @@ impl Unpacker for StubVariant30x86 {
             // Not encrypted, read as-is
             let section_file_offset = code_section.pointer_to_raw_data as usize;
             let section_size = code_section.size_of_raw_data as usize;
+            if section_file_offset.checked_add(section_size).map_or(true, |end| end > file_data.len()) {
+                return Err(SteamFlatlineError::InvalidPeFormat("Code section exceeds file".into()));
+            }
             file_data[section_file_offset..section_file_offset + section_size].to_vec()
         };
 
@@ -557,9 +592,6 @@ impl Unpacker for StubVariant30x86 {
 
         // Write unpacked file
         pe.write(output_path)?;
-
-        // Clean up temp
-        let _ = std::fs::remove_file(&temp_path);
 
         Ok(())
     }
@@ -625,11 +657,9 @@ impl Unpacker for StubVariant31x64 {
     }
 
     fn process(&self, data: &[u8], output_path: &Path) -> Result<()> {
-        // Write to temp file and parse with PeFile
-        let temp_path = std::env::temp_dir().join(format!("steamflatline_{}.exe", std::process::id()));
-        std::fs::write(&temp_path, data)?;
-
-        let mut pe = PeFile::parse(&temp_path)?;
+        // Write to unique temp file and parse with PeFile (auto-cleaned up on drop)
+        let temp_guard = TempPeGuard::create(data)?;
+        let mut pe = PeFile::parse(temp_guard.path())?;
 
         if !matches!(pe.architecture, Architecture::Pe64) {
             return Err(SteamFlatlineError::UnsupportedArchitecture);
@@ -647,7 +677,7 @@ impl Unpacker for StubVariant31x64 {
 
         // Read the dword at entry - 4
         let mut sig_bytes = [0u8; 4];
-        let file_data = std::fs::read(&temp_path)?;
+        let file_data = data;
         if entry_offset as usize + 4 > file_data.len() {
             return Err(SteamFlatlineError::InvalidStubFormat);
         }
@@ -739,11 +769,12 @@ impl Unpacker for StubVariant31x64 {
             .ok_or(SteamFlatlineError::MissingSection("Payload".into()))?;
 
         // Read and decrypt payload
-        let mut payload = vec![0u8; payload_size as usize];
-        if payload_offset as usize + payload_size as usize > file_data.len() {
+        let p_offset = payload_offset as usize;
+        let p_size = payload_size as usize;
+        if p_offset.checked_add(p_size).map_or(true, |end| end > file_data.len()) {
             return Err(SteamFlatlineError::PayloadDecryptionFailed("Payload exceeds file size".into()));
         }
-        payload.copy_from_slice(&file_data[payload_offset as usize..payload_offset as usize + payload_size as usize]);
+        let mut payload = file_data[p_offset..p_offset + p_size].to_vec();
 
         // XOR decrypt payload
         steam_xor(&mut payload, xor_key);
@@ -752,7 +783,7 @@ impl Unpacker for StubVariant31x64 {
         let drmp_offset = drmp_dll_offset as usize;
         let drmp_size = drmp_dll_size as usize;
 
-        if drmp_offset + drmp_size > payload.len() {
+        if drmp_offset.checked_add(drmp_size).map_or(true, |end| end > payload.len()) {
             return Err(SteamFlatlineError::DrmpDecryptionFailed("DRMP data exceeds payload".into()));
         }
 
@@ -773,15 +804,14 @@ impl Unpacker for StubVariant31x64 {
 
         let code_data = if is_encrypted {
             // Read encrypted section data
-            let encrypted_size = code_section_raw_size;
-            let mut encrypted_data = vec![0u8; (encrypted_size + 16) as usize];
-            encrypted_data[0..16].copy_from_slice(&stolen_data);
-
+            let encrypted_size = code_section_raw_size as usize;
             let section_file_offset = code_section.pointer_to_raw_data as usize;
-            if section_file_offset + encrypted_size as usize > file_data.len() {
+            if section_file_offset.checked_add(encrypted_size).map_or(true, |end| end > file_data.len()) {
                 return Err(SteamFlatlineError::AesDecryptionFailed("Code section exceeds file".into()));
             }
-            encrypted_data[16..].copy_from_slice(&file_data[section_file_offset..section_file_offset + encrypted_size as usize]);
+            let mut encrypted_data = vec![0u8; encrypted_size + 16];
+            encrypted_data[0..16].copy_from_slice(&stolen_data);
+            encrypted_data[16..].copy_from_slice(&file_data[section_file_offset..section_file_offset + encrypted_size]);
 
             // AES decrypt
             aes256_cbc_decrypt(&mut encrypted_data, &aes_key, &mut aes_iv)?;
@@ -790,6 +820,9 @@ impl Unpacker for StubVariant31x64 {
             // Not encrypted, read as-is
             let section_file_offset = code_section.pointer_to_raw_data as usize;
             let section_size = code_section.size_of_raw_data as usize;
+            if section_file_offset.checked_add(section_size).map_or(true, |end| end > file_data.len()) {
+                return Err(SteamFlatlineError::InvalidPeFormat("Code section exceeds file".into()));
+            }
             file_data[section_file_offset..section_file_offset + section_size].to_vec()
         };
 
@@ -851,9 +884,6 @@ impl Unpacker for StubVariant31x64 {
         // Write unpacked file
         pe.write(output_path)?;
 
-        // Clean up temp
-        let _ = std::fs::remove_file(&temp_path);
-
         Ok(())
     }
 }
@@ -902,15 +932,18 @@ impl Unpacker for StubVariant31x86 {
             return false;
         }
 
-        data.windows(5).any(|w| w == b".bind")
+        if !data.windows(5).any(|w| w == b".bind") {
+            return false;
+        }
+
+        // Check for v3.1 signature 0xC0DEC0D1
+        data.windows(4).any(|w| w == &[0xD1, 0xC0, 0xDE, 0xC0])
     }
 
     fn process(&self, data: &[u8], output_path: &Path) -> Result<()> {
-        // Write to temp file and parse with PeFile
-        let temp_path = std::env::temp_dir().join(format!("steamflatline_{}.exe", std::process::id()));
-        std::fs::write(&temp_path, data)?;
-
-        let mut pe = PeFile::parse(&temp_path)?;
+        // Write to unique temp file and parse with PeFile (auto-cleaned up on drop)
+        let temp_guard = TempPeGuard::create(data)?;
+        let mut pe = PeFile::parse(temp_guard.path())?;
 
         if !matches!(pe.architecture, Architecture::Pe32) {
             return Err(SteamFlatlineError::UnsupportedArchitecture);
@@ -928,7 +961,7 @@ impl Unpacker for StubVariant31x86 {
 
         // Read the dword at entry - 4
         let mut sig_bytes = [0u8; 4];
-        let file_data = std::fs::read(&temp_path)?;
+        let file_data = data;
         if entry_offset as usize + 4 > file_data.len() {
             return Err(SteamFlatlineError::InvalidStubFormat);
         }
@@ -1015,11 +1048,12 @@ impl Unpacker for StubVariant31x86 {
             .ok_or(SteamFlatlineError::MissingSection("Payload".into()))?;
 
         // Read and decrypt payload
-        let mut payload = vec![0u8; payload_size as usize];
-        if payload_offset as usize + payload_size as usize > file_data.len() {
+        let p_offset = payload_offset as usize;
+        let p_size = payload_size as usize;
+        if p_offset.checked_add(p_size).map_or(true, |end| end > file_data.len()) {
             return Err(SteamFlatlineError::PayloadDecryptionFailed("Payload exceeds file size".into()));
         }
-        payload.copy_from_slice(&file_data[payload_offset as usize..payload_offset as usize + payload_size as usize]);
+        let mut payload = file_data[p_offset..p_offset + p_size].to_vec();
 
         // XOR decrypt payload
         steam_xor(&mut payload, xor_key);
@@ -1028,7 +1062,7 @@ impl Unpacker for StubVariant31x86 {
         let drmp_offset = drmp_dll_offset as usize;
         let drmp_size = drmp_dll_size as usize;
 
-        if drmp_offset + drmp_size > payload.len() {
+        if drmp_offset.checked_add(drmp_size).map_or(true, |end| end > payload.len()) {
             return Err(SteamFlatlineError::DrmpDecryptionFailed("DRMP data exceeds payload".into()));
         }
 
@@ -1049,15 +1083,14 @@ impl Unpacker for StubVariant31x86 {
 
         let code_data = if is_encrypted {
             // Read encrypted section data
-            let encrypted_size = code_section_raw_size;
-            let mut encrypted_data = vec![0u8; (encrypted_size + 16) as usize];
-            encrypted_data[0..16].copy_from_slice(&stolen_data);
-
+            let encrypted_size = code_section_raw_size as usize;
             let section_file_offset = code_section.pointer_to_raw_data as usize;
-            if section_file_offset + encrypted_size as usize > file_data.len() {
+            if section_file_offset.checked_add(encrypted_size).map_or(true, |end| end > file_data.len()) {
                 return Err(SteamFlatlineError::AesDecryptionFailed("Code section exceeds file".into()));
             }
-            encrypted_data[16..].copy_from_slice(&file_data[section_file_offset..section_file_offset + encrypted_size as usize]);
+            let mut encrypted_data = vec![0u8; encrypted_size + 16];
+            encrypted_data[0..16].copy_from_slice(&stolen_data);
+            encrypted_data[16..].copy_from_slice(&file_data[section_file_offset..section_file_offset + encrypted_size]);
 
             // AES decrypt
             aes256_cbc_decrypt(&mut encrypted_data, &aes_key, &mut aes_iv)?;
@@ -1066,6 +1099,9 @@ impl Unpacker for StubVariant31x86 {
             // Not encrypted, read as-is
             let section_file_offset = code_section.pointer_to_raw_data as usize;
             let section_size = code_section.size_of_raw_data as usize;
+            if section_file_offset.checked_add(section_size).map_or(true, |end| end > file_data.len()) {
+                return Err(SteamFlatlineError::InvalidPeFormat("Code section exceeds file".into()));
+            }
             file_data[section_file_offset..section_file_offset + section_size].to_vec()
         };
 
@@ -1127,9 +1163,6 @@ impl Unpacker for StubVariant31x86 {
         // Write unpacked file
         pe.write(output_path)?;
 
-        // Clean up temp
-        let _ = std::fs::remove_file(&temp_path);
-
         Ok(())
     }
 }
@@ -1183,17 +1216,15 @@ impl Unpacker for StubVariant21x86 {
     }
 
     fn process(&self, data: &[u8], output_path: &Path) -> Result<()> {
-        // Write to temp file and parse with PeFile
-        let temp_path = std::env::temp_dir().join(format!("steamflatline_{}.exe", std::process::id()));
-        std::fs::write(&temp_path, data)?;
-
-        let mut pe = PeFile::parse(&temp_path)?;
+        // Write to unique temp file and parse with PeFile (auto-cleaned up on drop)
+        let temp_guard = TempPeGuard::create(data)?;
+        let mut pe = PeFile::parse(temp_guard.path())?;
 
         if !matches!(pe.architecture, Architecture::Pe32) {
             return Err(SteamFlatlineError::UnsupportedArchitecture);
         }
 
-        let file_data = std::fs::read(&temp_path)?;
+        let file_data = data;
 
         // Find the .bind section which contains the stub code and encrypted payload
         let bind_section_idx = pe.sections.iter().position(|s| s.name_str() == ".bind")
@@ -1283,12 +1314,12 @@ impl Unpacker for StubVariant21x86 {
         let header_size = 128; // Size of SteamStub32Var21Header
         let payload_offset = bind_section_offset + header_size;
 
-        if payload_offset + payload_size as usize > file_data.len() {
+        let p_size = payload_size as usize;
+        if payload_offset.checked_add(p_size).map_or(true, |end| end > file_data.len()) {
             return Err(SteamFlatlineError::PayloadDecryptionFailed("Payload exceeds file size".into()));
         }
 
-        let mut payload = vec![0u8; payload_size as usize];
-        payload.copy_from_slice(&file_data[payload_offset..payload_offset + payload_size as usize]);
+        let mut payload = file_data[payload_offset..payload_offset + p_size].to_vec();
 
         // XOR decrypt payload
         steam_xor(&mut payload, xor_key);
@@ -1297,7 +1328,7 @@ impl Unpacker for StubVariant21x86 {
         let drmp_offset = drmp_dll_offset as usize;
         let drmp_size = drmp_dll_size as usize;
 
-        if drmp_offset + drmp_size > payload.len() {
+        if drmp_offset.checked_add(drmp_size).map_or(true, |end| end > payload.len()) {
             return Err(SteamFlatlineError::DrmpDecryptionFailed("DRMP data exceeds payload".into()));
         }
 
@@ -1318,15 +1349,14 @@ impl Unpacker for StubVariant21x86 {
 
         let code_data = if is_encrypted {
             // Read encrypted section data
-            let encrypted_size = code_section_raw_size;
-            let mut encrypted_data = vec![0u8; (encrypted_size + 16) as usize];
-            encrypted_data[0..16].copy_from_slice(&stolen_data);
-
+            let encrypted_size = code_section_raw_size as usize;
             let section_file_offset = code_section.pointer_to_raw_data as usize;
-            if section_file_offset + encrypted_size as usize > file_data.len() {
+            if section_file_offset.checked_add(encrypted_size).map_or(true, |end| end > file_data.len()) {
                 return Err(SteamFlatlineError::AesDecryptionFailed("Code section exceeds file".into()));
             }
-            encrypted_data[16..].copy_from_slice(&file_data[section_file_offset..section_file_offset + encrypted_size as usize]);
+            let mut encrypted_data = vec![0u8; encrypted_size + 16];
+            encrypted_data[0..16].copy_from_slice(&stolen_data);
+            encrypted_data[16..].copy_from_slice(&file_data[section_file_offset..section_file_offset + encrypted_size]);
 
             // AES decrypt
             aes256_cbc_decrypt(&mut encrypted_data, &aes_key, &mut aes_iv)?;
@@ -1335,6 +1365,9 @@ impl Unpacker for StubVariant21x86 {
             // Not encrypted, read as-is
             let section_file_offset = code_section.pointer_to_raw_data as usize;
             let section_size = code_section.size_of_raw_data as usize;
+            if section_file_offset.checked_add(section_size).map_or(true, |end| end > file_data.len()) {
+                return Err(SteamFlatlineError::InvalidPeFormat("Code section exceeds file".into()));
+            }
             file_data[section_file_offset..section_file_offset + section_size].to_vec()
         };
 
@@ -1395,9 +1428,6 @@ impl Unpacker for StubVariant21x86 {
 
         // Write unpacked file
         pe.write(output_path)?;
-
-        // Clean up temp
-        let _ = std::fs::remove_file(&temp_path);
 
         Ok(())
     }
@@ -1507,13 +1537,16 @@ impl Unpacker for StubVariant10x86 {
             return false;
         }
 
-        // v1.0 has different characteristics - no .bind section typically
-        // For now, return false to avoid false positives
-        false
+        // Detect legacy SteamStub 1.0 (x86) binaries without .bind sections
+        let has_legacy_steam_stub = data.windows(12).any(|w| w == b"SteamDRM.dll" || w == b"SteamStub10");
+        let has_no_bind = !data.windows(5).any(|w| w == b".bind");
+        has_legacy_steam_stub && has_no_bind
     }
 
     fn process(&self, _data: &[u8], _output_path: &Path) -> Result<()> {
-        Err(SteamFlatlineError::UnsupportedFormat)
+        Err(SteamFlatlineError::HeaderParsingFailed(
+            "SteamStub 1.0 (legacy) unpacking is not supported for this binary; v1.0 lacks a .bind section".into(),
+        ))
     }
 }
 
@@ -1527,5 +1560,33 @@ mod tests {
         assert_eq!(unpackers.len(), 7);
         assert!(unpackers.iter().any(|u| u.name().contains("3.0")));
         assert!(unpackers.iter().any(|u| u.name().contains("2.1")));
+    }
+
+    #[test]
+    fn test_x86_v30_v31_dispatch_isolation() {
+        // Construct minimal mock PE32 data
+        let mut mock_pe = vec![0u8; 256];
+        mock_pe[0..2].copy_from_slice(b"MZ");
+        mock_pe[60..64].copy_from_slice(&64u32.to_le_bytes()); // PE offset at 64
+        mock_pe[64..68].copy_from_slice(b"PE\0\0");
+        mock_pe[68..70].copy_from_slice(&0x014cu16.to_le_bytes()); // Machine: x86 (0x014c)
+        mock_pe[100..105].copy_from_slice(b".bind");
+
+        let u30 = StubVariant30x86::new();
+        let u31 = StubVariant31x86::new();
+
+        // Without magic signature, neither 3.0 nor 3.1 should match
+        assert!(!u30.can_process(&mock_pe));
+        assert!(!u31.can_process(&mock_pe));
+
+        // Inject 3.0 signature 0xC0DEC0DE
+        mock_pe[120..124].copy_from_slice(&[0xDE, 0xC0, 0xDE, 0xC0]);
+        assert!(u30.can_process(&mock_pe));
+        assert!(!u31.can_process(&mock_pe));
+
+        // Inject 3.1 signature 0xC0DEC0D1
+        mock_pe[120..124].copy_from_slice(&[0xD1, 0xC0, 0xDE, 0xC0]);
+        assert!(!u30.can_process(&mock_pe));
+        assert!(u31.can_process(&mock_pe));
     }
 }

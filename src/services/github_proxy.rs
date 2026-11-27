@@ -23,10 +23,13 @@ pub struct GithubProxy {
     timeout: Duration,
     pub(crate) api_mirrors: Vec<String>,
     pub(crate) download_mirrors: Vec<String>,
+    pub(crate) mirrors_enabled: bool,
 }
 
 impl Default for GithubProxy {
     fn default() -> Self {
+        let mirrors_enabled = std::env::var("LUATOOLS_ENABLE_MIRRORS").is_ok()
+            || std::env::var("LUATOOLS_ALLOW_UNVERIFIED_MIRROR").is_ok();
         Self {
             http: Self::build_agent(DEFAULT_TIMEOUT),
             timeout: DEFAULT_TIMEOUT,
@@ -38,6 +41,7 @@ impl Default for GithubProxy {
                 "https://ghfast.top/".into(),
                 "https://gh-proxy.com/".into(),
             ],
+            mirrors_enabled,
         }
     }
 }
@@ -68,7 +72,17 @@ impl GithubProxy {
     pub fn with_mirrors(mut self, api_mirrors: Vec<String>, download_mirrors: Vec<String>) -> Self {
         self.api_mirrors = api_mirrors;
         self.download_mirrors = download_mirrors;
+        self.mirrors_enabled = true;
         self
+    }
+
+    pub fn enable_mirrors(mut self, enabled: bool) -> Self {
+        self.mirrors_enabled = enabled;
+        self
+    }
+
+    pub fn mirrors_enabled(&self) -> bool {
+        self.mirrors_enabled
     }
 
     pub fn api_mirrors(&self) -> &[String] {
@@ -89,12 +103,52 @@ impl GithubProxy {
             || low.starts_with("https://release-assets.githubusercontent.com/")
     }
 
+    /// Checks whether a mirror candidate URL uses secure HTTPS and does not point to internal/private addresses.
+    pub fn is_trusted_mirror(mirror: &str) -> bool {
+        let m = mirror.trim();
+        if !m.starts_with("https://") {
+            return false;
+        }
+        // Extract host
+        let host_part = &m["https://".len()..];
+        let host = host_part
+            .split(['/', ':', '?', '#'])
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if host.is_empty() {
+            return false;
+        }
+        // Reject localhost / private ranges / link-local / loopback
+        if host == "localhost"
+            || host == "127.0.0.1"
+            || host == "0.0.0.0"
+            || host == "::1"
+            || host.ends_with(".local")
+            || host.ends_with(".internal")
+            || host.starts_with("10.")
+            || host.starts_with("192.168.")
+            || (host.starts_with("172.") && {
+                let parts: Vec<&str> = host.split('.').collect();
+                if parts.len() >= 2 {
+                    parts[1].parse::<u8>().map(|b| (16..=31).contains(&b)).unwrap_or(false)
+                } else {
+                    false
+                }
+            })
+        {
+            return false;
+        }
+        true
+    }
+
     /// Generate candidate URLs: direct first, then mirror-prefixed variants.
     pub(crate) fn candidates(&self, url: &str) -> Vec<String> {
         let trimmed_url = url.trim();
         let mut candidates = vec![trimmed_url.to_string()];
 
-        if !Self::is_github(trimmed_url) {
+        if !self.mirrors_enabled || !Self::is_github(trimmed_url) {
             return candidates;
         }
 
@@ -112,7 +166,7 @@ impl GithubProxy {
 
         for mirror in mirrors {
             let m = mirror.trim();
-            if m.is_empty() {
+            if m.is_empty() || !Self::is_trusted_mirror(m) {
                 continue;
             }
             // Strip any trailing full URL prefix from mirror (e.g. "https://proxy/https://api.github.com")
@@ -135,32 +189,6 @@ impl GithubProxy {
         }
 
         candidates
-    }
-
-    /// Send a GET request, trying direct then mirrors. Returns the first successful response.
-    pub async fn send_async(&self, url: &str) -> Result<ureq::Response, Box<ureq::Error>> {
-        let mut last_err: Option<ureq::Error> = None;
-
-        for candidate in self.candidates(url) {
-            match self
-                .http
-                .get(&candidate)
-                .set("User-Agent", "LuaToolsGui")
-                .set("Accept", "application/vnd.github+json")
-                .call()
-            {
-                Ok(res) if res.status() < 400 => return Ok(res),
-                Ok(res) => {
-                    let status = res.status();
-                    last_err = Some(ureq::Error::Status(status, res));
-                }
-                Err(e) => last_err = Some(e),
-            }
-        }
-
-        Err(Box::new(last_err.unwrap_or_else(|| {
-            ureq::Error::from(io::Error::other("All GitHub mirrors failed"))
-        })))
     }
 
     /// Download a file synchronously, trying direct then mirrors. Streams atomically to disk with progress.
@@ -265,16 +293,6 @@ impl GithubProxy {
             ureq::Error::from(io::Error::other("All GitHub mirrors failed"))
         })))
     }
-
-    /// Download a file, trying direct then mirrors. Streams atomically to disk with progress.
-    pub async fn download_async(
-        &self,
-        url: &str,
-        dest_path: &std::path::Path,
-        progress: Option<&mut dyn FnMut(f64)>,
-    ) -> Result<(), Box<ureq::Error>> {
-        self.download_sync(url, dest_path, progress)
-    }
 }
 
 #[cfg(test)]
@@ -298,6 +316,16 @@ mod tests {
         ));
         assert!(!GithubProxy::is_github("https://example.com/file"));
         assert!(!GithubProxy::is_github("https://google.com"));
+    }
+
+    #[test]
+    fn test_is_trusted_mirror() {
+        assert!(GithubProxy::is_trusted_mirror("https://ghfast.top/"));
+        assert!(GithubProxy::is_trusted_mirror("https://gh-proxy.com/"));
+        assert!(!GithubProxy::is_trusted_mirror("http://insecure-mirror.com/"));
+        assert!(!GithubProxy::is_trusted_mirror("https://localhost/"));
+        assert!(!GithubProxy::is_trusted_mirror("https://127.0.0.1:8080/"));
+        assert!(!GithubProxy::is_trusted_mirror("https://192.168.1.1/"));
     }
 
     #[test]
@@ -340,6 +368,19 @@ mod tests {
         let p = GithubProxy::new();
         let cands = p.candidates("https://example.com/file");
         assert_eq!(cands, vec!["https://example.com/file"]);
+    }
+
+    #[test]
+    fn test_mirrors_disabled_by_default_unless_opted_in() {
+        let p = GithubProxy::new();
+        let cands = p.candidates("https://github.com/user/repo/archive/refs/heads/main.zip");
+        // By default, no third-party mirrors without explicit enable
+        assert_eq!(cands, vec!["https://github.com/user/repo/archive/refs/heads/main.zip"]);
+
+        let p_enabled = p.enable_mirrors(true);
+        let cands_enabled = p_enabled.candidates("https://github.com/user/repo/archive/refs/heads/main.zip");
+        assert!(cands_enabled.len() > 1);
+        assert_eq!(cands_enabled[0], "https://github.com/user/repo/archive/refs/heads/main.zip");
     }
 
     #[test]

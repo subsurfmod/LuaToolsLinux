@@ -149,6 +149,10 @@ pub fn get_install_dir_from_acf(library: &SteamLibrary, app_id: u32) -> Option<P
         .join(format!("appmanifest_{}.acf", app_id));
     let content = fs::read_to_string(acf).ok()?;
     let dir_name = acf_installdir_re().captures(&content)?.get(1)?.as_str();
+    let rel = Path::new(dir_name);
+    if !crate::services::lua_installer::LuaInstaller::is_safe_relative_path(rel) {
+        return None;
+    }
     let full = library.common().join(dir_name);
     Some(full)
 }

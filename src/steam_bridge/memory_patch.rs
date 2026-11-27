@@ -147,6 +147,241 @@ pub struct MemoryPatch {
     pub active: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RelocType {
+    None,
+    Rel32Call { disp_offset: usize },
+    Rel32Jmp { disp_offset: usize },
+    Rel8Jmp { disp_offset: usize },
+    RipRelative { disp_offset: usize },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DecodedInstruction {
+    offset: usize,
+    len: usize,
+    reloc: RelocType,
+}
+
+fn decode_one_instruction(data: &[u8], is_64bit: bool) -> Result<(usize, RelocType), String> {
+    if data.is_empty() {
+        return Err("unexpected end of code bytes".to_string());
+    }
+    let mut pos = 0;
+    let mut rex_w = false;
+    let mut has_op_size_override = false;
+    // Decode legacy prefixes
+    while pos < data.len() {
+        let b = data[pos];
+        if b == 0x66 {
+            has_op_size_override = true;
+            pos += 1;
+        } else if matches!(b, 0xF0 | 0xF2 | 0xF3 | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65 | 0x67) {
+            pos += 1;
+        } else if is_64bit && (b & 0xF0) == 0x40 {
+            // REX prefix
+            if (b & 0x08) != 0 {
+                rex_w = true;
+            }
+            pos += 1;
+        } else {
+            break;
+        }
+    }
+    if pos >= data.len() {
+        return Err("instruction ends after prefixes".to_string());
+    }
+    let b = data[pos];
+    pos += 1;
+
+    // VEX prefix check (reject unsupported VEX instructions in prologue)
+    if is_64bit && (b == 0xC4 || b == 0xC5) {
+        return Err("VEX encoded instruction not supported in hook prologue".to_string());
+    }
+
+    // 1-byte opcodes
+    if (0x50..=0x5F).contains(&b) || b == 0x90 || b == 0xC3 || b == 0xCC {
+        return Ok((pos, RelocType::None));
+    }
+    // push imm
+    if b == 0x68 {
+        let imm_len = if has_op_size_override { 2 } else { 4 };
+        if pos + imm_len > data.len() {
+            return Err("truncated push imm".to_string());
+        }
+        return Ok((pos + imm_len, RelocType::None));
+    }
+    if b == 0x6A {
+        if pos + 1 > data.len() {
+            return Err("truncated push imm8".to_string());
+        }
+        return Ok((pos + 1, RelocType::None));
+    }
+    // mov reg, imm
+    if (0xB8..=0xBF).contains(&b) {
+        let imm_len = if is_64bit && rex_w { 8 } else if has_op_size_override { 2 } else { 4 };
+        if pos + imm_len > data.len() {
+            return Err("truncated mov imm".to_string());
+        }
+        return Ok((pos + imm_len, RelocType::None));
+    }
+    if (0xB0..=0xB7).contains(&b) {
+        if pos + 1 > data.len() {
+            return Err("truncated mov imm8".to_string());
+        }
+        return Ok((pos + 1, RelocType::None));
+    }
+    // Relative jumps & calls
+    if b == 0xE8 {
+        if pos + 4 > data.len() {
+            return Err("truncated call rel32".to_string());
+        }
+        return Ok((pos + 4, RelocType::Rel32Call { disp_offset: pos }));
+    }
+    if b == 0xE9 {
+        if pos + 4 > data.len() {
+            return Err("truncated jmp rel32".to_string());
+        }
+        return Ok((pos + 4, RelocType::Rel32Jmp { disp_offset: pos }));
+    }
+    if b == 0xEB || (0x70..=0x7F).contains(&b) {
+        if pos + 1 > data.len() {
+            return Err("truncated jmp/jcc rel8".to_string());
+        }
+        return Ok((pos + 1, RelocType::Rel8Jmp { disp_offset: pos }));
+    }
+
+    // 2-byte opcodes (0x0F) and 3-byte opcodes (0x0F 0x38 / 0x0F 0x3A)
+    let is_0f = b == 0x0F;
+    let mut is_0f38 = false;
+    let mut is_0f3a = false;
+    if is_0f {
+        if pos >= data.len() {
+            return Err("truncated 0x0F escape".to_string());
+        }
+        let b2 = data[pos];
+        pos += 1;
+        if b2 == 0x38 {
+            is_0f38 = true;
+            if pos >= data.len() {
+                return Err("truncated 0x0F 0x38 escape".to_string());
+            }
+            pos += 1; // opcode byte
+        } else if b2 == 0x3A {
+            is_0f3a = true;
+            if pos >= data.len() {
+                return Err("truncated 0x0F 0x3A escape".to_string());
+            }
+            pos += 1; // opcode byte
+        } else if (0x80..=0x8F).contains(&b2) {
+            // jcc rel32
+            if pos + 4 > data.len() {
+                return Err("truncated jcc rel32".to_string());
+            }
+            return Ok((pos + 4, RelocType::Rel32Jmp { disp_offset: pos }));
+        }
+    }
+
+    // ModR/M instructions
+    if pos >= data.len() {
+        return Err("expected ModR/M byte".to_string());
+    }
+    let modrm = data[pos];
+    let reg_op = (modrm >> 3) & 7;
+    pos += 1;
+
+    let mode = (modrm >> 6) & 3;
+    let rm = modrm & 7;
+    let is_rip_rel = is_64bit && mode == 0 && rm == 5;
+    let mut disp_offset = 0;
+
+    if mode != 3 && rm == 4 {
+        // SIB byte
+        if pos >= data.len() {
+            return Err("expected SIB byte".to_string());
+        }
+        let sib = data[pos];
+        pos += 1;
+        if mode == 0 && (sib & 7) == 5 {
+            disp_offset = pos;
+            pos += 4;
+        }
+    } else if mode == 0 && rm == 5 {
+        disp_offset = pos;
+        pos += 4;
+    } else if mode == 1 {
+        pos += 1;
+    } else if mode == 2 {
+        pos += 4;
+    }
+
+    // Immediate operands
+    if is_0f3a {
+        pos += 1; // 1-byte immediate
+    } else if !is_0f && !is_0f38 {
+        if matches!(b, 0x80 | 0x82 | 0x83 | 0xC6 | 0xC0 | 0xC1 | 0x6B) {
+            pos += 1;
+        } else if b == 0xF6 && (reg_op == 0 || reg_op == 1) {
+            pos += 1;
+        } else if b == 0xF7 && (reg_op == 0 || reg_op == 1) {
+            pos += if has_op_size_override { 2 } else { 4 };
+        } else if b == 0x69 || matches!(b, 0x81 | 0xC7) {
+            pos += if has_op_size_override { 2 } else { 4 };
+        }
+    }
+
+    if pos > data.len() {
+        return Err("instruction exceeds available bytes".to_string());
+    }
+
+    let reloc = if is_rip_rel {
+        RelocType::RipRelative { disp_offset }
+    } else {
+        RelocType::None
+    };
+
+    Ok((pos, reloc))
+}
+
+fn decode_instruction_boundary(
+    target: *const u8,
+    min_bytes: usize,
+) -> Result<(usize, Vec<DecodedInstruction>), String> {
+    let max_read = 32.max(min_bytes + 15);
+    let mut total_len = 0;
+    let mut instructions = Vec::new();
+
+    if !is_readable(target as *const _, min_bytes) {
+        return Err("target address not readable for instruction decoding".to_string());
+    }
+    // Read up to max_read if readable, else at least min_bytes
+    let read_len = if is_readable(target as *const _, max_read) {
+        max_read
+    } else {
+        min_bytes
+    };
+    let code_slice = unsafe { std::slice::from_raw_parts(target, read_len) };
+
+    let is_64bit = !cfg!(target_arch = "x86");
+    while total_len < min_bytes {
+        if total_len >= code_slice.len() {
+            return Err("exceeded inspection window while decoding instruction boundary".to_string());
+        }
+        let (inst_len, reloc) = decode_one_instruction(
+            &code_slice[total_len..],
+            is_64bit,
+        )?;
+        instructions.push(DecodedInstruction {
+            offset: total_len,
+            len: inst_len,
+            reloc,
+        });
+        total_len += inst_len;
+    }
+
+    Ok((total_len, instructions))
+}
+
 impl MemoryPatch {
     pub fn new(target: *mut u8, replacement: *mut u8) -> Self {
         Self {
@@ -223,7 +458,10 @@ impl MemoryPatch {
             ));
         }
 
-        let overwrite_len = JMP_ABS64_LEN.max(min_orig_bytes);
+        let min_required = JMP_ABS64_LEN.max(min_orig_bytes);
+        validate_patch_target_range(self.target as usize, min_required)?;
+
+        let (overwrite_len, instructions) = decode_instruction_boundary(self.target, min_required)?;
         if overwrite_len + JMP_ABS64_LEN > TRAMPOLINE_SIZE {
             return Err("overwrite_len exceeds trampoline capacity".into());
         }
@@ -242,7 +480,60 @@ impl MemoryPatch {
                 let _ = libc::munmap(trampoline as *mut libc::c_void, alloc_size);
                 "trampoline return address overflow".to_string()
             })?;
-        ptr::copy_nonoverlapping(self.target, trampoline, overwrite_len);
+
+        // Copy decoded instructions into trampoline, relocating relative calls/jmps where safe.
+        for inst in &instructions {
+            let inst_src = self.target.add(inst.offset);
+            let inst_dst = trampoline.add(inst.offset);
+            ptr::copy_nonoverlapping(inst_src, inst_dst, inst.len);
+
+            match inst.reloc {
+                RelocType::None => {}
+                RelocType::Rel32Call { disp_offset } | RelocType::Rel32Jmp { disp_offset } => {
+                    let orig_inst_addr = (self.target as usize) + inst.offset;
+                    let tramp_inst_addr = (trampoline as usize) + inst.offset;
+                    let orig_disp = {
+                        let disp_ptr = self.target.add(inst.offset + disp_offset) as *const i32;
+                        ptr::read_unaligned(disp_ptr)
+                    };
+                    let orig_target = (orig_inst_addr + inst.len).wrapping_add(orig_disp as usize);
+                    let new_disp = (orig_target as isize).wrapping_sub((tramp_inst_addr + inst.len) as isize);
+                    if new_disp < i32::MIN as isize || new_disp > i32::MAX as isize {
+                        let _ = libc::munmap(trampoline as *mut libc::c_void, alloc_size);
+                        return Err(format!(
+                            "relative call/jmp at 0x{:x} cannot be relocated: distance {} exceeds 32-bit range",
+                            orig_inst_addr, new_disp
+                        ));
+                    }
+                    let disp_ptr = trampoline.add(inst.offset + disp_offset) as *mut i32;
+                    ptr::write_unaligned(disp_ptr, new_disp as i32);
+                }
+                RelocType::Rel8Jmp { .. } => {
+                    let _ = libc::munmap(trampoline as *mut libc::c_void, alloc_size);
+                    return Err("refusing to patch: target contains rel8 branch which cannot be safely relocated to trampoline page".to_string());
+                }
+                RelocType::RipRelative { disp_offset } => {
+                    let orig_inst_addr = (self.target as usize) + inst.offset;
+                    let tramp_inst_addr = (trampoline as usize) + inst.offset;
+                    let orig_disp = {
+                        let disp_ptr = self.target.add(inst.offset + disp_offset) as *const i32;
+                        ptr::read_unaligned(disp_ptr)
+                    };
+                    let orig_target = (orig_inst_addr + inst.len).wrapping_add(orig_disp as usize);
+                    let new_disp = (orig_target as isize).wrapping_sub((tramp_inst_addr + inst.len) as isize);
+                    if new_disp < i32::MIN as isize || new_disp > i32::MAX as isize {
+                        let _ = libc::munmap(trampoline as *mut libc::c_void, alloc_size);
+                        return Err(format!(
+                            "RIP-relative instruction at 0x{:x} cannot be relocated: distance {} exceeds 32-bit range",
+                            orig_inst_addr, new_disp
+                        ));
+                    }
+                    let disp_ptr = trampoline.add(inst.offset + disp_offset) as *mut i32;
+                    ptr::write_unaligned(disp_ptr, new_disp as i32);
+                }
+            }
+        }
+
         Self::write_abs_jmp64(trampoline.add(overwrite_len), ret_addr);
 
         // Lock trampoline page to R-X (W^X) before publishing.

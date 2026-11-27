@@ -3,7 +3,7 @@ members = [".", "bridge_lib", "steam_auto_patch_linux"]
 
 [package]
 name = "luatools-linux"
-version = "3.3.11"
+version = "4.0.0"
 edition = "2021"
 description = "Native lightweight Rust workstation for Steam stplug-in lua manifests, LuaVault variants, depot downloads, and game fixes"
 license = "GPL-3.0-or-later"
@@ -12,15 +12,33 @@ authors = ["LuaTools Linux Contributors"]
 [[bin]]
 name = "luatools"
 path = "src/main.rs"
+required-features = ["gui"]
+
+[[bin]]
+name = "extract_tickets"
+path = "src/bin/extract_tickets.rs"
+
+[[test]]
+name = "ui_visual_qa"
+path = "tests/ui_visual_qa.rs"
+required-features = ["gui"]
 
 [lib]
 name = "luatools_linux"
 path = "src/lib.rs"
 
+[features]
+default = ["gui"]
+gui = [
+    "dep:eframe",
+    "dep:egui",
+    "dep:egui_extras",
+]
+
 [dependencies]
-eframe = { version = "0.31", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
-egui = "0.31"
-egui_extras = { version = "0.31", default-features = false, features = ["image"] }
+eframe = { version = "0.31", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"], optional = true }
+egui = { version = "0.31", optional = true }
+egui_extras = { version = "0.31", default-features = false, features = ["image"], optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 serde = { version = "1.0", features = ["derive"] }

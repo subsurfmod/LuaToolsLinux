@@ -31,6 +31,7 @@ fn report_fatal_error(title: &str, message: &str, allow_dialog: bool) {
 enum IpcCommand {
     Focus,
     TrayLock,
+    RecheckUpdates,
     Url(String),
 }
 
@@ -75,6 +76,7 @@ struct AppWrapper {
     ipc_rx: Receiver<IpcCommand>,
     tray_locked: bool,
     initial_minimized: bool,
+    initial_recheck_updates: bool,
     sock_path: PathBuf,
     _instance_lock: InstanceLock,
 }
@@ -100,6 +102,11 @@ impl eframe::App for AppWrapper {
             }
         }
 
+        if self.initial_recheck_updates {
+            self.initial_recheck_updates = false;
+            self.inner.check_app_update_once_async(ctx);
+        }
+
         let mut had_ipc = false;
         while let Ok(cmd) = self.ipc_rx.try_recv() {
             had_ipc = true;
@@ -110,6 +117,9 @@ impl eframe::App for AppWrapper {
                 IpcCommand::TrayLock => {
                     self.tray_locked = true;
                     self.inner.tray_locked = true;
+                }
+                IpcCommand::RecheckUpdates => {
+                    self.inner.check_app_update_once_async(ctx);
                 }
                 IpcCommand::Url(url) => {
                     let is_silent = ProtocolService::parse(&url)
@@ -144,6 +154,7 @@ fn main() -> eframe::Result<()> {
     let mut qa_screenshots_dir: Option<PathBuf> = None;
     let mut minimized = false;
     let mut tray_locked = false;
+    let mut recheck_updates = false;
 
     let mut idx = 0;
     while idx < args.len() {
@@ -212,6 +223,9 @@ fn main() -> eframe::Result<()> {
             "--tray-locked" => {
                 tray_locked = true;
             }
+            "--recheck-updates" => {
+                recheck_updates = true;
+            }
             "--silent" => {
                 minimized = true;
             }
@@ -247,7 +261,8 @@ fn main() -> eframe::Result<()> {
                        --check               Verify binary and Steam discovery without opening GUI\n  \
                        --update              Pull latest source from Git and rebuild/install native binary\n  \
                        --minimized           Launch minimized\n  \
-                       --tray-locked         Keep running in background/tray on close\n  \
+                       --tray-locked         Keep running in background/tray on close and trigger update check\n  \
+                       --recheck-updates     Signal active instance (or startup) to recheck for updates\n  \
                        --silent              Start completely hidden (background install via protocol)\n  \
                        --autostart-enable    Enable login autostart (~/.config/autostart/luatools.desktop)\n  \
                        --autostart-disable   Disable login autostart\n  \
@@ -273,14 +288,17 @@ fn main() -> eframe::Result<()> {
     let instance_lock = match InstanceLock::try_acquire(&lock_path) {
         Ok(lock) => lock,
         Err(_) => {
-            // Another instance holds the flock lock; forward protocol action, tray-lock, or focus window
+            // Another instance holds the flock lock; forward protocol action, tray-lock, update check, or focus window
             let mut msgs: Vec<String> = Vec::new();
             if tray_locked {
                 msgs.push("TRAYLOCK\n".to_string());
             }
+            if recheck_updates || tray_locked {
+                msgs.push("RECHECK_UPDATES\n".to_string());
+            }
             if let Some(url) = &initial_protocol_url {
                 msgs.push(format!("URL {}\n", url));
-            } else if !minimized {
+            } else if !minimized && !recheck_updates {
                 msgs.push("FOCUS\n".to_string());
             }
 
@@ -319,7 +337,12 @@ fn main() -> eframe::Result<()> {
     let _ = std::fs::remove_file(&sock_path);
     let (ipc_tx, ipc_rx) = channel::<IpcCommand>();
 
-    let listener = match UnixListener::bind(&sock_path) {
+    // Eliminate TOCTOU window: set process umask to 0o177 before binding so socket file is created 0o600 atomically
+    let prev_umask = unsafe { libc::umask(0o177) };
+    let bind_res = UnixListener::bind(&sock_path);
+    unsafe { libc::umask(prev_umask); };
+
+    let listener = match bind_res {
         Ok(l) => {
             let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600));
             Some(l)
@@ -391,6 +414,9 @@ fn main() -> eframe::Result<()> {
                                 } else if trimmed == "TRAYLOCK" {
                                     let _ = tx.send(IpcCommand::TrayLock);
                                     repaint_ctx.request_repaint();
+                                } else if trimmed == "RECHECK_UPDATES" {
+                                    let _ = tx.send(IpcCommand::RecheckUpdates);
+                                    repaint_ctx.request_repaint();
                                 } else if let Some(url) = trimmed.strip_prefix("URL ") {
                                     let _ = tx.send(IpcCommand::Url(url.trim().to_string()));
                                     repaint_ctx.request_repaint();
@@ -423,6 +449,7 @@ fn main() -> eframe::Result<()> {
                 ipc_rx,
                 tray_locked,
                 initial_minimized: minimized || is_silent_init,
+                initial_recheck_updates: tray_locked || recheck_updates,
                 sock_path,
                 _instance_lock: instance_lock,
             }))

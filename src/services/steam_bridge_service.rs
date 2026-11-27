@@ -441,9 +441,14 @@ impl SteamBridgeService {
     pub fn ensure_integration_lib_staged(&self) -> Result<PathBuf, String> {
         let mut candidates: Vec<PathBuf> = Vec::new();
         if let Some(repo) = UpdateService::discover_repo_dir("") {
+            candidates.push(repo.join("target/i686-unknown-linux-gnu/release/libsteam_integration.so"));
+            candidates.push(repo.join("target/i686-unknown-linux-gnu/debug-debug/libsteam_integration.so"));
+            candidates.push(repo.join("target/i686-unknown-linux-gnu/debug/libsteam_integration.so"));
+            candidates.push(repo.join("dist/32/libsteam_integration.so"));
+            candidates.push(repo.join("dist/libsteam_integration32.so"));
+            candidates.push(repo.join("dist/libsteam_integration.so"));
             candidates.push(repo.join("target/debug-debug/libsteam_integration.so"));
             candidates.push(repo.join("target/release/libsteam_integration.so"));
-            candidates.push(repo.join("dist/libsteam_integration.so"));
             candidates.push(repo.join("target/debug/libsteam_integration.so"));
         }
         if let Ok(exe) = std::env::current_exe() {
@@ -480,6 +485,11 @@ impl SteamBridgeService {
             };
             if needs_copy {
                 UpdateService::atomic_replace_executable(&src, &self.lib_target_path)?;
+                if let Some(parent) = self.lib_target_path.parent() {
+                    let _ = fs::create_dir_all(parent.join("32"));
+                    let _ = fs::copy(&src, parent.join("32/libsteam_integration.so"));
+                    let _ = fs::copy(&src, parent.join("libsteam_integration32.so"));
+                }
             }
             return Ok(self.lib_target_path.clone());
         }
@@ -495,6 +505,33 @@ impl SteamBridgeService {
                     .map(|h| h.join(".cargo/bin/cargo"))
                     .filter(|p| p.is_file())
                     .unwrap_or_else(|| PathBuf::from("cargo"));
+
+                let out_i686 = Command::new(&cargo_bin)
+                    .args([
+                        "build",
+                        "--manifest-path",
+                        "bridge_lib/Cargo.toml",
+                        "--target",
+                        "i686-unknown-linux-gnu",
+                        "--release",
+                        "-j",
+                        "2",
+                    ])
+                    .current_dir(&repo)
+                    .output();
+                let built_i686 = repo.join("target/i686-unknown-linux-gnu/release/libsteam_integration.so");
+                if let Ok(ref out) = out_i686 {
+                    if out.status.success() && built_i686.is_file() {
+                        UpdateService::atomic_replace_executable(&built_i686, &self.lib_target_path)?;
+                        if let Some(parent) = self.lib_target_path.parent() {
+                            let _ = fs::create_dir_all(parent.join("32"));
+                            let _ = fs::copy(&built_i686, parent.join("32/libsteam_integration.so"));
+                            let _ = fs::copy(&built_i686, parent.join("libsteam_integration32.so"));
+                        }
+                        return Ok(self.lib_target_path.clone());
+                    }
+                }
+
                 let out = Command::new(&cargo_bin)
                     .args([
                         "build",
@@ -830,6 +867,34 @@ impl SteamBridgeService {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_denuvo_protected(app_id)
+    }
+
+    pub fn scan_executable_protection(
+        &self,
+        exe_path: &Path,
+    ) -> crate::steam_bridge::denuvo_auth::ProtectionScanReport {
+        self.denuvo_auth
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .scan_executable(exe_path)
+    }
+
+    pub fn scan_game_folder_protection(
+        &self,
+        app_id: u32,
+        game_dir: &Path,
+    ) -> crate::steam_bridge::denuvo_auth::ProtectionScanReport {
+        self.denuvo_auth
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .scan_game_folder(app_id, game_dir)
+    }
+
+    pub fn scan_process_protection(
+        &self,
+        pid: u32,
+    ) -> crate::steam_bridge::denuvo_auth::ProtectionScanReport {
+        crate::steam_bridge::denuvo_auth::scan_process_protection(pid)
     }
 
     pub fn dispatch_bst_uri(&self, uri: &str) -> Option<BstUri> {

@@ -302,8 +302,8 @@ impl LuaToolsApp {
         guide_step_card(
             ui,
             "STEP 01",
-            "Set Up Steam Unlocker (SLSsteam) or Rootless Bridge",
-            "- Click the top-right 'Setup Steam' pill (or open Settings › Steam Setup and click 'Install Steam Unlocker (SLSsteam)').\n\
+            "Set Up Steam Unlocker or Rootless Bridge",
+            "- Click the top-right 'Setup Steam' pill (or open Settings › Steam Setup and click 'Install Steam Unlocker').\n\
              - Optional: Open Settings › Advanced Bridge and click 'Install Integration (No Root)' to stage ~/.local/lib/luatools/libsteam_integration.so and ~/.local/bin/luatools-steam-launcher — zero root or sudo required.",
             |ui| {
                 if primary_button(ui, "Steam Setup ›").clicked() {
@@ -378,8 +378,8 @@ impl LuaToolsApp {
 
             let tasks = [
                 (
-                    "1-click SLSsteam setup",
-                    "Settings › Steam Setup › Install Steam Unlocker (SLSsteam)",
+                    "1-click Steam Unlocker setup",
+                    "Settings › Steam Setup › Install Steam Unlocker",
                 ),
                 (
                     "Open per-game Integration window",
@@ -867,7 +867,7 @@ impl LuaToolsApp {
             "STEAM SETUP & CLOUD",
             "1-Click SLSsteam, Cloud Save Redirect & Store Page Plugin",
             "In Settings › Steam Setup, every integration sits on its own open card:\n\
-             - 1-Click Steam Unlocker (SLSsteam): Installs SLSsteam (and optional ACCELA) natively in one click without root.\n\
+             - 1-Click Steam Unlocker: Installs Steam Unlocker natively in one click without root.\n\
              - Cloud Save Redirect: Restores per-game save cloud sync — tick games or enter an AppID and click 'Sync to CloudRedirect'.\n\
              - Steam Store Page Plugin & URI Links: Click 'Install Store Page Plugin', 'Register luatools:// Links', 'Enable Steam CEF Debugging', or 'Check Millennium Status'.",
             |ui| {
@@ -883,7 +883,7 @@ impl LuaToolsApp {
             ui,
             "06_settings_wired_cloud",
             "Settings › Steam Setup — SLSsteam, Cloud Save Redirect & Store Plugin",
-            "Install SLSsteam in one click, toggle PlayNotOwnedGames, configure Cloud Save Redirect, and install the Steam Store Page Plugin.",
+            "Install Steam Unlocker in one click, toggle PlayNotOwnedGames, configure Cloud Save Redirect, and install the Steam Store Page Plugin.",
         );
 
         if let Some(sub) = go_settings {

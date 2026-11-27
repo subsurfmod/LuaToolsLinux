@@ -5,7 +5,6 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::steam_bridge::credentials::appticket::AppTicketSource;
 use crate::steam_bridge::credentials::eticketclient::EticketClient;
@@ -16,7 +15,6 @@ use crate::steam_bridge::ticket_store::TicketStore;
 
 static FRESH_ETICKET: OnceLock<Mutex<HashMap<u32, Vec<u8>>>> = OnceLock::new();
 
-const DEFAULT_FORGED_STEAM_ID: u64 = 76_561_197_960_287_930;
 
 /// Decoded ownership ticket with field offsets.
 #[derive(Debug, Clone)]
@@ -68,9 +66,16 @@ pub fn fresh_eticket() -> &'static Mutex<HashMap<u32, Vec<u8>>> {
     FRESH_ETICKET.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Post-handler: `IClientUser::GetSteamID`.
-pub fn handler_post_get_steam_id(_pipe: *mut c_void, _read: &mut [u8], write: &mut [u8]) -> bool {
-    let app_id = resolve_app_id();
+/// Post-handler: `IClientUser::GetSteamID` with per-pipe AppID resolution (BST-52).
+pub fn handler_post_get_steam_id(pipe: *mut c_void, _read: &mut [u8], write: &mut [u8]) -> bool {
+    let app_id = {
+        let from_pipe = crate::steam_bridge::interop::interop_ipc::get_pipe_app_id(pipe);
+        if from_pipe != 0 {
+            from_pipe
+        } else {
+            resolve_app_id()
+        }
+    };
     if app_id == 0 {
         return false;
     }
@@ -99,9 +104,9 @@ pub fn handler_post_get_steam_id(_pipe: *mut c_void, _read: &mut [u8], write: &m
     true
 }
 
-/// Post-handler: `IClientUser::GetAppOwnershipTicketExtendedData`.
+/// Post-handler: `IClientUser::GetAppOwnershipTicketExtendedData` with per-pipe isolation (BST-52/BST-55).
 pub fn handler_post_get_app_ownership_ticket(
-    _pipe: *mut c_void,
+    pipe: *mut c_void,
     read: &mut [u8],
     write: &mut [u8],
 ) -> bool {
@@ -110,16 +115,24 @@ pub fn handler_post_get_app_ownership_ticket(
         return false;
     }
 
-    let app_id = if req.app_id() == ONLINE_FIX_APP_ID {
-        resolve_app_id()
-    } else {
-        req.app_id()
+    let app_id = {
+        let from_pipe = crate::steam_bridge::interop::interop_ipc::get_pipe_app_id(pipe);
+        if from_pipe != 0 {
+            from_pipe
+        } else if req.app_id() != 0 && req.app_id() != ONLINE_FIX_APP_ID {
+            req.app_id()
+        } else {
+            resolve_app_id()
+        }
     };
     if app_id == 0 {
         return false;
     }
 
-    let ticket_source = if is_online_fix_active() {
+    let pipe_handle = crate::steam_bridge::interop::interop_ipc::get_pipe_handle(pipe);
+    let pipe_pid = crate::steam_bridge::interop::interop_ipc::get_pipe_pid(pipe);
+    let is_denuvo_auth = crate::steam_bridge::denuvo_auth::is_pipe_authorized(pipe_handle, app_id, pipe_pid);
+    let ticket_source = if is_online_fix_active() || is_denuvo_auth {
         AppTicketSource::CredentialStoreOnly
     } else {
         AppTicketSource::CredentialStoreThenForge
@@ -173,9 +186,9 @@ fn write_ownership_ticket_response(
     true
 }
 
-/// Post-handler: `IClientUser::RequestEncryptedAppTicket`.
+/// Post-handler: `IClientUser::RequestEncryptedAppTicket` with per-pipe isolation (BST-52).
 pub fn handler_post_request_encrypted_app_ticket(
-    _pipe: *mut c_void,
+    pipe: *mut c_void,
     read: &mut [u8],
     write: &mut [u8],
 ) -> bool {
@@ -184,7 +197,14 @@ pub fn handler_post_request_encrypted_app_ticket(
         return false;
     }
 
-    let app_id = resolve_app_id();
+    let app_id = {
+        let from_pipe = crate::steam_bridge::interop::interop_ipc::get_pipe_app_id(pipe);
+        if from_pipe != 0 {
+            from_pipe
+        } else {
+            resolve_app_id()
+        }
+    };
     if app_id == 0 {
         return false;
     }
@@ -227,13 +247,20 @@ pub fn handler_post_request_encrypted_app_ticket(
     true
 }
 
-/// Post-handler: `IClientUser::GetEncryptedAppTicket`.
+/// Post-handler: `IClientUser::GetEncryptedAppTicket` with per-pipe isolation (BST-52).
 pub fn handler_post_get_encrypted_app_ticket(
-    _pipe: *mut c_void,
+    pipe: *mut c_void,
     _read: &mut [u8],
     write: &mut [u8],
 ) -> bool {
-    let app_id = resolve_app_id();
+    let app_id = {
+        let from_pipe = crate::steam_bridge::interop::interop_ipc::get_pipe_app_id(pipe);
+        if from_pipe != 0 {
+            from_pipe
+        } else {
+            resolve_app_id()
+        }
+    };
     if app_id == 0 {
         return false;
     }
@@ -291,25 +318,54 @@ pub fn handler_post_get_encrypted_app_ticket(
     true
 }
 
-fn forge_ownership_ticket(app_id: u32, steam_id: u64) -> AppOwnershipTicket {
-    let mut data = vec![0u8; 64];
-    data[0..4].copy_from_slice(&4u32.to_le_bytes()); // ticket version 4
-    data[4..12].copy_from_slice(&steam_id.to_le_bytes());
-    data[12..16].copy_from_slice(&app_id.to_le_bytes());
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as u32;
-    data[16..20].copy_from_slice(&now.to_le_bytes());
-    data[20..24].copy_from_slice(&(now.saturating_add(86_400 * 30)).to_le_bytes());
-    let total_size = data.len();
+/// Forges an App Ownership Ticket using the off-by-four RSA-1024 splice exploit (BST-49).
+///
+/// Follows UsefulSteamTools AppTicket.cpp layout:
+/// - Physical buffer has `S + 4` bytes (156 bytes)
+/// - `total_size` is `S` (152 bytes)
+/// - `app_id_offset` is `total_size - 128` (24), pointing directly at the 4 spliced AppID bytes
+/// - `signature_offset` is `app_id_offset + 4` (28), pointing at the shifted 128-byte RSA signature block
+/// - `steam_id_offset` is 8
+/// - `signature_size` is 128
+pub fn forge_ownership_ticket(app_id: u32, steam_id: u64) -> AppOwnershipTicket {
+    let forged = crate::steam_bridge::credentials::appticket::forge_local_app_ownership_ticket_with_steam_id(
+        app_id,
+        Some(steam_id),
+        None,
+    ).unwrap_or_else(|| {
+        let sid = steam_id;
+        let signed_size = 24usize;
+        let total_physical = signed_size + 4 + crate::steam_bridge::credentials::appticket::K_APP_TICKET_SIGNATURE_SIZE; // 156 bytes
+        let mut data = vec![0u8; total_physical];
+        data[0..4].copy_from_slice(&(signed_size as u32).to_le_bytes()); // signed payload size
+        data[4..8].copy_from_slice(&4u32.to_le_bytes()); // version 4
+        data[8..16].copy_from_slice(&sid.to_le_bytes());
+        data[16..20].copy_from_slice(&crate::steam_bridge::credentials::appticket::K_LOCAL_APP_TICKET_SOURCE_APP_ID.to_le_bytes()); // donor AppId 7
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32;
+        data[20..24].copy_from_slice(&now.to_le_bytes());
+        data[24..28].copy_from_slice(&app_id.to_le_bytes()); // spliced target AppId
+        for i in 0..crate::steam_bridge::credentials::appticket::K_APP_TICKET_SIGNATURE_SIZE {
+            data[28 + i] = ((i * 37 + 13) & 0xFF) as u8;
+        }
+        data
+    });
+
+    let total_size = forged.len().saturating_sub(4);
+    let app_id_offset = total_size.saturating_sub(crate::steam_bridge::credentials::appticket::K_APP_TICKET_SIGNATURE_SIZE) as i32;
+    let signature_offset = app_id_offset + 4;
+    let steam_id_offset = crate::steam_bridge::credentials::appticket::K_APP_TICKET_STEAM_ID_OFFSET as i32;
+    let signature_size = crate::steam_bridge::credentials::appticket::K_APP_TICKET_SIGNATURE_SIZE as i32;
+
     AppOwnershipTicket {
-        data,
+        data: forged,
         total_size,
-        app_id_offset: 12,
-        steam_id_offset: 4,
-        signature_offset: 24,
-        signature_size: 40,
+        app_id_offset,
+        steam_id_offset,
+        signature_offset,
+        signature_size,
     }
 }
 
@@ -321,44 +377,17 @@ fn get_app_ownership_ticket_with_source(
         return None;
     }
 
-    let (stored_ticket, spoof_steam_id) = {
-        let mut store = TicketStore::global()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let ticket = store
-            .get(app_id)
-            .ok()
-            .and_then(|d| d.app_ticket)
-            .and_then(|s| hex::decode(&s).ok())
-            .filter(|b| !b.is_empty());
-        let sid = store.get_spoof_steam_id(app_id);
-        (ticket, sid)
-    };
-
-    if let Some(raw) = stored_ticket {
-        let total_size = raw.len();
-        let (steam_id_offset, app_id_offset) = if raw.len() >= 16 { (4, 12) } else { (0, 0) };
-        return Some(AppOwnershipTicket {
-            data: raw,
-            total_size,
-            app_id_offset,
-            steam_id_offset,
-            signature_offset: 0,
-            signature_size: 0,
-        });
-    }
-
-    match source {
-        AppTicketSource::CredentialStoreOnly => None,
-        AppTicketSource::CredentialStoreThenForge => {
-            let sid = if spoof_steam_id != 0 {
-                spoof_steam_id
-            } else {
-                DEFAULT_FORGED_STEAM_ID
-            };
-            Some(forge_ownership_ticket(app_id, sid))
-        }
-    }
+    let details = crate::steam_bridge::credentials::appticket::get_app_ownership_ticket_details(
+        app_id, source,
+    )?;
+    Some(AppOwnershipTicket {
+        data: details.data,
+        total_size: details.total_size,
+        app_id_offset: details.app_id_offset as i32,
+        steam_id_offset: details.steam_id_offset as i32,
+        signature_offset: details.signature_offset as i32,
+        signature_size: details.signature_size as i32,
+    })
 }
 
 fn get_encrypted_ticket_from_store(app_id: u32) -> Vec<u8> {
@@ -612,22 +641,22 @@ mod tests {
 
     #[test]
     fn test_ownership_ticket_response_checks_write_buffer_capacity() {
-        let forged = forge_ownership_ticket(1245620, DEFAULT_FORGED_STEAM_ID);
-        assert_eq!(forged.total_size, 64);
-        assert_eq!(forged.app_id_offset, 12);
-        assert_eq!(forged.steam_id_offset, 4);
+        let forged = forge_ownership_ticket(1245620, 76_561_197_960_287_930u64);
+        assert_eq!(forged.total_size, 152);
+        assert_eq!(forged.app_id_offset, 24);
+        assert_eq!(forged.steam_id_offset, 8);
 
-        // Buffer has room for header (20) but NOT for 20 + 64 ticket bytes -> must fail without corrupting header
+        // Buffer has room for header (20) but NOT for 20 + 152 ticket bytes -> must fail without corrupting header
         let mut small = vec![0u8; 32];
         assert!(!write_ownership_ticket_response(&forged, 1024, &mut small));
         assert_eq!(small, vec![0u8; 32]);
 
-        let mut full = vec![0u8; 128];
+        let mut full = vec![0u8; 256];
         assert!(write_ownership_ticket_response(&forged, 1024, &mut full));
-        assert_eq!(&full[0..4], &64u32.to_le_bytes());
-        assert_eq!(&full[4..8], &12i32.to_le_bytes());
-        assert_eq!(&full[8..12], &4i32.to_le_bytes());
-        assert_eq!(&full[20..84], forged.data.as_slice());
+        assert_eq!(&full[0..4], &152u32.to_le_bytes());
+        assert_eq!(&full[4..8], &24i32.to_le_bytes());
+        assert_eq!(&full[8..12], &8i32.to_le_bytes());
+        assert_eq!(&full[20..20 + forged.data.len()], forged.data.as_slice());
     }
 
     #[test]
@@ -682,5 +711,80 @@ mod tests {
             .contains_key(&app_id));
 
         set_online_fix_real_app_id(0);
+    }
+
+    #[test]
+    fn test_bst52_per_pipe_appid_and_denuvo_auth_isolation() {
+        let _g = USER_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::steam_bridge::interop::interop_ipc::{
+            clear_pipe_app_ids, get_pipe_app_id, get_pipe_handle, get_pipe_pid,
+            register_pipe_app_id, register_pipe_handle, register_pipe_pid,
+        };
+        use crate::steam_bridge::interop::interop_ipc_isteamutils::handle_post_get_app_id;
+
+        clear_pipe_app_ids();
+
+        let pipe_a = 0xAA00_1100 as *mut c_void;
+        let pipe_b = 0xBB00_2200 as *mut c_void;
+        let app_a = 1245620u32;
+        let app_b = 730u32;
+
+        register_pipe_app_id(pipe_a, app_a);
+        register_pipe_handle(pipe_a, 101);
+        register_pipe_pid(pipe_a, 4001);
+
+        register_pipe_app_id(pipe_b, app_b);
+        register_pipe_handle(pipe_b, 102);
+        register_pipe_pid(pipe_b, 4002);
+
+        // 1. Verify get_pipe_* resolution
+        assert_eq!(get_pipe_app_id(pipe_a), app_a);
+        assert_eq!(get_pipe_handle(pipe_a), 101);
+        assert_eq!(get_pipe_pid(pipe_a), 4001);
+
+        assert_eq!(get_pipe_app_id(pipe_b), app_b);
+        assert_eq!(get_pipe_handle(pipe_b), 102);
+        assert_eq!(get_pipe_pid(pipe_b), 4002);
+
+        // 2. Verify handle_post_get_app_id distinguishes between pipe_a and pipe_b
+        let mut write_a = vec![0u8; 4];
+        assert!(handle_post_get_app_id(pipe_a, &mut [], &mut write_a));
+        assert_eq!(u32::from_le_bytes([write_a[0], write_a[1], write_a[2], write_a[3]]), app_a);
+
+        let mut write_b = vec![0u8; 4];
+        assert!(handle_post_get_app_id(pipe_b, &mut [], &mut write_b));
+        assert_eq!(u32::from_le_bytes([write_b[0], write_b[1], write_b[2], write_b[3]]), app_b);
+
+        // 3. Verify handler_post_get_encrypted_app_ticket retrieves distinct per-pipe cached tickets
+        fresh_eticket()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(app_a, vec![0x11, 0x22]);
+        fresh_eticket()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(app_b, vec![0x33, 0x44, 0x55]);
+
+        let mut out_a = vec![0u8; 16];
+        assert!(handler_post_get_encrypted_app_ticket(pipe_a, &mut [], &mut out_a));
+        assert_eq!(out_a[0], 1);
+        assert_eq!(&out_a[1..5], &2u32.to_le_bytes());
+        assert_eq!(&out_a[5..7], &[0x11, 0x22]);
+
+        let mut out_b = vec![0u8; 16];
+        assert!(handler_post_get_encrypted_app_ticket(pipe_b, &mut [], &mut out_b));
+        assert_eq!(out_b[0], 1);
+        assert_eq!(&out_b[1..5], &3u32.to_le_bytes());
+        assert_eq!(&out_b[5..8], &[0x33, 0x44, 0x55]);
+
+        // 4. Verify handler_post_get_app_ownership_ticket uses pipe app_id when req.app_id() == 0 or ONLINE_FIX_APP_ID
+        let req_bytes = [0u32.to_le_bytes(), 1024i32.to_le_bytes()].concat();
+        let mut ticket_out = vec![0u8; 256];
+        // With pipe_a (app_a = 1245620), forge returns valid ticket
+        assert!(handler_post_get_app_ownership_ticket(pipe_a, &mut req_bytes.clone(), &mut ticket_out));
+        let ret_len = u32::from_le_bytes([ticket_out[0], ticket_out[1], ticket_out[2], ticket_out[3]]);
+        assert!(ret_len > 0);
+
+        clear_pipe_app_ids();
     }
 }

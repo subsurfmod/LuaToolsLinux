@@ -24,6 +24,35 @@ use crate::models::config::default_luatools_data_dir;
 const ENCRYPTION_VERSION: u8 = 1;
 const ENCRYPTED_FILE_EXT: &str = "enc";
 
+/// Prefix used to mark encrypted string fields persisted inside JSON configs such as `settings.json` (LT-40).
+pub const SECRET_PREFIX: &str = "enc:v1:";
+
+fn write_private_tmp_and_rename(dest: &Path, bytes: &[u8]) -> Result<(), EncryptionError> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = dest.with_extension("tmp");
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(&tmp, bytes)?;
+    }
+    fs::rename(&tmp, dest)?;
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum EncryptionError {
     #[error("Encryption failed: {0}")]
@@ -83,35 +112,10 @@ impl EncryptionService {
             .clone()
     }
 
-    /// Gets or creates the master encryption key from the OS keyring.
-    fn get_or_create_master_key() -> Result<String, EncryptionError> {
-        let entry = Entry::new("luatools_linux", "master_key")
-            .map_err(|e| EncryptionError::Decrypt(format!("Keyring entry error: {e}")))?;
-
-        match entry.get_password() {
-            Ok(key) => Ok(key),
-            Err(keyring::Error::NoEntry) => {
-                // Generate new key and store in keyring
-                let new_key = Self::generate_secure_token(32);
-                entry.set_password(&new_key)
-                    .map_err(|e| EncryptionError::Decrypt(format!("Failed to store key: {e}")))?;
-                Ok(new_key)
-            }
-            Err(e) => Err(EncryptionError::Decrypt(format!("Keyring error: {e}"))),
-        }
-    }
-
-    /// Generates a cryptographically secure random token.
-    fn generate_secure_token(len: usize) -> String {
-        use rand::RngCore;
-        let mut bytes = vec![0u8; len];
-        rand::thread_rng().fill_bytes(&mut bytes);
-        hex::encode(bytes)
-    }
-
     /// Initializes the global encryption service.
-    /// Stores/loads the X25519 identity in the OS keyring when available, falling back
-    /// cleanly to a `0600` local key file on headless/non-D-Bus Linux environments.
+    /// Stores/loads the X25519 identity in the OS keyring when available, removing any
+    /// migrated plaintext `encryption_key.age`, and falls back cleanly to a `0600` local
+    /// key file on headless/non-D-Bus Linux environments.
     pub fn init_global() -> Result<(), EncryptionError> {
         let global = Self::global();
         let mut guard = global.lock().unwrap_or_else(|e| e.into_inner());
@@ -126,6 +130,10 @@ impl EncryptionService {
         let keyring_service = Entry::new("luatools_linux", "age_identity").ok().and_then(|entry| {
             match entry.get_password() {
                 Ok(secret) => secret.parse::<x25519::Identity>().ok().map(|identity| {
+                    // Clean up leftover plaintext file if keyring already holds the identity
+                    if key_file.exists() {
+                        let _ = fs::remove_file(&key_file);
+                    }
                     let recipient = identity.to_public();
                     Self {
                         identity,
@@ -135,7 +143,8 @@ impl EncryptionService {
                 }),
                 Err(keyring::Error::NoEntry) => {
                     // Migrate existing file key into keyring if present, else generate fresh identity
-                    let svc = if key_file.exists() {
+                    let migrated_from_file = key_file.exists();
+                    let svc = if migrated_from_file {
                         Self::load_from_key_file(&key_file).ok()
                     } else {
                         let identity = x25519::Identity::generate();
@@ -149,6 +158,9 @@ impl EncryptionService {
                     use age::secrecy::ExposeSecret;
                     let secret_str = svc.identity.to_string();
                     if entry.set_password(secret_str.expose_secret()).is_ok() {
+                        if migrated_from_file {
+                            let _ = fs::remove_file(&key_file);
+                        }
                         Some(svc)
                     } else {
                         None
@@ -176,7 +188,7 @@ impl EncryptionService {
         Ok(())
     }
 
-    /// Generates a new age identity and saves it to the key file.
+    /// Generates a new age identity and saves it to the key file with `0o600` set at creation time.
     fn generate_new(key_file: &Path) -> Result<Self, EncryptionError> {
         let identity = x25519::Identity::generate();
         let recipient = identity.to_public();
@@ -185,14 +197,24 @@ impl EncryptionService {
             fs::create_dir_all(parent)?;
         }
 
-        // Write identity with restrictive permissions
         let tmp = key_file.with_extension("tmp");
         let identity_str = identity.to_string();
-        fs::write(&tmp, identity_str.expose_secret().as_bytes())?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            file.write_all(identity_str.expose_secret().as_bytes())?;
+            file.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        {
+            fs::write(&tmp, identity_str.expose_secret().as_bytes())?;
         }
         fs::rename(&tmp, key_file)?;
 
@@ -295,7 +317,29 @@ impl EncryptionService {
             .map_err(|e| EncryptionError::Serde(e))
     }
 
-    /// Encrypts a file in place, replacing it with the encrypted version.
+    /// Encrypts a sensitive string (e.g. `hubcap_api_key`) into an `enc:v1:<base64>` token (LT-40).
+    pub fn encrypt_string(&self, plaintext: &str) -> Result<String, EncryptionError> {
+        if plaintext.is_empty() {
+            return Ok(String::new());
+        }
+        let payload = self.encrypt(&plaintext)?;
+        let json = serde_json::to_vec(&payload)?;
+        Ok(format!("{}{}", SECRET_PREFIX, STANDARD.encode(&json)))
+    }
+
+    /// Decrypts an `enc:v1:<base64>` token back into plaintext. Passes non-prefixed strings through unchanged.
+    pub fn decrypt_string(&self, encoded: &str) -> Result<String, EncryptionError> {
+        let Some(b64) = encoded.strip_prefix(SECRET_PREFIX) else {
+            return Ok(encoded.to_string());
+        };
+        let raw = STANDARD
+            .decode(b64)
+            .map_err(|e| EncryptionError::Decrypt(format!("Invalid secret base64: {e}")))?;
+        let payload: EncryptedPayload = serde_json::from_slice(&raw)?;
+        self.decrypt::<String>(&payload)
+    }
+
+    /// Encrypts a file in place, replacing it with the encrypted version (`0o600` at creation time).
     pub fn encrypt_file(&self, path: &Path) -> Result<PathBuf, EncryptionError> {
         let data = fs::read_to_string(path)?;
         let value: serde_json::Value = serde_json::from_str(&data)?;
@@ -303,15 +347,7 @@ impl EncryptionService {
 
         let encrypted_path = path.with_extension(ENCRYPTED_FILE_EXT);
         let json = serde_json::to_string_pretty(&payload)?;
-
-        let tmp = encrypted_path.with_extension("tmp");
-        fs::write(&tmp, json)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-        }
-        fs::rename(&tmp, &encrypted_path)?;
+        write_private_tmp_and_rename(&encrypted_path, json.as_bytes())?;
 
         // Remove original plaintext file
         fs::remove_file(path)?;
@@ -319,26 +355,14 @@ impl EncryptionService {
         Ok(encrypted_path)
     }
 
-    /// Decrypts an encrypted file and writes the plaintext to the destination.
+    /// Decrypts an encrypted file and writes the plaintext to the destination (`0o600` at creation time).
     pub fn decrypt_file(&self, encrypted_path: &Path, dest_path: &Path) -> Result<(), EncryptionError> {
         let data = fs::read_to_string(encrypted_path)?;
         let payload: EncryptedPayload = serde_json::from_str(&data)?;
 
         let value: serde_json::Value = self.decrypt(&payload)?;
         let json = serde_json::to_string_pretty(&value)?;
-
-        if let Some(parent) = dest_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let tmp = dest_path.with_extension("tmp");
-        fs::write(&tmp, json)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-        }
-        fs::rename(&tmp, dest_path)?;
+        write_private_tmp_and_rename(dest_path, json.as_bytes())?;
 
         Ok(())
     }
@@ -392,10 +416,30 @@ pub fn decrypt_auth_if_encrypted() -> Result<bool, EncryptionError> {
 /// Gets the encryption service, initializing if needed.
 pub fn get_encryption_service() -> Result<EncryptionService, EncryptionError> {
     let global = EncryptionService::global();
-    let guard = global.lock().unwrap();
+    let guard = global.lock().unwrap_or_else(|e| e.into_inner());
     guard.as_ref().cloned().ok_or_else(|| {
         EncryptionError::Decrypt("Encryption service not initialized".into())
     })
+}
+
+/// Encrypts a string using the global `EncryptionService` (auto-initializing on demand) (LT-40).
+pub fn encrypt_secret_string(plaintext: &str) -> Result<String, EncryptionError> {
+    if plaintext.is_empty() || plaintext.starts_with(SECRET_PREFIX) {
+        return Ok(plaintext.to_string());
+    }
+    let _ = EncryptionService::init_global();
+    let svc = get_encryption_service()?;
+    svc.encrypt_string(plaintext)
+}
+
+/// Decrypts an `enc:v1:...` string using the global `EncryptionService` (auto-initializing on demand) (LT-40).
+pub fn decrypt_secret_string(encoded: &str) -> Result<String, EncryptionError> {
+    if !encoded.starts_with(SECRET_PREFIX) {
+        return Ok(encoded.to_string());
+    }
+    let _ = EncryptionService::init_global();
+    let svc = get_encryption_service()?;
+    svc.decrypt_string(encoded)
 }
 
 // Need to implement Clone for EncryptionService
@@ -474,5 +518,13 @@ mod tests {
 
         let service2 = EncryptionService::load_from_key_file(&key_file).unwrap();
         assert_eq!(service2.recipient(), recipient);
+
+        let token = service1.encrypt_string("smm_secret_api_key_12345").unwrap();
+        assert!(token.starts_with(SECRET_PREFIX));
+        assert!(!token.contains("smm_secret_api_key_12345"));
+        assert_eq!(
+            service2.decrypt_string(&token).unwrap(),
+            "smm_secret_api_key_12345"
+        );
     }
 }

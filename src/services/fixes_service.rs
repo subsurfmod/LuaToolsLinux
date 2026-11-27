@@ -10,10 +10,10 @@ use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
 use crate::services::api_client::{DRMFixFixItem, LuaToolsApiClient};
-use crate::services::applied_fix_index::{AppliedFixIndexService as FixIndexService, AppliedFixRecord as IndexAppliedFixRecord, AppliedFixFileEntry};
+use crate::services::applied_fix_index::{
+    AppliedFixFileEntry, AppliedFixIndexService, AppliedFixRecord as IndexAppliedFixRecord,
+};
 use crate::services::lua_installer::LuaInstaller;
-use crate::services::settings_service::SettingsService;
-use crate::services::slssteam_service::SlssteamService;
 use crate::steam_bridge::ost_platform::encoding::wide_to_utf8_lossy;
 
 fn read_wine_registry_text(path: &Path) -> io::Result<String> {
@@ -115,68 +115,6 @@ impl FixesService {
         let legacy_file = format!("{}.json", fix_id);
         let dir = install_dir.join(FIX_DIR_NAME);
         dir.join(&safe_file).exists() || dir.join(&legacy_file).exists()
-    }
-
-    pub fn apply_drm_fix_manifest<F>(
-        api: &LuaToolsApiClient,
-        installer: &LuaInstaller,
-        app_id: u32,
-        fix: &DRMFixFixItem,
-        settings_svc: Option<&mut SettingsService>,
-        sls_svc: Option<&mut SlssteamService>,
-        progress_cb: F,
-    ) -> FixApplicationResult
-    where
-        F: FnMut(f32, String),
-    {
-        if !is_safe_fix_id(&fix.id) {
-            return FixApplicationResult::err("Invalid fix ID.");
-        }
-        let tmp = std::env::temp_dir().join(format!(
-            "luatools_fix_mf_{}_{}_{}",
-            std::process::id(),
-            app_id,
-            fix.id
-        ));
-        let _ = fs::create_dir_all(&tmp);
-        let fallback = fix
-            .manifest_filename
-            .clone()
-            .unwrap_or_else(|| format!("{}.zip", app_id));
-
-        let res = match api.download_drm_fix_slot(&fix.id, "manifest", &tmp, &fallback, progress_cb)
-        {
-            Ok(dl_path) => {
-                let inst_res = installer.install_any(
-                    &dl_path,
-                    Some(app_id),
-                    true,
-                    Some(&format!("fix:{}", fix.id)),
-                    settings_svc,
-                    sls_svc,
-                );
-                if inst_res.ok {
-                    FixApplicationResult {
-                        ok: true,
-                        error: None,
-                        applied_files: vec![dl_path
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string()],
-                    }
-                } else {
-                    FixApplicationResult::err(
-                        inst_res
-                            .error
-                            .unwrap_or_else(|| "Failed to install manifest.".into()),
-                    )
-                }
-            }
-            Err(e) => FixApplicationResult::err(e),
-        };
-        let _ = fs::remove_dir_all(&tmp);
-        res
     }
 
     pub fn apply_drm_fix_fix<F>(
@@ -322,6 +260,26 @@ impl FixesService {
         extract_dir: &Path,
         game_dir: &Path,
     ) -> FixApplicationResult {
+        Self::apply_extracted_with_backup_inner(app_id, fix_id, extract_dir, game_dir, None)
+    }
+
+    pub fn apply_extracted_with_backup_with_index(
+        app_id: u32,
+        fix_id: &str,
+        extract_dir: &Path,
+        game_dir: &Path,
+        index: &mut AppliedFixIndexService,
+    ) -> FixApplicationResult {
+        Self::apply_extracted_with_backup_inner(app_id, fix_id, extract_dir, game_dir, Some(index))
+    }
+
+    fn apply_extracted_with_backup_inner(
+        app_id: u32,
+        fix_id: &str,
+        extract_dir: &Path,
+        game_dir: &Path,
+        index_override: Option<&mut AppliedFixIndexService>,
+    ) -> FixApplicationResult {
         if !is_safe_fix_id(fix_id) {
             return FixApplicationResult::err("Invalid fix ID.");
         }
@@ -339,15 +297,16 @@ impl FixesService {
             return FixApplicationResult::err("Fix archive contained no files to apply.");
         }
 
+        let safe_id = sanitize_fix_id(fix_id);
         let fix_meta_dir = game_dir.join(FIX_DIR_NAME);
-        let backup_dir = fix_meta_dir.join("backups").join(fix_id);
+        let backup_dir = fix_meta_dir.join("backups").join(&safe_id);
         if let Err(e) = fs::create_dir_all(&backup_dir) {
             return FixApplicationResult::err(e.to_string());
         }
 
-        let mut records = Vec::new();
-        let mut applied = Vec::new();
-
+        // Phase 1: Validate all paths, pre-hash staged sources, and back up existing game files
+        // BEFORE mutating any file in `game_dir`.
+        let mut planned: Vec<(PathBuf, PathBuf, FixFileEntry)> = Vec::new();
         for src in files_to_apply {
             let Ok(rel) = src.strip_prefix(extract_dir) else {
                 continue;
@@ -357,17 +316,16 @@ impl FixesService {
             }
             let rel_posix = rel.to_string_lossy().replace('\\', "/");
             let dst = game_dir.join(rel);
-            if let Some(parent) = dst.parent() {
-                if let Err(e) = fs::create_dir_all(parent) {
-                    Self::rollback_partial_apply(game_dir, &fix_meta_dir, &records);
-                    let _ = fs::remove_dir_all(&backup_dir);
-                    return FixApplicationResult::err(format!("Failed to create folder: {}", e));
-                }
-            }
+            let Ok(hash_after) = sha256_file(&src) else {
+                let _ = fs::remove_dir_all(&backup_dir);
+                return FixApplicationResult::err(format!(
+                    "Failed to hash staged fix file {}",
+                    rel_posix
+                ));
+            };
 
             if dst.exists() {
                 let Ok(hash_before) = sha256_file(&dst) else {
-                    Self::rollback_partial_apply(game_dir, &fix_meta_dir, &records);
                     let _ = fs::remove_dir_all(&backup_dir);
                     return FixApplicationResult::err(format!(
                         "Failed to hash existing file {}",
@@ -377,58 +335,46 @@ impl FixesService {
                 let bkp_file = backup_dir.join(rel);
                 if let Some(bp) = bkp_file.parent() {
                     if let Err(e) = fs::create_dir_all(bp) {
-                        Self::rollback_partial_apply(game_dir, &fix_meta_dir, &records);
                         let _ = fs::remove_dir_all(&backup_dir);
                         return FixApplicationResult::err(format!("Backup dir failed: {}", e));
                     }
                 }
                 if let Err(e) = fs::copy(&dst, &bkp_file) {
-                    Self::rollback_partial_apply(game_dir, &fix_meta_dir, &records);
                     let _ = fs::remove_dir_all(&backup_dir);
                     return FixApplicationResult::err(format!("Backup failed: {}", e));
                 }
-                if let Err(e) = fs::copy(&src, &dst) {
-                    let _ = fs::copy(&bkp_file, &dst);
-                    Self::rollback_partial_apply(game_dir, &fix_meta_dir, &records);
-                    let _ = fs::remove_dir_all(&backup_dir);
-                    return FixApplicationResult::err(format!("Apply failed: {}", e));
-                }
-                let Ok(hash_after) = sha256_file(&dst) else {
-                    let _ = fs::copy(&bkp_file, &dst);
-                    Self::rollback_partial_apply(game_dir, &fix_meta_dir, &records);
-                    let _ = fs::remove_dir_all(&backup_dir);
-                    return FixApplicationResult::err("Post-apply hash failed.");
-                };
-                records.push(FixFileEntry {
-                    relative_path: rel_posix.clone(),
-                    action: "modified".into(),
-                    backup_path: Some(format!("backups/{}/{}", fix_id, rel_posix)),
-                    hash_before: Some(hash_before),
-                    hash_after,
-                });
+                planned.push((
+                    src,
+                    dst,
+                    FixFileEntry {
+                        relative_path: rel_posix.clone(),
+                        action: "modified".into(),
+                        backup_path: Some(format!("backups/{}/{}", safe_id, rel_posix)),
+                        hash_before: Some(hash_before),
+                        hash_after,
+                    },
+                ));
             } else {
-                if let Err(e) = fs::copy(&src, &dst) {
-                    Self::rollback_partial_apply(game_dir, &fix_meta_dir, &records);
-                    let _ = fs::remove_dir_all(&backup_dir);
-                    return FixApplicationResult::err(format!("Apply failed: {}", e));
-                }
-                let Ok(hash_after) = sha256_file(&dst) else {
-                    let _ = fs::remove_file(&dst);
-                    Self::rollback_partial_apply(game_dir, &fix_meta_dir, &records);
-                    let _ = fs::remove_dir_all(&backup_dir);
-                    return FixApplicationResult::err("Post-apply hash failed.");
-                };
-                records.push(FixFileEntry {
-                    relative_path: rel_posix.clone(),
-                    action: "added".into(),
-                    backup_path: None,
-                    hash_before: None,
-                    hash_after,
-                });
+                planned.push((
+                    src,
+                    dst,
+                    FixFileEntry {
+                        relative_path: rel_posix,
+                        action: "added".into(),
+                        backup_path: None,
+                        hash_before: None,
+                        hash_after,
+                    },
+                ));
             }
-            applied.push(rel_posix);
         }
 
+        if planned.is_empty() {
+            let _ = fs::remove_dir_all(&backup_dir);
+            return FixApplicationResult::err("Fix archive contained no valid files to apply.");
+        }
+
+        let records: Vec<FixFileEntry> = planned.iter().map(|(_, _, e)| e.clone()).collect();
         let mut dll_overrides = Vec::new();
         for r in &records {
             let p = Path::new(&r.relative_path);
@@ -447,74 +393,206 @@ impl FixesService {
         }
 
         let wine_overrides_str = if !dll_overrides.is_empty() {
-            let val = dll_overrides
-                .iter()
-                .map(|d| format!("{}=n,b", d))
-                .collect::<Vec<_>>()
-                .join(";");
-            let env_content = format!("WINEDLLOVERRIDES=\"{}\"\n", val);
-            let _ = fs::write(fix_meta_dir.join("winedlloverrides.env"), &env_content);
-            Self::configure_wine_registry_overrides(game_dir, app_id, &dll_overrides);
-            Some(val)
+            Some(
+                dll_overrides
+                    .iter()
+                    .map(|d| format!("{}=n,b", d))
+                    .collect::<Vec<_>>()
+                    .join(";"),
+            )
         } else {
             None
         };
 
+        // Phase 2 (LT-74): Persist the fix ledger JSON atomically BEFORE overwriting any game
+        // files so an interrupted/crashed install can still be cleanly reverted via `unfix_game`.
+        let applied_at = Utc::now().to_rfc3339();
         let record = AppliedFixRecord {
             app_id,
             fix_id: fix_id.to_string(),
-            applied_at: Utc::now().to_rfc3339(),
+            applied_at: applied_at.clone(),
             game_dir: Some(game_dir.to_path_buf()),
             files: records.clone(),
-            wine_dll_overrides: wine_overrides_str,
+            wine_dll_overrides: wine_overrides_str.clone(),
         };
-        let record_file = fix_meta_dir.join(format!("{}.json", sanitize_fix_id(fix_id)));
+        let record_file = fix_meta_dir.join(format!("{}.json", safe_id));
+        let record_tmp = fix_meta_dir.join(format!("{}.json.tmp", safe_id));
         let js = match serde_json::to_string_pretty(&record) {
             Ok(s) => s,
             Err(e) => {
-                Self::rollback_partial_apply(game_dir, &fix_meta_dir, &records);
                 let _ = fs::remove_dir_all(&backup_dir);
                 return FixApplicationResult::err(e.to_string());
             }
         };
-        if let Err(e) = fs::write(&record_file, js) {
-            Self::rollback_partial_apply(game_dir, &fix_meta_dir, &records);
+        if let Err(e) = fs::write(&record_tmp, &js).and_then(|_| fs::rename(&record_tmp, &record_file)) {
+            let _ = fs::remove_file(&record_tmp);
             let _ = fs::remove_dir_all(&backup_dir);
             return FixApplicationResult::err(e.to_string());
         }
 
-        if !cfg!(test) && !game_dir.starts_with(std::env::temp_dir()) {
-            let mut idx = FixIndexService::default();
-            let record = IndexAppliedFixRecord {
-                app_id,
-                fix_id: fix_id.to_string(),
-                applied_at: chrono::Utc::now().to_rfc3339(),
-                game_dir: Some(game_dir.to_path_buf()),
-                files: applied.iter().map(|f| AppliedFixFileEntry {
-                    relative_path: f.clone(),
-                    action: "modified".to_string(),
-                    backup_path: None,
-                    hash_before: None,
-                    hash_after: String::new(),
-                }).collect(),
-                wine_dll_overrides: None,
-            };
-            idx.add_fix(record);
+        // Phase 3: Copy fix files into `game_dir` and verify SHA-256; rollback cleanly on error.
+        let mut applied_entries: Vec<FixFileEntry> = Vec::with_capacity(planned.len());
+        let mut applied_paths: Vec<String> = Vec::with_capacity(planned.len());
+
+        for (src, dst, entry) in planned {
+            if let Some(parent) = dst.parent() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    Self::rollback_partial_apply(game_dir, &fix_meta_dir, &applied_entries);
+                    let _ = fs::remove_file(&record_file);
+                    let _ = fs::remove_dir_all(&backup_dir);
+                    return FixApplicationResult::err(format!("Failed to create folder: {}", e));
+                }
+            }
+            if let Err(e) = fs::copy(&src, &dst) {
+                if entry.action == "modified" {
+                    if let Some(ref bkp_rel) = entry.backup_path {
+                        let _ = fs::copy(fix_meta_dir.join(bkp_rel), &dst);
+                    }
+                } else {
+                    let _ = fs::remove_file(&dst);
+                }
+                Self::rollback_partial_apply(game_dir, &fix_meta_dir, &applied_entries);
+                let _ = fs::remove_file(&record_file);
+                let _ = fs::remove_dir_all(&backup_dir);
+                return FixApplicationResult::err(format!("Apply failed: {}", e));
+            }
+            let post_hash = sha256_file(&dst).ok();
+            if post_hash.as_deref() != Some(entry.hash_after.as_str()) {
+                if entry.action == "modified" {
+                    if let Some(ref bkp_rel) = entry.backup_path {
+                        let _ = fs::copy(fix_meta_dir.join(bkp_rel), &dst);
+                    }
+                } else {
+                    let _ = fs::remove_file(&dst);
+                }
+                Self::rollback_partial_apply(game_dir, &fix_meta_dir, &applied_entries);
+                let _ = fs::remove_file(&record_file);
+                let _ = fs::remove_dir_all(&backup_dir);
+                return FixApplicationResult::err("Post-apply hash verification failed.");
+            }
+            applied_paths.push(entry.relative_path.clone());
+            applied_entries.push(entry);
+        }
+
+        // Phase 4: Sync shared Wine DLL overrides and record real metadata into AppliedFixIndexService.
+        if !dll_overrides.is_empty() {
+            Self::sync_wine_dll_overrides_env(&fix_meta_dir);
+            Self::configure_wine_registry_overrides(game_dir, app_id, &dll_overrides);
+        }
+
+        let index_record = IndexAppliedFixRecord {
+            app_id,
+            fix_id: fix_id.to_string(),
+            applied_at,
+            game_dir: Some(game_dir.to_path_buf()),
+            files: records
+                .iter()
+                .map(|r| AppliedFixFileEntry {
+                    relative_path: r.relative_path.clone(),
+                    action: r.action.clone(),
+                    backup_path: r.backup_path.clone(),
+                    hash_before: r.hash_before.clone(),
+                    hash_after: r.hash_after.clone(),
+                })
+                .collect(),
+            wine_dll_overrides: wine_overrides_str,
+        };
+        if let Some(idx) = index_override {
+            idx.add_fix(index_record);
+        } else if !cfg!(test) && !game_dir.starts_with(std::env::temp_dir()) {
+            let mut idx = AppliedFixIndexService::default();
+            idx.add_fix(index_record);
         }
 
         FixApplicationResult {
             ok: true,
             error: None,
-            applied_files: applied,
+            applied_files: applied_paths,
         }
     }
 
+    /// Rebuilds `.luatools-fix/winedlloverrides.env` from all remaining `.json` fix records,
+    /// removing it only when no remaining fix requires DLL overrides.
+    fn sync_wine_dll_overrides_env(fix_meta_dir: &Path) {
+        let mut combined: Vec<String> = Vec::new();
+        if let Ok(rd) = fs::read_dir(fix_meta_dir) {
+            let mut json_paths: Vec<PathBuf> = rd
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+                .collect();
+            json_paths.sort();
+            for p in json_paths {
+                if let Ok(raw) = fs::read_to_string(&p) {
+                    if let Ok(rec) = serde_json::from_str::<AppliedFixRecord>(&raw) {
+                        if let Some(ov) = rec.wine_dll_overrides {
+                            for part in ov.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                                if !combined.iter().any(|c| c.eq_ignore_ascii_case(part)) {
+                                    combined.push(part.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let env_path = fix_meta_dir.join("winedlloverrides.env");
+        if combined.is_empty() {
+            let _ = fs::remove_file(&env_path);
+        } else {
+            let content = format!("WINEDLLOVERRIDES=\"{}\"\n", combined.join(";"));
+            let _ = fs::write(&env_path, content);
+        }
+    }
+
+    fn collect_remaining_dll_stems(fix_meta_dir: &Path) -> Vec<String> {
+        let mut stems = Vec::new();
+        if let Ok(rd) = fs::read_dir(fix_meta_dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|s| s.to_str()) != Some("json") {
+                    continue;
+                }
+                if let Ok(raw) = fs::read_to_string(&p) {
+                    if let Ok(rec) = serde_json::from_str::<AppliedFixRecord>(&raw) {
+                        if let Some(ov) = rec.wine_dll_overrides {
+                            for part in ov.split(';') {
+                                let stem = part.split('=').next().unwrap_or("").trim().to_ascii_lowercase();
+                                if !stem.is_empty() && !stems.contains(&stem) {
+                                    stems.push(stem);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stems
+    }
+
     pub fn unfix_game(game_dir: &Path, fix_id: &str) -> FixApplicationResult {
+        Self::unfix_game_inner(game_dir, fix_id, None)
+    }
+
+    pub fn unfix_game_with_index(
+        game_dir: &Path,
+        fix_id: &str,
+        index: &mut AppliedFixIndexService,
+    ) -> FixApplicationResult {
+        Self::unfix_game_inner(game_dir, fix_id, Some(index))
+    }
+
+    fn unfix_game_inner(
+        game_dir: &Path,
+        fix_id: &str,
+        index_override: Option<&mut AppliedFixIndexService>,
+    ) -> FixApplicationResult {
         if !is_safe_fix_id(fix_id) {
             return FixApplicationResult::err("Invalid fix ID.");
         }
+        let safe_id = sanitize_fix_id(fix_id);
         let fix_meta_dir = game_dir.join(FIX_DIR_NAME);
-        let safe_file = fix_meta_dir.join(format!("{}.json", sanitize_fix_id(fix_id)));
+        let safe_file = fix_meta_dir.join(format!("{}.json", safe_id));
         let legacy_file = fix_meta_dir.join(format!("{}.json", fix_id));
         let record_file = if safe_file.is_file() {
             safe_file
@@ -531,6 +609,7 @@ impl FixesService {
         };
 
         // Pre-flight validation: verify paths, external modification hashes, and backup presence
+        let mut already_reverted_flags = Vec::with_capacity(record.files.len());
         for entry in &record.files {
             if !LuaInstaller::is_safe_relative_path(Path::new(&entry.relative_path)) {
                 return FixApplicationResult::err(format!(
@@ -539,9 +618,15 @@ impl FixesService {
                 ));
             }
             let dst = game_dir.join(&entry.relative_path);
+            let mut is_already_reverted = false;
             if dst.exists() {
                 if let Ok(curr_hash) = sha256_file(&dst) {
-                    if curr_hash != entry.hash_after {
+                    is_already_reverted = entry
+                        .hash_before
+                        .as_deref()
+                        .map(|hb| hb == curr_hash)
+                        .unwrap_or(false);
+                    if curr_hash != entry.hash_after && !is_already_reverted {
                         return FixApplicationResult::err(format!(
                             "File '{}' was modified externally after fix '{}' was applied. Revert newer fixes first.",
                             entry.relative_path, fix_id
@@ -549,7 +634,7 @@ impl FixesService {
                     }
                 }
             }
-            if entry.action == "modified" {
+            if entry.action == "modified" && !is_already_reverted {
                 let Some(bkp_rel) = &entry.backup_path else {
                     return FixApplicationResult::err(format!(
                         "Missing backup path metadata for '{}'.",
@@ -570,11 +655,19 @@ impl FixesService {
                     ));
                 }
             }
+            already_reverted_flags.push(is_already_reverted);
         }
 
         let mut reverted = Vec::new();
-        for entry in &record.files {
-            let dst = game_dir.join(&entry.relative_path);
+        for (entry, is_already_reverted) in record.files.iter().zip(already_reverted_flags) {
+            let rel_path = Path::new(&entry.relative_path);
+            if !LuaInstaller::is_safe_relative_path(rel_path) {
+                return FixApplicationResult::err(format!(
+                    "Unsafe path '{}' encountered during fix revert.",
+                    entry.relative_path
+                ));
+            }
+            let dst = game_dir.join(rel_path);
             if entry.action == "added" {
                 if dst.exists() {
                     if let Err(e) = fs::remove_file(&dst) {
@@ -586,8 +679,17 @@ impl FixesService {
                 }
                 reverted.push(entry.relative_path.clone());
             } else if entry.action == "modified" {
-                if let Some(bkp_rel) = &entry.backup_path {
-                    let bkp = fix_meta_dir.join(bkp_rel);
+                if is_already_reverted {
+                    reverted.push(entry.relative_path.clone());
+                } else if let Some(bkp_rel) = &entry.backup_path {
+                    let bkp_path = Path::new(bkp_rel);
+                    if !LuaInstaller::is_safe_relative_path(bkp_path) {
+                        return FixApplicationResult::err(format!(
+                            "Unsafe backup path '{}' encountered during fix revert.",
+                            bkp_rel
+                        ));
+                    }
+                    let bkp = fix_meta_dir.join(bkp_path);
                     if let Some(p) = dst.parent() {
                         if let Err(e) = fs::create_dir_all(p) {
                             return FixApplicationResult::err(format!(
@@ -607,14 +709,32 @@ impl FixesService {
             }
         }
 
-        let _ = fs::remove_file(fix_meta_dir.join("winedlloverrides.env"));
-        if let Some(ref overrides_str) = record.wine_dll_overrides {
-            Self::remove_wine_registry_overrides(game_dir, record.app_id, overrides_str);
-        }
         let _ = fs::remove_file(&record_file);
-        let _ = fs::remove_dir_all(fix_meta_dir.join("backups").join(fix_id));
-        if !cfg!(test) && !game_dir.starts_with(std::env::temp_dir()) {
-            let mut idx = FixIndexService::default();
+        let _ = fs::remove_dir_all(fix_meta_dir.join("backups").join(&safe_id));
+        if safe_id != fix_id && is_safe_fix_id(fix_id) {
+            let _ = fs::remove_dir_all(fix_meta_dir.join("backups").join(fix_id));
+        }
+
+        // Preserve shared winedlloverrides.env for any remaining applied fix records (LT-75)
+        Self::sync_wine_dll_overrides_env(&fix_meta_dir);
+
+        if let Some(ref overrides_str) = record.wine_dll_overrides {
+            let still_needed = Self::collect_remaining_dll_stems(&fix_meta_dir);
+            let to_remove: Vec<&str> = overrides_str
+                .split(';')
+                .filter(|part| {
+                    let stem = part.split('=').next().unwrap_or("").trim().to_ascii_lowercase();
+                    !stem.is_empty() && !still_needed.contains(&stem)
+                })
+                .collect();
+            if !to_remove.is_empty() {
+                Self::remove_wine_registry_overrides(game_dir, record.app_id, &to_remove.join(";"));
+            }
+        }
+        if let Some(idx) = index_override {
+            idx.remove_fix(record.app_id, fix_id);
+        } else if !cfg!(test) && !game_dir.starts_with(std::env::temp_dir()) {
+            let mut idx = AppliedFixIndexService::default();
             idx.remove_fix(record.app_id, fix_id);
         }
         FixApplicationResult {
@@ -691,8 +811,8 @@ impl FixesService {
                     for part in overrides_str.split(';') {
                         let dll_stem = part.split('=').next().unwrap_or("").trim();
                         if !dll_stem.is_empty() {
-                            let prefix = format!("\"{}\"=", dll_stem);
-                            lines.retain(|l| !l.trim().starts_with(&prefix));
+                            let prefix = format!("\"{}\"=", dll_stem.to_ascii_lowercase());
+                            lines.retain(|l| !l.trim().to_ascii_lowercase().starts_with(&prefix));
                         }
                     }
                     let _ = fs::write(&reg_path, lines.join("\n"));
@@ -885,143 +1005,76 @@ mod tests {
         let cleaned = fs::read_to_string(&user_reg).unwrap();
         assert!(!cleaned.contains("\"winmm\"="));
     }
-}
-
-// ============================================================================
-// LT-76: AppliedFixIndexService Central Registry (applied-fixes.json)
-// ============================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AppliedFixIndexEntry {
-    pub app_id: u32,
-    pub fix_id: String,
-    pub game_dir: PathBuf,
-    pub applied_at: String,
-    pub files_count: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct AppliedFixIndex {
-    pub entries: Vec<AppliedFixIndexEntry>,
-}
-
-#[derive(Debug, Clone)]
-pub struct AppliedFixIndexService {
-    path: PathBuf,
-}
-
-impl Default for AppliedFixIndexService {
-    fn default() -> Self {
-        Self::new(None)
-    }
-}
-
-impl AppliedFixIndexService {
-    pub fn new(custom_path: Option<PathBuf>) -> Self {
-        let path = custom_path.unwrap_or_else(|| {
-            dirs::config_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("luatools/applied-fixes.json")
-        });
-        Self { path }
-    }
-
-    pub fn load_index(&self) -> AppliedFixIndex {
-        if !self.path.exists() {
-            return AppliedFixIndex::default();
-        }
-        let Ok(raw) = fs::read_to_string(&self.path) else {
-            return AppliedFixIndex::default();
-        };
-        serde_json::from_str::<AppliedFixIndex>(&raw).unwrap_or_default()
-    }
-
-    pub fn record_fix_applied(
-        &self,
-        app_id: u32,
-        fix_id: &str,
-        game_dir: &Path,
-        files_count: usize,
-    ) -> Result<(), String> {
-        let mut index = self.load_index();
-        index.entries.retain(|e| !(e.app_id == app_id && e.fix_id == fix_id));
-        index.entries.push(AppliedFixIndexEntry {
-            app_id,
-            fix_id: fix_id.to_string(),
-            game_dir: game_dir.to_path_buf(),
-            applied_at: chrono::Utc::now().to_rfc3339(),
-            files_count,
-        });
-        self.persist(&index)
-    }
-
-    pub fn record_fix_reverted(&self, app_id: u32, fix_id: &str) -> Result<(), String> {
-        let mut index = self.load_index();
-        let orig_len = index.entries.len();
-        index.entries.retain(|e| !(e.app_id == app_id && e.fix_id == fix_id));
-        if index.entries.len() != orig_len {
-            self.persist(&index)?;
-        }
-        Ok(())
-    }
-
-    pub fn list_verified_entries(&self) -> Vec<AppliedFixIndexEntry> {
-        let index = self.load_index();
-        let mut live = Vec::new();
-        let mut changed = false;
-
-        for entry in index.entries {
-            if FixesService::is_fix_applied(&entry.game_dir, &entry.fix_id) {
-                live.push(entry);
-            } else {
-                changed = true;
-            }
-        }
-
-        if changed {
-            let _ = self.persist(&AppliedFixIndex {
-                entries: live.clone(),
-            });
-        }
-        live
-    }
-
-    fn persist(&self, index: &AppliedFixIndex) -> Result<(), String> {
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let json = serde_json::to_string_pretty(index).map_err(|e| e.to_string())?;
-        let tmp = self.path.with_extension("tmp");
-        fs::write(&tmp, json).map_err(|e| e.to_string())?;
-        if self.path.exists() {
-            let _ = fs::copy(&self.path, self.path.with_extension("bak"));
-        }
-        fs::rename(&tmp, &self.path).map_err(|e| e.to_string())?;
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests_applied_fixes_index {
-    use super::*;
 
     #[test]
-    fn test_applied_fix_index_service_lifecycle() {
-        let tmp = tempfile::tempdir().unwrap();
-        let index_path = tmp.path().join("applied-fixes.json");
-        let svc = AppliedFixIndexService::new(Some(index_path));
-
-        let game_dir = tmp.path().join("elden_ring");
+    fn unfix_allows_already_reverted_hash_before_and_preserves_shared_winedlloverrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let game_dir = dir.path().join("game");
+        let extract1 = dir.path().join("extract1");
+        let extract2 = dir.path().join("extract2");
         fs::create_dir_all(&game_dir).unwrap();
+        fs::create_dir_all(&extract1).unwrap();
+        fs::create_dir_all(&extract2).unwrap();
 
-        svc.record_fix_applied(1245620, "fix:seamless", &game_dir, 3).unwrap();
-        let idx = svc.load_index();
-        assert_eq!(idx.entries.len(), 1);
-        assert_eq!(idx.entries[0].app_id, 1245620);
-        assert_eq!(idx.entries[0].fix_id, "fix:seamless");
+        fs::write(game_dir.join("engine.dll"), b"ORIG_ENGINE").unwrap();
+        fs::write(extract1.join("engine.dll"), b"FIX1_ENGINE").unwrap();
+        fs::write(extract1.join("winmm.dll"), b"FIX1_WINMM").unwrap();
+        fs::write(extract2.join("dinput8.dll"), b"FIX2_DINPUT").unwrap();
 
-        svc.record_fix_reverted(1245620, "fix:seamless").unwrap();
-        let idx2 = svc.load_index();
-        assert_eq!(idx2.entries.len(), 0);
+        let idx_path = dir.path().join("applied-fixes.json");
+        let mut idx = AppliedFixIndexService::new(Some(idx_path));
+
+        let r1 = FixesService::apply_extracted_with_backup_with_index(
+            1245620,
+            "online-fix:1111",
+            &extract1,
+            &game_dir,
+            &mut idx,
+        );
+        assert!(r1.ok);
+
+        // Verify LT-76: AppliedFixIndexService received real hashes, backup path, and wine overrides
+        let rec1 = idx.get_fix(1245620, "online-fix:1111").unwrap();
+        assert_eq!(rec1.files.len(), 2);
+        let eng_entry = rec1.files.iter().find(|f| f.relative_path == "engine.dll").unwrap();
+        assert!(eng_entry.hash_before.is_some());
+        assert!(!eng_entry.hash_after.is_empty());
+        assert_ne!(eng_entry.hash_before.as_deref(), Some(eng_entry.hash_after.as_str()));
+        assert!(eng_entry.backup_path.as_deref().unwrap().contains("online-fix_1111"));
+        assert!(rec1.wine_dll_overrides.as_deref().unwrap().contains("winmm=n,b"));
+
+        let r2 = FixesService::apply_extracted_with_backup_with_index(
+            1245620,
+            "online-fix:2222",
+            &extract2,
+            &game_dir,
+            &mut idx,
+        );
+        assert!(r2.ok);
+
+        // Shared winedlloverrides.env must contain both fixes' DLL overrides
+        let env_file = game_dir.join(FIX_DIR_NAME).join("winedlloverrides.env");
+        let env_both = fs::read_to_string(&env_file).unwrap();
+        assert!(env_both.contains("winmm=n,b"));
+        assert!(env_both.contains("dinput8=n,b"));
+
+        // Simulate partial revert / interrupted install: engine.dll already restored to ORIG_ENGINE (hash_before)
+        fs::write(game_dir.join("engine.dll"), b"ORIG_ENGINE").unwrap();
+        let rev1 = FixesService::unfix_game_with_index(&game_dir, "online-fix:1111", &mut idx);
+        assert!(rev1.ok, "Expected already-reverted hash_before to succeed: {:?}", rev1.error);
+        assert!(!idx.is_fix_applied(1245620, "online-fix:1111"));
+        assert!(idx.is_fix_applied(1245620, "online-fix:2222"));
+
+        // Shared winedlloverrides.env must survive with fix 2's override intact
+        assert!(env_file.exists());
+        let env_after_1 = fs::read_to_string(&env_file).unwrap();
+        assert!(env_after_1.contains("dinput8=n,b"));
+        assert!(!env_after_1.contains("winmm=n,b"));
+
+        // Reverting the last remaining fix removes winedlloverrides.env and clears the index
+        let rev2 = FixesService::unfix_game_with_index(&game_dir, "online-fix:2222", &mut idx);
+        assert!(rev2.ok);
+        assert!(!env_file.exists());
+        assert!(!idx.is_fix_applied(1245620, "online-fix:2222"));
     }
 }

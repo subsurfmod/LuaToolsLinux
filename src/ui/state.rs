@@ -231,6 +231,10 @@ pub enum AppMessage {
         ok: bool,
         msg: String,
     },
+    ProtocolRedeemFinished {
+        code: String,
+        result: Option<(u32, String, Option<String>, Option<String>)>,
+    },
     FolderPickedForDiagExport(PathBuf),
     WiredProgress {
         pct: f32,

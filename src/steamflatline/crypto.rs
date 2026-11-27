@@ -2,8 +2,8 @@
 //!
 //! Implements XOR decryption, XTEA decryption, and AES decryption used by SteamStub variants.
 
-use aes::cipher::{KeyIvInit, block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, BlockSizeUser};
-use cbc::{Decryptor, Encryptor};
+use aes::cipher::{KeyIvInit, block_padding::NoPadding, BlockDecryptMut};
+use cbc::Decryptor;
 
 type Aes256CbcDec = Decryptor<aes::Aes256>;
 
@@ -20,7 +20,7 @@ fn aes_rebuild_iv(key: &[u8; 32], iv: &mut [u8; 16]) {
     let key_arr = <aes::cipher::generic_array::GenericArray<u8, _>>::from_slice(key);
     let iv_arr = <aes::cipher::generic_array::GenericArray<u8, _>>::from_slice(iv);
 
-    let mut encryptor = <Encryptor<Aes256> as KeyIvInit>::new(key_arr, iv_arr);
+    let encryptor = <Encryptor<Aes256> as KeyIvInit>::new(key_arr, iv_arr);
     // Encrypt the IV in-place (1 block = 16 bytes for AES)
     let block_size = <Aes256 as BlockSizeUser>::block_size();
     encryptor.encrypt_padded_mut::<NoPadding>(iv, block_size)
@@ -117,7 +117,7 @@ pub fn aes256_cbc_decrypt(data: &mut [u8], key: &[u8; 32], iv: &mut [u8; 16]) ->
 
     let key_slice: &[u8] = key;
     let iv_slice: &[u8] = iv;
-    let mut decryptor = Aes256CbcDec::new(key_slice.into(), iv_slice.into());
+    let decryptor = Aes256CbcDec::new(key_slice.into(), iv_slice.into());
     decryptor.decrypt_padded_mut::<NoPadding>(data)
         .map_err(|e| crate::steamflatline::error::SteamFlatlineError::AesDecryptionFailed(e.to_string()))?;
     Ok(())
@@ -139,11 +139,11 @@ pub fn find_pattern(data: &[u8], pattern: &str) -> isize {
         })
         .collect();
 
-    if pattern_bytes.is_empty() {
+    if pattern_bytes.is_empty() || data.len() < pattern_bytes.len() {
         return -1;
     }
 
-    for i in 0..=data.len().saturating_sub(pattern_bytes.len()) {
+    for i in 0..=(data.len() - pattern_bytes.len()) {
         let mut matched = true;
         for (j, &pat_byte) in pattern_bytes.iter().enumerate() {
             if let Some(expected) = pat_byte {
@@ -204,6 +204,13 @@ mod tests {
         let data = [0x53, 0x51, 0x52, 0x56, 0x57, 0x55, 0x8B, 0xEC];
         assert_eq!(find_pattern(&data, "53 ?? 52 56"), 0);
         assert_eq!(find_pattern(&data, "?? ?? 52 56"), 0);
+    }
+
+    #[test]
+    fn test_find_pattern_data_smaller_than_pattern() {
+        let data = [0x53, 0x51];
+        assert_eq!(find_pattern(&data, "53 51 52 56"), -1);
+        assert_eq!(find_pattern(&[], "53"), -1);
     }
 
     #[test]

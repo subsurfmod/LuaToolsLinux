@@ -269,6 +269,7 @@ impl LuaVault {
             old_var.source.clone(),
         );
         updated_var.label = old_var.label.clone();
+        updated_var.captured_at = old_var.captured_at.clone();
         index.variants[pos] = updated_var.clone();
         index.edit_base_hash = None;
 
@@ -535,6 +536,7 @@ impl LuaVault {
                     existing.label = Some(lbl.to_string());
                 }
                 existing.kind = KIND_BUILD.to_string();
+                existing.captured_at = now_iso();
             }
             self.save_index(app_id, &index);
             return index.variants.iter().find(|v| v.hash == hash_str).cloned();
@@ -599,6 +601,7 @@ mod tests {
             .unwrap();
         assert_ne!(updated.hash, h1);
         assert_eq!(updated.label.as_deref(), Some("Initial Variant"));
+        assert_eq!(updated.captured_at, v1.captured_at);
         assert_eq!(updated.dlc_count, 1);
         assert_eq!(vault.get_edit_base(1245620), None);
 

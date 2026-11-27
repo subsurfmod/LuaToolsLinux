@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # LuaTools Linux — Steam Launcher Wrapper
-# Launches 32-bit Steam targeting ~/.local/bin/steam-sls (LD_AUDIT=SLSsteam.so)
-# to ensure game unlocks and manifest overrides take effect, while preventing
-# fatal ELFCLASS64 collisions from 64-bit libsteam_integration.so LD_PRELOAD.
+# Launches 32-bit Steam preloading native 32-bit libsteam_integration.so
+# (built for i686) via LD_PRELOAD instead of relying on 32-bit SLSsteam.so (LD_AUDIT).
+#
+# When 32-bit libsteam_integration.so is unavailable, safely strips 64-bit
+# libsteam_integration.so from LD_PRELOAD and falls back to SLSsteam.so (LD_AUDIT).
 #
 # Supports --gdb and --lldb interactive debugger options.
 # ==============================================================================
@@ -21,26 +23,83 @@ case "${1:-}" in
     ;;
 esac
 
-# Clean LD_PRELOAD: strip 64-bit libsteam_integration.so so 32-bit Steam never crashes with ELFCLASS64
+# LT-20: Auto-launch LuaTools minimized in background unless user opted out
+# Opt out via LUATOOLS_NO_AUTOLAUNCH=1 or creating ~/.config/luatools/no-autolaunch
+if [ "${LUATOOLS_NO_AUTOLAUNCH:-0}" != "1" ] && [ ! -f "${XDG_CONFIG_HOME:-$HOME/.config}/luatools/no-autolaunch" ]; then
+  if command -v luatools >/dev/null 2>&1; then
+    if ! pgrep -x luatools >/dev/null 2>&1; then
+      luatools --minimized --tray-locked >/dev/null 2>&1 &
+    fi
+  elif [ -x "${HOME}/.local/bin/luatools" ]; then
+    if ! pgrep -x luatools >/dev/null 2>&1; then
+      "${HOME}/.local/bin/luatools" --minimized --tray-locked >/dev/null 2>&1 &
+    fi
+  fi
+fi
+
+# Locate 32-bit libsteam_integration.so
+INTEGRATION_LIB=""
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
+for cand in \
+  "${HOME}/.local/lib/luatools/32/libsteam_integration.so" \
+  "${HOME}/.local/lib/luatools/libsteam_integration32.so" \
+  "${HOME}/.local/lib/luatools/libsteam_integration.so" \
+  "/usr/local/lib/luatools/32/libsteam_integration.so" \
+  "/usr/local/lib/luatools/libsteam_integration32.so" \
+  "/usr/local/lib/luatools/libsteam_integration.so" \
+  "/usr/lib/luatools/32/libsteam_integration.so" \
+  "/usr/lib/luatools/libsteam_integration32.so" \
+  "/usr/lib/luatools/libsteam_integration.so" \
+  "${SCRIPT_DIR}/../dist/32/libsteam_integration.so" \
+  "${SCRIPT_DIR}/../dist/libsteam_integration32.so" \
+  "${SCRIPT_DIR}/../dist/libsteam_integration.so" \
+  "${SCRIPT_DIR}/../target/i686-unknown-linux-gnu/release/libsteam_integration.so"; do
+  if [ -f "$cand" ]; then
+    if command -v file >/dev/null 2>&1; then
+      if file -L "$cand" | grep -q "ELF 32-bit"; then
+        INTEGRATION_LIB="$cand"
+        break
+      fi
+    else
+      INTEGRATION_LIB="$cand"
+      break
+    fi
+  fi
+done
+
+# Locate Steam binary
+STEAM_BIN=""
+if [ -x "${HOME}/.local/share/Steam/steam.sh" ]; then
+  STEAM_BIN="${HOME}/.local/share/Steam/steam.sh"
+elif [ -x "${HOME}/.steam/steam/steam.sh" ]; then
+  STEAM_BIN="${HOME}/.steam/steam/steam.sh"
+elif command -v steam >/dev/null 2>&1; then
+  STEAM_BIN="steam"
+else
+  STEAM_BIN="steam"
+fi
+
+# Primary launch path: when 32-bit libsteam_integration.so is available,
+# inject via LD_PRELOAD and launch Steam directly without relying on SLSsteam.so (LD_AUDIT).
+if [ -n "$INTEGRATION_LIB" ]; then
+  export LD_PRELOAD="${INTEGRATION_LIB}${LD_PRELOAD:+:$LD_PRELOAD}"
+  if [ "$DEBUGGER" = "gdb" ]; then
+    exec gdb --args "$STEAM_BIN" "$@"
+  elif [ "$DEBUGGER" = "lldb" ]; then
+    exec lldb -- "$STEAM_BIN" "$@"
+  else
+    exec "$STEAM_BIN" "$@"
+  fi
+fi
+
+# Fallback path: when 32-bit bridge_lib is absent, strip 64-bit lib from LD_PRELOAD
+# and delegate to external 32-bit SLSsteam.so via steam-sls or LD_AUDIT
 if [ -n "${LD_PRELOAD:-}" ]; then
   CLEANED_PRELOAD="$(echo "$LD_PRELOAD" | tr ':' '\n' | grep -v 'libsteam_integration.so' | tr '\n' ':' | sed 's/:$//')"
   export LD_PRELOAD="$CLEANED_PRELOAD"
 fi
 
-# LT-20: Auto-launch LuaTools minimized in background if in PATH and not already running
-if command -v luatools >/dev/null 2>&1; then
-  if ! pgrep -x luatools >/dev/null 2>&1; then
-    luatools --minimized --tray-locked >/dev/null 2>&1 &
-  fi
-elif [ -x "${HOME}/.local/bin/luatools" ]; then
-  if ! pgrep -x luatools >/dev/null 2>&1; then
-    "${HOME}/.local/bin/luatools" --minimized --tray-locked >/dev/null 2>&1 &
-  fi
-fi
-
 STEAM_SLS="${HOME}/.local/bin/steam-sls"
-
-# If ~/.local/bin/steam-sls exists and is executable, execute it directly
 if [ -x "$STEAM_SLS" ]; then
   if [ "$DEBUGGER" = "gdb" ]; then
     exec gdb --args "$STEAM_SLS" "$@"
@@ -70,18 +129,6 @@ if [ -n "$SLS_DIR" ]; then
     AUDIT="${SLS_DIR}/SLSsteam.so"
   fi
   export LD_AUDIT="${AUDIT}${LD_AUDIT:+:$LD_AUDIT}"
-fi
-
-# Locate Steam binary
-STEAM_BIN=""
-if [ -x "${HOME}/.local/share/Steam/steam.sh" ]; then
-  STEAM_BIN="${HOME}/.local/share/Steam/steam.sh"
-elif [ -x "${HOME}/.steam/steam/steam.sh" ]; then
-  STEAM_BIN="${HOME}/.steam/steam/steam.sh"
-elif command -v steam >/dev/null 2>&1; then
-  STEAM_BIN="steam"
-else
-  STEAM_BIN="steam"
 fi
 
 if [ "$DEBUGGER" = "gdb" ]; then

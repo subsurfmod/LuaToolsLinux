@@ -38,7 +38,10 @@ clean_mime_handlers() {
 if [ "$SYSTEM_WIDE" -eq 1 ]; then
     if [ "$(id -u)" -eq 0 ]; then
         rm -f /usr/local/bin/luatools \
+              /usr/local/bin/luatools-steam-launcher \
               /usr/local/lib/luatools/libsteam_integration.so \
+              /usr/local/lib/luatools/libsteam_integration32.so \
+              /usr/local/lib/luatools/libsteam_integration64.so \
               /usr/local/lib/luatools/libsteam_auto_patch_linux.so \
               /usr/local/share/applications/luatools.desktop \
               /usr/local/share/icons/hicolor/scalable/apps/luatools.svg \
@@ -51,18 +54,25 @@ if [ "$SYSTEM_WIDE" -eq 1 ]; then
                 sudo -u "$SUDO_USER" update-desktop-database "/home/${SUDO_USER}/.local/share/applications" 2>/dev/null || true
             fi
         fi
+        rm -rf /usr/local/lib/luatools/32 \
+               /usr/local/lib/luatools/64
         rmdir /usr/local/lib/luatools 2>/dev/null || true
         if command -v update-desktop-database >/dev/null 2>&1; then
             update-desktop-database /usr/local/share/applications 2>/dev/null || true
         fi
     else
         sudo rm -f /usr/local/bin/luatools \
+                   /usr/local/bin/luatools-steam-launcher \
                    /usr/local/lib/luatools/libsteam_integration.so \
+                   /usr/local/lib/luatools/libsteam_integration32.so \
+                   /usr/local/lib/luatools/libsteam_integration64.so \
                    /usr/local/lib/luatools/libsteam_auto_patch_linux.so \
                    /usr/local/share/applications/luatools.desktop \
                    /usr/local/share/icons/hicolor/scalable/apps/luatools.svg
         rm -f "${HOME}/.config/autostart/luatools.desktop"
         clean_mime_handlers "${HOME}"
+        sudo rm -rf /usr/local/lib/luatools/32 \
+                    /usr/local/lib/luatools/64
         sudo rmdir /usr/local/lib/luatools 2>/dev/null || true
         if command -v update-desktop-database >/dev/null 2>&1; then
             sudo update-desktop-database /usr/local/share/applications 2>/dev/null || true
@@ -74,11 +84,16 @@ else
     rm -f "${HOME}/.local/bin/luatools" \
           "${HOME}/.local/bin/luatools-steam-launcher" \
           "${HOME}/.local/lib/luatools/libsteam_integration.so" \
+          "${HOME}/.local/lib/luatools/libsteam_integration32.so" \
+          "${HOME}/.local/lib/luatools/libsteam_integration64.so" \
           "${HOME}/.local/lib/luatools/libsteam_auto_patch_linux.so" \
           "${HOME}/.local/share/applications/luatools.desktop" \
           "${HOME}/.local/share/icons/hicolor/scalable/apps/luatools.svg" \
           "${HOME}/.config/autostart/luatools.desktop"
     clean_mime_handlers "${HOME}"
+    rm -rf "${HOME}/.local/lib/luatools/32" \
+           "${HOME}/.local/lib/luatools/64"
+    rmdir "${HOME}/.local/lib/luatools" 2>/dev/null || true
     if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database "${HOME}/.local/share/applications" 2>/dev/null || true
     fi

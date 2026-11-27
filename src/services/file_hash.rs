@@ -136,6 +136,53 @@ impl FileHashService {
     pub fn clear_cache(&mut self) {
         self.cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
+
+    /// Parses a GitHub release asset `digest` string (e.g. `"sha256:abcd..."` or raw 64-char hex)
+    /// into a normalized lowercase 64-char SHA-256 hex digest (LT-49).
+    pub fn parse_github_sha256_digest(digest: &str) -> Option<String> {
+        let trimmed = digest.trim();
+        let hex_part = trimmed
+            .strip_prefix("sha256:")
+            .or_else(|| trimmed.strip_prefix("SHA256:"))
+            .unwrap_or(trimmed)
+            .trim();
+        if hex_part.len() == 64 && hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+            Some(hex_part.to_ascii_lowercase())
+        } else {
+            None
+        }
+    }
+
+    /// Computes and caches the SHA-256 hash of `file_path` and verifies it against `expected_digest`
+    /// (`"sha256:..."` or raw 64-char hex). Returns `Err` on unreadable file or digest mismatch (LT-49).
+    pub fn verify_sha256_digest(
+        &self,
+        file_path: &Path,
+        file_name: &str,
+        expected_digest: &str,
+    ) -> Result<FileHash, String> {
+        let expected = Self::parse_github_sha256_digest(expected_digest).ok_or_else(|| {
+            format!(
+                "Invalid SHA-256 digest format for {}: '{}'",
+                file_name, expected_digest
+            )
+        })?;
+        let computed = self.hash_file(file_path, file_name);
+        if computed.sha256.is_empty() {
+            return Err(format!(
+                "Failed to hash {} at {}",
+                file_name,
+                file_path.display()
+            ));
+        }
+        if !computed.sha256.eq_ignore_ascii_case(&expected) {
+            return Err(format!(
+                "SHA-256 mismatch for {}: expected {}, got {}",
+                file_name, expected, computed.sha256
+            ));
+        }
+        Ok(computed)
+    }
 }
 
 #[cfg(test)]
@@ -179,5 +226,27 @@ mod tests {
 
         std::fs::write(&missing, b"").unwrap();
         assert!(!service.verify_file(&missing));
+    }
+
+    #[test]
+    fn test_verify_github_sha256_digest_succeeds_and_rejects_mismatch() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("asset.tar.gz");
+        std::fs::write(&file_path, b"hello world").unwrap();
+
+        let service = FileHashService::new();
+        let ok = service.verify_sha256_digest(
+            &file_path,
+            "asset.tar.gz",
+            "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+        );
+        assert!(ok.is_ok());
+
+        let bad = service.verify_sha256_digest(
+            &file_path,
+            "asset.tar.gz",
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        );
+        assert!(bad.is_err());
     }
 }

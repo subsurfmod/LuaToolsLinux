@@ -6,9 +6,16 @@
 //! This module reads/writes those values so ticket-based features work on Linux.
 
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
+
+use serde::{Deserialize, Serialize};
+
+pub const TICKETS_SIDECAR_FILENAME: &str = "tickets_store.json";
 
 /// Error type for ticket store operations.
 #[derive(Debug, thiserror::Error)]
@@ -21,12 +28,16 @@ pub enum TicketError {
     Parse(String),
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppTicketData {
     pub app_id: u32,
+    #[serde(default)]
     pub steam_id: Option<String>,
+    #[serde(default)]
     pub app_ticket: Option<String>,
+    #[serde(default)]
     pub e_ticket: Option<String>,
+    #[serde(default)]
     pub last_update: Option<u64>,
 }
 
@@ -45,18 +56,180 @@ impl TicketStore {
 
     pub fn new(config_dir: &Path) -> Self {
         Self {
-            config_dir: config_dir.to_path_buf(),
+            config_dir: Self::resolve_config_dir(config_dir),
             cache: BTreeMap::new(),
             async_calls: BTreeMap::new(),
         }
+    }
+
+    pub fn new_for_steam_root(steam_root: &Path) -> Self {
+        Self::new(steam_root)
     }
 
     pub fn config_dir(&self) -> &Path {
         &self.config_dir
     }
 
+    pub fn sidecar_path(&self) -> PathBuf {
+        self.config_dir.join(TICKETS_SIDECAR_FILENAME)
+    }
+
+    fn active_account_from_loginusers(steam_root: &Path) -> Option<u32> {
+        let loginusers = steam_root.join("config").join("loginusers.vdf");
+        let content = fs::read_to_string(loginusers).ok()?;
+        let mut current_sid: Option<u64> = None;
+        let mut best_ts: Option<(u64, u64)> = None;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if let Some((tok, rest)) = Self::parse_quoted_token(trimmed) {
+                let trailing = rest.trim();
+                if (trailing.is_empty() || trailing == "{")
+                    && !tok.is_empty()
+                    && tok.bytes().all(|b| b.is_ascii_digit())
+                {
+                    if let Ok(sid) = tok.parse::<u64>() {
+                        if sid >= 0x0110_0001_0000_0000 {
+                            current_sid = Some(sid);
+                            continue;
+                        }
+                    }
+                }
+            }
+            if let (Some(sid), Some((k, v))) = (current_sid, Self::split_kv(trimmed)) {
+                if k.eq_ignore_ascii_case("MostRecent") && v.trim() == "1" {
+                    return Some((sid & 0xFFFF_FFFF) as u32);
+                }
+                if k.eq_ignore_ascii_case("Timestamp") {
+                    if let Ok(ts) = v.trim().parse::<u64>() {
+                        if best_ts.is_none_or(|(b, _)| ts > b) {
+                            best_ts = Some((ts, sid));
+                        }
+                    }
+                }
+            }
+        }
+        best_ts.map(|(_, sid)| (sid & 0xFFFF_FFFF) as u32)
+    }
+
+    fn select_active_userdata_config(
+        steam_root: &Path,
+        allow_without_localconfig: bool,
+    ) -> Option<PathBuf> {
+        let userdata = steam_root.join("userdata");
+        let entries = fs::read_dir(&userdata).ok()?;
+        let preferred_acc = Self::active_account_from_loginusers(steam_root);
+
+        let mut best_with_vdf: Option<(SystemTime, bool, u32, PathBuf)> = None;
+        let mut best_account_dir: Option<(bool, SystemTime, u32, PathBuf)> = None;
+
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.is_empty() || name == "0" || !name.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            let Ok(acc_id) = name.parse::<u32>() else {
+                continue;
+            };
+            if acc_id == 0 {
+                continue;
+            }
+
+            let is_preferred = preferred_acc == Some(acc_id);
+            let cfg_dir = p.join("config");
+            let vdf_path = cfg_dir.join("localconfig.vdf");
+
+            if let Ok(meta) = fs::metadata(&vdf_path) {
+                let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                let key = (mtime, is_preferred, acc_id);
+                if best_with_vdf
+                    .as_ref()
+                    .is_none_or(|(bm, bp, ba, _)| key > (*bm, *bp, *ba))
+                {
+                    best_with_vdf = Some((mtime, is_preferred, acc_id, cfg_dir));
+                }
+            } else if allow_without_localconfig {
+                let dir_mtime = fs::metadata(&p)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                let key = (is_preferred, dir_mtime, acc_id);
+                if best_account_dir
+                    .as_ref()
+                    .is_none_or(|(bp, bm, ba, _)| key > (*bp, *bm, *ba))
+                {
+                    best_account_dir = Some((is_preferred, dir_mtime, acc_id, cfg_dir));
+                }
+            }
+        }
+
+        best_with_vdf
+            .map(|(_, _, _, p)| p)
+            .or_else(|| best_account_dir.map(|(_, _, _, p)| p))
+    }
+
+    /// Resolves `<steam_root>` or `<steam_root>/config` to the active user's
+    /// `<steam_root>/userdata/<account_id>/config` directory when `userdata/` is present,
+    /// while falling back to `config_dir` for isolated unit-test directories.
+    pub fn resolve_config_dir(config_dir: &Path) -> PathBuf {
+        let is_already_userdata_cfg = config_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("config"))
+            && config_dir
+                .parent()
+                .and_then(|acc| {
+                    let acc_ok = acc.file_name().and_then(|n| n.to_str()).is_some_and(|s| {
+                        !s.is_empty() && s != "0" && s.bytes().all(|b| b.is_ascii_digit())
+                    });
+                    let ud_ok = acc
+                        .parent()
+                        .and_then(|u| u.file_name())
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|u| u.eq_ignore_ascii_case("userdata"));
+                    Some(acc_ok && ud_ok)
+                })
+                .unwrap_or(false);
+        if is_already_userdata_cfg {
+            return config_dir.to_path_buf();
+        }
+
+        let candidate_steam_root = if config_dir.join("userdata").is_dir() {
+            Some(config_dir)
+        } else if config_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("config"))
+        {
+            config_dir.parent().filter(|p| p.join("userdata").is_dir())
+        } else if config_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("userdata"))
+            && config_dir.is_dir()
+        {
+            config_dir.parent()
+        } else {
+            None
+        };
+
+        if let Some(root) = candidate_steam_root {
+            let allow_without_vdf = !config_dir.join("localconfig.vdf").exists()
+                && !config_dir.join(TICKETS_SIDECAR_FILENAME).exists();
+            if let Some(resolved) = Self::select_active_userdata_config(root, allow_without_vdf) {
+                return resolved;
+            }
+        }
+
+        config_dir.to_path_buf()
+    }
+
     pub fn default_path() -> PathBuf {
-        // Resolve active userdata/<account_id>/config/localconfig.vdf if present
+        // Resolve active userdata/<account_id>/config/localconfig.vdf preferring most-recent mtime
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         let steam_roots = [
             home.join(".steam/steam"),
@@ -64,22 +237,24 @@ impl TicketStore {
             home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam"),
         ];
 
+        let mut best_global: Option<(SystemTime, PathBuf)> = None;
         for root in &steam_roots {
-            let userdata = root.join("userdata");
-            if let Ok(entries) = fs::read_dir(&userdata) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.is_dir() {
-                        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                            if name.chars().all(|c| c.is_ascii_digit()) && name != "0" {
-                                let localcfg_dir = p.join("config");
-                                if localcfg_dir.join("localconfig.vdf").exists() {
-                                    return localcfg_dir;
-                                }
-                            }
-                        }
-                    }
+            if let Some(cfg_dir) = Self::select_active_userdata_config(root, false) {
+                let mtime = fs::metadata(cfg_dir.join("localconfig.vdf"))
+                    .and_then(|m| m.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                if best_global.as_ref().is_none_or(|(bm, _)| mtime > *bm) {
+                    best_global = Some((mtime, cfg_dir));
                 }
+            }
+        }
+        if let Some((_, best)) = best_global {
+            return best;
+        }
+
+        for root in &steam_roots {
+            if let Some(cfg_dir) = Self::select_active_userdata_config(root, true) {
+                return cfg_dir;
             }
         }
 
@@ -95,14 +270,40 @@ impl TicketStore {
 
     pub fn load(&mut self) -> Result<(), TicketError> {
         let vdf_path = self.config_dir.join("localconfig.vdf");
-        if !vdf_path.exists() {
+        if vdf_path.exists() {
+            self._parse_vdf(&vdf_path)?;
+        } else {
             let alt = self.config_dir.join("localconfig.vdf.bak");
             if alt.exists() {
                 self._parse_vdf(&alt)?;
+            } else {
+                self.cache.clear();
             }
-            return Ok(());
         }
-        self._parse_vdf(&vdf_path)?;
+
+        // Merge companion JSON sidecar (`tickets_store.json`) so AppTicket/ETicket/SteamID
+        // survive Steam client rewrites that strip unknown VDF keys under `"apps"`.
+        let sidecar = self._load_sidecar();
+        for (app_id, sc) in sidecar {
+            self.cache
+                .entry(app_id)
+                .and_modify(|existing| {
+                    if existing.steam_id.as_deref().unwrap_or("").is_empty() {
+                        existing.steam_id = sc.steam_id.clone();
+                    }
+                    if existing.app_ticket.as_deref().unwrap_or("").is_empty() {
+                        existing.app_ticket = sc.app_ticket.clone();
+                    }
+                    if existing.e_ticket.as_deref().unwrap_or("").is_empty() {
+                        existing.e_ticket = sc.e_ticket.clone();
+                    }
+                    if existing.last_update.is_none() {
+                        existing.last_update = sc.last_update;
+                    }
+                })
+                .or_insert(sc);
+        }
+
         Ok(())
     }
 
@@ -194,6 +395,59 @@ impl TicketStore {
         Ok(())
     }
 
+    fn write_atomic_0600(path: &Path, content: &str) -> Result<(), TicketError> {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(TICKETS_SIDECAR_FILENAME);
+        let tmp_path = path.with_file_name(format!(".{}.tmp.{}", file_name, std::process::id()));
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        f.write_all(content.as_bytes())?;
+        f.flush()?;
+        drop(f);
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;
+        fs::rename(&tmp_path, path)?;
+        Ok(())
+    }
+
+    fn _load_sidecar(&self) -> BTreeMap<u32, AppTicketData> {
+        let path = self.sidecar_path();
+        let Ok(raw) = fs::read_to_string(&path) else {
+            return BTreeMap::new();
+        };
+        let Ok(mut map) = serde_json::from_str::<BTreeMap<u32, AppTicketData>>(&raw) else {
+            return BTreeMap::new();
+        };
+        for (&app_id, entry) in &mut map {
+            entry.app_id = app_id;
+        }
+        map
+    }
+
+    fn _save_sidecar(&self) -> Result<(), TicketError> {
+        let persisted: BTreeMap<u32, &AppTicketData> = self
+            .cache
+            .iter()
+            .filter(|(_, d)| {
+                d.steam_id.as_deref().is_some_and(|s| !s.is_empty())
+                    || d.app_ticket.as_deref().is_some_and(|s| !s.is_empty())
+                    || d.e_ticket.as_deref().is_some_and(|s| !s.is_empty())
+            })
+            .map(|(&k, v)| (k, v))
+            .collect();
+        let json = serde_json::to_string_pretty(&persisted)
+            .map_err(|e| TicketError::Parse(e.to_string()))?;
+        Self::write_atomic_0600(&self.sidecar_path(), &json)
+    }
+
     fn _parse_vdf(&mut self, path: &Path) -> Result<(), TicketError> {
         let content = fs::read_to_string(path)?;
         let app_blocks = Self::extract_app_blocks(&content);
@@ -221,6 +475,34 @@ impl TicketStore {
                 parsed.insert(app_id, data);
             }
         }
+
+        // Also parse native Steam "apptickets" flat block of "<appid>" "<hex>" (BST-49/BST-53)
+        if let Some(sec_idx) = content.find("\"apptickets\"") {
+            if let Some(open_rel) = content[sec_idx..].find('{') {
+                let open = sec_idx + open_rel + 1;
+                let close = content[open..].find('}').map(|c| open + c).unwrap_or(content.len());
+                let slice = &content[open..close];
+                for line in slice.lines() {
+                    let line = line.trim();
+                    if let Some((k, v)) = Self::split_kv(line) {
+                        if let Ok(app_id) = k.parse::<u32>() {
+                            if !v.is_empty() {
+                                parsed.entry(app_id).and_modify(|d| {
+                                    if d.app_ticket.as_deref().unwrap_or("").is_empty() {
+                                        d.app_ticket = Some(v.clone());
+                                    }
+                                }).or_insert_with(|| AppTicketData {
+                                    app_id,
+                                    app_ticket: Some(v),
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         self.cache = parsed;
         Ok(())
     }
@@ -334,14 +616,25 @@ impl TicketStore {
     }
 
     pub fn set(&mut self, data: AppTicketData) -> Result<(), TicketError> {
+        if self.cache.is_empty() {
+            let _ = self.load();
+        }
         self._persist_app(&data)?;
         self.cache.insert(data.app_id, data);
+        self._save_sidecar()?;
         Ok(())
     }
 
     pub fn remove(&mut self, app_id: u32) -> Result<(), TicketError> {
+        if self.cache.is_empty() {
+            let _ = self.load();
+        }
         self.cache.remove(&app_id);
-        self._remove_app_from_vdf(app_id)
+        self._remove_app_from_vdf(app_id)?;
+        if self.sidecar_path().exists() || !self.cache.is_empty() {
+            self._save_sidecar()?;
+        }
+        Ok(())
     }
 
     pub fn has_app_ticket(&mut self, app_id: u32) -> bool {
@@ -629,11 +922,38 @@ impl TicketStore {
         if self.load().is_err() {
             return 0;
         }
-        self.cache
-            .get(&app_id)
-            .and_then(|d| d.steam_id.as_ref())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0)
+        if let Some(d) = self.cache.get(&app_id) {
+            if let Some(sid) = d.steam_id.as_ref().and_then(|s| s.parse::<u64>().ok()) {
+                if sid >= 0x0110_0001_0000_0000 {
+                    return sid;
+                }
+            }
+            if let Some(ticket_hex) = d.app_ticket.as_ref() {
+                if let Ok(bytes) = hex::decode(ticket_hex) {
+                    let sid = crate::steam_bridge::credentials::appticket::extract_steam_id_from_ticket_bytes(&bytes);
+                    if sid != 0 {
+                        return sid;
+                    }
+                }
+            }
+        }
+        0
+    }
+
+    /// Set spoofed SteamID for an app (BST-55).
+    pub fn set_spoof_steam_id(&mut self, app_id: u32, sid: u64) {
+        if self.cache.is_empty() {
+            let _ = self.load();
+        }
+        let entry = self.cache.entry(app_id).or_insert_with(|| AppTicketData {
+            app_id,
+            steam_id: None,
+            app_ticket: None,
+            e_ticket: None,
+            last_update: None,
+        });
+        entry.steam_id = Some(sid.to_string());
+        let _ = self._save_sidecar();
     }
 }
 
@@ -833,5 +1153,102 @@ mod tests {
             TicketStore::split_kv("\"LaunchOptions\" \"echo \\\"hello\\\"\""),
             Some(("LaunchOptions".into(), "echo \"hello\"".into()))
         );
+    }
+
+    #[test]
+    fn resolves_steam_root_and_steam_config_to_active_userdata_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let steam_root = tmp.path().join("Steam");
+        let root_cfg = steam_root.join("config");
+        let older_user_cfg = steam_root.join("userdata/111111/config");
+        let newer_user_cfg = steam_root.join("userdata/222222/config");
+        fs::create_dir_all(&root_cfg).unwrap();
+        fs::create_dir_all(&older_user_cfg).unwrap();
+        fs::create_dir_all(&newer_user_cfg).unwrap();
+
+        fs::write(
+            older_user_cfg.join("localconfig.vdf"),
+            "\"UserLocalConfigStore\"\n{\n    \"apps\"\n    {\n    }\n}\n",
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        fs::write(
+            newer_user_cfg.join("localconfig.vdf"),
+            "\"UserLocalConfigStore\"\n{\n    \"apps\"\n    {\n    }\n}\n",
+        )
+        .unwrap();
+
+        // Both <steam_root>/config and <steam_root> must resolve to userdata/222222/config
+        let mut store_from_cfg = TicketStore::new(&root_cfg);
+        assert_eq!(store_from_cfg.config_dir(), newer_user_cfg.as_path());
+
+        let store_from_root = TicketStore::new_for_steam_root(&steam_root);
+        assert_eq!(store_from_root.config_dir(), newer_user_cfg.as_path());
+
+        store_from_cfg
+            .set(AppTicketData {
+                app_id: 480,
+                steam_id: Some("76561198000222222".into()),
+                app_ticket: Some("aabbccdd".into()),
+                e_ticket: Some("11223344".into()),
+                last_update: Some(1_700_000_000),
+            })
+            .unwrap();
+        assert!(!root_cfg.join("localconfig.vdf").exists());
+        assert!(newer_user_cfg.join(TICKETS_SIDECAR_FILENAME).is_file());
+    }
+
+    #[test]
+    fn sidecar_0600_survives_steam_rewriting_localconfig_vdf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = TicketStore::new(tmp.path());
+        store
+            .set(AppTicketData {
+                app_id: 1245620,
+                steam_id: Some("76561198028121353".into()),
+                app_ticket: Some("deadbeef".into()),
+                e_ticket: Some("cafebabe".into()),
+                last_update: Some(1_700_000_123),
+            })
+            .unwrap();
+
+        let sidecar = store.sidecar_path();
+        assert!(sidecar.is_file());
+        let mode = fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        // Simulate Steam client rewriting localconfig.vdf and stripping AppTicket/ETicket/SteamID
+        let rewritten_by_steam = r#""UserLocalConfigStore"
+{
+    "Software"
+    {
+        "Valve"
+        {
+            "Steam"
+            {
+                "apps"
+                {
+                    "1245620"
+                    {
+                        "Playtime" "999"
+                    }
+                }
+            }
+        }
+    }
+}
+"#;
+        fs::write(tmp.path().join("localconfig.vdf"), rewritten_by_steam).unwrap();
+
+        let mut reloaded = TicketStore::new(tmp.path());
+        let recovered = reloaded.get(1245620).unwrap();
+        assert_eq!(recovered.steam_id.as_deref(), Some("76561198028121353"));
+        assert_eq!(recovered.app_ticket.as_deref(), Some("deadbeef"));
+        assert_eq!(recovered.e_ticket.as_deref(), Some("cafebabe"));
+        assert_eq!(recovered.last_update, Some(1_700_000_123));
+
+        reloaded.remove(1245620).unwrap();
+        let mut after_rm = TicketStore::new(tmp.path());
+        assert!(after_rm.get(1245620).is_err());
     }
 }

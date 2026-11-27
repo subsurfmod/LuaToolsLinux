@@ -196,6 +196,18 @@ pub fn parse_ownershipticket_steam_id(write_buf: &[u8]) -> Option<u64> {
         return None;
     }
 
+    // Standard Valve AppOwnershipTicket layout: [size:4][version:4][steam_id:8]...
+    // SteamID is at ticket_data_start + 8 = write_buf[24..32]
+    if ticket_data_end >= 32 && write_buf.len() >= 32 {
+        let sid = u64::from_le_bytes([
+            write_buf[24], write_buf[25], write_buf[26], write_buf[27],
+            write_buf[28], write_buf[29], write_buf[30], write_buf[31],
+        ]);
+        if sid >= 0x0110_0001_0000_0000 {
+            return Some(sid);
+        }
+    }
+
     if let Some(varint_start) = ticket_data_start.checked_add(8) {
         if varint_start < ticket_data_end {
             if let Some((val, _)) = decode_varint(&write_buf[varint_start..ticket_data_end]) {
@@ -206,6 +218,8 @@ pub fn parse_ownershipticket_steam_id(write_buf: &[u8]) -> Option<u64> {
         }
     }
 
+    // Compact ticket layout: [version:4][steam_id:8]...
+    // SteamID is at ticket_data_start + 4 = write_buf[20..28]
     if ticket_data_end >= 28 && write_buf.len() >= 28 {
         let potential_steam_id = u64::from_le_bytes([
             write_buf[20],
@@ -310,9 +324,154 @@ pub fn handle_recv_get_app_ownership_ticket_extended_data_response(
     );
 }
 
-/// IPC adapter for Recv: MsgClientGetAppOwnershipTicketResponse (858)
-pub fn handle_recv_get_app_ownership_ticket_response_ipc(ctx: &mut crate::steam_bridge::netpacket::netpacket_core::NetPacketContext) -> Result<(), String> {
-    handle_recv_get_app_ownership_ticket_response(&mut ctx.frame_buffer, ctx.app_id);
+/// Encode a protobuf varint.
+fn encode_varint(mut val: u64, out: &mut Vec<u8>) {
+    loop {
+        let mut byte = (val & 0x7F) as u8;
+        val >>= 7;
+        if val != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if val == 0 {
+            break;
+        }
+    }
+}
+
+/// Encode CMsgClientGetAppOwnershipTicketResponse (EMsg 858) protobuf payload.
+pub fn encode_ownership_ticket_response(app_id: u32, ticket_bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + ticket_bytes.len());
+    // Field 1: eresult = 1 (k_EResultOK)
+    out.push(0x08);
+    encode_varint(1, &mut out);
+    // Field 2: app_id
+    out.push(0x10);
+    encode_varint(u64::from(app_id), &mut out);
+    // Field 3: ticket (bytes)
+    out.push(0x1A);
+    encode_varint(ticket_bytes.len() as u64, &mut out);
+    out.extend_from_slice(ticket_bytes);
+    out
+}
+
+/// Parse CMsgClientGetAppOwnershipTicketResponse (EMsg 858) protobuf payload.
+pub fn parse_ownership_ticket_response(
+    body: &[u8],
+) -> (Option<i32>, Option<u32>, Option<Vec<u8>>) {
+    let mut idx = 0;
+    let mut eresult = None;
+    let mut app_id = None;
+    let mut ticket = None;
+    while idx < body.len() {
+        let Some((tag, tag_len)) = decode_varint(&body[idx..]) else {
+            break;
+        };
+        idx += tag_len;
+        let field_num = tag >> 3;
+        let wire_type = tag & 0x07;
+        match (field_num, wire_type) {
+            (1, 0) => {
+                if let Some((val, vlen)) = decode_varint(&body[idx..]) {
+                    eresult = Some(val as i32);
+                    idx += vlen;
+                } else {
+                    break;
+                }
+            }
+            (2, 0) => {
+                if let Some((val, vlen)) = decode_varint(&body[idx..]) {
+                    app_id = Some(val as u32);
+                    idx += vlen;
+                } else {
+                    break;
+                }
+            }
+            (3, 2) => {
+                if let Some((len, vlen)) = decode_varint(&body[idx..]) {
+                    idx += vlen;
+                    let len = len as usize;
+                    if idx + len <= body.len() {
+                        ticket = Some(body[idx..idx + len].to_vec());
+                        idx += len;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            (_, 0) => {
+                if let Some((_, vlen)) = decode_varint(&body[idx..]) {
+                    idx += vlen;
+                } else {
+                    break;
+                }
+            }
+            (_, 2) => {
+                if let Some((len, vlen)) = decode_varint(&body[idx..]) {
+                    idx += vlen + len as usize;
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    (eresult, app_id, ticket)
+}
+
+/// IPC adapter for Recv: MsgClientGetAppOwnershipTicketResponse (858) (BST-39)
+pub fn handle_recv_get_app_ownership_ticket_response_ipc(
+    ctx: &mut crate::steam_bridge::netpacket::netpacket_core::NetPacketContext,
+) -> Result<(), String> {
+    let body = ctx.body();
+    let (eresult, parsed_app_id, _existing_ticket) = parse_ownership_ticket_response(body);
+    if eresult == Some(1) {
+        // Steam already returned OK (account genuinely owns it)
+        return Ok(());
+    }
+
+    let app_id = parsed_app_id
+        .filter(|&id| id != 0)
+        .unwrap_or(if ctx.app_id != 0 {
+            ctx.app_id
+        } else {
+            resolve_app_id()
+        });
+    if app_id == 0 {
+        return Ok(());
+    }
+
+    // Retrieve ticket from credential store or forge using BST-49 exploit
+    let ticket_bytes = if let Ok(Some(stored)) = read_app_ticket(app_id) {
+        stored
+            .app_ticket
+            .as_deref()
+            .and_then(|h| hex::decode(h).ok())
+            .or_else(|| {
+                crate::steam_bridge::credentials::appticket::forge_local_app_ownership_ticket(
+                    app_id, None,
+                )
+            })
+    } else {
+        crate::steam_bridge::credentials::appticket::forge_local_app_ownership_ticket(app_id, None)
+    };
+
+    let Some(ticket_bytes) = ticket_bytes else {
+        return Ok(());
+    };
+
+    let new_body = encode_ownership_ticket_response(app_id, &ticket_bytes);
+    let mut new_frame = Vec::with_capacity(ctx.body_offset + new_body.len());
+    new_frame.extend_from_slice(&ctx.frame_buffer[..ctx.body_offset]);
+    new_frame.extend_from_slice(&new_body);
+    ctx.replace_frame(new_frame);
+    log::info!(
+        "[OwnershipTicket] Rewrote EMsg 858 response for AppId={} (ticket len={})",
+        app_id,
+        ticket_bytes.len()
+    );
     Ok(())
 }
 
@@ -460,5 +619,16 @@ mod tests {
         assert_eq!(ext_buf[8..12], 0u32.to_le_bytes());
         assert_eq!(ext_buf.len(), 12 + 20 + 4);
         assert_eq!(&ext_buf[32..36], &[0xCA, 0xFE, 0xBA, 0xBE]);
+    }
+
+    #[test]
+    fn test_ownership_ticket_protobuf_codec_roundtrip() {
+        let app_id = 1245620u32;
+        let ticket = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x42];
+        let encoded = encode_ownership_ticket_response(app_id, &ticket);
+        let (eresult, parsed_app, parsed_ticket) = parse_ownership_ticket_response(&encoded);
+        assert_eq!(eresult, Some(1));
+        assert_eq!(parsed_app, Some(app_id));
+        assert_eq!(parsed_ticket, Some(ticket));
     }
 }

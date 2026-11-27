@@ -192,10 +192,15 @@ impl SteamDepotInfo {
                 });
 
                 let mut os = None;
+                let mut arch = None;
                 let mut language = None;
                 if let Some(cfg) = dmap.get("config").and_then(|c| c.as_object()) {
                     os = cfg
                         .get("oslist")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string);
+                    arch = cfg
+                        .get("osarch")
                         .and_then(|v| v.as_str())
                         .map(ToString::to_string);
                     language = cfg
@@ -233,7 +238,7 @@ impl SteamDepotInfo {
                     dlc_app_id,
                     is_shared,
                     os,
-                    arch: None,
+                    arch,
                     language,
                     public_manifest_id,
                     from_app_id,
@@ -254,11 +259,32 @@ impl SteamDepotInfo {
             }
         }
 
+        let mut launch_exes = Vec::new();
+        if let Some(launch_obj) = app
+            .get("config")
+            .and_then(|c| c.get("launch"))
+            .and_then(|l| l.as_object())
+        {
+            for entry in launch_obj.values() {
+                if let Some(exe) = entry
+                    .get("executable")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    let s = exe.to_string();
+                    if !launch_exes.contains(&s) {
+                        launch_exes.push(s);
+                    }
+                }
+            }
+        }
+
         Some(AppDepotInfo {
             app_id,
             depots,
             dlc_ids,
-            launch_exes: Vec::new(),
+            launch_exes,
             public_build_id,
         })
     }

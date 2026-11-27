@@ -3,6 +3,7 @@
 //! Port of usefulsteamtools `Interop_Package.cpp`.
 //! Handles injecting depots into Steam's Package 0 (free sub) to make games appear owned.
 
+use std::collections::HashSet;
 use std::os::raw::c_void;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +24,27 @@ static PENDING_LICENSES: OnceLock<Mutex<Vec<License>>> = OnceLock::new();
 static OWNED_DEPOTS: OnceLock<Mutex<Vec<u32>>> = OnceLock::new();
 static OWNED_DEPOTS_READY: AtomicBool = AtomicBool::new(false);
 static OWNED_DEPOTS_DUMPED: AtomicBool = AtomicBool::new(false);
+static OWNED_APPS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+
+fn owned_apps() -> &'static Mutex<HashSet<u32>> {
+    OWNED_APPS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Mark an AppId as genuinely owned so HasDepot bypasses spoofing.
+pub fn mark_owned(app_id: u32) {
+    if app_id != 0 {
+        let mut apps = owned_apps().lock().unwrap_or_else(|e| e.into_inner());
+        if !apps.contains(&app_id) {
+            log::info!("[InteropPackage] Marking app {} as owned", app_id);
+            apps.insert(app_id);
+        }
+    }
+}
+
+/// Check if an AppId was marked as genuinely owned.
+pub fn is_owned(app_id: u32) -> bool {
+    owned_apps().lock().unwrap_or_else(|e| e.into_inner()).contains(&app_id)
+}
 static C_USER_PTR: OnceLock<Mutex<Option<usize>>> = OnceLock::new();
 static INJECTED_PKG_INFO_PTR: OnceLock<Mutex<Option<usize>>> = OnceLock::new();
 
@@ -189,11 +211,17 @@ pub fn try_dump_owned_depots() {
     if OWNED_DEPOTS_DUMPED.load(Ordering::Acquire) {
         return;
     }
-    let pending = pending_licenses().lock().unwrap_or_else(|e| e.into_inner());
-    if pending.is_empty() {
+    let pending = {
+        let p = pending_licenses().lock().unwrap_or_else(|e| e.into_inner());
+        if p.is_empty() {
+            return;
+        }
+        p.clone()
+    };
+    if original_get_package_info().lock().unwrap_or_else(|e| e.into_inner()).is_none() {
         return;
     }
-    if original_get_package_info().lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+    if c_user_ptr().lock().unwrap_or_else(|e| e.into_inner()).is_none() {
         return;
     }
 
@@ -214,8 +242,12 @@ fn dump_owned_depots(licenses: &[License]) {
         return;
     };
 
+    let Some(c_user) = *c_user_ptr().lock().unwrap_or_else(|e| e.into_inner()) else {
+        return;
+    };
+
     for lic in licenses {
-        let pkg_ptr = unsafe { get_pkg_info(0, lic.package_id, lic.access_token) };
+        let pkg_ptr = unsafe { get_pkg_info(c_user, lic.package_id, lic.access_token) };
         if pkg_ptr == 0 {
             unresolved += 1;
             log::debug!("[InteropPackage] OwnedDepots: package {} did not resolve (token={})", lic.package_id, lic.access_token);
@@ -271,9 +303,26 @@ pub fn get_owned_depots() -> (bool, Vec<u32>) {
     (OWNED_DEPOTS_READY.load(Ordering::Acquire), depots.clone())
 }
 
+/// Register an owned depot ID (used in testing or direct registration).
+pub fn add_owned_depot_id(depot_id: u32) {
+    let mut depots = owned_depots().lock().unwrap_or_else(|e| e.into_inner());
+    if !depots.contains(&depot_id) {
+        depots.push(depot_id);
+    }
+}
+
 /// Check if a depot is owned by the user.
 /// Checks both the owned depots cache (from license list) and Package 0's DepotIdVec.
 pub fn has_depot(depot_id: u32) -> bool {
+    has_depot_ex(depot_id, true)
+}
+
+/// Check if a depot is owned, optionally checking the genuine ownership mark.
+pub fn has_depot_ex(depot_id: u32, check_owned: bool) -> bool {
+    if check_owned && is_owned(depot_id) {
+        return false;
+    }
+
     // First check the owned depots cache
     {
         let depots = owned_depots().lock().unwrap_or_else(|e| e.into_inner());
@@ -287,7 +336,10 @@ pub fn has_depot(depot_id: u32) -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     if let Some(get_pkg_info) = get_pkg_info_opt {
-        let pkg_ptr = unsafe { get_pkg_info(0, K_INJECTED_PACKAGE_ID, K_INJECTED_PKG_ACCESS_TOKEN) };
+        let Some(c_user) = *c_user_ptr().lock().unwrap_or_else(|e| e.into_inner()) else {
+            return false;
+        };
+        let pkg_ptr = unsafe { get_pkg_info(c_user, K_INJECTED_PACKAGE_ID, K_INJECTED_PKG_ACCESS_TOKEN) };
         if pkg_ptr != 0 {
             let pkg = unsafe { &*(pkg_ptr as *const PackageInfo) };
             for i in 0..pkg.depot_id_vec.size {
@@ -373,7 +425,7 @@ unsafe extern "C" fn check_app_ownership_detour(
         try_dump_owned_depots();
 
         // Check if we have a depot for this app
-        if has_depot(app_id) {
+        if has_depot_ex(app_id, false) {
             let orig = *original_check_app_ownership()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
@@ -383,10 +435,11 @@ unsafe extern "C" fn check_app_ownership_detour(
                 false
             };
 
-            if result && !p_own.is_null() {
+            if !p_own.is_null() {
                 let own = &mut *p_own;
-                if own.exist_in_package_nums > 1 {
+                if result && own.exist_in_package_nums > 1 {
                     // Actually owned — record so has_depot excludes it going forward
+                    mark_owned(app_id);
                     own.release_state = EAppReleaseState::Released;
                 } else {
                     own.package_id = K_INJECTED_PACKAGE_ID;
@@ -424,7 +477,11 @@ fn try_init_fake_license_once() {
         None => return,
     };
 
-    let pkg_ptr = unsafe { get_pkg_info(0, K_INJECTED_PACKAGE_ID, K_INJECTED_PKG_ACCESS_TOKEN) };
+    let c_user = match *c_user_ptr().lock().unwrap_or_else(|e| e.into_inner()) {
+        Some(p) => p,
+        None => return,
+    };
+    let pkg_ptr = unsafe { get_pkg_info(c_user, K_INJECTED_PACKAGE_ID, K_INJECTED_PKG_ACCESS_TOKEN) };
     if pkg_ptr == 0 {
         log::warn!("[InteropPackage] TryInitFakeLicenseOnce: GetPackageInfo returned null for injected package");
         return;
@@ -677,11 +734,11 @@ pub fn notify_license_changed() {
         removed_count
     );
 
-    // Queue UI removals (would integrate with InteropSteamUI)
+    // Queue UI removals (integrates with InteropSteamUI)
     let mut queued_removal_count = 0;
     for id in &removals {
         if !added_ids.contains(id) {
-            // InteropSteamUI::QueueRemoval(id);
+            crate::steam_bridge::interop::interop_steamui::queue_removal(*id);
             queued_removal_count += 1;
         }
     }
@@ -717,18 +774,25 @@ fn resolve_function_address(
     channel: PatternChannel,
     pattern_name: &str,
 ) -> Result<u64, String> {
+    let expected_class = if cfg!(target_pointer_width = "64") {
+        crate::steam_bridge::binary_reader::ElfClass::Class64
+    } else {
+        crate::steam_bridge::binary_reader::ElfClass::Class32
+    };
+
     let binaries = crate::steam_bridge::binary_reader::scan_steam_binaries(steam_root);
     let binary = binaries
         .into_iter()
         .find(|b| {
-            b.path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| match component {
-                    BinaryComponent::SteamClient => n.contains("steamclient"),
-                    BinaryComponent::SteamUi => n.contains("steamui"),
-                })
-                .unwrap_or(false)
+            b.class == expected_class
+                && b.path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| match component {
+                        BinaryComponent::SteamClient => n.contains("steamclient"),
+                        BinaryComponent::SteamUi => n.contains("steamui"),
+                    })
+                    .unwrap_or(false)
         })
         .ok_or_else(|| "Steam binary not found".to_string())?;
 
@@ -737,10 +801,18 @@ fn resolve_function_address(
         .lookup_by_binary(&binary, channel, component)
         .map_err(|e| format!("Pattern lookup failed: {}", e))?;
 
+    if pf.is_fallback() {
+        return Err("Fallback patterns not permitted for in-process memory hooks".to_string());
+    }
+
     let entry = pf
         .patterns
         .get(pattern_name)
         .ok_or_else(|| format!("Pattern '{}' not found", pattern_name))?;
+
+    if entry.is_generic_compiler_prologue() {
+        return Err(format!("Pattern '{}' is a generic compiler prologue", pattern_name));
+    }
 
     let mod_name = binary
         .path
@@ -778,15 +850,11 @@ pub fn install(steam_root: &std::path::Path) -> Result<(), String> {
         "CUtlMemoryGrow",
     ) {
         let replacement = cutl_memory_grow_detour as *const () as *mut u8;
-        let patch = unsafe { memory_patch::patch_by_offset(addr, 0, replacement) }
+        let patch = unsafe { memory_patch::patch_by_offset_with_callback(addr, 0, replacement, |trampoline| {
+            let orig_fn: CUtlMemoryGrowFn = unsafe { std::mem::transmute(trampoline as *const ()) };
+            *original_cutl_memory_grow().lock().unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
+        }) }
             .map_err(|e| format!("Failed to install CUtlMemoryGrow hook: {}", e))?;
-
-        if !patch.trampoline.is_null() {
-            let orig_fn: CUtlMemoryGrowFn = unsafe { std::mem::transmute(patch.trampoline) };
-            *original_cutl_memory_grow()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
-        }
         installed_package_patches()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -802,15 +870,11 @@ pub fn install(steam_root: &std::path::Path) -> Result<(), String> {
         "MarkLicenseAsChanged",
     ) {
         let replacement = mark_license_as_changed_detour as *const () as *mut u8;
-        let patch = unsafe { memory_patch::patch_by_offset(addr, 0, replacement) }
+        let patch = unsafe { memory_patch::patch_by_offset_with_callback(addr, 0, replacement, |trampoline| {
+            let orig_fn: MarkLicenseAsChangedFn = unsafe { std::mem::transmute(trampoline as *const ()) };
+            *original_mark_license_as_changed().lock().unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
+        }) }
             .map_err(|e| format!("Failed to install MarkLicenseAsChanged hook: {}", e))?;
-
-        if !patch.trampoline.is_null() {
-            let orig_fn: MarkLicenseAsChangedFn = unsafe { std::mem::transmute(patch.trampoline) };
-            *original_mark_license_as_changed()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
-        }
         installed_package_patches()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -826,15 +890,11 @@ pub fn install(steam_root: &std::path::Path) -> Result<(), String> {
         "ProcessPendingLicenseUpdates",
     ) {
         let replacement = process_pending_license_updates_detour as *const () as *mut u8;
-        let patch = unsafe { memory_patch::patch_by_offset(addr, 0, replacement) }
+        let patch = unsafe { memory_patch::patch_by_offset_with_callback(addr, 0, replacement, |trampoline| {
+            let orig_fn: ProcessPendingLicenseUpdatesFn = unsafe { std::mem::transmute(trampoline as *const ()) };
+            *original_process_pending_license_updates().lock().unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
+        }) }
             .map_err(|e| format!("Failed to install ProcessPendingLicenseUpdates hook: {}", e))?;
-
-        if !patch.trampoline.is_null() {
-            let orig_fn: ProcessPendingLicenseUpdatesFn = unsafe { std::mem::transmute(patch.trampoline) };
-            *original_process_pending_license_updates()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
-        }
         installed_package_patches()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -864,15 +924,11 @@ pub fn install(steam_root: &std::path::Path) -> Result<(), String> {
         "CheckAppOwnership",
     ) {
         let replacement = check_app_ownership_detour as *const () as *mut u8;
-        let patch = unsafe { memory_patch::patch_by_offset(addr, 0, replacement) }
+        let patch = unsafe { memory_patch::patch_by_offset_with_callback(addr, 0, replacement, |trampoline| {
+            let orig_fn: CheckAppOwnershipFn = unsafe { std::mem::transmute(trampoline as *const ()) };
+            *original_check_app_ownership().lock().unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
+        }) }
             .map_err(|e| format!("Failed to install CheckAppOwnership hook: {}", e))?;
-
-        if !patch.trampoline.is_null() {
-            let orig_fn: CheckAppOwnershipFn = unsafe { std::mem::transmute(patch.trampoline) };
-            *original_check_app_ownership()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(orig_fn);
-        }
         installed_package_patches()
             .lock()
             .unwrap_or_else(|e| e.into_inner())

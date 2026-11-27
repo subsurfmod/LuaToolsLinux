@@ -6,13 +6,18 @@
 
 pub mod binary_reader;
 pub mod cloud_redirect;
+pub mod config_file_watcher;
 pub mod credentials;
 pub mod denuvo_auth;
+pub mod extract_tickets;
+pub mod injection;
 pub mod interop;
 pub mod ipc;
+pub mod manifest_donor;
 pub mod manifest_hooks;
 pub mod memory_patch;
 pub mod netpacket;
+pub mod ost_config;
 pub mod ost_platform;
 pub mod pattern_db;
 pub mod preload_loader;

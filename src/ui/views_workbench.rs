@@ -16,11 +16,12 @@ use crate::services::api_client::HubcapService;
 use crate::services::cef_bridge::CefBridgeService;
 use crate::services::cloud_redirect_service::CloudRedirectStatus;
 use crate::services::depot_downloader::{DepotDownloadOptions, DepotSelection};
+use crate::services::download_queue::DownloadTask;
 use crate::services::external_tools::TOOLS;
 use crate::services::fixes_service::FixesService;
 use crate::services::protocol_service::ProtocolService;
 use crate::services::update_service::UpdateService;
-use crate::ui::app::LuaToolsApp;
+use crate::ui::app::{LuaToolsApp, PendingConfirmAction, UiInternalMsg, UpdateOutcomeState};
 use crate::ui::lua_editor::validate_lua_text;
 use crate::ui::state::{AppMessage, DepotsSubTab, SettingsSubTab, ToastKind, UpdateBannerState};
 use crate::ui::theme::{
@@ -69,6 +70,10 @@ impl LuaToolsApp {
         if do_refresh {
             if let Some(aid) = self.depots_app_id {
                 self.open_game_in_depots(aid, ui.ctx());
+                self.notify(
+                    format!("Reloading .lua & Steam depot metadata for AppID {}…", aid),
+                    ToastKind::Info,
+                );
             }
         }
 
@@ -135,6 +140,8 @@ impl LuaToolsApp {
                             } else {
                                 jump_invalid = true;
                             }
+                        } else {
+                            jump_invalid = true;
                         }
                     }
                 },
@@ -199,6 +206,12 @@ impl LuaToolsApp {
         if let Some(aid) = switch_to_app.or(jump_to_app) {
             self.depots_jump_input.clear();
             self.open_game_in_depots(aid, ui.ctx());
+            if jump_to_app.is_some() {
+                self.notify(
+                    format!("Loaded AppID {} in Depots & LuaVault.", aid),
+                    ToastKind::Info,
+                );
+            }
         } else if jump_invalid {
             self.notify(
                 "Enter a valid numeric AppID or Steam Store URL.",
@@ -710,6 +723,12 @@ impl LuaToolsApp {
                             if self.lua_vault.delete(app_id, &h) {
                                 self.depots_variants = self.lua_vault.get_variants(app_id);
                                 self.depots_selected_variant_hash = None;
+                                self.notify("Deleted LuaVault snapshot.", ToastKind::Info);
+                            } else {
+                                self.notify(
+                                    "Could not delete LuaVault snapshot.",
+                                    ToastKind::Warning,
+                                );
                             }
                         }
                     });
@@ -1068,6 +1087,13 @@ impl LuaToolsApp {
                 }
                 self.depots_editor_text = live;
                 self.depots_editing_live = true;
+                self.notify(
+                    format!(
+                        "Editing live stplug-in/{}.lua — click Save to Steam when done.",
+                        app_id
+                    ),
+                    ToastKind::Info,
+                );
             }
             if act_save_live {
                 let mut editor = crate::ui::lua_editor::LuaEditor::new();
@@ -1098,6 +1124,7 @@ impl LuaToolsApp {
             if act_cancel_edit {
                 self.depots_editing_live = false;
                 self.reload_depots_local(app_id);
+                self.notify("Discarded unsaved .lua edits.", ToastKind::Info);
             }
 
             ui.add_space(8.0);
@@ -1180,6 +1207,8 @@ impl LuaToolsApp {
 
             let mut click_qr_login = false;
             let mut click_refresh_info = false;
+            let mut click_clear_depots = false;
+            let mut click_select_all_depots = false;
 
             ui.label(
                 RichText::new(
@@ -1221,16 +1250,10 @@ impl LuaToolsApp {
                     // Sides right closure runs right-to-left
                     ui.spacing_mut().item_spacing.x = 8.0;
                     if ghost_button(ui, "Clear").clicked() {
-                        for p in &mut self.depots_picks {
-                            p.is_selected = false;
-                        }
+                        click_clear_depots = true;
                     }
                     if ghost_button(ui, "Select All").clicked() {
-                        for p in &mut self.depots_picks {
-                            if p.blocked_reason.is_none() {
-                                p.is_selected = true;
-                            }
-                        }
+                        click_select_all_depots = true;
                     }
                     if ghost_button(ui, "Refresh Info")
                         .on_hover_text("Invalidate cached SteamCMD depot metadata and fetch fresh info")
@@ -1251,6 +1274,25 @@ impl LuaToolsApp {
                 },
             );
 
+            if click_clear_depots {
+                for p in &mut self.depots_picks {
+                    p.is_selected = false;
+                }
+                self.notify("Cleared depot selection.", ToastKind::Info);
+            }
+            if click_select_all_depots {
+                let mut count = 0usize;
+                for p in &mut self.depots_picks {
+                    if p.blocked_reason.is_none() {
+                        p.is_selected = true;
+                        count += 1;
+                    }
+                }
+                self.notify(
+                    format!("Selected {} downloadable depot(s).", count),
+                    ToastKind::Info,
+                );
+            }
             if click_refresh_info {
                 self.refresh_depot_info_async(_app_id, ui.ctx());
             }
@@ -1320,12 +1362,20 @@ impl LuaToolsApp {
                                     );
                                 });
                                 row.col(|ui| {
-                                    let title = pick
+                                    let base_title = pick
                                         .lua_entry
                                         .as_ref()
                                         .and_then(|e| e.comment.clone())
                                         .unwrap_or_else(|| "Game Content".into());
-                                    ui.label(title);
+                                    if let Some(ref lang) = pick.depot.language {
+                                        if !lang.trim().is_empty() {
+                                            ui.label(format!("{} [{}]", base_title, lang));
+                                        } else {
+                                            ui.label(base_title);
+                                        }
+                                    } else {
+                                        ui.label(base_title);
+                                    }
                                 });
                                 row.col(|ui| {
                                     ui.label(
@@ -1396,12 +1446,107 @@ impl LuaToolsApp {
 
             if self.depots_downloading {
                 ui.add_space(6.0);
-                ui.add(
-                    ProgressBar::new((self.depots_dl_pct / 100.0).clamp(0.0, 1.0))
-                        .show_percentage()
-                        .corner_radius(CornerRadius::same(3)),
-                );
+                ui.horizontal(|ui| {
+                    let bar_w = (ui.available_width() - 90.0).max(120.0);
+                    ui.add_sized(
+                        [bar_w, 20.0],
+                        ProgressBar::new((self.depots_dl_pct / 100.0).clamp(0.0, 1.0))
+                            .show_percentage()
+                            .corner_radius(CornerRadius::same(3)),
+                    );
+                    if danger_button(ui, "Cancel").clicked() {
+                        if let Some(ref tid) = self.active_depot_task_id {
+                            self.download_queue.cancel_task(tid);
+                        } else {
+                            let _ = self.download_queue.cancel_all();
+                        }
+                        self.depots_dl_status = "Cancelling depot download…".into();
+                        self.notify("Requested download cancellation.", ToastKind::Info);
+                    }
+                });
             }
+
+            // LT-38: Live DownloadQueue active/pending status & cancellation controls
+            let active_q = self.download_queue.active_tasks();
+            let pending_q = self.download_queue.pending_tasks();
+            if !active_q.is_empty() || !pending_q.is_empty() {
+                ui.add_space(8.0);
+                let speed_str = self
+                    .download_queue
+                    .current_speed()
+                    .map(|bps| format!(" · {}/s", format_bytes(bps)))
+                    .unwrap_or_default();
+                let mut click_cancel_all = false;
+                let mut cancel_ids: Vec<String> = Vec::new();
+                inset_paper_sheet(ui, Margin::symmetric(10, 8), |ui| {
+                    ui.set_width(ui.available_width());
+                    egui::Sides::new().show(
+                        ui,
+                        |ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Download Queue ({} active, {} queued){}",
+                                    active_q.len(),
+                                    pending_q.len(),
+                                    speed_str
+                                ))
+                                .font(semibold_font(12.0))
+                                .color(Palette::BLUE_LIGHT),
+                            );
+                        },
+                        |ui| {
+                            if ghost_button(ui, "Cancel All").clicked() {
+                                click_cancel_all = true;
+                            }
+                        },
+                    );
+                    for task in &active_q {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "[Active] {} ({}) — {:.0}% · {}",
+                                    task.label,
+                                    task.source,
+                                    task.progress * 100.0,
+                                    task.status
+                                ))
+                                .size(11.5)
+                                .color(Palette::TEXT_SECONDARY),
+                            );
+                            if !task.cancelled && ghost_button(ui, "Cancel").clicked() {
+                                cancel_ids.push(task.id.clone());
+                            }
+                        });
+                    }
+                    for task in &pending_q {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "[Queued] #{} {} ({})",
+                                    task.app_id, task.label, task.source
+                                ))
+                                .size(11.5)
+                                .color(Palette::TEXT_MUTED),
+                            );
+                            if ghost_button(ui, "Remove").clicked() {
+                                cancel_ids.push(task.id.clone());
+                            }
+                        });
+                    }
+                });
+                if click_cancel_all {
+                    let n = self.download_queue.cancel_all();
+                    self.notify(
+                        format!("Cancelled {} queued/active download(s).", n),
+                        ToastKind::Info,
+                    );
+                }
+                for cid in cancel_ids {
+                    self.download_queue.cancel_task(&cid);
+                    self.notify(format!("Cancelled download task {}.", cid), ToastKind::Info);
+                }
+            }
+
             ui.add_space(8.0);
             egui::CollapsingHeader::new(
                 RichText::new(format!(
@@ -1487,55 +1632,235 @@ impl LuaToolsApp {
         let tx = self.msg_tx.clone();
         let ctx_c = ctx.clone();
 
+        let total_size: u64 = selections.iter().map(|s| s.size).sum();
+        let depot_count = selections.len();
+        let task_id = format!("depots-{}-{}", app_id, depot_count);
+        let gtitle = self.resolve_game_title(app_id);
+
         self.depots_downloading = true;
         self.depots_dl_pct = 0.0;
-        self.depots_dl_status = "Starting official SteamRE/DepotDownloader…".into();
+        self.depots_dl_status = "Queued depot download in DownloadQueue…".into();
+        self.active_depot_task_id = Some(task_id.clone());
+        self.notify(
+            format!(
+                "Started downloading {} depot(s) for {}…",
+                depot_count, gtitle
+            ),
+            ToastKind::Info,
+        );
 
-        thread::spawn(move || {
-            let mut results = Vec::new();
-            for sel in selections {
-                let sub = dest_root.join(format!("depot_{}", sel.depot_id));
-                let tx_p = tx.clone();
+        // LT-38 & LT-68: Enqueue and run bounded-concurrency cancellable DepotDownloader batch via DownloadQueue
+        self.download_queue.enqueue_with_runner(
+            DownloadTask {
+                id: task_id,
+                app_id,
+                label: format!("{} ({} depot(s))", gtitle, depot_count),
+                source: "DepotDownloader".into(),
+                url: format!("https://store.steampowered.com/app/{}", app_id),
+                dest_path: dest_root.clone(),
+                total_bytes: (total_size > 0).then_some(total_size),
+                priority: 5,
+            },
+            move |qctx| {
+                qctx.report_progress(0.0, "Preparing depot batch…", None);
+                let tx_p = std::sync::Mutex::new(tx.clone());
                 let ctx_p = ctx_c.clone();
-                let label = format!("Depot {}", sel.depot_id);
-                let _ = tx.send(AppMessage::DepotDownloadProgress {
-                    depot_label: label.clone(),
-                    pct: 0.0,
-                    msg: "Preparing depot download…".into(),
-                });
+                let qctx_p = qctx.clone();
+                let results = dd.download_depots_batch(
+                    app_id,
+                    &selections,
+                    &dest_root,
+                    &dl_opts,
+                    Some(qctx.cancel_flag()),
+                    move |depot_id, pct, msg| {
+                        let label = format!("Depot {}", depot_id);
+                        let frac = (pct.clamp(0.0, 100.0) / 100.0).clamp(0.0, 1.0);
+                        qctx_p.report_progress(frac, format!("{}: {}", label, msg), None);
+                        if let Ok(guard) = tx_p.lock() {
+                            let _ = guard.send(AppMessage::DepotDownloadProgress {
+                                depot_label: label,
+                                pct,
+                                msg,
+                            });
+                        }
+                        ctx_p.request_repaint();
+                    },
+                );
+                let ok_count = results.iter().filter(|r| r.ok).count();
+                let failed = results.iter().find_map(|r| r.error.clone());
+                let _ = tx.send(AppMessage::DepotDownloadFinished { results });
                 ctx_c.request_repaint();
-                let r = dd.download_depot(app_id, &sel, &sub, &dl_opts, move |pct, msg| {
-                    let _ = tx_p.send(AppMessage::DepotDownloadProgress {
-                        depot_label: label.clone(),
-                        pct,
-                        msg,
-                    });
-                    ctx_p.request_repaint();
-                });
-                results.push(r);
-            }
-            let _ = tx.send(AppMessage::DepotDownloadFinished { results });
-            ctx_c.request_repaint();
-        });
+                if qctx.is_cancelled() {
+                    Err("Cancelled by user".into())
+                } else if ok_count == depot_count {
+                    Ok((total_size > 0).then_some(total_size))
+                } else {
+                    Err(failed.unwrap_or_else(|| "One or more depots failed".into()))
+                }
+            },
+        );
     }
 
     // ===== 5. GAME FIXES =====
 
     pub fn render_fixes(&mut self, ui: &mut egui::Ui) {
+        let verified_applied_fixes = self.applied_fix_index.list_verified_fixes();
+        let applied_total = verified_applied_fixes.len();
         let mut do_refresh = false;
+        let mut index_revert_req: Option<(u32, String, PathBuf)> = None;
         section_header(
             ui,
             "FIXES",
             "Game & DRM Fix Catalog",
             "Verified manifests and patches with automatic .luatools-fix SHA-256 backup and clean revert",
             |ui| {
+                if applied_total > 0 {
+                    status_badge(
+                        ui,
+                        &format!("{} applied", applied_total),
+                        BadgeTone::Ready,
+                    );
+                }
                 if secondary_button(ui, "Refresh Catalog").clicked() {
                     do_refresh = true;
                 }
             },
         );
         if do_refresh {
+            self.start_action_modal(
+                "fix_catalog",
+                "Refresh Game Fixes Catalog",
+                "Rebuilding local applied-fix index & fetching catalog from lua.tools…",
+                None,
+            );
+            self.applied_fix_index.rebuild_index(&self.steam_service);
             self.fetch_fix_listings_async(ui.ctx());
+        }
+
+        // LT-76: Display AppliedFixIndexService entries with file counts, backup badges, and revert actions
+        if !verified_applied_fixes.is_empty() {
+            let section_lbl = format!(
+                "Applied Fixes Index ({})",
+                verified_applied_fixes.len()
+            );
+            paper_card_padded(ui, Margin::symmetric(14, 10), |ui| {
+                ui.set_width(ui.available_width());
+                egui::CollapsingHeader::new(
+                    RichText::new(section_lbl)
+                        .font(semibold_font(13.0))
+                        .color(Palette::TEXT_PRIMARY),
+                )
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    ScrollArea::vertical()
+                        .id_salt("applied_fix_index_scroll")
+                        .max_height(145.0)
+                        .show(ui, |ui| {
+                            for rec in &verified_applied_fixes {
+                                let backup_count = rec
+                                    .files
+                                    .iter()
+                                    .filter(|f| f.backup_path.is_some() || f.hash_before.is_some())
+                                    .count();
+                                let game_title = self.resolve_game_title(rec.app_id);
+                                let resolved_dir = rec
+                                    .game_dir
+                                    .clone()
+                                    .or_else(|| self.steam_service.find_install_dir(rec.app_id));
+                                let short_ts = rec
+                                    .applied_at
+                                    .get(0..19)
+                                    .unwrap_or(&rec.applied_at)
+                                    .replace('T', " ");
+                                inset_paper_sheet(ui, Margin::symmetric(10, 7), |ui| {
+                                    ui.set_width(ui.available_width());
+                                    egui::Sides::new().show(
+                                        ui,
+                                        |ui| {
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.spacing_mut().item_spacing.x = 8.0;
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "{} (#{}) — {}",
+                                                        game_title, rec.app_id, rec.fix_id
+                                                    ))
+                                                    .font(semibold_font(12.5))
+                                                    .color(Palette::TEXT_PRIMARY),
+                                                );
+                                                status_badge(
+                                                    ui,
+                                                    &format!("{} file(s)", rec.files.len()),
+                                                    BadgeTone::Blue,
+                                                );
+                                                if backup_count > 0 {
+                                                    status_badge(
+                                                        ui,
+                                                        &format!("{} SHA-256 backup(s)", backup_count),
+                                                        BadgeTone::Ready,
+                                                    );
+                                                } else {
+                                                    status_badge(
+                                                        ui,
+                                                        "Added Files Only",
+                                                        BadgeTone::Neutral,
+                                                    );
+                                                }
+                                                if rec.wine_dll_overrides.is_some() {
+                                                    status_badge(
+                                                        ui,
+                                                        "WINEDLLOVERRIDES",
+                                                        BadgeTone::Warn,
+                                                    );
+                                                }
+                                                ui.label(
+                                                    RichText::new(short_ts)
+                                                        .font(FontId::new(
+                                                            11.0,
+                                                            FontFamily::Monospace,
+                                                        ))
+                                                        .color(Palette::TEXT_MUTED),
+                                                );
+                                            });
+                                        },
+                                        |ui| {
+                                            if let Some(dir) = resolved_dir {
+                                                ui.add_enabled_ui(!self.fixes_busy, |ui| {
+                                                    if danger_button(ui, "Revert").clicked() {
+                                                        index_revert_req = Some((
+                                                            rec.app_id,
+                                                            rec.fix_id.clone(),
+                                                            dir,
+                                                        ));
+                                                    }
+                                                });
+                                            }
+                                        },
+                                    );
+                                });
+                            }
+                        });
+                });
+            });
+            ui.add_space(10.0);
+        }
+        if let Some((raid, rfid, rdir)) = index_revert_req {
+            self.request_confirm_action(
+                "Confirm Revert Fix",
+                format!(
+                    "Revert applied fix '{}' for {} (AppID {})? Backed-up original files will be restored from .luatools-fix and added patch files removed.",
+                    rfid,
+                    self.resolve_game_title(raid),
+                    raid
+                ),
+                "Revert",
+                true,
+                PendingConfirmAction::RevertFix {
+                    app_id: raid,
+                    fix_id: rfid,
+                    dir: rdir,
+                },
+            );
         }
 
         egui::Sides::new().show(
@@ -1819,31 +2144,23 @@ impl LuaToolsApp {
                                 self.apply_fix_files_async(aid, fx, dir, ui.ctx());
                             }
                             if let Some((fid, dir)) = act_rev {
-                                self.fixes_busy = true;
-                                self.fixes_progress = 0.25;
-                                self.status_text = format!("Reverting fix {}…", fid);
-                                let tx = self.msg_tx.clone();
-                                let ctx_c = ui.ctx().clone();
-                                thread::spawn(move || {
-                                    let res = FixesService::unfix_game(&dir, &fid);
-                                    let msg = if res.ok {
-                                        format!(
-                                            "Reverted {} file(s) for AppID {}",
-                                            res.applied_files.len(),
-                                            aid
-                                        )
-                                    } else {
-                                        res.error.unwrap_or_else(|| "Revert failed".into())
-                                    };
-                                    let _ = tx.send(AppMessage::FixActionFinished {
+                                // LT-75: Always prompt confirmation before reverting game files
+                                self.request_confirm_action(
+                                    "Confirm Revert Fix",
+                                    format!(
+                                        "Revert fix '{}' for {} (AppID {})? Original files will be restored from SHA-256 backups in .luatools-fix and added patch files will be deleted.",
+                                        fid,
+                                        self.resolve_game_title(aid),
+                                        aid
+                                    ),
+                                    "Revert",
+                                    true,
+                                    PendingConfirmAction::RevertFix {
                                         app_id: aid,
-                                        ok: res.ok,
-                                        downloaded_manifest: None,
                                         fix_id: fid,
-                                        msg,
-                                    });
-                                    ctx_c.request_repaint();
-                                });
+                                        dir,
+                                    },
+                                );
                             }
                         } else {
                             ui.vertical_centered(|ui| {
@@ -1938,7 +2255,7 @@ impl LuaToolsApp {
             }
         }
 
-        // Clean Sub-Tab Strip (plain-English labels + clear hover descriptions)
+        // Clean Sub-Tab Strip (clear hover descriptions)
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             if chip_button(ui, "General", self.settings_subtab == SettingsSubTab::General)
@@ -1963,7 +2280,7 @@ impl LuaToolsApp {
                 self.settings_subtab == SettingsSubTab::Integrations,
             )
             .on_hover_text(
-                "1-click SLSsteam unlocker installer, Play Unowned toggle, Cloud Save Redirect, and Steam Store Page Plugin",
+                "1-click Steam Unlocker installer, Play Unowned toggle, Cloud Save Redirect, and Steam Store Page Plugin",
             )
             .clicked()
             {
@@ -1999,7 +2316,7 @@ impl LuaToolsApp {
                 self.settings_subtab == SettingsSubTab::Telemetry,
             )
             .on_hover_text(
-                "Privacy-scrubbed error logs, crash diagnostics, and 1-click GitHub bug report helper",
+                "Privacy-scrubbed error logs, crash diagnostics, DoH resolver, and 1-click GitHub bug report helper",
             )
             .clicked()
             {
@@ -2097,6 +2414,8 @@ impl LuaToolsApp {
             }
 
             ui.add_space(6.0);
+            let mut confirm_restart_steam = false;
+            let mut confirm_kill_steam = false;
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 if secondary_button(ui, "Rescan Steam").clicked() {
@@ -2118,7 +2437,7 @@ impl LuaToolsApp {
                     self.trigger_donate_keys(ui.ctx());
                 }
                 if ghost_button(ui, "Restart Steam").clicked() {
-                    self.trigger_restart_steam(ui.ctx());
+                    confirm_restart_steam = true;
                 }
                 if danger_button(ui, "Kill Steam")
                     .on_hover_text(
@@ -2126,9 +2445,27 @@ impl LuaToolsApp {
                     )
                     .clicked()
                 {
-                    self.trigger_kill_steam(ui.ctx());
+                    confirm_kill_steam = true;
                 }
             });
+            if confirm_restart_steam {
+                self.request_confirm_action(
+                    "Confirm Restart Steam",
+                    "Shut down running Steam processes and relaunch Steam with SLSsteam / LuaTools active?",
+                    "Restart Steam",
+                    false,
+                    PendingConfirmAction::RestartSteam,
+                );
+            }
+            if confirm_kill_steam {
+                self.request_confirm_action(
+                    "Confirm Kill Steam",
+                    "Terminate all running Steam client, overlay, and webhelper processes? Unsaved progress in active Steam games could be lost.",
+                    "Kill Steam",
+                    true,
+                    PendingConfirmAction::KillSteam,
+                );
+            }
         });
 
         ui.add_space(16.0);
@@ -2289,6 +2626,12 @@ impl LuaToolsApp {
                     let auth = self.auth_service.clone();
                     let tx = self.msg_tx.clone();
                     let ctx = ui.ctx().clone();
+                    self.start_action_modal(
+                        "auth",
+                        "Discord OAuth Sign-In",
+                        "Opened browser — complete Discord sign-in to continue…",
+                        None,
+                    );
                     self.notify(
                         "Opening browser for Discord OAuth sign-in…",
                         ToastKind::Info,
@@ -2370,11 +2713,18 @@ impl LuaToolsApp {
                     if !HubcapService::is_valid_key_format(&key) {
                         self.settings_hubcap_status =
                             "Invalid format — expected smm_ + 96 lowercase hex chars.".into();
+                        self.notify(self.settings_hubcap_status.clone(), ToastKind::Warning);
                     } else {
                         let hc = self.hubcap_service.clone();
                         let tx = self.msg_tx.clone();
                         let ctx = ui.ctx().clone();
                         self.settings_hubcap_status = "Checking Hubcap quota…".into();
+                        self.start_action_modal(
+                            "hubcap",
+                            "Verify Hubcap API Key",
+                            "Verifying Hubcap API key & daily quota…",
+                            None,
+                        );
                         thread::spawn(move || {
                             let msg = if let Some(st) = hc.get_stats(&key) {
                                 (
@@ -2460,11 +2810,12 @@ impl LuaToolsApp {
     }
 
     fn render_settings_integrations(&mut self, ui: &mut egui::Ui) {
-        // 1. Primary Card: 1-Click Steam Unlocker (SLSsteam + Optional ACCELA)
+        // 1. Primary Card: 1-Click Steam Unlocker
         let wired_st = self.wired_service.status();
         let mut wired_act: Option<&'static str> = None;
         let mut launch_accela = false;
         let mut uninstall_wired = false;
+        let mut copy_wired_hash: Option<(&'static str, String)> = None;
 
         paper_card(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -2473,7 +2824,7 @@ impl LuaToolsApp {
                 ui,
                 |ui| {
                     ui.label(
-                        RichText::new("1-Click Steam Unlocker (SLSsteam)")
+                        RichText::new("1-Click Steam Unlocker")
                             .font(display_font(17.5))
                             .color(Palette::TEXT_PRIMARY),
                     );
@@ -2492,25 +2843,78 @@ impl LuaToolsApp {
             );
             ui.label(
                 RichText::new(
-                    "Install SLSsteam so Steam can recognize and launch games added with LuaTools. No root password required.",
+                    "Install Steam Unlocker so Steam can recognize and launch games added with LuaTools. No root password required.",
                 )
                 .size(12.5)
                 .color(Palette::TEXT_MUTED),
             );
+
+            // LT-65: Surface SHA-256 verification status of installed Steam Unlocker components
+            inset_paper_sheet(ui, Margin::symmetric(12, 8), |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 4.0;
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.label(
+                        RichText::new("SLSsteam.so:")
+                            .font(semibold_font(12.0))
+                            .color(Palette::TEXT_SECONDARY),
+                    );
+                    if let Some(ref sha) = wired_st.slssteam_sha256 {
+                        status_badge(ui, "SHA-256 Verified", BadgeTone::Ready);
+                        let short = if sha.len() > 20 {
+                            format!("{}…{}", &sha[..12], &sha[sha.len() - 8..])
+                        } else {
+                            sha.clone()
+                        };
+                        ui.label(
+                            RichText::new(short)
+                                .font(FontId::new(11.5, FontFamily::Monospace))
+                                .color(Palette::TEXT_PRIMARY),
+                        )
+                        .on_hover_text(format!("Full SHA-256: {}", sha));
+                        if ghost_button(ui, "Copy").clicked() {
+                            copy_wired_hash = Some(("SLSsteam.so SHA-256", sha.clone()));
+                        }
+                    } else {
+                        status_badge(ui, "Missing", BadgeTone::Warn);
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.label(
+                        RichText::new("library-inject.so:")
+                            .font(semibold_font(12.0))
+                            .color(Palette::TEXT_SECONDARY),
+                    );
+                    if let Some(ref sha) = wired_st.library_inject_sha256 {
+                        status_badge(ui, "SHA-256 Verified", BadgeTone::Ready);
+                        let short = if sha.len() > 20 {
+                            format!("{}…{}", &sha[..12], &sha[sha.len() - 8..])
+                        } else {
+                            sha.clone()
+                        };
+                        ui.label(
+                            RichText::new(short)
+                                .font(FontId::new(11.5, FontFamily::Monospace))
+                                .color(Palette::TEXT_PRIMARY),
+                        )
+                        .on_hover_text(format!("Full SHA-256: {}", sha));
+                        if ghost_button(ui, "Copy").clicked() {
+                            copy_wired_hash = Some(("library-inject.so SHA-256", sha.clone()));
+                        }
+                    } else {
+                        status_badge(ui, "Not Present", BadgeTone::Muted);
+                    }
+                });
+            });
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 ui.add_enabled_ui(!self.wired_busy, |ui| {
-                    if primary_button(ui, "Install Steam Unlocker (SLSsteam)").clicked() {
-                        wired_act = Some("slssteam");
+                    if primary_button(ui, "Install Steam Unlocker").clicked() {
+                        wired_act = Some("steam_unlocker");
                     }
-                    if secondary_button(ui, "Install Both (SLSsteam + ACCELA)").clicked() {
-                        wired_act = Some("all");
-                    }
-                    if secondary_button(ui, "Install ACCELA Only").clicked() {
-                        wired_act = Some("accela");
-                    }
-                    if wired_st.accela_installed && secondary_button(ui, "Launch ACCELA").clicked()
-                    {
+                    if wired_st.accela_installed && secondary_button(ui, "Launch ACCELA").clicked() {
                         launch_accela = true;
                     }
                     if (wired_st.accela_installed || wired_st.slssteam_installed)
@@ -2536,6 +2940,10 @@ impl LuaToolsApp {
             }
         });
 
+        if let Some((lbl, hash)) = copy_wired_hash {
+            ui.ctx().copy_text(hash);
+            self.notify(format!("Copied {} to clipboard.", lbl), ToastKind::Info);
+        }
         if let Some(act) = wired_act {
             self.trigger_wired_action(act, ui.ctx());
         }
@@ -2548,9 +2956,9 @@ impl LuaToolsApp {
         if uninstall_wired {
             match self.wired_service.uninstall_all() {
                 Ok(()) => {
-                    self.wired_status_text = "Uninstalled ACCELA and SLSsteam.".into();
+                    self.wired_status_text = "Uninstalled Steam Unlocker.".into();
                     self.refresh_all_local_state();
-                    self.notify("Uninstalled ACCELA and SLSsteam.", ToastKind::Info);
+                    self.notify("Uninstalled Steam Unlocker.", ToastKind::Info);
                 }
                 Err(e) => self.notify(e, ToastKind::Warning),
             }
@@ -2815,24 +3223,7 @@ impl LuaToolsApp {
                     )
                     .clicked()
                 {
-                    if let Some(inst) = &self.steam_service.installation {
-                        let plugin_svc =
-                            crate::services::plugin_installer_service::PluginInstallerService::new(
-                                None,
-                            );
-                        match plugin_svc.download_and_install_ltsp(Some(&inst.root)) {
-                            Ok(path) => self.notify(
-                                format!("Installed LTSP Steam Store Plugin to {}", path.display()),
-                                ToastKind::Success,
-                            ),
-                            Err(e) => self.notify(
-                                format!("Failed to install LTSP Store Plugin: {}", e),
-                                ToastKind::Warning,
-                            ),
-                        }
-                    } else {
-                        self.notify("Steam installation not detected.", ToastKind::Warning);
-                    }
+                    self.install_ltsp_plugin_async(ui.ctx());
                 }
                 if secondary_button(ui, "Register luatools:// Links")
                     .on_hover_text(
@@ -2861,9 +3252,15 @@ impl LuaToolsApp {
                     }
                 }
                 if ghost_button(ui, "Check Millennium Status")
-                    .on_hover_text("Check if Millennium RPC is running on 127.0.0.1:38495")
+                    .on_hover_text("Inspect local Millennium Linux installation and plugin configuration")
                     .clicked()
                 {
+                    self.start_action_modal(
+                        "millennium",
+                        "Check Millennium Status",
+                        "Inspecting local Millennium installation & plugin status…",
+                        None,
+                    );
                     self.probe_bridge_async(ui.ctx());
                 }
             });
@@ -2893,8 +3290,22 @@ impl LuaToolsApp {
         if let Some((aid, on)) = toggle_cloud {
             if on {
                 self.cloud_redirect_service.enable_cloud_for_app(aid);
+                self.notify(
+                    format!(
+                        "Enabled CloudRedirect for AppID {} (click Sync to CloudRedirect to save).",
+                        aid
+                    ),
+                    ToastKind::Info,
+                );
             } else {
                 self.cloud_redirect_service.disable_cloud_for_app(aid);
+                self.notify(
+                    format!(
+                        "Disabled CloudRedirect for AppID {} (click Sync to CloudRedirect to save).",
+                        aid
+                    ),
+                    ToastKind::Info,
+                );
             }
         }
         if sync_cloud {
@@ -2981,19 +3392,50 @@ impl LuaToolsApp {
             });
 
             let is_updating = matches!(self.update_banner, UpdateBannerState::Updating { .. });
-            ui.horizontal(|ui| {
+            let show_feed = !matches!(self.updater_feed.outcome, UpdateOutcomeState::Idle)
+                || !self.updater_feed.lines.is_empty();
+            let mut click_relaunch_settings: Option<PathBuf> = None;
+            ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 ui.add_enabled_ui(!is_updating, |ui| {
                     if secondary_button(ui, "Check for Updates").clicked() {
                         let _ = self.settings_service.save();
-                        self.check_app_update_once_async(ui.ctx());
+                        self.check_app_update_interactive(ui.ctx());
                     }
                     if primary_button(ui, "Pull & Update Now").clicked() {
                         let _ = self.settings_service.save();
                         self.trigger_git_self_update(ui.ctx());
                     }
                 });
+                if show_feed && ghost_button(ui, "Open Progress Popup").clicked() {
+                    self.updater_feed.modal_open = true;
+                }
+                if let UpdateOutcomeState::Succeeded { ref exe_path, .. } =
+                    self.updater_feed.outcome
+                {
+                    if primary_button(ui, "↻ Restart to Apply").clicked() {
+                        click_relaunch_settings = Some(exe_path.clone());
+                    }
+                }
             });
+
+            if show_feed {
+                ui.add_space(6.0);
+                let ctx_clone = ui.ctx().clone();
+                self.render_updater_progress_panel(
+                    ui,
+                    &ctx_clone,
+                    "settings_updater_feed_scroll",
+                    220.0,
+                );
+            }
+            if let Some(exe) = click_relaunch_settings {
+                self.notify("Relaunching updated LuaTools…", ToastKind::Info);
+                match UpdateService::relaunch_binary(&exe) {
+                    Ok(()) => self.request_quit(ui.ctx()),
+                    Err(e) => self.notify(e, ToastKind::Warning),
+                }
+            }
         });
 
         ui.add_space(18.0);
@@ -3022,6 +3464,10 @@ impl LuaToolsApp {
                     .clicked()
                 {
                     self.cached_tool_statuses.clear();
+                    self.notify(
+                        "Refreshed external toolchain installation statuses.",
+                        ToastKind::Info,
+                    );
                 }
             },
         );
@@ -3114,7 +3560,16 @@ impl LuaToolsApp {
                     if ghost_button(ui, "Open Folder").clicked() {
                         let d = self.tools_manager.tools_dir.join(spec.key);
                         let _ = std::fs::create_dir_all(&d);
-                        let _ = Command::new("xdg-open").arg(&d).spawn();
+                        match Command::new("xdg-open").arg(&d).spawn() {
+                            Ok(_) => self.notify(
+                                format!("Opened folder {}", d.display()),
+                                ToastKind::Info,
+                            ),
+                            Err(e) => self.notify(
+                                format!("Failed to open folder {}: {}", d.display(), e),
+                                ToastKind::Warning,
+                            ),
+                        }
                     }
                     if spec.key == "steamautopatch"
                         && secondary_button(ui, "Run on Game Folder…").clicked()
@@ -3386,6 +3841,12 @@ impl LuaToolsApp {
             let tx = self.msg_tx.clone();
             let ctx = ui.ctx().clone();
             self.settings_telemetry_status = "Sending test diagnostic ping…".into();
+            self.start_action_modal(
+                "telemetry_test",
+                "Test Telemetry Endpoint",
+                "Sending scrubbed diagnostic test ping…",
+                None,
+            );
             thread::spawn(move || {
                 match tel.send_test_ping() {
                     Ok(m) => {
@@ -3401,7 +3862,7 @@ impl LuaToolsApp {
 
         ui.add_space(16.0);
 
-        // 4. DNS-over-HTTPS (DoH) Resolver (LT-47)
+        // 4. DNS-over-HTTPS (DoH) Resolver (LT-47, LT-79)
         paper_card(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 10.0;
@@ -3430,11 +3891,20 @@ impl LuaToolsApp {
                 .color(Palette::TEXT_MUTED),
             );
 
-            ui.checkbox(
-                &mut self.settings_service.settings.doh_enabled,
-                "Enable DNS-over-HTTPS for Steam domain resolution",
-            )
-            .on_hover_text("Encrypts DNS queries for Steam API and CDN domains");
+            if ui
+                .checkbox(
+                    &mut self.settings_service.settings.doh_enabled,
+                    "Enable DNS-over-HTTPS for Steam domain resolution",
+                )
+                .on_hover_text("Encrypts DNS queries for Steam API and CDN domains")
+                .changed()
+            {
+                crate::services::doh_resolver::DohResolver::configure_global(
+                    self.settings_service.settings.doh_enabled,
+                    &self.settings_service.settings.doh_endpoint,
+                );
+                let _ = self.settings_service.save();
+            }
 
             ui.horizontal(|ui| {
                 let w = (ui.available_width() - 140.0).max(180.0);
@@ -3447,9 +3917,55 @@ impl LuaToolsApp {
                     .hint_text("https://1.1.1.1/dns-query (optional, defaults to Cloudflare)"),
                 );
                 if secondary_button(ui, "Test Resolution").clicked() {
-                    // Test DNS resolution
+                    let ep = self.settings_service.settings.doh_endpoint.trim().to_string();
+                    let ui_tx = self.ui_tx.clone();
+                    let ctx_c = ui.ctx().clone();
+                    self.settings_doh_status = "Resolving api.steampowered.com via DoH…".into();
+                    self.start_action_modal(
+                        "doh_test",
+                        "Test DNS-over-HTTPS Resolution",
+                        "Resolving api.steampowered.com via encrypted DoH…",
+                        None,
+                    );
+                    thread::spawn(move || {
+                        let resolver = crate::services::doh_resolver::DohResolver::new(
+                            (!ep.is_empty()).then_some(ep.as_str()),
+                        );
+                        let t0 = std::time::Instant::now();
+                        let (ok, msg) = match resolver.resolve("api.steampowered.com") {
+                            Some(records) if !records.is_empty() => {
+                                let ips: Vec<String> =
+                                    records.iter().map(|r| r.value.clone()).collect();
+                                (
+                                    true,
+                                    format!(
+                                        "DoH OK ({}) · api.steampowered.com → {} ({} ms)",
+                                        resolver.endpoint(),
+                                        ips.join(", "),
+                                        t0.elapsed().as_millis()
+                                    ),
+                                )
+                            }
+                            _ => (
+                                false,
+                                format!(
+                                    "DoH resolution failed via {} — check endpoint or network.",
+                                    resolver.endpoint()
+                                ),
+                            ),
+                        };
+                        let _ = ui_tx.send(UiInternalMsg::DohTestFinished { ok, msg });
+                        ctx_c.request_repaint();
+                    });
                 }
             });
+            if !self.settings_doh_status.is_empty() {
+                ui.label(
+                    RichText::new(&self.settings_doh_status)
+                        .size(12.0)
+                        .color(Palette::BLUE_LIGHT),
+                );
+            }
             if !self.settings_service.settings.doh_endpoint.trim().is_empty() {
                 ui.label(
                     RichText::new(format!("Custom endpoint: {}", self.settings_service.settings.doh_endpoint))
@@ -3478,6 +3994,7 @@ impl LuaToolsApp {
                 |ui| {
                     if ghost_button(ui, "Refresh").clicked() {
                         self.telemetry_cache_dirty = true;
+                        self.notify("Refreshed recorded telemetry events.", ToastKind::Info);
                     }
                 },
             );
@@ -3712,7 +4229,9 @@ impl LuaToolsApp {
 
         if do_refresh {
             self.steam_bridge_service.refresh_steam_detection();
+            self.poll_live_steam_pid_async(ui.ctx(), true);
             self.bridge_status_msg = "Refreshed Steam process & IPC detection.".into();
+            self.notify("Refreshed Steam process & IPC detection.", ToastKind::Info);
         }
         if do_install {
             self.trigger_bridge_action_async("install", ui.ctx());

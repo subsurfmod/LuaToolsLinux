@@ -47,9 +47,10 @@ pub use bkv_parser::{
 
 // New Valve KV1 parser (replaces custom BKV format for UserGameStats_*.bin)
 pub use keyvalues1::{
-    extract_achievements_kv1, extract_achievements_with_schema,
-    find_user_game_stats_file as find_user_game_stats_file_kv1, parse_kv1_bytes, parse_kv1_file,
-    write_kv1, AchievementData as Kv1AchievementData, Kv1Error, Kv1Reader, Kv1Value,
+    extract_achievements_from_stats_file, extract_achievements_kv1,
+    extract_achievements_with_schema, find_user_game_stats_file as find_user_game_stats_file_kv1,
+    find_user_game_stats_schema_file, parse_kv1_bytes, parse_kv1_file, write_kv1,
+    AchievementData as Kv1AchievementData, Kv1Error, Kv1Reader, Kv1Value,
 };
 pub use byte_search::{find, find_in_file, find_in_file_range, find_with_mask};
 pub use directory_watch::{wait_any, Change, ChangeAction, WaitResult, WaitStatus, Watch};
@@ -57,4 +58,9 @@ pub use memory::{get_module_image, is_readable, write_executable_byte, ModuleIma
 pub use steam_credential_store::{
     get_active_user, get_app_ticket, get_e_ticket, get_steam_id, initialize, to_string,
     write_app_ticket, write_e_ticket, write_steam_id, Status,
+};
+pub use trap::{
+    add_vectored_handler, exception_kind_from_signal, install as install_trap_handler,
+    remove_vectored_handler, uninstall as uninstall_trap_handler, Context as TrapContext,
+    ExceptionKind, Handler as TrapHandler, HandlerHandle, TrapError,
 };

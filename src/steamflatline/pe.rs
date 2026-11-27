@@ -891,7 +891,7 @@ impl PeFile {
         }
 
         // Write section data (aligned to file alignment)
-        let file_alignment = match &self.optional_header {
+        let _file_alignment = match &self.optional_header {
             OptionalHeader::Pe32(h) => h.file_alignment,
             OptionalHeader::Pe64(h) => h.file_alignment,
         };
@@ -915,7 +915,7 @@ impl PeFile {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     #[test]
     fn test_pe_module_compiles() {

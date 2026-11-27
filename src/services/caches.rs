@@ -59,17 +59,15 @@ fn parse_release_year(date_str: &str) -> Option<i32> {
 }
 
 const STEAM_PLACEHOLDER_SHA256: &str =
-    "732ec27ff347292488e3341f00d0750a31f42c44f55da4e04bc8f61d7eb1b6f3";
+    "732ec27f2af650fe079f1c83b0bb0c712a322dc175f383504176724675ad2700";
 const STEAM_HTTP_UA: &str =
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 const HARDWARE_APPID_URL: &str =
     "https://raw.githubusercontent.com/jsnli/steamappidlist/master/data/hardware_appid.json";
 const TTL_14_DAYS: u64 = 14 * 24 * 3600;
-#[allow(dead_code)]
+const NEGATIVE_CACHE_TTL_SECS: u64 = 24 * 3600;
 const RATE_LIMIT_WINDOW_SECS: u64 = 200;
-#[allow(dead_code)]
 const MAX_REQ_PER_WINDOW: usize = 190;
-#[allow(dead_code)]
 const REQUEST_TIMESTAMPS_FILE: &str = "request_timestamps.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -160,6 +158,8 @@ pub struct SteamAppInfoCache {
     cache_dir: PathBuf,
     steam_root: Option<PathBuf>,
     mem: Arc<Mutex<HashMap<u32, GameDetails>>>,
+    neg_mem: Arc<Mutex<HashMap<u32, u64>>>,
+    req_timestamps: Arc<Mutex<Vec<u64>>>,
     last_req: Arc<Mutex<Option<Instant>>>,
 }
 
@@ -173,16 +173,53 @@ impl SteamAppInfoCache {
     pub fn new(cache_dir: Option<PathBuf>) -> Self {
         let dir = cache_dir.unwrap_or_else(|| default_luatools_cache_dir().join("details"));
         let _ = fs::create_dir_all(&dir);
+        let ts_path = dir.join(REQUEST_TIMESTAMPS_FILE);
+        let initial_ts = fs::read_to_string(&ts_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Vec<u64>>(&s).ok())
+            .unwrap_or_default();
         Self {
             cache_dir: dir,
             steam_root: None,
             mem: Arc::new(Mutex::new(HashMap::new())),
+            neg_mem: Arc::new(Mutex::new(HashMap::new())),
+            req_timestamps: Arc::new(Mutex::new(initial_ts)),
             last_req: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn set_steam_root(&mut self, root: Option<PathBuf>) {
         self.steam_root = root;
+    }
+
+    fn now_unix_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// Sliding-window rate limiter enforcing at most `MAX_REQ_PER_WINDOW` Steam Store API
+    /// calls per `RATE_LIMIT_WINDOW_SECS`, persisted to `request_timestamps.json` (LT-51).
+    fn record_and_enforce_rate_limit(&self) -> bool {
+        let now = Self::now_unix_secs();
+        let cutoff = now.saturating_sub(RATE_LIMIT_WINDOW_SECS);
+        let mut ts = self
+            .req_timestamps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ts.retain(|&t| t >= cutoff);
+        if ts.len() >= MAX_REQ_PER_WINDOW {
+            return false;
+        }
+        ts.push(now);
+        if let Ok(json) = serde_json::to_string(&*ts) {
+            let _ = atomic_write_bytes(
+                &self.cache_dir.join(REQUEST_TIMESTAMPS_FILE),
+                json.as_bytes(),
+            );
+        }
+        true
     }
 
     pub fn get(&self, app_id: u32) -> Option<GameDetails> {
@@ -196,10 +233,30 @@ impl SteamAppInfoCache {
             return Some(hit);
         }
 
+        let now = Self::now_unix_secs();
+        {
+            let mut neg = self.neg_mem.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(&cached_at) = neg.get(&app_id) {
+                if now.saturating_sub(cached_at) < NEGATIVE_CACHE_TTL_SECS {
+                    return None;
+                }
+                neg.remove(&app_id);
+            }
+        }
+
         let cache_file = self.cache_dir.join(format!("{}.json", app_id));
         if let Ok(raw) = fs::read_to_string(&cache_file) {
             if let Ok(val) = serde_json::from_str::<Value>(&raw) {
-                if let Some(d) = Self::parse_details(app_id, &val) {
+                if val.get("_not_found").and_then(|v| v.as_bool()) == Some(true) {
+                    let cached_at = val.get("_cached_at").and_then(|v| v.as_u64()).unwrap_or(0);
+                    if now.saturating_sub(cached_at) < NEGATIVE_CACHE_TTL_SECS {
+                        self.neg_mem
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(app_id, cached_at);
+                        return None;
+                    }
+                } else if let Some(d) = Self::parse_details(app_id, &val) {
                     let mut mem = self.mem.lock().unwrap_or_else(|e| e.into_inner());
                     if mem.len() >= 32 {
                         mem.clear();
@@ -210,7 +267,17 @@ impl SteamAppInfoCache {
             }
         }
 
-        // Gentle 350ms rate limit against Steam Store API
+        if !self.record_and_enforce_rate_limit() {
+            log::warn!(
+                "Steam Store API rate limit reached ({}/{}s); deferring lookup for {}",
+                MAX_REQ_PER_WINDOW,
+                RATE_LIMIT_WINDOW_SECS,
+                app_id
+            );
+            return None;
+        }
+
+        // Gentle 350ms pacing against Steam Store API
         {
             let mut last = self.last_req.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(prev) = *last {
@@ -243,6 +310,19 @@ impl SteamAppInfoCache {
             .ok()?;
         let entry = payload.get(app_id.to_string())?;
         if entry.get("success").and_then(|v| v.as_bool()) != Some(true) {
+            // LT-51: Cache `success: false` delisted/unavailable apps with a 24h TTL
+            let neg_ts = Self::now_unix_secs();
+            let neg_payload = serde_json::json!({
+                "_not_found": true,
+                "_cached_at": neg_ts
+            });
+            if let Ok(serialized) = serde_json::to_string(&neg_payload) {
+                let _ = atomic_write_bytes(&cache_file, serialized.as_bytes());
+            }
+            self.neg_mem
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(app_id, neg_ts);
             return None;
         }
         let data = entry.get("data")?;
@@ -581,10 +661,30 @@ impl SteamAppListCache {
                 .timeout_connect(Duration::from_secs(10))
                 .timeout(Duration::from_secs(30))
                 .build();
-            let Ok(resp) = agent.get("https://applist.morrenus.xyz/").call() else {
-                return;
-            };
-            let Ok(val) = resp.into_json::<Value>() else {
+            // LT-51: Primary applist mirror with Steam Web API ISteamApps/GetAppList/v2 fallback
+            let applist_urls = [
+                "https://applist.morrenus.xyz/",
+                "https://api.steampowered.com/ISteamApps/GetAppList/v2/",
+            ];
+            let mut parsed_val: Option<Value> = None;
+            for url in applist_urls {
+                if let Ok(resp) = agent.get(url).set("User-Agent", STEAM_HTTP_UA).call() {
+                    if let Ok(v) = resp.into_json::<Value>() {
+                        let has_apps = v
+                            .get("applist")
+                            .and_then(|a| a.get("apps"))
+                            .and_then(|x| x.as_array())
+                            .or_else(|| v.as_array())
+                            .map(|a| !a.is_empty())
+                            .unwrap_or(false);
+                        if has_apps {
+                            parsed_val = Some(v);
+                            break;
+                        }
+                    }
+                }
+            }
+            let Some(val) = parsed_val else {
                 return;
             };
             let apps_opt = val

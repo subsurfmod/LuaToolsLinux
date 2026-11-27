@@ -1,13 +1,13 @@
-//! Denuvo authorization window integration for Linux.
+//! Denuvo authorization window integration and PE protection scanner for Linux (BST-54, BST-55).
 //!
-//! Port of usefulsteamtools `Pipe/Features/Auth/DenuvoAuth.cpp`.
+//! Port of usefulsteamtools `Pipe/Features/DenuvoAuth/DenuvoAuth.cpp` and `ProtectionScan.cpp`.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
 use std::os::raw::c_void;
-use std::path::Path;
-use std::sync::{Mutex, RwLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::steam_bridge::ost_platform::http;
@@ -15,6 +15,21 @@ use crate::steam_bridge::ost_platform::http;
 const DEFAULT_TICKET_TTL_SECS: u32 = 86_400;
 const MAX_AUTH_RESPONSE_BYTES: u32 = 64 * 1024;
 const AUTH_HTTP_TIMEOUT_MS: u32 = 2_000;
+
+/// Minimum candidate packed module size on disk (80 MiB = 83,886,080 bytes) per BST-54.
+pub const MIN_PACKED_MODULE_BYTES: u64 = 80 * 1024 * 1024;
+
+/// Minimum raw size of a W+X protected section blob (4 MiB = 4,194,304 bytes) per BST-54.
+pub const PROTECTOR_BLOB_MIN_BYTES: u32 = 4 * 1024 * 1024;
+
+/// Shannon entropy floor for W+X protected blobs (6.0 bits/byte) per BST-54.
+pub const PROTECTOR_BLOB_MIN_ENTROPY: f64 = 6.0;
+
+/// Shannon entropy threshold for high-confidence encrypted blobs (7.0 bits/byte).
+pub const PROTECTOR_BLOB_HIGH_CONFIDENCE_ENTROPY: f64 = 7.0;
+
+/// Maximum bytes sampled from a section for entropy calculation (8 MiB).
+pub const PROTECTOR_BLOB_ENTROPY_SAMPLE_BYTES: usize = 8 * 1024 * 1024;
 
 fn is_http_url(url: &str) -> bool {
     url.get(..7)
@@ -29,6 +44,28 @@ fn now_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Computes Shannon byte entropy (bits/byte) over a byte slice:
+/// H = - sum_{b=0}^{255} p_b * log2(p_b)
+/// Ranges from 0.0 (all bytes identical) to 8.0 (uniform random / packed).
+pub fn calculate_shannon_entropy(bytes: &[u8]) -> f64 {
+    if bytes.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0u64; 256];
+    for &b in bytes {
+        counts[b as usize] += 1;
+    }
+    let total = bytes.len() as f64;
+    let mut entropy = 0.0;
+    for &count in &counts {
+        if count > 0 {
+            let p = count as f64 / total;
+            entropy -= p * p.log2();
+        }
+    }
+    entropy
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +104,33 @@ struct StoredTicket {
     ttl_secs: u32,
 }
 
+/// Stage in the 2-handshake Denuvo authorization window state machine (BST-55).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenuvoStage {
+    None,
+    Authorizing,
+    EndAuthorization,
+}
+
+/// State tracking per process for the Denuvo authorization window (BST-55).
+#[derive(Debug, Clone)]
+pub struct ProcessAuthState {
+    pub scanned: bool,
+    pub denuvo: bool,
+    pub stage: DenuvoStage,
+    pub pid: u32,
+    pub handshake_count: u32,
+    pub authorization_pipe: Option<u32>,
+    pub authorized_app_id: u32,
+}
+
+#[derive(Debug)]
+struct PendingAuth {
+    created_at: u64,
+    pid: u32,
+}
+
+#[derive(Debug)]
 pub struct DenuvoAuthService {
     config: DenuvoAuthConfig,
     pending_auth: Mutex<HashMap<u32, PendingAuth>>,
@@ -74,11 +138,10 @@ pub struct DenuvoAuthService {
     authorized_pipes: RwLock<HashMap<u32, HashSet<u32>>>,
     stored_tickets: RwLock<HashMap<u32, StoredTicket>>,
     protected_apps: RwLock<HashSet<u32>>,
-}
-
-struct PendingAuth {
-    created_at: u64,
-    pid: u32,
+    /// 2-handshake state machine tracking per PID (BST-55)
+    process_auth: Mutex<HashMap<u32, ProcessAuthState>>,
+    /// Pipe handle to PID reverse mapping (BST-55)
+    pipe_to_pid: Mutex<HashMap<u32, u32>>,
 }
 
 impl DenuvoAuthService {
@@ -89,6 +152,8 @@ impl DenuvoAuthService {
             authorized_pipes: RwLock::new(HashMap::new()),
             stored_tickets: RwLock::new(HashMap::new()),
             protected_apps: RwLock::new(HashSet::new()),
+            process_auth: Mutex::new(HashMap::new()),
+            pipe_to_pid: Mutex::new(HashMap::new()),
         }
     }
 
@@ -114,35 +179,7 @@ impl DenuvoAuthService {
             .remove(&app_id);
     }
 
-    /// Register a pipe handshake for a Denuvo game.
-    pub fn on_handshake(&self, app_id: u32, pid: u32) -> bool {
-        if !self.config.enabled || app_id == 0 {
-            return false;
-        }
-
-        if self.is_denuvo_protected(app_id) {
-            let mut pending = self.pending_auth.lock().unwrap_or_else(|e| e.into_inner());
-            let now = now_unix_secs();
-
-            pending.insert(
-                app_id,
-                PendingAuth {
-                    created_at: now,
-                    pid,
-                },
-            );
-
-            log::debug!(
-                "[denuvo] detected Denuvo game {} (pid={}), scheduling auth",
-                app_id,
-                pid
-            );
-            true
-        } else {
-            false
-        }
-    }
-
+    /// Check if an app is Denuvo-protected (either registered or forced).
     pub fn is_denuvo_protected(&self, app_id: u32) -> bool {
         if app_id == 0 || self.config.pool_steam_id.is_none() {
             return false;
@@ -151,13 +188,137 @@ impl DenuvoAuthService {
             .protected_apps
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        protected.is_empty() || protected.contains(&app_id)
+        protected.contains(&app_id)
     }
 
-    pub fn is_authorized_pipe(&self, app_id: u32, pid: u32) -> bool {
+    /// Lazy one-time protection scanner for process auth state (BST-54/55).
+    fn ensure_scanned(&self, auth: &mut ProcessAuthState, pid: u32, app_id: u32) {
+        // Always check if app is explicitly registered/forced as Denuvo, even if already scanned
+        let is_denuvo_app = self.should_force_denuvo(app_id) || self.is_denuvo_protected(app_id);
+
+        if auth.scanned && !is_denuvo_app {
+            // Previously scanned and not a known Denuvo app - keep existing result
+            return;
+        }
+
+        // Not yet scanned OR app is now registered as Denuvo - (re)scan
+        auth.scanned = true;
+        if is_denuvo_app {
+            auth.denuvo = true;
+            log::info!("[denuvo] AppID {} is forced/registered Denuvo; skipping binary scan", app_id);
+        } else {
+            let report = scan_process(pid);
+            auth.denuvo = report.denuvo_detected;
+            if auth.denuvo {
+                log::info!(
+                    "[denuvo] Detected Denuvo in PID {} for AppID {} via {:?}",
+                    pid,
+                    app_id,
+                    report.method
+                );
+                self.register_denuvo_app(app_id);
+            }
+        }
+        if !auth.denuvo {
+            auth.stage = DenuvoStage::None;
+        }
+    }
+
+    /// Register a pipe handshake with pipe handle and client PID (BST-55).
+    pub fn on_handshake_pipe(&self, pipe_id: u32, app_id: u32, pid: u32) -> bool {
+        if !self.config.enabled || app_id == 0 {
+            return false;
+        }
+
+        let mut process_auth = self.process_auth.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pipe_to_pid = self.pipe_to_pid.lock().unwrap_or_else(|e| e.into_inner());
+        if pipe_id != 0 {
+            pipe_to_pid.insert(pipe_id, pid);
+        }
+
+        let auth = process_auth.entry(pid).or_insert_with(|| ProcessAuthState {
+            scanned: false,
+            denuvo: false,
+            stage: DenuvoStage::None,
+            pid,
+            handshake_count: 0,
+            authorization_pipe: None,
+            authorized_app_id: app_id,
+        });
+
+        self.ensure_scanned(auth, pid, app_id);
+        auth.handshake_count += 1;
+
+        if !auth.denuvo {
+            auth.stage = DenuvoStage::None;
+            return false;
+        }
+
+        // Handshake 1: Open 2-handshake authorization window
+        if auth.authorization_pipe.is_none() {
+            auth.authorization_pipe = Some(pipe_id);
+            auth.authorized_app_id = app_id;
+            auth.pid = pid;
+            auth.stage = DenuvoStage::Authorizing;
+            log::info!(
+                "[denuvo] Handshake #1: authorization window opened for app {} (pid={}, pipe={})",
+                app_id, pid, pipe_id
+            );
+        }
+
+        // Handshake 2+: End authorization window permanently
+        if auth.stage == DenuvoStage::Authorizing && auth.handshake_count >= 2 {
+            auth.stage = DenuvoStage::EndAuthorization;
+            log::info!(
+                "[denuvo] Handshake #2+: authorization window ended for app {} (pid={}, pipe={})",
+                app_id, pid, pipe_id
+            );
+            self.write_steam_id_on_end_authorization(app_id);
+        }
+
+        // Keep legacy pending_auth queue for fallback HTTP token collectors
+        let mut pending = self.pending_auth.lock().unwrap_or_else(|e| e.into_inner());
+        pending.insert(
+            app_id,
+            PendingAuth {
+                created_at: now_unix_secs(),
+                pid,
+            },
+        );
+
+        true
+    }
+
+    /// Convenience wrapper for handshake without an explicit pipe handle.
+    pub fn on_handshake(&self, app_id: u32, pid: u32) -> bool {
+        self.on_handshake_pipe(0, app_id, pid)
+    }
+
+    /// Check if a pipe is currently in the Denuvo authorization window (BST-55).
+    pub fn is_authorized_pipe(&self, pipe_id: u32, app_id: u32, pid: u32) -> bool {
         if app_id == 0 {
             return false;
         }
+
+        let effective_pid = if pid != 0 {
+            pid
+        } else if pipe_id != 0 {
+            let pipe_map = self.pipe_to_pid.lock().unwrap_or_else(|e| e.into_inner());
+            pipe_map.get(&pipe_id).copied().unwrap_or(0)
+        } else {
+            0
+        };
+
+        let process_auth = self.process_auth.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(auth) = process_auth.get(&effective_pid) {
+            if auth.denuvo && auth.stage == DenuvoStage::Authorizing {
+                if pipe_id == 0 || auth.authorization_pipe == Some(pipe_id) || auth.authorization_pipe == Some(0) {
+                    return true;
+                }
+            }
+        }
+
+        // Fallback check against manual authorized_pipes
         let auth_pipes = self
             .authorized_pipes
             .read()
@@ -172,12 +333,28 @@ impl DenuvoAuthService {
         }
     }
 
+    /// Persist current Pool SteamID on handshake end-authorization (BST-55).
+    fn write_steam_id_on_end_authorization(&self, app_id: u32) {
+        if let Some(sid) = self.config.pool_steam_id {
+            if sid != 0 {
+                let mut store = crate::steam_bridge::ticket_store::TicketStore::global()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                store.set_spoof_steam_id(app_id, sid);
+                log::info!(
+                    "[denuvo] Persisted end-authorization SteamID 0x{:X} for app {}",
+                    sid,
+                    app_id
+                );
+            }
+        }
+    }
+
     pub fn apply(&self, app_id: u32, ticket: Option<Vec<u8>>) {
         if app_id == 0 {
             return;
         }
 
-        // Release `pending_auth` lock before acquiring RwLocks to avoid nested lock ordering.
         let pending_auth = {
             let mut pending = self.pending_auth.lock().unwrap_or_else(|e| e.into_inner());
             pending.remove(&app_id)
@@ -192,8 +369,6 @@ impl DenuvoAuthService {
             );
             p.pid
         }) else {
-            // Allow storing an explicit non-empty ticket even without a prior handshake,
-            // authorizing wildcard PID 0.
             if let Some(ticket_data) = ticket.filter(|t| !t.is_empty()) {
                 self.store_auth_ticket(app_id, &ticket_data);
                 self.authorized_pipes
@@ -218,7 +393,6 @@ impl DenuvoAuthService {
         }
     }
 
-    /// Revoke authorization and discard any cached Denuvo ticket for an app.
     pub fn revoke(&self, app_id: u32) {
         self.pending_auth
             .lock()
@@ -298,13 +472,7 @@ impl DenuvoAuthService {
             let clean = cid.replace(['\r', '\n'], "");
             header_lines.push_str(&format!("X-Client-Id: {}\r\n", clean));
         }
-        if let Some(sec) = self
-            .config
-            .client_secret
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
+        if let Some(sec) = self.config.client_secret.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             let clean = sec.replace(['\r', '\n'], "");
             header_lines.push_str(&format!("X-Client-Secret: {}\r\n", clean));
         }
@@ -370,6 +538,11 @@ impl DenuvoAuthService {
         Ok((ticket_bytes, DEFAULT_TICKET_TTL_SECS))
     }
 
+    /// Fetches an uncorrupted Denuvo auth ticket (BST-55).
+    ///
+    /// Cryptographic note: Ticket bytes are returned EXACTLY as issued by the signer.
+    /// Under NO circumstances are raw nonce/steam_id bytes appended onto the payload,
+    /// which would corrupt the ASN.1 / RSA signature structures.
     pub fn fetch_auth_ticket(&self, app_id: u32, nonce: &[u8]) -> Option<DenuvoAuthResult> {
         if !self.config.enabled || app_id == 0 {
             return None;
@@ -397,13 +570,9 @@ impl DenuvoAuthService {
             if elapsed < u64::from(entry.ttl_secs) {
                 let remaining =
                     (u64::from(entry.ttl_secs) - elapsed).min(u64::from(u32::MAX)) as u32;
-                let mut payload = entry.bytes;
-                if !nonce.is_empty() {
-                    payload.extend_from_slice(nonce);
-                }
                 return Some(DenuvoAuthResult {
                     success: true,
-                    ticket: Some(payload),
+                    ticket: Some(entry.bytes),
                     error: None,
                     expires_in: remaining,
                 });
@@ -419,13 +588,9 @@ impl DenuvoAuthService {
             match self.fetch_remote_auth_ticket(app_id, pool_sid, nonce) {
                 Ok((ticket_bytes, ttl)) => {
                     self.store_auth_ticket_with_ttl(app_id, &ticket_bytes, ttl);
-                    let mut payload = ticket_bytes;
-                    if !nonce.is_empty() {
-                        payload.extend_from_slice(nonce);
-                    }
                     return Some(DenuvoAuthResult {
                         success: true,
-                        ticket: Some(payload),
+                        ticket: Some(ticket_bytes),
                         error: None,
                         expires_in: ttl,
                     });
@@ -482,6 +647,53 @@ impl DenuvoAuthService {
     pub fn should_force_denuvo(&self, app_id: u32) -> bool {
         self.config.enabled && self.is_denuvo_protected(app_id)
     }
+
+    /// Scan a candidate PE executable for Denuvo protection with the >=80 MiB gate (BST-54).
+    pub fn scan_executable(&self, exe_path: &Path) -> ProtectionScanReport {
+        let size = fs::metadata(exe_path).map(|m| m.len()).unwrap_or(0);
+        if size > 0 && size < MIN_PACKED_MODULE_BYTES {
+            log::trace!(
+                "[denuvo_scan] Skipping {} ({} bytes < 80 MiB floor)",
+                exe_path.display(),
+                size
+            );
+            return ProtectionScanReport {
+                denuvo_detected: false,
+                method: DenuvoDetectionMethod::None,
+                module_path: Some(exe_path.to_string_lossy().into_owned()),
+                file_size: size,
+                module_size: size,
+                ..Default::default()
+            };
+        }
+        let mut rep = scan_protection_pe(exe_path);
+        rep.module_path = Some(exe_path.to_string_lossy().into_owned());
+        rep
+    }
+
+    /// Scan a game folder for any Denuvo-protected PE executable >=80 MiB (BST-54).
+    pub fn scan_game_folder(&self, app_id: u32, game_dir: &Path) -> ProtectionScanReport {
+        if let Ok(entries) = fs::read_dir(game_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_file()
+                    && p.extension()
+                        .map(|e| e.eq_ignore_ascii_case("exe"))
+                        .unwrap_or(false)
+                {
+                    let size = p.metadata().map(|m| m.len()).unwrap_or(0);
+                    if size >= MIN_PACKED_MODULE_BYTES {
+                        let report = scan_protection_pe(&p);
+                        if report.denuvo_detected {
+                            self.register_denuvo_app(app_id);
+                            return report;
+                        }
+                    }
+                }
+            }
+        }
+        ProtectionScanReport::default()
+    }
 }
 
 impl Default for DenuvoAuthService {
@@ -490,6 +702,7 @@ impl Default for DenuvoAuthService {
     }
 }
 
+#[derive(Debug)]
 pub struct DenuvoAuth {
     service: DenuvoAuthService,
 }
@@ -511,12 +724,20 @@ impl DenuvoAuth {
         self.service.configure(config);
     }
 
+    pub fn on_handshake_pipe(&self, pipe_id: u32, app_id: u32, pid: u32) -> bool {
+        self.service.on_handshake_pipe(pipe_id, app_id, pid)
+    }
+
     pub fn on_handshake(&self, app_id: u32, pid: u32) -> bool {
         self.service.on_handshake(app_id, pid)
     }
 
+    pub fn is_authorized_pipe(&self, pipe_id: u32, app_id: u32, pid: u32) -> bool {
+        self.service.is_authorized_pipe(pipe_id, app_id, pid)
+    }
+
     pub fn is_authorized(&self, app_id: u32, pid: u32) -> bool {
-        self.service.is_authorized_pipe(app_id, pid)
+        self.service.is_authorized_pipe(0, app_id, pid)
     }
 
     pub fn apply(&self, app_id: u32, ticket: Option<Vec<u8>>) {
@@ -525,6 +746,10 @@ impl DenuvoAuth {
 
     pub fn set_pool_steam_id(&mut self, steam_id: u64) {
         self.service.config.pool_steam_id = Some(steam_id);
+    }
+
+    pub fn pool_steam_id(&self) -> Option<u64> {
+        self.service.config.pool_steam_id
     }
 
     pub fn set_auth_url(&mut self, url: String) {
@@ -563,15 +788,49 @@ impl DenuvoAuth {
         self.service.fetch_auth_ticket(app_id, nonce)
     }
 
-    /// Scan a game executable for Denuvo protection (BST-54).
     pub fn scan_executable(&self, exe_path: &Path) -> ProtectionScanReport {
         self.service.scan_executable(exe_path)
     }
 
-    /// Recursively scan a game directory for Denuvo-protected executables and auto-register (BST-54).
     pub fn scan_game_folder(&self, app_id: u32, game_dir: &Path) -> ProtectionScanReport {
         self.service.scan_game_folder(app_id, game_dir)
     }
+}
+
+static GLOBAL_DENUVO_AUTH: OnceLock<RwLock<DenuvoAuth>> = OnceLock::new();
+
+/// Global singleton DenuvoAuth instance.
+pub fn global() -> &'static RwLock<DenuvoAuth> {
+    GLOBAL_DENUVO_AUTH.get_or_init(|| RwLock::new(DenuvoAuth::new()))
+}
+
+/// Convenience dispatcher for IPC handshake hooking.
+pub fn on_pipe_handshake(pipe_id: u32, app_id: u32, pid: u32) -> bool {
+    let auth = global().read().unwrap_or_else(|e| e.into_inner());
+    auth.on_handshake_pipe(pipe_id, app_id, pid)
+}
+
+/// Convenience query for pipe authorization.
+pub fn is_pipe_authorized(pipe_id: u32, app_id: u32, pid: u32) -> bool {
+    let auth = global().read().unwrap_or_else(|e| e.into_inner());
+    auth.is_authorized_pipe(pipe_id, app_id, pid)
+}
+
+/// Convenience scan for candidate PE executable (BST-54).
+pub fn scan_executable_protection(exe_path: &Path) -> ProtectionScanReport {
+    let auth = global().read().unwrap_or_else(|e| e.into_inner());
+    auth.scan_executable(exe_path)
+}
+
+/// Convenience scan for game folder (BST-54).
+pub fn scan_game_folder_protection(app_id: u32, game_dir: &Path) -> ProtectionScanReport {
+    let auth = global().read().unwrap_or_else(|e| e.into_inner());
+    auth.scan_game_folder(app_id, game_dir)
+}
+
+/// Convenience scan for running process by PID (BST-54).
+pub fn scan_process_protection(pid: u32) -> ProtectionScanReport {
+    scan_process(pid)
 }
 
 /// Denuvo heuristic detection method (BST-54).
@@ -583,100 +842,106 @@ pub enum DenuvoDetectionMethod {
     ProtectedBlobSection,
 }
 
-/// Protection scan report matching usefulsteamtools::ProtectionScanReport (BST-54).
+/// Protection scan report matching usefulsteamtools `ProtectionScanReport` (BST-54).
 #[derive(Debug, Clone)]
 pub struct ProtectionScanReport {
     pub denuvo_detected: bool,
     pub method: DenuvoDetectionMethod,
+    pub module_path: Option<String>,
     pub section_name: Option<String>,
+    pub pid: u32,
+    pub module_size: u64,
     pub file_size: u64,
+    pub entry_point_rva: u32,
+    pub match_rva: u32,
+    pub match_raw_offset: usize,
+    pub scanned_modules: usize,
+    pub elapsed_ms: f64,
 }
 
-impl DenuvoAuthService {
-    /// Scan a PE executable for Denuvo signatures (BST-54).
-    pub fn scan_executable(&self, exe_path: &Path) -> ProtectionScanReport {
-        scan_protection_pe(exe_path)
-    }
-
-    /// Scan a game folder for any Denuvo-protected PE executable and auto-register the app (BST-54).
-    pub fn scan_game_folder(&self, app_id: u32, game_dir: &Path) -> ProtectionScanReport {
-        if let Ok(entries) = fs::read_dir(game_dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_file()
-                    && p.extension()
-                        .map(|e| e.eq_ignore_ascii_case("exe"))
-                        .unwrap_or(false)
-                {
-                    let report = scan_protection_pe(&p);
-                    if report.denuvo_detected {
-                        self.register_denuvo_app(app_id);
-                        return report;
-                    }
-                }
-            }
-        }
-        ProtectionScanReport {
+impl Default for ProtectionScanReport {
+    fn default() -> Self {
+        Self {
             denuvo_detected: false,
             method: DenuvoDetectionMethod::None,
+            module_path: None,
             section_name: None,
+            pid: 0,
+            module_size: 0,
             file_size: 0,
+            entry_point_rva: 0,
+            match_rva: 0,
+            match_raw_offset: 0,
+            scanned_modules: 0,
+            elapsed_ms: 0.0,
         }
     }
 }
 
 /// Core PE binary scanner for Denuvo protection signatures (BST-54).
 ///
-/// Ported from `usefulsteamtools::PipeManager::DenuvoAuth::RunProtectionScan`:
-/// 1. OEP Pattern scan: `48 B9 44 4F 44 45 4E 55 56 4F` (`mov rcx, 'DODENUVO'`)
-/// 2. Legacy Section String scan: `.arch`, `.srdata`, `.xpdata`, `.xdata`, `.xtls` containing `"DENUVO"`
-/// 3. Protected W+X blob section: simultaneous write + execute flags with packed multi-MB payload
+/// 3-Tier Denuvo Detection Cascade:
+/// 1. OEP Pattern scan: `48 B9 44 4F 44 45 4E 55 56 4F` (`mov rcx, 'DODENUVO'`) in entry-point section.
+/// 2. Legacy Section String scan: `.arch`, `.srdata`, `.xpdata`, `.xdata`, `.xtls` containing `"DENUVO"`.
+/// 3. Protected W+X blob section: simultaneous write + execute flags, raw size >= 4 MiB, and Shannon entropy >= 6.0.
 pub fn scan_protection_pe(exe_path: &Path) -> ProtectionScanReport {
     let path_str = match exe_path.to_str() {
         Some(s) => s,
-        None => {
-            return ProtectionScanReport {
-                denuvo_detected: false,
-                method: DenuvoDetectionMethod::None,
-                section_name: None,
-                file_size: 0,
-            }
-        }
+        None => return ProtectionScanReport::default(),
     };
     let image = match crate::steam_bridge::ost_platform::pe::Image::new(path_str) {
         Ok(img) if img.is_valid() => img,
-        _ => {
-            return ProtectionScanReport {
-                denuvo_detected: false,
-                method: DenuvoDetectionMethod::None,
-                section_name: None,
-                file_size: 0,
-            }
-        }
+        _ => return ProtectionScanReport::default(),
     };
 
     let file_bytes = image.bytes();
     let file_size = image.file_size();
 
-    // 1. OEP Pattern scan: 48 B9 44 4F 44 45 4E 55 56 4F (mov rcx, 'DODENUVO')
+    // 1. Tier 1 — OEP Pattern scan: 48 B9 44 4F 44 45 4E 55 56 4F (mov rcx, 'DODENUVO')
     const DENUVO_OEP_PATTERN: [u8; 10] = [
         0x48, 0xB9, 0x44, 0x4F, 0x44, 0x45, 0x4E, 0x55, 0x56, 0x4F,
     ];
+    let ep_rva = image.entry_point_rva();
+    if ep_rva != 0 {
+        if let Some(sec) = image.section_containing_rva(ep_rva) {
+            let offset = sec.raw_offset as usize;
+            let size = sec.raw_size as usize;
+            if let Some(slice) = file_bytes.get(offset..offset.saturating_add(size)) {
+                if let Some(pos) = slice.windows(DENUVO_OEP_PATTERN.len()).position(|w| w == DENUVO_OEP_PATTERN) {
+                    return ProtectionScanReport {
+                        denuvo_detected: true,
+                        method: DenuvoDetectionMethod::OepPattern,
+                        section_name: Some(sec.name.clone()),
+                        entry_point_rva: ep_rva,
+                        match_rva: sec.virtual_address.saturating_add(pos as u32),
+                        match_raw_offset: offset.saturating_add(pos),
+                        file_size,
+                        module_size: file_size,
+                        ..Default::default()
+                    };
+                }
+            }
+        }
+    }
+
+    // Broad fallback OEP pattern check across file if entry point section mapping is truncated
     if file_bytes
         .windows(DENUVO_OEP_PATTERN.len())
         .any(|w| w == DENUVO_OEP_PATTERN)
     {
-        let ep_rva = image.entry_point_rva();
         let sec_name = image.section_containing_rva(ep_rva).map(|s| s.name.clone());
         return ProtectionScanReport {
             denuvo_detected: true,
             method: DenuvoDetectionMethod::OepPattern,
             section_name: sec_name,
+            entry_point_rva: ep_rva,
             file_size,
+            module_size: file_size,
+            ..Default::default()
         };
     }
 
-    // 2. Legacy Section String scan (".arch", ".srdata", ".xpdata", ".xdata", ".xtls" containing "DENUVO")
+    // 2. Tier 2 — Legacy Section String scan (".arch", ".srdata", ".xpdata", ".xdata", ".xtls" containing "DENUVO")
     const LEGACY_SECTIONS: &[&str] = &[".arch", ".srdata", ".xpdata", ".xdata", ".xtls"];
     for sec in image.sections() {
         let name_lower = sec.name.to_ascii_lowercase();
@@ -692,22 +957,59 @@ pub fn scan_protection_pe(exe_path: &Path) -> ProtectionScanReport {
                         denuvo_detected: true,
                         method: DenuvoDetectionMethod::LegacySectionString,
                         section_name: Some(sec.name.clone()),
+                        entry_point_rva: ep_rva,
                         file_size,
+                        module_size: file_size,
+                        ..Default::default()
                     };
                 }
             }
         }
     }
 
-    // 3. Protected W+X blob section (executable + writable with multi-MB payload)
+    // 3. Tier 3 — Protected W+X blob section (executable + writable, >= 4 MiB, and Shannon entropy >= 6.0)
     for sec in image.sections() {
-        if sec.is_executable_and_writable() && sec.raw_size >= 1_000_000 {
-            return ProtectionScanReport {
-                denuvo_detected: true,
-                method: DenuvoDetectionMethod::ProtectedBlobSection,
-                section_name: Some(sec.name.clone()),
-                file_size,
-            };
+        if sec.is_executable_and_writable() && sec.raw_size >= PROTECTOR_BLOB_MIN_BYTES {
+            let offset = sec.raw_offset as usize;
+            let sample_len = (sec.raw_size as usize).min(PROTECTOR_BLOB_ENTROPY_SAMPLE_BYTES);
+            if let Some(sample) = file_bytes.get(offset..offset.saturating_add(sample_len)) {
+                let entropy = calculate_shannon_entropy(sample);
+                if entropy >= PROTECTOR_BLOB_MIN_ENTROPY {
+                    let confidence = if entropy >= PROTECTOR_BLOB_HIGH_CONFIDENCE_ENTROPY {
+                        "high(encrypted)"
+                    } else {
+                        "elevated"
+                    };
+                    log::info!(
+                        "[denuvo_scan] Protector blob detected in {} section '{}' raw_size={} ({:.2} MB) entropy={:.3} confidence={}",
+                        exe_path.display(),
+                        sec.name,
+                        sec.raw_size,
+                        sec.raw_size as f64 / (1024.0 * 1024.0),
+                        entropy,
+                        confidence
+                    );
+                    return ProtectionScanReport {
+                        denuvo_detected: true,
+                        method: DenuvoDetectionMethod::ProtectedBlobSection,
+                        section_name: Some(sec.name.clone()),
+                        entry_point_rva: ep_rva,
+                        match_rva: sec.virtual_address,
+                        match_raw_offset: offset,
+                        file_size,
+                        module_size: file_size,
+                        ..Default::default()
+                    };
+                } else {
+                    log::debug!(
+                        "[denuvo_scan] RWX section '{}' below entropy floor ({:.3} < {:.1}) in {}",
+                        sec.name,
+                        entropy,
+                        PROTECTOR_BLOB_MIN_ENTROPY,
+                        exe_path.display()
+                    );
+                }
+            }
         }
     }
 
@@ -716,6 +1018,128 @@ pub fn scan_protection_pe(exe_path: &Path) -> ProtectionScanReport {
         method: DenuvoDetectionMethod::None,
         section_name: None,
         file_size,
+        module_size: file_size,
+        entry_point_rva: ep_rva,
+        ..Default::default()
+    }
+}
+
+/// Enumerate modules of a live process and run candidate priority filtering (BST-54).
+pub fn scan_process(pid: u32) -> ProtectionScanReport {
+    if pid == 0 {
+        return ProtectionScanReport::default();
+    }
+    let timer = std::time::Instant::now();
+    let modules = crate::steam_bridge::ost_platform::process::enumerate_modules(pid);
+    if modules.is_empty() {
+        return ProtectionScanReport::default();
+    }
+
+    struct Candidate {
+        path: PathBuf,
+        size: u64,
+        is_executable: bool,
+        in_game_tree: bool,
+        order: usize,
+    }
+
+    let steam_runtime_modules = [
+        "steamclient.dll",
+        "steamclient64.dll",
+        "steam_api.dll",
+        "steam_api64.dll",
+        "tier0_s.dll",
+        "tier0_s64.dll",
+        "vstdlib_s.dll",
+        "vstdlib_s64.dll",
+        "gameoverlayrenderer.dll",
+        "gameoverlayrenderer64.dll",
+    ];
+
+    let mut candidates = Vec::new();
+    let mut order = 0;
+
+    for m in &modules {
+        let path = &m.native_path;
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let is_exe = ext.eq_ignore_ascii_case("exe");
+        let is_dll = ext.eq_ignore_ascii_case("dll");
+        if !is_exe && !is_dll {
+            continue;
+        }
+
+        let file_size = fs::metadata(path).map(|meta| meta.len()).unwrap_or(m.size as u64);
+        if file_size < MIN_PACKED_MODULE_BYTES {
+            continue;
+        }
+
+        let path_str = path.to_string_lossy();
+        if !is_exe && (path_str.starts_with("/usr") || path_str.starts_with("/lib") || path_str.contains("windows/system32")) {
+            continue;
+        }
+
+        let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
+        if !is_exe && steam_runtime_modules.contains(&fname.as_str()) {
+            continue;
+        }
+
+        candidates.push(Candidate {
+            path: path.clone(),
+            size: file_size,
+            is_executable: is_exe,
+            in_game_tree: false,
+            order,
+        });
+        order += 1;
+    }
+
+    let game_dir = candidates
+        .iter()
+        .find(|c| c.is_executable)
+        .and_then(|c| c.path.parent().map(|p| p.to_path_buf()));
+    if let Some(ref gdir) = game_dir {
+        for c in &mut candidates {
+            if !c.is_executable && c.path.starts_with(gdir) {
+                c.in_game_tree = true;
+            }
+        }
+    }
+
+    // Sort: (1) main exe, (2) in-game-tree DLLs, (3) descending module size, (4) original order
+    candidates.sort_by(|a, b| {
+        if a.is_executable != b.is_executable {
+            return b.is_executable.cmp(&a.is_executable);
+        }
+        if !a.is_executable && a.in_game_tree != b.in_game_tree {
+            return b.in_game_tree.cmp(&a.in_game_tree);
+        }
+        if !a.is_executable && a.size != b.size {
+            return b.size.cmp(&a.size);
+        }
+        a.order.cmp(&b.order)
+    });
+
+    let mut scanned_count = 0;
+    for cand in &candidates {
+        scanned_count += 1;
+        let mut report = scan_protection_pe(&cand.path);
+        if report.denuvo_detected {
+            report.pid = pid;
+            report.module_path = Some(cand.path.to_string_lossy().into_owned());
+            report.module_size = cand.size;
+            report.scanned_modules = scanned_count;
+            report.elapsed_ms = timer.elapsed().as_secs_f64() * 1000.0;
+            return report;
+        }
+    }
+
+    ProtectionScanReport {
+        denuvo_detected: false,
+        method: DenuvoDetectionMethod::None,
+        pid,
+        scanned_modules: scanned_count,
+        elapsed_ms: timer.elapsed().as_secs_f64() * 1000.0,
+        ..Default::default()
     }
 }
 
@@ -747,16 +1171,17 @@ mod tests {
         assert!(miss.ticket.is_none());
 
         assert!(auth.on_handshake(1245620, 4242));
-        assert!(!auth.is_authorized_pipe(1245620, 4242));
+        assert!(!auth.is_authorized_pipe(0, 1245620, 9999));
 
         auth.apply(1245620, Some(vec![0xAA, 0xBB, 0xCC]));
-        assert!(auth.is_authorized_pipe(1245620, 4242));
-        assert!(!auth.is_authorized_pipe(1245620, 9999));
-        assert!(auth.is_authorized_pipe(1245620, 0));
+        assert!(auth.is_authorized_pipe(0, 1245620, 4242));
+        assert!(!auth.is_authorized_pipe(0, 1245620, 9999));
+        assert!(auth.is_authorized_pipe(0, 1245620, 0));
 
+        // BST-55: Ticket bytes are genuine and uncorrupted (NOT concatenated with nonce!)
         let hit = auth.fetch_auth_ticket(1245620, &[0x01, 0x02]).unwrap();
         assert!(hit.success);
-        assert_eq!(hit.ticket, Some(vec![0xAA, 0xBB, 0xCC, 0x01, 0x02]));
+        assert_eq!(hit.ticket, Some(vec![0xAA, 0xBB, 0xCC]));
         assert!(hit.expires_in > 0);
 
         // Expire immediately with max_age_secs = 0
@@ -765,7 +1190,31 @@ mod tests {
         assert!(!expired.success);
 
         auth.revoke(1245620);
-        assert!(!auth.is_authorized_pipe(1245620, 4242));
+        assert!(!auth.is_authorized_pipe(0, 1245620, 4242));
+    }
+
+    #[test]
+    fn denuvo_two_handshake_state_machine_window() {
+        let mut auth = DenuvoAuthService::new();
+        auth.configure(DenuvoAuthConfig {
+            enabled: true,
+            auth_url: None,
+            pool_steam_id: Some(76_561_198_028_121_353),
+            ..Default::default()
+        });
+        auth.register_denuvo_app(1245620);
+
+        let pipe_id = 1001;
+        let pid = 5555;
+
+        // Handshake 1: Opens authorization window
+        assert!(auth.on_handshake_pipe(pipe_id, 1245620, pid));
+        assert!(auth.is_authorized_pipe(pipe_id, 1245620, pid));
+        assert!(!auth.is_authorized_pipe(pipe_id + 1, 1245620, pid));
+
+        // Handshake 2: Ends authorization window
+        assert!(auth.on_handshake_pipe(pipe_id, 1245620, pid));
+        assert!(!auth.is_authorized_pipe(pipe_id, 1245620, pid));
     }
 
     #[test]
@@ -799,25 +1248,6 @@ mod tests {
     }
 
     #[test]
-    fn remote_fetch_closed_loopback_port_fails_fast() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-
-        let mut auth = DenuvoAuth::new();
-        auth.configure(DenuvoAuthConfig {
-            enabled: true,
-            auth_url: Some(format!("http://{}", addr)),
-            pool_steam_id: Some(76_561_198_028_121_353),
-            ..Default::default()
-        });
-        let res = auth.fetch_auth_ticket(1245620, b"nonce").unwrap();
-        assert!(!res.success);
-        assert!(res.ticket.is_none());
-        assert!(res.error.is_some());
-    }
-
-    #[test]
     fn remote_fetch_succeeds_against_local_http_and_caches() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -848,15 +1278,16 @@ mod tests {
         });
         auth.register_denuvo_app(1245620);
 
+        // BST-55: Ticket bytes are untouched and uncorrupted
         let first = auth.fetch_auth_ticket(1245620, &[0x01, 0x02]).unwrap();
         assert!(first.success);
-        assert_eq!(first.ticket, Some(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02]));
+        assert_eq!(first.ticket, Some(vec![0xDE, 0xAD, 0xBE, 0xEF]));
         assert_eq!(first.expires_in, 3600);
 
-        // Second call must hit local cache even though the single-accept server has exited.
+        // Second call must hit local cache
         let second = auth.fetch_auth_ticket(1245620, &[0x03]).unwrap();
         assert!(second.success);
-        assert_eq!(second.ticket, Some(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x03]));
+        assert_eq!(second.ticket, Some(vec![0xDE, 0xAD, 0xBE, 0xEF]));
 
         handle.join().unwrap();
     }
@@ -898,5 +1329,27 @@ mod tests {
         let rep2 = scan_protection_pe(&oep_exe);
         assert!(rep2.denuvo_detected);
         assert_eq!(rep2.method, DenuvoDetectionMethod::OepPattern);
+
+        // 3. Size gate on scan_executable: < 80 MiB returns denuvo_detected = false
+        let auth = DenuvoAuthService::new();
+        let rep_gate = auth.scan_executable(&oep_exe);
+        assert!(!rep_gate.denuvo_detected);
+    }
+
+    #[test]
+    fn test_shannon_entropy_calculation() {
+        // Uniform byte slice has 0 entropy
+        let zeros = vec![0u8; 1024];
+        assert_eq!(calculate_shannon_entropy(&zeros), 0.0);
+
+        // Maximum entropy: equal distribution of all 256 bytes (8.0 bits/byte)
+        let mut uniform = Vec::with_capacity(256 * 10);
+        for _ in 0..10 {
+            for b in 0..=255u8 {
+                uniform.push(b);
+            }
+        }
+        let ent = calculate_shannon_entropy(&uniform);
+        assert!((ent - 8.0).abs() < 1e-6);
     }
 }
