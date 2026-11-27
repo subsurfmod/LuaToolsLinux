@@ -196,7 +196,22 @@ ensure_source_checkout() {
 ensure_binary() {
     local has_newer_src=0
     if [ -f "${SCRIPT_DIR}/Cargo.toml" ] && [ -x "${SCRIPT_DIR}/dist/${APP_NAME}" ]; then
-        if [ -n "$(find "${SCRIPT_DIR}/Cargo.toml" "${SCRIPT_DIR}/src" "${SCRIPT_DIR}/bridge_lib" "${SCRIPT_DIR}/steam_auto_patch_linux" -newer "${SCRIPT_DIR}/dist/${APP_NAME}" 2>/dev/null | head -n 1)" ]; then
+        local check_paths=(
+            "${SCRIPT_DIR}/Cargo.toml"
+            "${SCRIPT_DIR}/src"
+            "${SCRIPT_DIR}/bridge_lib"
+            "${SCRIPT_DIR}/steam_auto_patch_linux"
+        )
+        if [ -d "${SCRIPT_DIR}/assets/guide" ]; then
+            check_paths+=("${SCRIPT_DIR}/assets/guide")
+        fi
+        if [ -e "${SCRIPT_DIR}/.git/HEAD" ]; then
+            check_paths+=("${SCRIPT_DIR}/.git/HEAD")
+        fi
+        if [ -e "${SCRIPT_DIR}/.git/refs/heads/main" ]; then
+            check_paths+=("${SCRIPT_DIR}/.git/refs/heads/main")
+        fi
+        if [ -n "$(find "${check_paths[@]}" -newer "${SCRIPT_DIR}/dist/${APP_NAME}" 2>/dev/null | head -n 1)" ]; then
             has_newer_src=1
         fi
     fi

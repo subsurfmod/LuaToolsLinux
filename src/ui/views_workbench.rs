@@ -518,7 +518,6 @@ impl LuaToolsApp {
                                 );
                             },
                             |ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
                                 if table_button(ui, "+ Save Preset", false).clicked() {
                                     self.text_prompt_modal.open = true;
                                     self.text_prompt_modal.kind = "preset".into();
@@ -527,54 +526,6 @@ impl LuaToolsApp {
                                         "Name this .lua build/preset:".into();
                                     self.text_prompt_modal.value.clear();
                                 }
-                                if ghost_button(ui, "Collapse Defaults").clicked() {
-                                    let removed = self.lua_vault.collapse_defaults(app_id);
-                                    self.depots_variants = self.lua_vault.get_variants(app_id);
-                                    self.notify(
-                                        format!("Collapsed {} duplicate default variant(s)", removed),
-                                        ToastKind::Info,
-                                    );
-                                }
-                                if ghost_button(ui, "Stamp Now").clicked() {
-                                    let label = if self.depots_selected_variant_hash.is_some() {
-                                        self.depots_variants
-                                            .iter()
-                                            .find(|v| self.depots_selected_variant_hash.as_deref() == Some(v.hash.as_str()))
-                                            .and_then(|v| v.label.clone())
-                                    } else {
-                                        None
-                                    };
-                                    if let Some(v) = self.lua_vault.stamp_now(app_id, label.as_deref()) {
-                                        self.depots_variants = self.lua_vault.get_variants(app_id);
-                                        self.notify(
-                                            format!("Stamped live .lua as build variant: {}", v.display_label()),
-                                            ToastKind::Success,
-                                        );
-                                    } else {
-                                        self.notify("No live .lua to stamp", ToastKind::Warning);
-                                    }
-                                }
-                                if ghost_button(ui, "Apply Build If Live Empty").clicked() {
-                                    if let Some(v) = self.lua_vault.apply_build_if_nothing_live(app_id) {
-                                        let live_txt = self.lua_vault.read_live_text(app_id);
-                                        if !live_txt.trim().is_empty() {
-                                            let parsed = LuaFileParser::parse_text(&live_txt, app_id);
-                                            crate::services::lua_installer::LuaInstaller::sync_with_slssteam(
-                                                &mut self.slssteam_service,
-                                                app_id,
-                                                &parsed,
-                                            );
-                                        }
-                                        self.reload_depots_local(app_id);
-                                        self.refresh_all_local_state();
-                                        self.notify(
-                                            format!("Applied build variant (was empty): {}", v.display_label()),
-                                            ToastKind::Success,
-                                        );
-                                    } else {
-                                        self.notify("Already have live .lua or no build variants exist", ToastKind::Info);
-                                    }
-                                }
                             },
                         );
                         ui.label(
@@ -582,6 +533,58 @@ impl LuaToolsApp {
                                 .size(12.0)
                                 .color(Palette::TEXT_MUTED),
                         );
+                        ui.add_space(6.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = egui::Vec2::new(6.0, 6.0);
+                            if ghost_button(ui, "Collapse Defaults").clicked() {
+                                let removed = self.lua_vault.collapse_defaults(app_id);
+                                self.depots_variants = self.lua_vault.get_variants(app_id);
+                                self.notify(
+                                    format!("Collapsed {} duplicate default variant(s)", removed),
+                                    ToastKind::Info,
+                                );
+                            }
+                            if ghost_button(ui, "Stamp Now").clicked() {
+                                let label = if self.depots_selected_variant_hash.is_some() {
+                                    self.depots_variants
+                                        .iter()
+                                        .find(|v| self.depots_selected_variant_hash.as_deref() == Some(v.hash.as_str()))
+                                        .and_then(|v| v.label.clone())
+                                } else {
+                                    None
+                                };
+                                if let Some(v) = self.lua_vault.stamp_now(app_id, label.as_deref()) {
+                                    self.depots_variants = self.lua_vault.get_variants(app_id);
+                                    self.notify(
+                                        format!("Stamped live .lua as build variant: {}", v.display_label()),
+                                        ToastKind::Success,
+                                    );
+                                } else {
+                                    self.notify("No live .lua to stamp", ToastKind::Warning);
+                                }
+                            }
+                            if ghost_button(ui, "Apply Build If Live Empty").clicked() {
+                                if let Some(v) = self.lua_vault.apply_build_if_nothing_live(app_id) {
+                                    let live_txt = self.lua_vault.read_live_text(app_id);
+                                    if !live_txt.trim().is_empty() {
+                                        let parsed = LuaFileParser::parse_text(&live_txt, app_id);
+                                        crate::services::lua_installer::LuaInstaller::sync_with_slssteam(
+                                            &mut self.slssteam_service,
+                                            app_id,
+                                            &parsed,
+                                        );
+                                    }
+                                    self.reload_depots_local(app_id);
+                                    self.refresh_all_local_state();
+                                    self.notify(
+                                        format!("Applied build variant (was empty): {}", v.display_label()),
+                                        ToastKind::Success,
+                                    );
+                                } else {
+                                    self.notify("Already have live .lua or no build variants exist", ToastKind::Info);
+                                }
+                            }
+                        });
                         ui.add_space(10.0);
 
                         let active_hash = self.lua_vault.get_active_hash(app_id);

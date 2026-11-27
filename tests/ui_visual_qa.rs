@@ -4,13 +4,15 @@
 
 #![cfg(feature = "gui")]
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::io::Read;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use eframe::egui::{
     self,
     epaint::{ImageData, Primitive, TextureId},
-    Color32, Pos2, RawInput, Rect, Vec2,
+    Color32, ColorImage, Pos2, RawInput, Rect, TextureOptions, Vec2,
 };
 
 use luatools_linux::ui::app::LuaToolsApp;
@@ -205,6 +207,78 @@ fn rasterize_primitives(
     raw
 }
 
+fn load_cover_bytes(app_id: u32, agent: &ureq::Agent) -> Option<Vec<u8>> {
+    if let Some(cache_dir) = dirs::cache_dir().map(|d| d.join("luatools/covers")) {
+        for ext in ["jpg", "png", "webp"] {
+            let p = cache_dir.join(format!("{}.{}", app_id, ext));
+            if let Ok(bytes) = std::fs::read(&p) {
+                if !bytes.is_empty() {
+                    return Some(bytes);
+                }
+            }
+        }
+    }
+
+    let urls = [
+        format!(
+            "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/{}/header.jpg",
+            app_id
+        ),
+        format!(
+            "https://cdn.akamai.steamstatic.com/steam/apps/{}/header.jpg",
+            app_id
+        ),
+    ];
+    for url in urls {
+        if let Ok(resp) = agent.get(&url).call() {
+            let mut buf = Vec::new();
+            if resp.into_reader().take(4 * 1024 * 1024).read_to_end(&mut buf).is_ok()
+                && !buf.is_empty()
+            {
+                return Some(buf);
+            }
+        }
+    }
+    None
+}
+
+fn preload_demo_covers(ctx: &egui::Context, app: &mut LuaToolsApp) {
+    let mut app_ids: BTreeSet<u32> = BTreeSet::new();
+    for (aid, _) in &app.recent_installed {
+        app_ids.insert(*aid);
+    }
+    for row in &app.library_rows {
+        app_ids.insert(row.app_id);
+    }
+    for item in app.featured_top.iter().chain(app.featured_new.iter()) {
+        app_ids.insert(item.app_id);
+    }
+    if let Some(aid) = app.depots_app_id {
+        app_ids.insert(aid);
+    }
+    if let Some(aid) = app.fixes_current_app {
+        app_ids.insert(aid);
+    }
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(10))
+        .build();
+
+    for aid in app_ids {
+        let bytes = load_cover_bytes(aid, &agent)
+            .unwrap_or_else(|| panic!("Failed to load Steam cover artwork for AppID {}", aid));
+        let decoded = image::load_from_memory(&bytes)
+            .unwrap_or_else(|e| panic!("Failed to decode cover for AppID {}: {}", aid, e))
+            .to_rgba8();
+        let (w, h) = decoded.dimensions();
+        let color_img = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], decoded.as_raw());
+        let tex = ctx.load_texture(format!("cover_{}", aid), color_img, TextureOptions::LINEAR);
+        app.cover_textures.insert(aid, tex);
+        app.cover_in_flight.remove(&aid);
+        app.cover_failed_at.remove(&aid);
+    }
+}
+
 #[test]
 fn headless_papercut_views_render_cleanly_at_wide_and_narrow_resolutions() {
     let tmp = tempfile::tempdir().unwrap();
@@ -385,6 +459,10 @@ fn headless_papercut_views_render_cleanly_at_wide_and_narrow_resolutions() {
     let guide_out_opt = std::env::var("LUATOOLS_GUIDE_OUT").ok().map(PathBuf::from);
     if let Some(ref gd) = guide_out_opt {
         std::fs::create_dir_all(gd).unwrap();
+    }
+
+    if out_dir_opt.is_some() || guide_out_opt.is_some() {
+        preload_demo_covers(&ctx, &mut app);
     }
 
     for case in cases {
