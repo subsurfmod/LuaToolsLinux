@@ -9,8 +9,41 @@
 
 local millennium = require("millennium")
 local http = require("http")
-local json = require("cjson.safe")
 local logger = require("logger")
+
+-- Millennium v3.6+ preloads lua-cjson under require("json") (not "cjson.safe").
+-- Wrap encode/decode with pcall so malformed JSON never crashes the Lua host.
+local raw_json = nil
+for _, mod_name in ipairs({ "json", "cjson.safe", "cjson" }) do
+    local ok, mod = pcall(require, mod_name)
+    if ok and type(mod) == "table" then
+        raw_json = mod
+        break
+    end
+end
+
+local json = {
+    decode = function(str)
+        if not raw_json or type(str) ~= "string" or str == "" then
+            return nil
+        end
+        local ok, res = pcall(raw_json.decode, str)
+        if ok then
+            return res
+        end
+        return nil
+    end,
+    encode = function(val)
+        if not raw_json then
+            return "{}"
+        end
+        local ok, res = pcall(raw_json.encode, val)
+        if ok then
+            return res
+        end
+        return "{}"
+    end
+}
 
 local luatools_backend = {
     name = "LuaToolsLinux",
@@ -117,11 +150,17 @@ local function rpc_call(method, params)
         headers["X-LuaTools-Token"] = luatools_backend.token
     end
 
-    local response, err = http.post(luatools_backend.endpoint .. "/rpc", {
+    local ok, response, err = pcall(http.post, luatools_backend.endpoint .. "/rpc", {
+        data = payload,
         body = payload,
         headers = headers,
         timeout = 10
     })
+
+    if not ok then
+        err = response
+        response = nil
+    end
 
     if err or not response then
         logger.warn("[LuaToolsLinux] RPC call " .. method .. " failed: " .. tostring(err))
@@ -166,10 +205,20 @@ function on_load()
 
     -- Inject Store scripts via Millennium Webkit API
     if millennium.add_browser_js then
-        luatools_backend.browser_js_hook = millennium.add_browser_js("public/luatools.js")
+        local ok_js, hook_js = pcall(millennium.add_browser_js, "public/luatools.js")
+        if ok_js then
+            luatools_backend.browser_js_hook = hook_js
+        else
+            logger.warn("[LuaToolsLinux] add_browser_js warning: " .. tostring(hook_js))
+        end
     end
     if millennium.add_browser_css then
-        luatools_backend.browser_css_hook = millennium.add_browser_css("public/luatools.css")
+        local ok_css, hook_css = pcall(millennium.add_browser_css, "public/luatools.css")
+        if ok_css then
+            luatools_backend.browser_css_hook = hook_css
+        else
+            logger.warn("[LuaToolsLinux] add_browser_css warning: " .. tostring(hook_css))
+        end
     end
 
     if millennium.ready then
@@ -363,3 +412,38 @@ function GetVersion(args)
         millenniumVersion = "3.6.3"
     })
 end
+
+-- Millennium v3.6+ lua-host requires main.lua to return a lifecycle/export table
+return {
+    on_load = on_load,
+    on_unload = on_unload,
+    on_frontend_loaded = on_frontend_loaded,
+    HasLuaToolsForApp = HasLuaToolsForApp,
+    CheckSources = CheckSources,
+    StartAddViaLuaTools = StartAddViaLuaTools,
+    GetAddViaLuaToolsStatus = GetAddViaLuaToolsStatus,
+    CancelAddViaLuaTools = CancelAddViaLuaTools,
+    DeleteLuaToolsForApp = DeleteLuaToolsForApp,
+    ToggleAppEnabled = ToggleAppEnabled,
+    CheckForFixes = CheckForFixes,
+    ApplyRecommendedFixes = ApplyRecommendedFixes,
+    GetApplyFixStatus = GetApplyFixStatus,
+    GetInstalledFixes = GetInstalledFixes,
+    RemoveAppliedFixes = RemoveAppliedFixes,
+    OpenFixInDesktopApp = OpenFixInDesktopApp,
+    SyncDlcForApp = SyncDlcForApp,
+    RestartSteam = RestartSteam,
+    GetCompanionStatus = GetCompanionStatus,
+    WakeCompanion = WakeCompanion,
+    GetInstalledLuaScripts = GetInstalledLuaScripts,
+    SetLoadedApps = SetLoadedApps,
+    SyncSlsSteamConfig = SyncSlsSteamConfig,
+    GetSettingsConfig = GetSettingsConfig,
+    UpdateSettingValue = UpdateSettingValue,
+    GetApiList = GetApiList,
+    CheckUpdates = CheckUpdates,
+    OpenSettings = OpenSettings,
+    GetTranslations = GetTranslations,
+    GetBridgeDiagnostics = GetBridgeDiagnostics,
+    GetVersion = GetVersion
+}
