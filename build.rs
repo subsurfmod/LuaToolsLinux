@@ -1,11 +1,24 @@
-use std::path::Path;
+use std::fs;
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-changed=build.rs");
-    for git_path in [".git/HEAD", ".git/refs/heads/main", ".git/packed-refs"] {
-        if Path::new(git_path).exists() {
-            println!("cargo:rerun-if-changed={}", git_path);
+    for path in [
+        "build.rs",
+        ".git/HEAD",
+        ".git/logs/HEAD",
+        ".git/packed-refs",
+        ".git/refs/heads",
+        ".git/refs/heads/main",
+    ] {
+        println!("cargo:rerun-if-changed={}", path);
+    }
+
+    if let Ok(head) = fs::read_to_string(".git/HEAD") {
+        if let Some(ref_path) = head.trim().strip_prefix("ref:") {
+            let ref_path = ref_path.trim();
+            if !ref_path.is_empty() && ref_path != "refs/heads/main" {
+                println!("cargo:rerun-if-changed=.git/{}", ref_path);
+            }
         }
     }
 

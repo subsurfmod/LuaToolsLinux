@@ -1,0 +1,17 @@
+{
+  "$schema": "https://raw.githubusercontent.com/SteamClientHomebrew/Millennium/main/src/sys/plugin-schema.json",
+  "name": "LuaToolsLinux",
+  "common_name": "LuaTools Linux",
+  "description": "Direct Steam game manifests, depot keys, DLC unlockers, and game fixes integration via LuaTools Linux.",
+  "version": "4.1.2",
+  "author": "subsurfmod",
+  "backendType": "lua",
+  "useBackend": true,
+  "patches": [
+    {
+      "MatchRegexString": "^https?://store\\.steampowered\\.com/app/\\d+.*",
+      "TargetCss": "public/luatools.css",
+      "TargetJs": "public/luatools.js"
+    }
+  ]
+}

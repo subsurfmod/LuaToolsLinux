@@ -4,8 +4,11 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_yml::{Mapping, Value};
+
+static SLS_TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 use crate::models::config::{default_slssteam_config_path, SlssteamConfig};
 
@@ -931,7 +934,8 @@ impl SlssteamService {
             }
         }
         let content = self.serialize_yaml();
-        let tmp = self.config_path.with_extension("yaml.tmp");
+        let cnt = SLS_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = self.config_path.with_extension(format!("yaml.tmp.{}.{}", std::process::id(), cnt));
         if fs::write(&tmp, content).is_err() {
             return false;
         }

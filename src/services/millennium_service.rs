@@ -371,6 +371,9 @@ impl MillenniumService {
         if lower.is_empty() {
             return false;
         }
+        if lower == "luatoolslinux" {
+            return false;
+        }
         let first_tok = lower.split_whitespace().next().unwrap_or(&lower);
         CONFLICTING_PLUGIN_TOKENS.iter().any(|&tok| {
             first_tok == tok
@@ -672,6 +675,226 @@ impl MillenniumService {
             }
         }
     }
+
+    /// Default sentinel file tracking whether LuaToolsLinux was auto-enabled and whether
+    /// the user manually opted out in Steam's Millennium UI (`~/.config/luatools/millennium_plugin_state.json`).
+    pub fn default_plugin_state_path() -> PathBuf {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".config")
+            .join("luatools")
+            .join("millennium_plugin_state.json")
+    }
+
+    fn is_millennium_installed_on_host(steam_root: Option<&Path>) -> bool {
+        if Self::detect_with_root(steam_root).installed {
+            return true;
+        }
+        if Path::new("/usr/lib/millennium").is_dir() {
+            return true;
+        }
+        if let Some(h) = dirs::home_dir() {
+            if h.join(".local/share/millennium").is_dir() || h.join(".config/millennium").is_dir() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn load_plugin_state(state_path: &Path) -> MillenniumPluginState {
+        fs::read_to_string(state_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<MillenniumPluginState>(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_plugin_state(state_path: &Path, state: &MillenniumPluginState) {
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(pretty) = serde_json::to_string_pretty(state) {
+            let tmp = state_path.with_extension("json.tmp");
+            if fs::write(&tmp, pretty).is_ok() {
+                let _ = fs::rename(&tmp, state_path);
+            }
+        }
+    }
+
+    fn is_config_json_path(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.eq_ignore_ascii_case("config.json"))
+            .unwrap_or(false)
+    }
+
+    fn ensure_luatoolslinux_plugin_installed_in(
+        millennium_installed: bool,
+        plugins_base_dir: Option<&Path>,
+        config_files: &[PathBuf],
+        state_sentinel_path: &Path,
+    ) -> Result<PathBuf, String> {
+        if !millennium_installed {
+            let msg = "Millennium is not installed; skipping LuaToolsLinux plugin deployment";
+            PluginLog::global().info(Some("Millennium"), msg);
+            return Err(msg.into());
+        }
+
+        let target_plugin_dir = plugins_base_dir
+            .map(|p| p.join("LuaToolsLinux"))
+            .unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".local/share/millennium/plugins/LuaToolsLinux")
+            });
+
+        let mut state = Self::load_plugin_state(state_sentinel_path);
+        if state.user_opted_out {
+            PluginLog::global().info(
+                Some("Millennium"),
+                "Respecting user opt-out sentinel; skipping LuaToolsLinux Millennium plugin auto-enable",
+            );
+            return Ok(target_plugin_dir);
+        }
+
+        let existing_config_jsons: Vec<&PathBuf> = config_files
+            .iter()
+            .filter(|p| p.is_file() && Self::is_config_json_path(p))
+            .collect();
+
+        // If we previously auto-enabled LuaToolsLinux and the user later removed it from
+        // Millennium's config.json enabledPlugins, record the opt-out sentinel and respect it.
+        if state.auto_enabled_once && !existing_config_jsons.is_empty() {
+            let mut saw_enabled_list = false;
+            let mut still_enabled = false;
+            for cfg in &existing_config_jsons {
+                if let Ok(raw) = fs::read_to_string(cfg) {
+                    if let Ok(val) = serde_json::from_str::<Value>(&raw) {
+                        if let Some(arr) = val
+                            .get("plugins")
+                            .and_then(|p| p.get("enabledPlugins"))
+                            .and_then(|e| e.as_array())
+                        {
+                            saw_enabled_list = true;
+                            if arr.iter().any(|v| v.as_str() == Some("LuaToolsLinux")) {
+                                still_enabled = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if saw_enabled_list && !still_enabled {
+                state.user_opted_out = true;
+                Self::save_plugin_state(state_sentinel_path, &state);
+                PluginLog::global().info(
+                    Some("Millennium"),
+                    "Detected manual disable of LuaToolsLinux in Millennium config; recorded opt-out sentinel",
+                );
+                return Ok(target_plugin_dir);
+            }
+        }
+
+        let installer =
+            crate::services::plugin_installer_service::PluginInstallerService::default();
+        let plugin_path = installer.install_embedded_millennium_plugin(plugins_base_dir)?;
+
+        // Ensure config.json has general.injectJavascript, general.injectCSS, and
+        // plugins.enabledPlugins containing "LuaToolsLinux" (creating missing objects).
+        for cfg in existing_config_jsons {
+            if let Ok(raw) = fs::read_to_string(cfg) {
+                if let Ok(mut val) = serde_json::from_str::<Value>(&raw) {
+                    let mut modified = false;
+
+                    if !val.is_object() {
+                        val = json!({});
+                        modified = true;
+                    }
+                    if let Some(root_obj) = val.as_object_mut() {
+                        if !root_obj.get("general").map_or(false, Value::is_object) {
+                            root_obj.insert("general".into(), json!({}));
+                            modified = true;
+                        }
+                        if let Some(gen) = root_obj.get_mut("general").and_then(Value::as_object_mut)
+                        {
+                            if gen.get("injectJavascript").and_then(Value::as_bool) != Some(true) {
+                                gen.insert("injectJavascript".into(), json!(true));
+                                modified = true;
+                            }
+                            if gen.get("injectCSS").and_then(Value::as_bool) != Some(true) {
+                                gen.insert("injectCSS".into(), json!(true));
+                                modified = true;
+                            }
+                        }
+
+                        if !root_obj.get("plugins").map_or(false, Value::is_object) {
+                            root_obj.insert("plugins".into(), json!({}));
+                            modified = true;
+                        }
+                        if let Some(plugins_obj) =
+                            root_obj.get_mut("plugins").and_then(Value::as_object_mut)
+                        {
+                            if !plugins_obj
+                                .get("enabledPlugins")
+                                .map_or(false, Value::is_array)
+                            {
+                                plugins_obj.insert("enabledPlugins".into(), json!([]));
+                                modified = true;
+                            }
+                            if let Some(arr) = plugins_obj
+                                .get_mut("enabledPlugins")
+                                .and_then(Value::as_array_mut)
+                            {
+                                if !arr.iter().any(|v| v.as_str() == Some("LuaToolsLinux")) {
+                                    arr.push(json!("LuaToolsLinux"));
+                                    modified = true;
+                                }
+                            }
+                        }
+                    }
+
+                    if modified {
+                        if let Ok(pretty) = serde_json::to_string_pretty(&val) {
+                            let tmp = cfg.with_extension("json.tmp");
+                            if fs::write(&tmp, pretty).is_ok() {
+                                let _ = fs::rename(&tmp, cfg);
+                                PluginLog::global().info(
+                                    Some("Millennium"),
+                                    &format!("Enabled LuaToolsLinux plugin in {}", cfg.display()),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !state.auto_enabled_once {
+            state.auto_enabled_once = true;
+            Self::save_plugin_state(state_sentinel_path, &state);
+        }
+
+        Ok(plugin_path)
+    }
+
+    /// Ensures that the native LuaToolsLinux plugin is installed in Millennium's plugins
+    /// directory and enabled in `~/.config/millennium/config.json` non-destructively,
+    /// only when Millennium is installed and the user has not opted out.
+    pub fn ensure_luatoolslinux_plugin_installed(
+        steam_root: Option<&Path>,
+    ) -> Result<PathBuf, String> {
+        let installed = Self::is_millennium_installed_on_host(steam_root);
+        let cfgs = Self::config_paths(steam_root);
+        let state_path = Self::default_plugin_state_path();
+        Self::ensure_luatoolslinux_plugin_installed_in(installed, None, &cfgs, &state_path)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MillenniumPluginState {
+    #[serde(default)]
+    pub auto_enabled_once: bool,
+    #[serde(default, alias = "opted_out", alias = "disabled")]
+    pub user_opted_out: bool,
 }
 
 fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -779,5 +1002,118 @@ mod tests {
         assert_eq!(arr[0]["enabled"], json!(true));
         assert_eq!(arr[1]["enabled"], json!(false));
         assert_eq!(arr[2]["enabled"], json!(false));
+    }
+
+    #[test]
+    fn ensure_luatoolslinux_skips_when_millennium_not_installed() {
+        let tmp = tempdir().unwrap();
+        let plugins_dir = tmp.path().join("plugins");
+        let cfg_json = tmp.path().join("config.json");
+        let state_json = tmp.path().join("millennium_plugin_state.json");
+
+        let res = MillenniumService::ensure_luatoolslinux_plugin_installed_in(
+            false,
+            Some(&plugins_dir),
+            &[cfg_json],
+            &state_json,
+        );
+        assert!(res.is_err());
+        assert!(!plugins_dir.join("LuaToolsLinux").exists());
+        assert!(!state_json.exists());
+    }
+
+    #[test]
+    fn ensure_luatoolslinux_creates_missing_general_and_plugins_objects_and_preserves_plugins_json() {
+        let tmp = tempdir().unwrap();
+        let plugins_dir = tmp.path().join("plugins");
+        let cfg_json = tmp.path().join("config.json");
+        let plugins_json = tmp.path().join("plugins.json");
+        let state_json = tmp.path().join("millennium_plugin_state.json");
+
+        // Minimal config.json missing both "general" and "plugins" objects
+        fs::write(&cfg_json, r#"{"themes":{"activeTheme":"dark"}}"#).unwrap();
+        // Sibling plugins.json array must NOT be clobbered
+        let orig_plugins_json = r#"[{"name":"protondb","enabled":true}]"#;
+        fs::write(&plugins_json, orig_plugins_json).unwrap();
+
+        let deployed = MillenniumService::ensure_luatoolslinux_plugin_installed_in(
+            true,
+            Some(&plugins_dir),
+            &[cfg_json.clone(), plugins_json.clone()],
+            &state_json,
+        )
+        .unwrap();
+        assert_eq!(deployed, plugins_dir.join("LuaToolsLinux"));
+        assert!(deployed.join("plugin.json").is_file());
+
+        let after_cfg: Value =
+            serde_json::from_str(&fs::read_to_string(&cfg_json).unwrap()).unwrap();
+        assert_eq!(after_cfg["themes"]["activeTheme"], json!("dark"));
+        assert_eq!(after_cfg["general"]["injectJavascript"], json!(true));
+        assert_eq!(after_cfg["general"]["injectCSS"], json!(true));
+        assert_eq!(
+            after_cfg["plugins"]["enabledPlugins"],
+            json!(["LuaToolsLinux"])
+        );
+
+        // plugins.json must remain untouched
+        assert_eq!(fs::read_to_string(&plugins_json).unwrap(), orig_plugins_json);
+    }
+
+    #[test]
+    fn ensure_luatoolslinux_respects_user_opt_out_sentinel_and_manual_disable() {
+        let tmp = tempdir().unwrap();
+        let plugins_dir = tmp.path().join("plugins");
+        let cfg_json = tmp.path().join("config.json");
+        let state_json = tmp.path().join("millennium_plugin_state.json");
+
+        fs::write(&cfg_json, r#"{"plugins":{"enabledPlugins":["protondb"]}}"#).unwrap();
+
+        // 1. First run auto-enables LuaToolsLinux and records auto_enabled_once
+        MillenniumService::ensure_luatoolslinux_plugin_installed_in(
+            true,
+            Some(&plugins_dir),
+            &[cfg_json.clone()],
+            &state_json,
+        )
+        .unwrap();
+        let after_first: Value =
+            serde_json::from_str(&fs::read_to_string(&cfg_json).unwrap()).unwrap();
+        assert_eq!(
+            after_first["plugins"]["enabledPlugins"],
+            json!(["protondb", "LuaToolsLinux"])
+        );
+
+        // 2. Simulate user disabling LuaToolsLinux in Steam's Millennium UI
+        fs::write(&cfg_json, r#"{"plugins":{"enabledPlugins":["protondb"]}}"#).unwrap();
+
+        // 3. Startup self-heal detects manual removal, writes opt-out sentinel, and does NOT re-enable
+        MillenniumService::ensure_luatoolslinux_plugin_installed_in(
+            true,
+            Some(&plugins_dir),
+            &[cfg_json.clone()],
+            &state_json,
+        )
+        .unwrap();
+        let after_disable: Value =
+            serde_json::from_str(&fs::read_to_string(&cfg_json).unwrap()).unwrap();
+        assert_eq!(after_disable["plugins"]["enabledPlugins"], json!(["protondb"]));
+        let state: MillenniumPluginState =
+            serde_json::from_str(&fs::read_to_string(&state_json).unwrap()).unwrap();
+        assert!(state.user_opted_out);
+
+        // 4. Subsequent runs also respect explicit user_opted_out sentinel without modifying config
+        let plugins_dir2 = tmp.path().join("plugins2");
+        MillenniumService::ensure_luatoolslinux_plugin_installed_in(
+            true,
+            Some(&plugins_dir2),
+            &[cfg_json.clone()],
+            &state_json,
+        )
+        .unwrap();
+        assert!(!plugins_dir2.join("LuaToolsLinux").exists());
+        let after_optout: Value =
+            serde_json::from_str(&fs::read_to_string(&cfg_json).unwrap()).unwrap();
+        assert_eq!(after_optout["plugins"]["enabledPlugins"], json!(["protondb"]));
     }
 }

@@ -28,6 +28,7 @@ const ACCELA_REPO: &str = "ciscosweater/enter-the-wired";
 const ACCELA_FALLBACK_URL: &str =
     "https://github.com/ciscosweater/enter-the-wired/releases/download/latest/deps.tar.gz";
 const SLSSTEAM_REPO: &str = "AceSLS/SLSsteam";
+const MILLENNIUM_INSTALL_CMD: &str = r#"curl -fsSL "https://steambrew.app/install.sh" | bash"#;
 
 #[derive(Debug, Clone)]
 pub struct WiredStatus {
@@ -458,15 +459,55 @@ impl WiredService {
         }
 
         progress_cb(
-            0.85,
+            0.80,
             "Extracting SLSsteam.so and configuring launcher...".into(),
         );
         let install_res = self.finish_slssteam_from_archive(&archive_path, &tmp_dir);
         let _ = fs::remove_dir_all(&tmp_dir);
         let so_path = install_res?;
 
-        progress_cb(1.0, format!("SLSsteam installed ({})", so_path.display()));
+        self.install_millennium_steambrew(|p, m| progress_cb(0.85 + p * 0.13, m))?;
+
+        progress_cb(
+            1.0,
+            format!("SLSsteam + Millennium installed ({})", so_path.display()),
+        );
         Ok(so_path)
+    }
+
+    /// Installs Millennium via SteamBrew (`curl -fsSL "https://steambrew.app/install.sh" | bash`).
+    /// Skipped in unit tests, `LUATOOLS_MOCK_LAUNCH=1`, or sandboxed (`uses_system_home == false`) instances.
+    pub fn install_millennium_steambrew<F>(&self, mut progress_cb: F) -> Result<String, String>
+    where
+        F: FnMut(f32, String),
+    {
+        progress_cb(0.05, "Installing Millennium (SteamBrew)...".into());
+        let mock_launch = std::env::var("LUATOOLS_MOCK_LAUNCH")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if cfg!(test) || mock_launch || !self.uses_system_home {
+            let msg = "Millennium (SteamBrew) install skipped in test/sandbox mode.".to_string();
+            progress_cb(1.0, msg.clone());
+            return Ok(msg);
+        }
+
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(MILLENNIUM_INSTALL_CMD)
+            .output()
+            .map_err(|e| format!("Failed to execute Millennium installer: {}", e))?;
+
+        if output.status.success() {
+            let _ = crate::services::millennium_service::MillenniumService::ensure_luatoolslinux_plugin_installed(None);
+            let msg = "Millennium (SteamBrew) installed successfully.".to_string();
+            progress_cb(1.0, msg.clone());
+            Ok(msg)
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let detail = if !stderr.is_empty() { stderr } else { stdout };
+            Err(format!("Millennium installation failed: {}", detail))
+        }
     }
 
     pub fn finish_slssteam_from_archive(
@@ -571,9 +612,11 @@ impl WiredService {
              # Set target platform for LuaTools depot filtering (auto-detect or override via env)\n\
              export LUATOOLS_TARGET_OS=\"${{LUATOOLS_TARGET_OS:-linux}}\"\n\
              export LUATOOLS_TARGET_ARCH=\"${{LUATOOLS_TARGET_ARCH:-x86_64}}\"\n\
-             # Include LuaTools integration library via LD_PRELOAD ONLY if it is a 32-bit ELF matching Steam\n\
-             # (Never inject 64-bit ELFCLASS64 libsteam_integration.so into 32-bit ubuntu12_32/steam)\n\
-             if [ -f \"{integration_lib}\" ] && command -v file >/dev/null 2>&1; then\n\
+             # Include LuaTools integration library via multilib $LIB or single 32-bit ELF\n\
+             LIB_BASE=\"$HOME/.local/lib/luatools\"\n\
+             if [ -f \"$LIB_BASE/lib/libsteam_integration.so\" ] && [ -f \"$LIB_BASE/lib64/libsteam_integration.so\" ]; then\n\
+                 export LD_PRELOAD=\"$LIB_BASE/\\$LIB/libsteam_integration.so${{LD_PRELOAD:+:$LD_PRELOAD}}\"\n\
+             elif [ -f \"{integration_lib}\" ] && command -v file >/dev/null 2>&1; then\n\
                  if file -L \"{integration_lib}\" | grep -q \"ELF 32-bit\"; then\n\
                      export LD_PRELOAD=\"{integration_lib}${{LD_PRELOAD:+:$LD_PRELOAD}}\"\n\
                  fi\n\
@@ -976,5 +1019,18 @@ mod tests {
         assert!(!svc.is_accela_installed());
         assert!(!svc.is_slssteam_installed());
         assert!(!svc.bin_dir.join("steam-sls").exists());
+    }
+
+    #[test]
+    fn install_millennium_steambrew_is_sandbox_and_test_safe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = WiredService::new(Some(tmp.path().join("sandbox")));
+        let mut steps: Vec<(f32, String)> = Vec::new();
+        let res = svc
+            .install_millennium_steambrew(|p, m| steps.push((p, m)))
+            .expect("sandbox/test millennium install should succeed without network");
+        assert!(res.contains("skipped"));
+        assert!(steps.len() >= 2);
+        assert!((steps.last().unwrap().0 - 1.0).abs() < f32::EPSILON);
     }
 }

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [4.1.2] - 2026-11-27
+
+> **Release (`v4.1.2`)**: Introduces the Home Steam Setup Hub, plain-English `?` help popups across all Settings tabs, the native Linux Millennium v3.6+ `LuaToolsLinux` plugin, strict `X-LuaTools-Token` companion RPC authentication with real DLC/config/settings handlers, lock-free `bridge_lib` socket isolation and crash guards, multi-arch `$LIB` packaging, and unconditional `.git` build SHA tracking — verified with **617 passing workspace tests**.
+
+### Added & Improved
+- **Home Steam Setup Hub & Settings `?` Help Popups (`src/ui/views_primary.rs`, `src/ui/views_workbench.rs`, `src/ui/theme.rs`)**: Added a unified Home Steam Setup Hub with a live `X / 5 Ready` readiness tracker, 1-click setup actions, and quick links, plus plain-English floating `?` help popups explaining every setting across all 6 Settings tabs.
+- **Native Linux Millennium v3.6+ Plugin & CEF Coexistence (`assets/millennium_plugin/`, `src/services/millennium_service.rs`, `src/services/plugin_installer_service.rs`, `src/services/cef_bridge.rs`, `src/services/wired_service.rs`)**:
+  - Shipped the embedded native `LuaToolsLinux` plugin by `subsurfmod` (Lua backend `backend/main.lua`, Steam Store SPA UI `public/luatools.js` + `public/luatools.css`, and `SharedJSContext` bundle `dist/index.js` / `.millennium/Dist/index.js`) with per-UID companion discovery, automatic companion wake, and offline local `stplug-in/` fallback.
+  - Added CEF Bridge Touchpoint 4 yield when Millennium is active so store injection never conflicts with the native plugin, and wired `steambrew.app` Millennium installation into the setup workflow.
+- **Hardened Companion RPC & Real Handlers (`src/services/http_server.rs`)**:
+  - Enforced strict `X-LuaTools-Token` cryptographic session authentication backed by mode-`0600` `$XDG_RUNTIME_DIR/luatools_rpc.json` discovery and automatic ephemeral port fallback/propagation.
+  - Implemented real companion RPC handlers including `SyncDlcForApp`, `SyncSlsSteamConfig`, `UpdateSettingValue`, `HasLuaToolsForApp`, `ToggleAppEnabled`, `CheckForFixes`, `ApplyRecommendedFixes`, `RemoveAppliedFixes`, `GetCompanionStatus`, and `GetBridgeDiagnostics`.
+- **Steam Bridge Hardening & Runtime Guards (`bridge_lib/src/lib.rs`)**:
+  - Added lock-free `dlsym` symbol caching, multi-user `/tmp/millennium-mep.sock` → `/tmp/millennium-mep-{uid}.sock` redirection with stale MEP socket cleanup, null-safe `V_strncpy` (mitigating `steamwebhelper` `CGamepadAPITask` NULL-dereference crashes), and `Plat_IsInDebugSession` (preventing `Assert(pUser)` `SIGTRAP` halts under `strace`/GDB).
+- **Multi-Arch `$LIB` Packaging, Uninstaller & Build Tracking (`install.sh`, `uninstall.sh`, `packaging/`, `assets/luatools-steam-launcher`, `build.rs`)**:
+  - Added multi-arch `$LIB` symlink staging (`lib/` 32-bit + `lib64/` 64-bit) and `LuaToolsLinux` Millennium plugin staging across `install.sh`, `.rpm` (`luatools-linux.spec`), and `.deb` (`build-packages.sh`).
+  - Fixed `uninstall.sh` `--system` mode and atomic Millennium `config.json` cleanup.
+  - Updated `build.rs` with unconditional `.git` rerun tracking so `LUATOOLS_BUILD_GIT_SHA` always reflects the exact compiled commit.
+
+---
+
 ## [4.0.0] - 2026-11-27
 
 > **Major Release (`v4.0.0`)**: Reaches full production maturity across the native Rust/`egui` desktop app, dual-architecture (`i686` 32-bit + `x86_64` 64-bit) Linux Steam bridge, live streaming self-updater, authoritative Steam lifecycle management, and hardened sandboxed Lua 5.4 execution — verified with **603 passing workspace tests**.

@@ -727,26 +727,25 @@ pub fn generate_ld_preload_launcher(
          else\n\
            unset LD_PRELOAD\n\
          fi\n\
-         # Only export libsteam_integration.so via LD_PRELOAD when its ELF class is 32-bit (matching Steam)\n\
+         # Prefer multilib $LIB expansion if both lib/ and lib64/ are present\n\
          IS_ELF32=0\n\
-         ACTIVE_LIB=\"{lib}\"\n\
-         if [ -f \"$ACTIVE_LIB\" ] && command -v file >/dev/null 2>&1; then\n\
-           if file -L \"$ACTIVE_LIB\" | grep -q \"ELF 32-bit\"; then\n\
-             IS_ELF32=1\n\
-           fi\n\
+         ACTIVE_LIB=\"\"\n\
+         if [ -f \"{lib_dir}/lib/libsteam_integration.so\" ] && [ -f \"{lib_dir}/lib64/libsteam_integration.so\" ]; then\n\
+           ACTIVE_LIB=\"{lib_dir}/\\$LIB/libsteam_integration.so\"\n\
+           IS_ELF32=1\n\
          fi\n\
-         if [ \"$IS_ELF32\" -ne 1 ]; then\n\
-           for alt in \"{lib_dir}/32/libsteam_integration.so\" \"{lib_dir}/libsteam_integration32.so\"; do\n\
-             if [ -f \"$alt\" ] && command -v file >/dev/null 2>&1; then\n\
-               if file -L \"$alt\" | grep -q \"ELF 32-bit\"; then\n\
-                 ACTIVE_LIB=\"$alt\"\n\
+         if [ -z \"$ACTIVE_LIB\" ]; then\n\
+           for cand in \"{lib}\" \"{lib_dir}/lib/libsteam_integration.so\" \"{lib_dir}/32/libsteam_integration.so\" \"{lib_dir}/libsteam_integration32.so\"; do\n\
+             if [ -f \"$cand\" ] && command -v file >/dev/null 2>&1; then\n\
+               if file -L \"$cand\" | grep -q \"ELF 32-bit\"; then\n\
+                 ACTIVE_LIB=\"$cand\"\n\
                  IS_ELF32=1\n\
                  break\n\
                fi\n\
              fi\n\
            done\n\
          fi\n\
-         if [ \"$IS_ELF32\" -eq 1 ]; then\n\
+         if [ \"$IS_ELF32\" -eq 1 ] && [ -n \"$ACTIVE_LIB\" ]; then\n\
            export LD_PRELOAD=\"$ACTIVE_LIB${{LD_PRELOAD:+:$LD_PRELOAD}}\"\n\
          fi\n\
          # LT-20 / BST-65: Auto-launch LuaTools minimized in background unless user opted out\n\

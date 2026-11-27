@@ -1,0 +1,219 @@
+/* LuaTools Linux - Steam Store Webkit Stylesheet */
+#luatools-store-container {
+  margin: 16px 0;
+  padding: 16px;
+  background: linear-gradient(135deg, rgba(27, 40, 56, 0.95) 0%, rgba(16, 24, 34, 0.95) 100%);
+  border: 1px solid #2a475e;
+  border-left: 4px solid #5c7e10;
+  border-radius: 4px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  font-family: "Motiva Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  color: #c6d4df;
+  position: relative;
+  z-index: 100;
+}
+
+#luatools-store-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.luatools-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #ffffff;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.luatools-title svg {
+  width: 18px;
+  height: 18px;
+  fill: #a4d007;
+}
+
+.luatools-badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 3px;
+  text-transform: uppercase;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+.luatools-badge-installed {
+  background: rgba(92, 126, 16, 0.3);
+  color: #a4d007;
+  border: 1px solid #5c7e10;
+}
+
+.luatools-badge-available {
+  background: rgba(42, 71, 94, 0.4);
+  color: #66c0f4;
+  border: 1px solid #2a475e;
+}
+
+.luatools-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.luatools-btn-group {
+  display: inline-flex;
+  position: relative;
+  overflow: visible;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+}
+
+.luatools-btn-group .luatools-btn-primary {
+  border-radius: 3px 0 0 3px;
+}
+
+.luatools-btn-group .luatools-dropdown-btn {
+  border-radius: 0 3px 3px 0;
+}
+
+.luatools-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  user-select: none;
+  text-decoration: none;
+}
+
+.luatools-btn-primary {
+  background: linear-gradient(90deg, #799905 0%, #536f06 100%);
+  color: #ffffff;
+  text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+}
+
+.luatools-btn-primary:hover {
+  background: linear-gradient(90deg, #8cb006 0%, #5e7f07 100%);
+  box-shadow: 0 0 10px rgba(164, 208, 7, 0.4);
+}
+
+.luatools-btn-secondary {
+  background: #2a475e;
+  color: #c6d4df;
+}
+
+.luatools-btn-secondary:hover {
+  background: #3a6282;
+  color: #ffffff;
+}
+
+.luatools-btn-danger {
+  background: #80222b;
+  color: #ffccd0;
+}
+
+.luatools-btn-danger:hover {
+  background: #a32b37;
+  color: #ffffff;
+}
+
+.luatools-btn-restart {
+  background: linear-gradient(90deg, #2d73b0 0%, #1a4d7c 100%);
+  color: #ffffff;
+  animation: luatools-pulse 2s infinite ease-in-out;
+}
+
+@keyframes luatools-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(102, 192, 244, 0.5); }
+  70% { box-shadow: 0 0 0 8px rgba(102, 192, 244, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(102, 192, 244, 0); }
+}
+
+.luatools-dropdown-btn {
+  padding: 8px 10px;
+  background: #476005;
+  color: #ffffff;
+  border-left: 1px solid rgba(0,0,0,0.2);
+  cursor: pointer;
+}
+
+.luatools-dropdown-btn:hover {
+  background: #536f06;
+}
+
+.luatools-dropdown-menu {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  background: #1b2838;
+  border: 1px solid #2a475e;
+  border-radius: 4px;
+  box-shadow: 0 6px 18px rgba(0,0,0,0.7);
+  min-width: 180px;
+  display: none;
+  flex-direction: column;
+  z-index: 1000;
+}
+
+.luatools-dropdown-menu.active {
+  display: flex;
+}
+
+.luatools-dropdown-item {
+  padding: 8px 14px;
+  font-size: 12px;
+  color: #c6d4df;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.luatools-dropdown-item:hover {
+  background: #2a475e;
+  color: #ffffff;
+}
+
+/* Progress bar */
+.luatools-progress-container {
+  margin-top: 12px;
+  background: #121a24;
+  border-radius: 4px;
+  padding: 10px 14px;
+  border: 1px solid #233547;
+}
+
+.luatools-progress-meta {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  margin-bottom: 6px;
+  color: #8f98a0;
+}
+
+.luatools-progress-track {
+  height: 8px;
+  background: #1e2837;
+  border-radius: 4px;
+  overflow: hidden;
+  position: relative;
+}
+
+.luatools-progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #5c7e10 0%, #a4d007 100%);
+  width: 0%;
+  transition: width 0.3s ease;
+  border-radius: 4px;
+}
+
+.luatools-detail-text {
+  font-size: 12px;
+  color: #8f98a0;
+  margin-top: 8px;
+}

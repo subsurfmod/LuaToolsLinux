@@ -829,9 +829,18 @@ pub fn draw_taped_paper_tag(ui: &mut Ui, text: &str) {
 
 /// Minimalist cut-paper Rem nightcap medallion (orthographic flat paper shapes + drop shadow).
 pub fn draw_rem_medallion(ui: &mut Ui, size: f32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    let _ = draw_rem_medallion_with_sense(ui, size, Sense::hover());
+}
+
+/// Interactive variant of the Rem nightcap medallion returning its click/hover `Response`.
+pub fn draw_rem_medallion_interactive(ui: &mut Ui, size: f32) -> egui::Response {
+    draw_rem_medallion_with_sense(ui, size, Sense::click())
+}
+
+fn draw_rem_medallion_with_sense(ui: &mut Ui, size: f32, sense: Sense) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), sense);
     if !ui.is_rect_visible(rect) {
-        return;
+        return resp;
     }
     let p = ui.painter();
     let c = rect.center();
@@ -892,6 +901,205 @@ pub fn draw_rem_medallion(ui: &mut Ui, size: f32) {
         (size * 0.085).max(2.2),
         eye_col,
     );
+    resp
+}
+
+fn help_tip_card_frame() -> Frame {
+    Frame::new()
+        .fill(Color32::from_rgb(18, 20, 26))
+        .stroke(Stroke::new(1.0_f32, Palette::BLUE_BORDER))
+        .corner_radius(CornerRadius::same(6))
+        .shadow(egui::Shadow {
+            offset: [2, 5],
+            blur: 14,
+            spread: 0,
+            color: Color32::from_black_alpha(175),
+        })
+        .inner_margin(Margin::symmetric(12, 10))
+}
+
+fn render_help_tip_card(ui: &mut Ui, title: &str, body: &str, pinned: bool) {
+    ui.set_max_width(296.0);
+    ui.spacing_mut().item_spacing.y = 5.0;
+    ui.style_mut().interaction.selectable_labels = pinned;
+
+    if !title.is_empty() {
+        ui.add(
+            egui::Label::new(
+                RichText::new(title)
+                    .font(semibold_font(12.5))
+                    .color(Palette::TEXT_PRIMARY),
+            )
+            .wrap(),
+        );
+    }
+    if !body.is_empty() {
+        ui.add(
+            egui::Label::new(
+                RichText::new(body)
+                    .size(12.0)
+                    .color(Palette::TEXT_SECONDARY),
+            )
+            .wrap(),
+        );
+    }
+    if pinned {
+        ui.add_space(2.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new("Click outside or press Esc to close")
+                    .size(10.5)
+                    .color(Palette::TEXT_MUTED),
+            )
+            .selectable(false),
+        );
+    }
+}
+
+/// Compact circular `?` help-tip icon button (`18×18 px`).
+///
+/// - Hovering shows a dark obsidian floating info card with `title` and wrapped `body`.
+/// - Clicking toggles a pinned floating popup (with selectable text) dismissed by clicking
+///   outside, pressing `Esc`, or clicking `?` again.
+pub fn help_tip_icon(ui: &mut egui::Ui, id_salt: &str, title: &str, body: &str) {
+    let popup_id = ui.make_persistent_id(id_salt);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
+
+    let just_toggled = resp.clicked();
+    if just_toggled {
+        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+    }
+    let is_open = ui.memory(|mem| mem.is_popup_open(popup_id));
+
+    if resp.hovered() && ui.is_enabled() {
+        ui.ctx().set_cursor_icon(CursorIcon::Help);
+    }
+
+    if ui.is_rect_visible(rect) {
+        let enabled = ui.is_enabled();
+        let (bg, border, fg) = if !enabled {
+            (
+                Palette::BG_PANEL,
+                Palette::BORDER_SUBTLE,
+                Palette::TEXT_MUTED,
+            )
+        } else if is_open {
+            (
+                Palette::BLUE_PRIMARY,
+                Palette::BLUE_LIGHT,
+                Palette::TEXT_PRIMARY,
+            )
+        } else if resp.hovered() {
+            (
+                Palette::BLUE_SUBTLE,
+                Palette::BLUE_LIGHT,
+                Palette::BLUE_LIGHT,
+            )
+        } else {
+            (
+                Palette::BG_ELEVATED,
+                Palette::BORDER_DEFAULT,
+                Palette::TEXT_SECONDARY,
+            )
+        };
+
+        let painter = ui.painter();
+        let center = rect.center();
+        let radius = rect.width().min(rect.height()) * 0.5 - 0.5;
+        painter.circle_filled(
+            center + Vec2::new(0.0, 1.0),
+            radius,
+            Color32::from_black_alpha(80),
+        );
+        painter.circle_filled(center, radius, bg);
+        painter.circle_stroke(center, radius, Stroke::new(1.0_f32, border));
+
+        let galley = painter.layout_no_wrap("?".to_string(), semibold_font(11.0), fg);
+        painter.galley(
+            Pos2::new(
+                center.x - galley.size().x * 0.5,
+                center.y - galley.size().y * 0.5,
+            ),
+            galley,
+            fg,
+        );
+    }
+
+    if !is_open && !(resp.hovered() && ui.is_enabled()) {
+        return;
+    }
+
+    let mut anchor_rect = rect;
+    if let Some(to_global) = ui.ctx().layer_transform_to_global(ui.layer_id()) {
+        anchor_rect = to_global * anchor_rect;
+    }
+
+    let card_max_w = 296.0_f32;
+    let screen = ui.ctx().screen_rect();
+    let safe_screen = if screen.width() > 24.0 && screen.height() > 24.0 {
+        screen.shrink(8.0)
+    } else {
+        screen
+    };
+    let open_left = anchor_rect.left() + card_max_w + 32.0 > screen.right()
+        && anchor_rect.right() - (card_max_w + 32.0) >= screen.left();
+    let open_above = anchor_rect.bottom() + 140.0 > screen.bottom()
+        && anchor_rect.top() - 140.0 >= screen.top();
+    let (pivot, anchor_pos) = match (open_left, open_above) {
+        (false, false) => (
+            egui::Align2::LEFT_TOP,
+            Pos2::new(anchor_rect.left(), anchor_rect.bottom() + 6.0),
+        ),
+        (true, false) => (
+            egui::Align2::RIGHT_TOP,
+            Pos2::new(anchor_rect.right(), anchor_rect.bottom() + 6.0),
+        ),
+        (false, true) => (
+            egui::Align2::LEFT_BOTTOM,
+            Pos2::new(anchor_rect.left(), anchor_rect.top() - 6.0),
+        ),
+        (true, true) => (
+            egui::Align2::RIGHT_BOTTOM,
+            Pos2::new(anchor_rect.right(), anchor_rect.top() - 6.0),
+        ),
+    };
+
+    if is_open {
+        let area_resp = egui::Area::new(popup_id.with("pinned_card"))
+            .kind(egui::UiKind::Popup)
+            .order(egui::Order::Tooltip)
+            .fixed_pos(anchor_pos)
+            .pivot(pivot)
+            .constrain_to(safe_screen)
+            .default_width(card_max_w)
+            .show(ui.ctx(), |ui| {
+                help_tip_card_frame().show(ui, |ui| {
+                    render_help_tip_card(ui, title, body, true);
+                });
+            });
+
+        let esc_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        let clicked_outside =
+            !just_toggled && resp.clicked_elsewhere() && area_resp.response.clicked_elsewhere();
+        if esc_pressed || clicked_outside {
+            ui.memory_mut(|mem| mem.close_popup());
+        }
+    } else {
+        egui::Area::new(popup_id.with("hover_card"))
+            .kind(egui::UiKind::Popup)
+            .order(egui::Order::Tooltip)
+            .interactable(false)
+            .sense(Sense::hover())
+            .fixed_pos(anchor_pos)
+            .pivot(pivot)
+            .constrain_to(safe_screen)
+            .default_width(card_max_w)
+            .show(ui.ctx(), |ui| {
+                help_tip_card_frame().show(ui, |ui| {
+                    render_help_tip_card(ui, title, body, false);
+                });
+            });
+    }
 }
 
 pub fn format_bytes(bytes: u64) -> String {

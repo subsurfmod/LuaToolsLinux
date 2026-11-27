@@ -14,12 +14,15 @@ use eframe::egui::{
 use egui_extras::{Column, Size, StripBuilder, TableBuilder};
 
 use crate::parsers::vdf_binary::LaunchOptionsService;
-use crate::ui::app::LuaToolsApp;
-use crate::ui::state::{AcquireTab, ActiveView, AppMessage, ToastKind};
+use crate::services::cloud_redirect_service::CloudRedirectStatus;
+use crate::services::protocol_service::ProtocolService;
+use crate::ui::app::{LuaToolsApp, PendingConfirmAction};
+use crate::ui::state::{AcquireTab, ActiveView, AppMessage, SettingsSubTab, ToastKind};
 use crate::ui::theme::{
-    chip_button, danger_button, display_font, draw_rem_medallion, ghost_button, inset_paper_sheet,
-    paper_card, paper_card_padded, pick_files_native, primary_button, secondary_button,
-    section_header, semibold_font, status_badge, table_button, BadgeTone, Palette,
+    chip_button, danger_button, display_font, draw_rem_medallion, ghost_button, help_tip_icon,
+    inset_paper_sheet, paper_card, paper_card_padded, pick_files_native, primary_button,
+    secondary_button, section_header, semibold_font, status_badge, table_button, BadgeTone,
+    Palette,
 };
 
 impl LuaToolsApp {
@@ -245,15 +248,438 @@ impl LuaToolsApp {
 
                 if click_steam_tile {
                     self.active_view = ActiveView::Settings;
-                    self.settings_subtab = crate::ui::state::SettingsSubTab::General;
+                    self.settings_subtab = SettingsSubTab::General;
                 }
                 if click_unlocker_tile {
                     self.active_view = ActiveView::Settings;
-                    self.settings_subtab = crate::ui::state::SettingsSubTab::Integrations;
+                    self.settings_subtab = SettingsSubTab::Integrations;
                 }
                 if click_account_tile {
                     self.active_view = ActiveView::Settings;
-                    self.settings_subtab = crate::ui::state::SettingsSubTab::Account;
+                    self.settings_subtab = SettingsSubTab::Account;
+                }
+
+                ui.add_space(18.0);
+
+                // 2b. Steam Setup Hub — Everything LuaTools Offers for Steam
+                let wired_st = self.wired_service.status();
+                let hub_unlocker_ready = wired_st.slssteam_installed;
+                let hub_bridge_active = bridge_st.integration_active;
+                let hub_bridge_installed = bridge_st.integration_lib_installed;
+                let hub_bridge_ready = hub_bridge_active || hub_bridge_installed;
+                let hub_millennium_conn = self.millennium_connected;
+                let hub_cef_enabled = self.settings_service.settings.cef_bridge_enabled;
+                let hub_store_ready = hub_millennium_conn || hub_cef_enabled;
+                let cloud_st = self.cloud_redirect_service.status();
+                let cloud_apps_count = self.cloud_redirect_service.list_cloud_apps().len();
+                let hub_cloud_ready = matches!(
+                    cloud_st,
+                    CloudRedirectStatus::Active | CloudRedirectStatus::Installed
+                );
+                let hr_running = self.hot_reload_service.is_running();
+                let hub_hr_ready = hr_running;
+
+                let hub_ready_count = usize::from(hub_unlocker_ready)
+                    + usize::from(hub_bridge_ready)
+                    + usize::from(hub_store_ready)
+                    + usize::from(hub_cloud_ready)
+                    + usize::from(hub_hr_ready);
+                let hub_summary_tone = if hub_ready_count == 5 {
+                    BadgeTone::Ready
+                } else if hub_ready_count >= 3 {
+                    BadgeTone::Blue
+                } else {
+                    BadgeTone::Warn
+                };
+
+                let wired_busy = self.wired_busy;
+                let bridge_busy = self.bridge_busy;
+                let steam_running = self.live_steam_pid.is_some();
+
+                let mut hub_install_unlocker = false;
+                let mut hub_install_bridge = false;
+                let mut hub_install_ltsp = false;
+                let mut hub_register_protocol = false;
+                let mut hub_sync_cloud = false;
+                let mut hub_toggle_hr = false;
+                let mut hub_go_settings: Option<SettingsSubTab> = None;
+                let mut hub_launch_restart_steam = false;
+
+                paper_card_padded(ui, Margin::symmetric(20, 18), |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 10.0;
+
+                    egui::Sides::new().show(
+                        ui,
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                ui.label(
+                                    RichText::new(
+                                        "Steam Setup Hub — Everything LuaTools Offers for Steam",
+                                    )
+                                    .font(display_font(17.5))
+                                    .color(Palette::TEXT_PRIMARY),
+                                );
+                                help_tip_icon(
+                                    ui,
+                                    "home_hub_overview",
+                                    "Steam Setup Hub",
+                                    "See every Steam integration LuaTools Linux includes in one place. Start with Steam Unlocker + Millennium so Steam can launch added games, then turn on any extra tools below with a single click.",
+                                );
+                            });
+                        },
+                        |ui| {
+                            status_badge(
+                                ui,
+                                &format!("{} / 5 Ready", hub_ready_count),
+                                hub_summary_tone,
+                            );
+                        },
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Live readiness checklist with 1-click setup for every Steam feature — click any ? icon for a plain-English explanation",
+                        )
+                        .size(12.0)
+                        .color(Palette::TEXT_MUTED),
+                    );
+
+                    let compact_rows = ui.available_width() < 820.0;
+
+                    // Row 1: Steam Unlocker + Millennium
+                    let (unlocker_badge, unlocker_tone) = if hub_unlocker_ready {
+                        ("Ready", BadgeTone::Ready)
+                    } else {
+                        ("Not Set Up", BadgeTone::Warn)
+                    };
+                    let unlocker_desc = if hub_unlocker_ready {
+                        "SLSsteam.so is verified on disk — Steam can download and launch added games."
+                    } else {
+                        "Installs SLSsteam (Linux Steam unlocker) plus Millennium in one step."
+                    };
+                    steam_hub_row(
+                        ui,
+                        compact_rows,
+                        "1. Steam Unlocker + Millennium",
+                        unlocker_desc,
+                        "home_hub_unlocker",
+                        "Steam Unlocker + Millennium",
+                        "Installs SLSsteam (the Linux unlocker that lets Steam download and launch added games) together with Millennium (the Steam UI mod loader used for the Steam Store page button). Run this once for first-time setup or reinstall after a big Steam update.",
+                        unlocker_badge,
+                        unlocker_tone,
+                        |ui| {
+                            ui.add_enabled_ui(!wired_busy, |ui| {
+                                let lbl = if wired_busy {
+                                    "Installing…"
+                                } else if hub_unlocker_ready {
+                                    "Reinstall Unlocker"
+                                } else {
+                                    "Install Unlocker + Millennium"
+                                };
+                                if table_button(ui, lbl, !hub_unlocker_ready)
+                                    .on_hover_text(
+                                        "Install or update SLSsteam and Millennium automatically",
+                                    )
+                                    .clicked()
+                                {
+                                    hub_install_unlocker = true;
+                                }
+                            });
+                        },
+                    );
+
+                    // Row 2: Native Steam Bridge (libsteam_integration.so + Launcher)
+                    let (bridge_badge, bridge_tone) = if hub_bridge_active {
+                        ("Active", BadgeTone::Ready)
+                    } else if hub_bridge_installed {
+                        ("Ready", BadgeTone::Blue)
+                    } else {
+                        ("Not Set Up", BadgeTone::Warn)
+                    };
+                    let bridge_desc = if hub_bridge_active {
+                        "Native bridge library is loaded inside your running Steam process."
+                    } else if hub_bridge_installed {
+                        "libsteam_integration.so is staged — launch Steam with bridge to activate."
+                    } else {
+                        "Stages libsteam_integration.so and generates the Linux Steam launcher."
+                    };
+                    steam_hub_row(
+                        ui,
+                        compact_rows,
+                        "2. Native Steam Bridge (libsteam_integration.so + Launcher)",
+                        bridge_desc,
+                        "home_hub_bridge",
+                        "Native Steam Bridge",
+                        "Installs LuaTools' built-in Linux library (libsteam_integration.so) and Steam launcher wrapper. It connects directly to Steam for ownership tickets, depot keys, and per-game overrides like AppID 480 redirects.",
+                        bridge_badge,
+                        bridge_tone,
+                        |ui| {
+                            ui.add_enabled_ui(!bridge_busy, |ui| {
+                                let lbl = if bridge_busy {
+                                    "Working…"
+                                } else if hub_bridge_installed {
+                                    "Reinstall Bridge"
+                                } else {
+                                    "Install Native Bridge"
+                                };
+                                if table_button(ui, lbl, !hub_bridge_ready)
+                                    .on_hover_text(
+                                        "Stage libsteam_integration.so and generate ~/.local/bin/luatools-steam-launcher",
+                                    )
+                                    .clicked()
+                                {
+                                    hub_install_bridge = true;
+                                }
+                            });
+                        },
+                    );
+
+                    // Row 3: Steam Store Plugin & luatools:// Links
+                    let (store_badge, store_tone) = if hub_millennium_conn {
+                        ("Connected", BadgeTone::Ready)
+                    } else if hub_cef_enabled {
+                        ("Ready", BadgeTone::Blue)
+                    } else {
+                        ("Not Set Up", BadgeTone::Warn)
+                    };
+                    let store_desc = if hub_millennium_conn {
+                        "Millennium store plugin is connected — add games directly from Steam Store pages."
+                    } else if hub_cef_enabled {
+                        "CEF Store bridge is enabled — install the Store plugin or register luatools:// links."
+                    } else {
+                        "Adds an 'Add via LuaTools' button inside Steam Store pages and handles browser links."
+                    };
+                    steam_hub_row(
+                        ui,
+                        compact_rows,
+                        "3. Steam Store Plugin & luatools:// Links",
+                        store_desc,
+                        "home_hub_store_plugin",
+                        "Steam Store Plugin & luatools:// Links",
+                        "Installs the LTSP plugin so an 'Add via LuaTools' button appears right on Steam Store pages, and registers luatools:// links on your Linux desktop so web links open straight in LuaTools.",
+                        store_badge,
+                        store_tone,
+                        |ui| {
+                            if table_button(ui, "Install Store Plugin", !hub_store_ready)
+                                .on_hover_text(
+                                    "Download and install the LuaTools Steam Store Page Plugin (LTSP)",
+                                )
+                                .clicked()
+                            {
+                                hub_install_ltsp = true;
+                            }
+                            if table_button(ui, "Register luatools:// Links", false)
+                                .on_hover_text(
+                                    "Register the luatools:// URI handler in your Linux desktop applications",
+                                )
+                                .clicked()
+                            {
+                                hub_register_protocol = true;
+                            }
+                        },
+                    );
+
+                    // Row 4: Cloud Save Redirect (CloudRedirect)
+                    let (cloud_badge, cloud_tone) = match &cloud_st {
+                        CloudRedirectStatus::Active => ("Active", BadgeTone::Ready),
+                        CloudRedirectStatus::Installed => ("Ready", BadgeTone::Blue),
+                        CloudRedirectStatus::Error(_) => ("Error", BadgeTone::Danger),
+                        CloudRedirectStatus::NotInstalled => ("Not Set Up", BadgeTone::Muted),
+                    };
+                    let cloud_desc = match &cloud_st {
+                        CloudRedirectStatus::Active => format!(
+                            "Redirecting cloud saves & local achievements for {} game(s).",
+                            cloud_apps_count
+                        ),
+                        CloudRedirectStatus::Installed => {
+                            "Local CloudRedirect folder is ready — add games in Steam Setup or sync now."
+                                .to_string()
+                        }
+                        CloudRedirectStatus::Error(err) => format!("CloudRedirect error: {}", err),
+                        CloudRedirectStatus::NotInstalled => {
+                            "Stores Steam Cloud saves & local achievements safely on disk without Valve's servers."
+                                .to_string()
+                        }
+                    };
+                    steam_hub_row(
+                        ui,
+                        compact_rows,
+                        "4. Cloud Save Redirect (CloudRedirect)",
+                        &cloud_desc,
+                        "home_hub_cloud",
+                        "Cloud Save Redirect (CloudRedirect)",
+                        "Keeps your game saves and local achievements in a dedicated local folder inside Steam instead of failing against Valve's online Cloud servers. Click Sync Cloud Saves to save your config, or Configure to pick specific games.",
+                        cloud_badge,
+                        cloud_tone,
+                        |ui| {
+                            if table_button(ui, "Sync Cloud Saves", !hub_cloud_ready)
+                                .on_hover_text(
+                                    "Write cloud_state.json and sync local CloudRedirect folders now",
+                                )
+                                .clicked()
+                            {
+                                hub_sync_cloud = true;
+                            }
+                            if table_button(ui, "Configure", false)
+                                .on_hover_text(
+                                    "Open Settings › Steam Setup to choose which games use CloudRedirect",
+                                )
+                                .clicked()
+                            {
+                                hub_go_settings = Some(SettingsSubTab::Integrations);
+                            }
+                        },
+                    );
+
+                    // Row 5: Live stplug-in/ Hot-Reload Watcher
+                    let (hr_badge, hr_tone) = if hr_running {
+                        ("Running", BadgeTone::Ready)
+                    } else {
+                        ("Not Set Up", BadgeTone::Muted)
+                    };
+                    let hr_desc = if hr_running {
+                        "Watching Steam's stplug-in/ folder live — external .lua changes sync automatically."
+                    } else {
+                        "Start watching stplug-in/ so dropped or edited .lua files auto-sync with SLSsteam."
+                    };
+                    steam_hub_row(
+                        ui,
+                        compact_rows,
+                        "5. Live stplug-in/ Hot-Reload Watcher",
+                        hr_desc,
+                        "home_hub_hotreload",
+                        "Live stplug-in/ Hot-Reload Watcher",
+                        "Monitors Steam's stplug-in folder in real time using Linux inotify. Whenever you add, edit, or delete a .lua file outside the app, LuaTools automatically updates SLSsteam and refreshes your library.",
+                        hr_badge,
+                        hr_tone,
+                        |ui| {
+                            let lbl = if hr_running {
+                                "Stop Watcher"
+                            } else {
+                                "Start Watcher"
+                            };
+                            if table_button(ui, lbl, !hr_running)
+                                .on_hover_text(
+                                    "Toggle real-time Linux inotify watching of Steam's stplug-in/ directory",
+                                )
+                                .clicked()
+                            {
+                                hub_toggle_hr = true;
+                            }
+                        },
+                    );
+
+                    ui.add_space(2.0);
+
+                    // Row 6: Quick Links Row
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
+                        ui.label(
+                            RichText::new("Quick Links:")
+                                .font(semibold_font(12.0))
+                                .color(Palette::TEXT_MUTED),
+                        );
+                        help_tip_icon(
+                            ui,
+                            "home_hub_quick_links",
+                            "Steam Quick Links",
+                            "Jump directly to any Steam settings page — including Steam Setup, Advanced Bridge overrides, external tools (Goldberg Emulator, DepotDownloader, Steamless) — or launch/restart Steam with LuaTools active.",
+                        );
+                        if ghost_button(ui, "Settings › Steam Setup")
+                            .on_hover_text(
+                                "Open Steam Unlocker, Play Unowned, Cloud Save Redirect & Store Plugin settings",
+                            )
+                            .clicked()
+                        {
+                            hub_go_settings = Some(SettingsSubTab::Integrations);
+                        }
+                        if ghost_button(ui, "Settings › Advanced Bridge")
+                            .on_hover_text(
+                                "Open Native Steam Bridge patterns, LD_PRELOAD, tickets & Denuvo auth tools",
+                            )
+                            .clicked()
+                        {
+                            hub_go_settings = Some(SettingsSubTab::SteamIntegration);
+                        }
+                        if ghost_button(ui, "Settings › Updates & Tools")
+                            .on_hover_text(
+                                "Manage Goldberg Steam Emulator, DepotDownloader, Steamless & Git self-updates",
+                            )
+                            .clicked()
+                        {
+                            hub_go_settings = Some(SettingsSubTab::UpdatesAndTools);
+                        }
+                        let steam_btn_lbl = if steam_running {
+                            "Restart Steam"
+                        } else {
+                            "Launch / Restart Steam"
+                        };
+                        if secondary_button(ui, steam_btn_lbl)
+                            .on_hover_text(
+                                "Launch or cleanly restart Steam with SLSsteam and LuaTools bridge active",
+                            )
+                            .clicked()
+                        {
+                            hub_launch_restart_steam = true;
+                        }
+                    });
+                });
+
+                if hub_install_unlocker {
+                    self.trigger_wired_action("steam_unlocker", ui.ctx());
+                }
+                if hub_install_bridge {
+                    self.trigger_bridge_action_async("install", ui.ctx());
+                }
+                if hub_install_ltsp {
+                    self.install_ltsp_plugin_async(ui.ctx());
+                }
+                if hub_register_protocol {
+                    match ProtocolService::register_desktop_handler() {
+                        Ok(m) => self.notify(m, ToastKind::Success),
+                        Err(m) => self.notify(m, ToastKind::Warning),
+                    }
+                }
+                if hub_sync_cloud {
+                    match self.cloud_redirect_service.sync_to_cloudredirect() {
+                        Ok(p) => self.notify(
+                            format!("Synced CloudRedirect config to {}", p.display()),
+                            ToastKind::Success,
+                        ),
+                        Err(e) => self.notify(e, ToastKind::Warning),
+                    }
+                }
+                if hub_toggle_hr {
+                    if hr_running {
+                        self.hot_reload_service.stop();
+                        self.notify("Stopped stplug-in/ hot-reload watcher.", ToastKind::Info);
+                    } else {
+                        match self.hot_reload_service.start() {
+                            Ok(()) => self.notify(
+                                "Started stplug-in/ hot-reload watcher.",
+                                ToastKind::Success,
+                            ),
+                            Err(e) => self.notify(e, ToastKind::Warning),
+                        }
+                    }
+                }
+                if let Some(subtab) = hub_go_settings {
+                    self.active_view = ActiveView::Settings;
+                    self.settings_subtab = subtab;
+                }
+                if hub_launch_restart_steam {
+                    if steam_running {
+                        self.request_confirm_action(
+                            "Restart Steam",
+                            "Steam is currently running. Restarting Steam will close active Steam windows and relaunch with SLSsteam / LuaTools active. Continue?",
+                            "Restart Steam",
+                            false,
+                            PendingConfirmAction::LaunchSteamWithBridge,
+                        );
+                    } else {
+                        self.launch_steam_with_bridge(ui.ctx());
+                    }
                 }
 
                 ui.add_space(20.0);
@@ -1696,6 +2122,82 @@ impl LuaToolsApp {
         self.launch_options_modal.busy = false;
         self.launch_options_modal.open = true;
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn steam_hub_row<F>(
+    ui: &mut egui::Ui,
+    compact: bool,
+    title: &str,
+    description: &str,
+    tip_id: &str,
+    tip_title: &str,
+    tip_body: &str,
+    badge_text: &str,
+    badge_tone: BadgeTone,
+    add_actions: F,
+) where
+    F: FnOnce(&mut egui::Ui),
+{
+    inset_paper_sheet(ui, Margin::symmetric(14, 10), |ui| {
+        ui.set_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = 5.0;
+        if compact {
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(
+                            RichText::new(title)
+                                .font(semibold_font(13.0))
+                                .color(Palette::TEXT_PRIMARY),
+                        );
+                        help_tip_icon(ui, tip_id, tip_title, tip_body);
+                    });
+                },
+                |ui| {
+                    status_badge(ui, badge_text, badge_tone);
+                },
+            );
+            ui.label(
+                RichText::new(description)
+                    .size(12.0)
+                    .color(Palette::TEXT_SECONDARY),
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
+                add_actions(ui);
+            });
+        } else {
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(
+                            RichText::new(title)
+                                .font(semibold_font(13.0))
+                                .color(Palette::TEXT_PRIMARY),
+                        );
+                        help_tip_icon(ui, tip_id, tip_title, tip_body);
+                    });
+                },
+                |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        status_badge(ui, badge_text, badge_tone);
+                        add_actions(ui);
+                    });
+                },
+            );
+            ui.label(
+                RichText::new(description)
+                    .size(12.0)
+                    .color(Palette::TEXT_SECONDARY),
+            );
+        }
+    });
 }
 
 fn summary_paper_tile(

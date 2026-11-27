@@ -16,7 +16,7 @@ use std::io::Write;
 use std::os::raw::{c_uint, c_void};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Once, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -2296,6 +2296,281 @@ pub unsafe extern "C" fn get_stat_override(
     .unwrap_or(false)
 }
 
+// ---------------------------------------------------------------------------
+// Robust Interception Guards: V_strncpy & Millennium Multi-User Socket Redirection
+// ---------------------------------------------------------------------------
+
+/// Null-safe V_strncpy implementation exported into Steam / steamwebhelper.
+///
+/// In Valve's `steamclient.so` and `steamwebhelper`, functions such as `IClientNetworkingUtils_Create`
+/// invoke `IClientUtils::GetInstallPath` over IPC and blindly pass the returned `const char*` to
+/// `V_strncpy`. When IPC returns NULL (e.g. if the Steam master process terminates or fails to reply),
+/// Valve's `V_strncpy` asserts `pSrc != NULL` but proceeds to read from `0x0`, causing a fatal
+/// `SIGSEGV` (`SEGV_MAPERR`).
+///
+/// This symbol interposes `V_strncpy` via `LD_PRELOAD`, ensuring that if `src` is NULL, `*dest = '\0'`
+/// is set and `dest` is returned immediately without dereferencing NULL.
+#[no_mangle]
+pub unsafe extern "C" fn V_strncpy(
+    dest: *mut libc::c_char,
+    src: *const libc::c_char,
+    maxlen: libc::c_int,
+) -> *mut libc::c_char {
+    if dest.is_null() || maxlen <= 0 {
+        return dest;
+    }
+    if src.is_null() {
+        *dest = 0;
+        return dest;
+    }
+
+    let limit = (maxlen as usize).saturating_sub(1);
+    let mut i = 0usize;
+    while i < limit {
+        let ch = *src.add(i);
+        *dest.add(i) = ch;
+        if ch == 0 {
+            return dest;
+        }
+        i += 1;
+    }
+    *dest.add(limit) = 0;
+    dest
+}
+
+/// Prevents Valve's `Assert()` macro in `steamclient.so` / `steamui.so` / `steamwebhelper`
+/// from executing `int3` (`SIGTRAP`) when `TracerPid != 0` in `/proc/self/status`
+/// (e.g. under `strace`, `ptrace` monitors, or profilers). Set `LUATOOLS_ALLOW_DEBUGBREAK=1`
+/// when intentionally breaking inside an interactive `gdb`/`lldb` session.
+#[no_mangle]
+pub unsafe extern "C" fn Plat_IsInDebugSession() -> u8 {
+    static ALLOW_BREAK: OnceLock<u8> = OnceLock::new();
+    *ALLOW_BREAK.get_or_init(|| {
+        match std::env::var("LUATOOLS_ALLOW_DEBUGBREAK") {
+            Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => 1,
+            _ => 0,
+        }
+    })
+}
+
+const RTLD_NEXT: *mut libc::c_void = -1isize as *mut libc::c_void;
+
+type UnlinkFn = unsafe extern "C" fn(*const libc::c_char) -> libc::c_int;
+type BindFn =
+    unsafe extern "C" fn(libc::c_int, *const libc::sockaddr, libc::socklen_t) -> libc::c_int;
+type ConnectFn =
+    unsafe extern "C" fn(libc::c_int, *const libc::sockaddr, libc::socklen_t) -> libc::c_int;
+
+const FN_PTR_UNRESOLVED: usize = 0;
+const FN_PTR_MISSING: usize = 1;
+
+unsafe fn resolve_cached_symbol(cache: &AtomicUsize, name: &[u8]) -> Option<*mut libc::c_void> {
+    let cached = cache.load(Ordering::Acquire);
+    if cached == FN_PTR_MISSING {
+        return None;
+    }
+    if cached != FN_PTR_UNRESOLVED {
+        return Some(cached as *mut libc::c_void);
+    }
+    let fn_ptr = libc::dlsym(RTLD_NEXT, name.as_ptr() as *const libc::c_char);
+    let addr = fn_ptr as usize;
+    if fn_ptr.is_null() || addr == FN_PTR_MISSING {
+        cache.store(FN_PTR_MISSING, Ordering::Release);
+        None
+    } else {
+        cache.store(addr, Ordering::Release);
+        Some(fn_ptr)
+    }
+}
+
+unsafe fn real_unlink_fn() -> Option<UnlinkFn> {
+    static CACHE: AtomicUsize = AtomicUsize::new(FN_PTR_UNRESOLVED);
+    resolve_cached_symbol(&CACHE, b"unlink\0")
+        .map(|p| std::mem::transmute::<*mut libc::c_void, UnlinkFn>(p))
+}
+
+unsafe fn real_bind_fn() -> Option<BindFn> {
+    static CACHE: AtomicUsize = AtomicUsize::new(FN_PTR_UNRESOLVED);
+    resolve_cached_symbol(&CACHE, b"bind\0")
+        .map(|p| std::mem::transmute::<*mut libc::c_void, BindFn>(p))
+}
+
+unsafe fn real_connect_fn() -> Option<ConnectFn> {
+    static CACHE: AtomicUsize = AtomicUsize::new(FN_PTR_UNRESOLVED);
+    resolve_cached_symbol(&CACHE, b"connect\0")
+        .map(|p| std::mem::transmute::<*mut libc::c_void, ConnectFn>(p))
+}
+
+/// Async-signal-safe, allocation-free formatter for `/tmp/millennium-mep-{uid}.sock\0`.
+fn format_millennium_socket_path(uid: libc::uid_t) -> ([u8; 64], usize) {
+    let mut buf = [0u8; 64];
+    let prefix = b"/tmp/millennium-mep-";
+    let mut pos = prefix.len();
+    buf[..pos].copy_from_slice(prefix);
+
+    let mut digits = [0u8; 10];
+    let mut n = uid;
+    let mut dlen = 0usize;
+    if n == 0 {
+        digits[0] = b'0';
+        dlen = 1;
+    } else {
+        while n > 0 {
+            digits[dlen] = b'0' + (n % 10) as u8;
+            n /= 10;
+            dlen += 1;
+        }
+    }
+    while dlen > 0 {
+        dlen -= 1;
+        buf[pos] = digits[dlen];
+        pos += 1;
+    }
+
+    let suffix = b".sock";
+    buf[pos..pos + suffix.len()].copy_from_slice(suffix);
+    pos += suffix.len();
+    buf[pos] = 0;
+    (buf, pos)
+}
+
+/// Redirects `/tmp/millennium-mep.sock` to `/tmp/millennium-mep-{uid}.sock` so multiple users
+/// on the same Linux host do not hit `mep: bind(): Address already in use` crashes.
+unsafe fn redirect_millennium_socket(
+    addr: *const libc::sockaddr,
+    addrlen: libc::socklen_t,
+) -> Option<libc::sockaddr_un> {
+    let fam_sz = std::mem::size_of::<libc::sa_family_t>();
+    if addr.is_null() || (addrlen as usize) <= fam_sz {
+        return None;
+    }
+    if (*addr).sa_family != libc::AF_UNIX as libc::sa_family_t {
+        return None;
+    }
+
+    let un = addr as *const libc::sockaddr_un;
+    let max_path = ((addrlen as usize) - fam_sz).min((*un).sun_path.len());
+    let raw_bytes = std::slice::from_raw_parts((*un).sun_path.as_ptr() as *const u8, max_path);
+    // Abstract Linux sockets start with '\0'; never touch them.
+    if raw_bytes.first().copied().unwrap_or(0) == 0 {
+        return None;
+    }
+    let path_len = raw_bytes.iter().position(|&c| c == 0).unwrap_or(max_path);
+    let path_slice = &raw_bytes[..path_len];
+
+    if path_slice == b"/tmp/millennium-mep.sock" {
+        let (target_buf, target_len) = format_millennium_socket_path(libc::getuid());
+        let mut new_un: libc::sockaddr_un = std::mem::zeroed();
+        new_un.sun_family = libc::AF_UNIX as libc::sa_family_t;
+
+        let max_copy = target_len.min(new_un.sun_path.len() - 1);
+        for i in 0..max_copy {
+            new_un.sun_path[i] = target_buf[i] as libc::c_char;
+        }
+        new_un.sun_path[max_copy] = 0;
+
+        Some(new_un)
+    } else {
+        None
+    }
+}
+
+/// Returns true only when `new_un` points to a stale Unix stream socket (`ECONNREFUSED`).
+unsafe fn is_stale_unix_socket(new_un: &libc::sockaddr_un) -> bool {
+    let Some(real_connect) = real_connect_fn() else {
+        return false;
+    };
+    let probe_fd = libc::socket(
+        libc::AF_UNIX,
+        libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+        0,
+    );
+    if probe_fd < 0 {
+        return false;
+    }
+    let rc = real_connect(
+        probe_fd,
+        new_un as *const libc::sockaddr_un as *const libc::sockaddr,
+        std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+    );
+    let conn_errno = *libc::__errno_location();
+    libc::close(probe_fd);
+    rc < 0 && conn_errno == libc::ECONNREFUSED
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn unlink(pathname: *const libc::c_char) -> libc::c_int {
+    let Some(real_unlink) = real_unlink_fn() else {
+        *libc::__errno_location() = libc::ENOSYS;
+        return -1;
+    };
+    if !pathname.is_null()
+        && std::ffi::CStr::from_ptr(pathname).to_bytes() == b"/tmp/millennium-mep.sock"
+    {
+        let (target_buf, _) = format_millennium_socket_path(libc::getuid());
+        return real_unlink(target_buf.as_ptr() as *const libc::c_char);
+    }
+    real_unlink(pathname)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn bind(
+    sockfd: libc::c_int,
+    addr: *const libc::sockaddr,
+    addrlen: libc::socklen_t,
+) -> libc::c_int {
+    let Some(real_bind) = real_bind_fn() else {
+        *libc::__errno_location() = libc::ENOSYS;
+        return -1;
+    };
+
+    // Keep `redirected` alive on stack for the entire duration of `real_bind(...)`!
+    let redirected = redirect_millennium_socket(addr, addrlen);
+    match redirected.as_ref() {
+        Some(new_un) => {
+            let new_addr = new_un as *const libc::sockaddr_un as *const libc::sockaddr;
+            let new_len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+            let rc = real_bind(sockfd, new_addr, new_len);
+            if rc == 0 {
+                return 0;
+            }
+            let bind_errno = *libc::__errno_location();
+            if bind_errno == libc::EADDRINUSE && is_stale_unix_socket(new_un) {
+                if let Some(real_unlink) = real_unlink_fn() {
+                    let _ = real_unlink(new_un.sun_path.as_ptr());
+                }
+                return real_bind(sockfd, new_addr, new_len);
+            }
+            *libc::__errno_location() = bind_errno;
+            rc
+        }
+        None => real_bind(sockfd, addr, addrlen),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn connect(
+    sockfd: libc::c_int,
+    addr: *const libc::sockaddr,
+    addrlen: libc::socklen_t,
+) -> libc::c_int {
+    let Some(real_connect) = real_connect_fn() else {
+        *libc::__errno_location() = libc::ENOSYS;
+        return -1;
+    };
+
+    // Keep `redirected` alive on stack for the entire duration of `real_connect(...)`!
+    let redirected = redirect_millennium_socket(addr, addrlen);
+    match redirected.as_ref() {
+        Some(new_un) => real_connect(
+            sockfd,
+            new_un as *const libc::sockaddr_un as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        ),
+        None => real_connect(sockfd, addr, addrlen),
+    }
+}
+
 #[ctor]
 fn init() {
     libsteam_integration_init();
@@ -2399,5 +2674,133 @@ mod tests {
             &mut empty_read,
             &mut write_buf
         ));
+    }
+
+    #[test]
+    fn test_v_strncpy_null_safety_and_truncation() {
+        let mut buf = [b'X' as libc::c_char; 8];
+
+        // 1. Null source pointer must NOT crash and must null-terminate dest
+        unsafe {
+            let res = V_strncpy(buf.as_mut_ptr(), std::ptr::null(), 8);
+            assert_eq!(res, buf.as_mut_ptr());
+            assert_eq!(buf[0], 0);
+        }
+
+        // 2. Normal copy
+        let src = std::ffi::CString::new("hello").unwrap();
+        unsafe {
+            let res = V_strncpy(buf.as_mut_ptr(), src.as_ptr(), 8);
+            assert_eq!(res, buf.as_mut_ptr());
+            let s = std::ffi::CStr::from_ptr(buf.as_ptr()).to_str().unwrap();
+            assert_eq!(s, "hello");
+        }
+
+        // 3. Truncation with guaranteed null termination
+        let long_src = std::ffi::CString::new("longstringhere").unwrap();
+        unsafe {
+            let res = V_strncpy(buf.as_mut_ptr(), long_src.as_ptr(), 6);
+            assert_eq!(res, buf.as_mut_ptr());
+            let s = std::ffi::CStr::from_ptr(buf.as_ptr()).to_str().unwrap();
+            assert_eq!(s, "longs");
+            assert_eq!(buf[5], 0);
+        }
+
+        // 4. Zero or negative maxlen
+        unsafe {
+            assert_eq!(V_strncpy(buf.as_mut_ptr(), src.as_ptr(), 0), buf.as_mut_ptr());
+            assert_eq!(V_strncpy(buf.as_mut_ptr(), src.as_ptr(), -1), buf.as_mut_ptr());
+            assert!(V_strncpy(std::ptr::null_mut(), src.as_ptr(), 8).is_null());
+        }
+    }
+
+    #[test]
+    fn test_millennium_socket_redirection() {
+        let mut un: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        un.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let orig = b"/tmp/millennium-mep.sock";
+        for (i, &b) in orig.iter().enumerate() {
+            un.sun_path[i] = b as libc::c_char;
+        }
+
+        let redirected = unsafe {
+            redirect_millennium_socket(
+                &un as *const libc::sockaddr_un as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            )
+        };
+        assert!(redirected.is_some());
+        let red = redirected.unwrap();
+        assert_eq!(red.sun_family, libc::AF_UNIX as libc::sa_family_t);
+        let path = unsafe { std::ffi::CStr::from_ptr(red.sun_path.as_ptr()).to_str().unwrap() };
+        let expected = format!("/tmp/millennium-mep-{}.sock", unsafe { libc::getuid() });
+        assert_eq!(path, expected);
+
+        // End-to-end live socket bind + listen + EADDRINUSE protection + stale-socket recovery + unlink
+        unsafe {
+            let sfd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            assert!(sfd >= 0);
+            let compact_len = (std::mem::size_of::<libc::sa_family_t>() + orig.len() + 1) as libc::socklen_t;
+            let rc_bind = bind(
+                sfd,
+                &un as *const libc::sockaddr_un as *const libc::sockaddr,
+                compact_len,
+            );
+            assert_eq!(rc_bind, 0, "bind must succeed with compact addrlen without EINVAL");
+            assert_eq!(libc::listen(sfd, 1), 0);
+
+            // Second bind while a live listener exists must return EADDRINUSE without hijacking
+            let sfd2 = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            assert!(sfd2 >= 0);
+            let rc_bind2 = bind(
+                sfd2,
+                &un as *const libc::sockaddr_un as *const libc::sockaddr,
+                compact_len,
+            );
+            assert_eq!(rc_bind2, -1, "bind must fail with EADDRINUSE while a live listener owns the socket");
+            assert_eq!(*libc::__errno_location(), libc::EADDRINUSE);
+            libc::close(sfd2);
+
+            let cfd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            assert!(cfd >= 0);
+            let rc_conn = connect(
+                cfd,
+                &un as *const libc::sockaddr_un as *const libc::sockaddr,
+                compact_len,
+            );
+            assert_eq!(rc_conn, 0, "connect must succeed to redirected per-UID socket");
+
+            libc::close(cfd);
+            libc::close(sfd);
+
+            // Socket file is now stale (listener closed without unlink); new bind must recover it
+            let sfd3 = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            assert!(sfd3 >= 0);
+            let rc_bind3 = bind(
+                sfd3,
+                &un as *const libc::sockaddr_un as *const libc::sockaddr,
+                compact_len,
+            );
+            assert_eq!(rc_bind3, 0, "bind must clean up a stale socket and succeed");
+            libc::close(sfd3);
+
+            let c_orig = std::ffi::CString::new("/tmp/millennium-mep.sock").unwrap();
+            assert_eq!(unlink(c_orig.as_ptr()), 0);
+        }
+
+        // Non-matching socket must not be redirected
+        let other = b"/tmp/other.sock";
+        let mut un_other: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        un_other.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (i, &b) in other.iter().enumerate() {
+            un_other.sun_path[i] = b as libc::c_char;
+        }
+        let no_redir = unsafe {
+            redirect_millennium_socket(
+                &un_other as *const libc::sockaddr_un as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            )
+        };
+        assert!(no_redir.is_none());
     }
 }

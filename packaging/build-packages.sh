@@ -4,7 +4,7 @@
 # ==============================================================================
 set -euo pipefail
 
-VERSION="4.0.0"
+VERSION="4.1.2"
 ARCH="$(uname -m)"
 DEB_ARCH="amd64"
 [ "$ARCH" = "aarch64" ] && DEB_ARCH="arm64"
@@ -26,7 +26,7 @@ if rustup target list 2>/dev/null | grep -q "i686-unknown-linux-gnu (installed)"
     (cd "$ROOT_DIR" && cargo build --manifest-path bridge_lib/Cargo.toml --target i686-unknown-linux-gnu --release -j "$CARGO_JOBS" ${CARGO_EXTRA_ARGS:-} || true)
 fi
 (cd "$ROOT_DIR" && cargo build --profile debug-debug -p bridge_lib -j "$CARGO_JOBS" ${CARGO_EXTRA_ARGS:-} || true)
-mkdir -p "$DIST_DIR" "$DIST_DIR/32" "$DIST_DIR/64"
+mkdir -p "$DIST_DIR" "$DIST_DIR/32" "$DIST_DIR/64" "$DIST_DIR/lib" "$DIST_DIR/lib64"
 BIN="${ROOT_DIR}/target/release/luatools"
 BRIDGE_32="${ROOT_DIR}/target/i686-unknown-linux-gnu/release/libsteam_integration.so"
 BRIDGE_64="${ROOT_DIR}/target/release/libsteam_integration.so"
@@ -38,11 +38,18 @@ if [ -f "$BRIDGE_32" ]; then
     cp -f "$BRIDGE_32" "${DIST_DIR}/libsteam_integration.so"
     cp -f "$BRIDGE_32" "${DIST_DIR}/libsteam_integration32.so"
     cp -f "$BRIDGE_32" "${DIST_DIR}/32/libsteam_integration.so"
+    cp -f "$BRIDGE_32" "${DIST_DIR}/lib/libsteam_integration.so"
+    mkdir -p "${DIST_DIR}/lib32" "${DIST_DIR}/i386-linux-gnu"
+    cp -f "$BRIDGE_32" "${DIST_DIR}/lib32/libsteam_integration.so"
+    cp -f "$BRIDGE_32" "${DIST_DIR}/i386-linux-gnu/libsteam_integration.so"
 fi
 if [ -f "$BRIDGE_64" ]; then
     [ -f "$BRIDGE_32" ] || cp -f "$BRIDGE_64" "${DIST_DIR}/libsteam_integration.so"
     cp -f "$BRIDGE_64" "${DIST_DIR}/libsteam_integration64.so"
     cp -f "$BRIDGE_64" "${DIST_DIR}/64/libsteam_integration.so"
+    cp -f "$BRIDGE_64" "${DIST_DIR}/lib64/libsteam_integration.so"
+    mkdir -p "${DIST_DIR}/x86_64-linux-gnu"
+    cp -f "$BRIDGE_64" "${DIST_DIR}/x86_64-linux-gnu/libsteam_integration.so"
 fi
 [ -f "$PATCH_SO" ] && cp -f "$PATCH_SO" "${DIST_DIR}/libsteam_auto_patch_linux.so"
 
@@ -52,21 +59,24 @@ fi
 echo "[2/4] Creating portable tarball bundle..."
 STAGE_TAR="$(mktemp -d)"
 BUNDLE_NAME="luatools-linux-${VERSION}-${ARCH}"
-mkdir -p "${STAGE_TAR}/${BUNDLE_NAME}/dist" "${STAGE_TAR}/${BUNDLE_NAME}/dist/32" "${STAGE_TAR}/${BUNDLE_NAME}/dist/64" "${STAGE_TAR}/${BUNDLE_NAME}/assets"
+mkdir -p "${STAGE_TAR}/${BUNDLE_NAME}/dist" "${STAGE_TAR}/${BUNDLE_NAME}/dist/32" "${STAGE_TAR}/${BUNDLE_NAME}/dist/64" "${STAGE_TAR}/${BUNDLE_NAME}/dist/lib" "${STAGE_TAR}/${BUNDLE_NAME}/dist/lib64" "${STAGE_TAR}/${BUNDLE_NAME}/assets"
 cp -f "$BIN" "${STAGE_TAR}/${BUNDLE_NAME}/dist/luatools"
 if [ -f "$BRIDGE_32" ]; then
     cp -f "$BRIDGE_32" "${STAGE_TAR}/${BUNDLE_NAME}/dist/libsteam_integration.so"
     cp -f "$BRIDGE_32" "${STAGE_TAR}/${BUNDLE_NAME}/dist/libsteam_integration32.so"
     cp -f "$BRIDGE_32" "${STAGE_TAR}/${BUNDLE_NAME}/dist/32/libsteam_integration.so"
+    cp -f "$BRIDGE_32" "${STAGE_TAR}/${BUNDLE_NAME}/dist/lib/libsteam_integration.so"
 fi
 if [ -f "$BRIDGE_64" ]; then
     [ -f "$BRIDGE_32" ] || cp -f "$BRIDGE_64" "${STAGE_TAR}/${BUNDLE_NAME}/dist/libsteam_integration.so"
     cp -f "$BRIDGE_64" "${STAGE_TAR}/${BUNDLE_NAME}/dist/libsteam_integration64.so"
     cp -f "$BRIDGE_64" "${STAGE_TAR}/${BUNDLE_NAME}/dist/64/libsteam_integration.so"
+    cp -f "$BRIDGE_64" "${STAGE_TAR}/${BUNDLE_NAME}/dist/lib64/libsteam_integration.so"
 fi
 [ -f "$PATCH_SO" ] && cp -f "$PATCH_SO" "${STAGE_TAR}/${BUNDLE_NAME}/dist/libsteam_auto_patch_linux.so"
 cp -f "${ROOT_DIR}/install.sh" "${ROOT_DIR}/uninstall.sh" "${ROOT_DIR}/README.md" "${STAGE_TAR}/${BUNDLE_NAME}/"
 cp -f "${ROOT_DIR}/assets/luatools.svg" "${ROOT_DIR}/assets/luatools.desktop.in" "${ROOT_DIR}/assets/luatools-steam-launcher" "${STAGE_TAR}/${BUNDLE_NAME}/assets/"
+cp -rf "${ROOT_DIR}/assets/millennium_plugin" "${STAGE_TAR}/${BUNDLE_NAME}/assets/"
 chmod +x "${STAGE_TAR}/${BUNDLE_NAME}/install.sh" "${STAGE_TAR}/${BUNDLE_NAME}/uninstall.sh" "${STAGE_TAR}/${BUNDLE_NAME}/dist/luatools" "${STAGE_TAR}/${BUNDLE_NAME}/assets/luatools-steam-launcher"
 tar -C "$STAGE_TAR" -czf "${DIST_DIR}/${BUNDLE_NAME}.tar.gz" "$BUNDLE_NAME"
 rm -rf "$STAGE_TAR"
@@ -90,6 +100,9 @@ if command -v rpmbuild >/dev/null 2>&1; then
         cp -f "$BRIDGE_64" "${RPM_TOP}/SOURCES/libsteam_integration64.so"
     fi
     [ -f "$PATCH_SO" ] && cp -f "$PATCH_SO" "${RPM_TOP}/SOURCES/libsteam_auto_patch_linux.so"
+    if [ -d "${ROOT_DIR}/assets/millennium_plugin" ]; then
+        cp -a "${ROOT_DIR}/assets/millennium_plugin" "${RPM_TOP}/SOURCES/millennium_plugin"
+    fi
     cp -f "${ROOT_DIR}/assets/luatools.svg" "${RPM_TOP}/SOURCES/luatools.svg"
     sed "s|@EXEC_PATH@|/usr/bin/luatools|g" "${ROOT_DIR}/assets/luatools.desktop.in" > "${RPM_TOP}/SOURCES/luatools.desktop"
     cp -f "${SCRIPT_DIR}/luatools-linux.spec" "${RPM_TOP}/SPECS/luatools-linux.spec"
@@ -117,6 +130,9 @@ mkdir -p "${DEB_ROOT}/DEBIAN" \
          "${DEB_ROOT}/usr/lib/luatools" \
          "${DEB_ROOT}/usr/lib/luatools/32" \
          "${DEB_ROOT}/usr/lib/luatools/64" \
+         "${DEB_ROOT}/usr/lib/luatools/lib" \
+         "${DEB_ROOT}/usr/lib/luatools/lib64" \
+         "${DEB_ROOT}/usr/share/luatools" \
          "${DEB_ROOT}/usr/share/applications" \
          "${DEB_ROOT}/usr/share/icons/hicolor/scalable/apps"
 
@@ -126,13 +142,23 @@ if [ -f "$BRIDGE_32" ]; then
     install -m 0755 "$BRIDGE_32" "${DEB_ROOT}/usr/lib/luatools/libsteam_integration.so"
     install -m 0755 "$BRIDGE_32" "${DEB_ROOT}/usr/lib/luatools/libsteam_integration32.so"
     install -m 0755 "$BRIDGE_32" "${DEB_ROOT}/usr/lib/luatools/32/libsteam_integration.so"
+    install -m 0755 "$BRIDGE_32" "${DEB_ROOT}/usr/lib/luatools/lib/libsteam_integration.so"
+    ln -sfn lib "${DEB_ROOT}/usr/lib/luatools/lib32"
+    ln -sfn lib "${DEB_ROOT}/usr/lib/luatools/i386-linux-gnu"
+    ln -sfn . "${DEB_ROOT}/usr/lib/luatools/lib/i386-linux-gnu"
 fi
 if [ -f "$BRIDGE_64" ]; then
     [ -f "$BRIDGE_32" ] || install -m 0755 "$BRIDGE_64" "${DEB_ROOT}/usr/lib/luatools/libsteam_integration.so"
     install -m 0755 "$BRIDGE_64" "${DEB_ROOT}/usr/lib/luatools/libsteam_integration64.so"
     install -m 0755 "$BRIDGE_64" "${DEB_ROOT}/usr/lib/luatools/64/libsteam_integration.so"
+    install -m 0755 "$BRIDGE_64" "${DEB_ROOT}/usr/lib/luatools/lib64/libsteam_integration.so"
+    ln -sfn lib64 "${DEB_ROOT}/usr/lib/luatools/x86_64-linux-gnu"
+    ln -sfn ../lib64 "${DEB_ROOT}/usr/lib/luatools/lib/x86_64-linux-gnu"
 fi
 [ -f "$PATCH_SO" ] && install -m 0755 "$PATCH_SO" "${DEB_ROOT}/usr/lib/luatools/libsteam_auto_patch_linux.so"
+if [ -d "${ROOT_DIR}/assets/millennium_plugin" ]; then
+    cp -a "${ROOT_DIR}/assets/millennium_plugin" "${DEB_ROOT}/usr/share/luatools/millennium_plugin"
+fi
 install -m 0644 "${ROOT_DIR}/assets/luatools.svg" "${DEB_ROOT}/usr/share/icons/hicolor/scalable/apps/luatools.svg"
 sed "s|@EXEC_PATH@|/usr/bin/luatools|g" "${ROOT_DIR}/assets/luatools.desktop.in" > "${DEB_ROOT}/usr/share/applications/luatools.desktop"
 chmod 0644 "${DEB_ROOT}/usr/share/applications/luatools.desktop"

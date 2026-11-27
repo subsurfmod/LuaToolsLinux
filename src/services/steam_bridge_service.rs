@@ -487,8 +487,28 @@ impl SteamBridgeService {
                 UpdateService::atomic_replace_executable(&src, &self.lib_target_path)?;
                 if let Some(parent) = self.lib_target_path.parent() {
                     let _ = fs::create_dir_all(parent.join("32"));
+                    let _ = fs::create_dir_all(parent.join("lib"));
                     let _ = fs::copy(&src, parent.join("32/libsteam_integration.so"));
+                    let _ = fs::copy(&src, parent.join("lib/libsteam_integration.so"));
                     let _ = fs::copy(&src, parent.join("libsteam_integration32.so"));
+                    if let Some(repo) = UpdateService::discover_repo_dir("") {
+                        let rel64 = repo.join("target/release/libsteam_integration.so");
+                        let dbg64 = repo.join("target/debug-debug/libsteam_integration.so");
+                        let src64 = if rel64.is_file() {
+                            Some(rel64)
+                        } else if dbg64.is_file() {
+                            Some(dbg64)
+                        } else {
+                            None
+                        };
+                        if let Some(s64) = src64 {
+                            let _ = fs::create_dir_all(parent.join("64"));
+                            let _ = fs::create_dir_all(parent.join("lib64"));
+                            let _ = fs::copy(&s64, parent.join("64/libsteam_integration.so"));
+                            let _ = fs::copy(&s64, parent.join("lib64/libsteam_integration.so"));
+                            let _ = fs::copy(&s64, parent.join("libsteam_integration64.so"));
+                        }
+                    }
                 }
             }
             return Ok(self.lib_target_path.clone());
@@ -525,7 +545,9 @@ impl SteamBridgeService {
                         UpdateService::atomic_replace_executable(&built_i686, &self.lib_target_path)?;
                         if let Some(parent) = self.lib_target_path.parent() {
                             let _ = fs::create_dir_all(parent.join("32"));
+                            let _ = fs::create_dir_all(parent.join("lib"));
                             let _ = fs::copy(&built_i686, parent.join("32/libsteam_integration.so"));
+                            let _ = fs::copy(&built_i686, parent.join("lib/libsteam_integration.so"));
                             let _ = fs::copy(&built_i686, parent.join("libsteam_integration32.so"));
                         }
                         return Ok(self.lib_target_path.clone());

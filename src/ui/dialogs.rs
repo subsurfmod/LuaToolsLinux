@@ -21,12 +21,15 @@ use crate::ui::theme::{
 };
 use crate::VERSION;
 
+const PAPER_GRAIN_FALLBACK_BYTES: &[u8] = include_bytes!("../../assets/paper_grain_fallback.jpg");
+
 impl LuaToolsApp {
     pub fn render_modals(&mut self, ctx: &egui::Context) {
         let show_first_run = (!self.settings_service.settings.telemetry_consent_seen
             && !self.started_hidden_or_silent)
             || self.telemetry_modal_open;
         let any_modal_open = show_first_run
+            || self.emblem_overlay_open
             || self.confirm_modal.open
             || self.updater_feed.modal_open
             || self.action_modal.open
@@ -54,7 +57,9 @@ impl LuaToolsApp {
 
         let esc_pressed = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         if esc_pressed && any_modal_open {
-            if self.confirm_modal.open {
+            if self.emblem_overlay_open {
+                self.close_emblem_overlay();
+            } else if self.confirm_modal.open {
                 self.confirm_modal.open = false;
                 self.confirm_modal.action = None;
             } else if self.action_modal.open
@@ -110,6 +115,7 @@ impl LuaToolsApp {
         self.render_confirm_action_modal(ctx);
         self.render_update_progress_modal(ctx);
         self.render_action_progress_modal(ctx);
+        self.render_emblem_overlay(ctx);
     }
 
     fn render_update_progress_modal(&mut self, ctx: &egui::Context) {
@@ -1890,6 +1896,8 @@ impl LuaToolsApp {
             return;
         }
         let mut close = false;
+        let mut knock_title = false;
+        let mut open_emblem = false;
         egui::Window::new(format!("About LuaTools Linux v{}", VERSION))
             .order(egui::Order::Foreground)
             .collapsible(false)
@@ -1897,11 +1905,17 @@ impl LuaToolsApp {
             .fixed_size([490.0, 275.0])
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label(
-                    RichText::new(format!("LuaTools Linux  v{}", VERSION))
-                        .font(display_font(19.0))
-                        .color(Palette::TEXT_PRIMARY),
+                let title_resp = ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("LuaTools Linux  v{}", VERSION))
+                            .font(display_font(19.0))
+                            .color(Palette::TEXT_PRIMARY),
+                    )
+                    .sense(egui::Sense::click()),
                 );
+                if title_resp.clicked() {
+                    knock_title = true;
+                }
                 ui.add_space(4.0);
                 ui.label(
                     "Native Rust workstation for Steam stplug-in manifests, LuaVault variants, \
@@ -1922,14 +1936,166 @@ impl LuaToolsApp {
                     );
                 }
                 ui.add_space(14.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if primary_button(ui, "Close").clicked() {
-                        close = true;
-                    }
-                });
+                egui::Sides::new().show(
+                    ui,
+                    |ui| {
+                        let hint_resp = ui
+                            .add(
+                                egui::Label::new(
+                                    RichText::new("Good luck.")
+                                        .font(egui::FontId::new(
+                                            10.5,
+                                            egui::FontFamily::Monospace,
+                                        ))
+                                        .color(Palette::TEXT_MUTED),
+                                )
+                                .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text("Look behind the paper…");
+                        if hint_resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if hint_resp.clicked() {
+                            open_emblem = true;
+                        }
+                    },
+                    |ui| {
+                        if primary_button(ui, "Close").clicked() {
+                            close = true;
+                        }
+                    },
+                );
             });
-        if close {
+        if knock_title {
+            self.register_emblem_knock();
+        }
+        if open_emblem {
             self.about_modal_open = false;
+            self.open_emblem_overlay();
+        } else if close {
+            self.about_modal_open = false;
+        }
+    }
+
+    fn render_emblem_overlay(&mut self, ctx: &egui::Context) {
+        if !self.emblem_overlay_open {
+            return;
+        }
+
+        if self.emblem_overlay_texture.is_none() {
+            if let Ok(img) = image::load_from_memory(PAPER_GRAIN_FALLBACK_BYTES) {
+                let rgba = img.into_rgba8();
+                let (w, h) = rgba.dimensions();
+                let color_img = egui::ColorImage::from_rgba_unmultiplied(
+                    [w as usize, h as usize],
+                    rgba.as_raw(),
+                );
+                let handle = ctx.load_texture(
+                    "paper_grain_fallback_tex",
+                    color_img,
+                    egui::TextureOptions::LINEAR,
+                );
+                self.emblem_overlay_texture = Some(handle);
+            }
+        }
+
+        let elapsed = self
+            .emblem_overlay_opened_at
+            .map(|t| t.elapsed().as_secs_f32())
+            .unwrap_or(1.0);
+        let fade = (elapsed / 0.28).clamp(0.0, 1.0);
+        let eased = 1.0 - (1.0 - fade).powi(3);
+        if fade < 1.0 {
+            ctx.request_repaint();
+        }
+
+        let screen = ctx.screen_rect();
+        let can_click_dismiss = elapsed >= 0.28;
+        let mut dismiss = false;
+
+        egui::Area::new(egui::Id::new("emblem_overlay_surface"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(screen.min)
+            .interactable(true)
+            .show(ctx, |ui| {
+                let (rect, resp) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                if resp.hovered() && can_click_dismiss {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if resp.clicked() && can_click_dismiss {
+                    dismiss = true;
+                }
+
+                let p = ui.painter();
+                let scrim_alpha = (236.0 * eased).round() as u8;
+                p.rect_filled(
+                    rect,
+                    egui::CornerRadius::ZERO,
+                    egui::Color32::from_rgba_unmultiplied(3, 4, 6, scrim_alpha),
+                );
+
+                if let Some(ref tex) = self.emblem_overlay_texture {
+                    let native = tex.size_vec2();
+                    let aspect = (native.x / native.y.max(1.0)).max(0.1);
+                    let max_w = (screen.width() - 96.0).clamp(240.0, 660.0);
+                    let max_h = (screen.height() - 130.0).clamp(180.0, 500.0);
+                    let mut draw_w = max_w;
+                    let mut draw_h = draw_w / aspect;
+                    if draw_h > max_h {
+                        draw_h = max_h;
+                        draw_w = draw_h * aspect;
+                    }
+
+                    let plate_size = egui::Vec2::new(draw_w + 28.0, draw_h + 52.0);
+                    let plate_rect = egui::Rect::from_center_size(screen.center(), plate_size);
+                    let img_rect = egui::Rect::from_min_size(
+                        egui::pos2(plate_rect.left() + 14.0, plate_rect.top() + 14.0),
+                        egui::Vec2::new(draw_w, draw_h),
+                    );
+
+                    let shadow_alpha = (165.0 * eased).round() as u8;
+                    p.rect_filled(
+                        plate_rect.translate(egui::Vec2::new(4.0, 8.0)),
+                        egui::CornerRadius::same(6),
+                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, shadow_alpha),
+                    );
+                    let plate_alpha = (255.0 * eased).round() as u8;
+                    p.rect_filled(
+                        plate_rect,
+                        egui::CornerRadius::same(6),
+                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, plate_alpha),
+                    );
+                    p.rect_stroke(
+                        plate_rect,
+                        egui::CornerRadius::same(6),
+                        egui::Stroke::new(
+                            1.0_f32,
+                            egui::Color32::from_rgba_unmultiplied(64, 70, 84, plate_alpha),
+                        ),
+                        egui::StrokeKind::Inside,
+                    );
+
+                    let tint = egui::Color32::from_rgba_unmultiplied(255, 255, 255, plate_alpha);
+                    p.image(
+                        tex.id(),
+                        img_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        tint,
+                    );
+
+                    let hint_alpha = (170.0 * eased).round() as u8;
+                    p.text(
+                        egui::pos2(plate_rect.center().x, plate_rect.bottom() - 18.0),
+                        egui::Align2::CENTER_CENTER,
+                        "Click anywhere or press Esc to return",
+                        egui::FontId::new(11.5, egui::FontFamily::Monospace),
+                        egui::Color32::from_rgba_unmultiplied(145, 152, 168, hint_alpha),
+                    );
+                }
+            });
+
+        if dismiss {
+            self.close_emblem_overlay();
         }
     }
 
@@ -2859,5 +3025,53 @@ fn format_key_preview(k: &str) -> String {
         format!("{}…{}", head, tail)
     } else {
         k.to_string()
+    }
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+    use eframe::egui::{Pos2, RawInput, Rect, Vec2};
+
+    #[test]
+    fn emblem_overlay_lazy_decode_and_escape_dismiss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let mut app = LuaToolsApp::new_headless_demo(&ctx, tmp.path());
+
+        // Zero startup decode cost: texture must be None before trigger.
+        assert!(!app.emblem_overlay_open);
+        assert!(app.emblem_overlay_texture.is_none());
+
+        // Five rapid knocks open the overlay.
+        for _ in 0..5 {
+            app.register_emblem_knock();
+        }
+        assert!(app.emblem_overlay_open);
+
+        // First rendered frame lazily decodes the embedded asset.
+        let raw = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0))),
+            ..Default::default()
+        };
+        let full = ctx.run(raw, |ctx| app.render_shell(ctx));
+        assert!(!ctx.tessellate(full.shapes, 1.0).is_empty());
+        assert!(app.emblem_overlay_texture.is_some());
+
+        // Escape dismisses cleanly and frees the texture.
+        let esc_raw = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0))),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(esc_raw, |ctx| app.render_shell(ctx));
+        assert!(!app.emblem_overlay_open);
+        assert!(app.emblem_overlay_texture.is_none());
     }
 }

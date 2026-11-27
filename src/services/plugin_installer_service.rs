@@ -533,7 +533,60 @@ impl PluginInstallerService {
         }
         self.install_ltsp_js_payload(DEFAULT_LUATOOLS_JS, steam_root)
     }
+
+    /// Atomically deploys the embedded LuaToolsLinux Millennium v3.6+ plugin payload
+    /// into `~/.local/share/millennium/plugins/LuaToolsLinux/` (or target path).
+    pub fn install_embedded_millennium_plugin(
+        &self,
+        base_dir: Option<&Path>,
+    ) -> Result<PathBuf, String> {
+        let root = base_dir.map(PathBuf::from).unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".local/share/millennium/plugins")
+        });
+        let target_dir = root.join("LuaToolsLinux");
+        let backend_dir = target_dir.join("backend");
+        let public_dir = target_dir.join("public");
+        let dist_dir = target_dir.join("dist");
+        let dot_dist_dir = target_dir.join(".millennium/Dist");
+
+        fs::create_dir_all(&backend_dir)
+            .map_err(|e| format!("Failed to create plugin backend dir: {}", e))?;
+        fs::create_dir_all(&public_dir)
+            .map_err(|e| format!("Failed to create plugin public dir: {}", e))?;
+        fs::create_dir_all(&dist_dir)
+            .map_err(|e| format!("Failed to create plugin dist dir: {}", e))?;
+        fs::create_dir_all(&dot_dist_dir)
+            .map_err(|e| format!("Failed to create plugin .millennium/Dist dir: {}", e))?;
+
+        write_file_atomic(&target_dir.join("plugin.json"), MILLENNIUM_PLUGIN_JSON.as_bytes())
+            .map_err(|e| format!("Failed to write plugin.json: {}", e))?;
+        write_file_atomic(&backend_dir.join("main.lua"), MILLENNIUM_BACKEND_MAIN_LUA.as_bytes())
+            .map_err(|e| format!("Failed to write backend/main.lua: {}", e))?;
+        write_file_atomic(&public_dir.join("luatools.js"), MILLENNIUM_PUBLIC_LUATOOLS_JS.as_bytes())
+            .map_err(|e| format!("Failed to write public/luatools.js: {}", e))?;
+        write_file_atomic(&public_dir.join("luatools.css"), MILLENNIUM_PUBLIC_LUATOOLS_CSS.as_bytes())
+            .map_err(|e| format!("Failed to write public/luatools.css: {}", e))?;
+        write_file_atomic(&dist_dir.join("index.js"), MILLENNIUM_DIST_INDEX_JS.as_bytes())
+            .map_err(|e| format!("Failed to write dist/index.js: {}", e))?;
+        write_file_atomic(&dot_dist_dir.join("index.js"), MILLENNIUM_DIST_INDEX_JS.as_bytes())
+            .map_err(|e| format!("Failed to write .millennium/Dist/index.js: {}", e))?;
+
+        PluginLog::global().info(
+            Some("PluginInstaller"),
+            &format!("Installed LuaToolsLinux Millennium plugin to {}", target_dir.display()),
+        );
+
+        Ok(target_dir)
+    }
 }
+
+pub const MILLENNIUM_PLUGIN_JSON: &str = include_str!("../../assets/millennium_plugin/plugin.json");
+pub const MILLENNIUM_BACKEND_MAIN_LUA: &str = include_str!("../../assets/millennium_plugin/backend/main.lua");
+pub const MILLENNIUM_PUBLIC_LUATOOLS_JS: &str = include_str!("../../assets/millennium_plugin/public/luatools.js");
+pub const MILLENNIUM_PUBLIC_LUATOOLS_CSS: &str = include_str!("../../assets/millennium_plugin/public/luatools.css");
+pub const MILLENNIUM_DIST_INDEX_JS: &str = include_str!("../../assets/millennium_plugin/dist/index.js");
 
 fn write_file_atomic(target: &Path, data: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = target.parent() {
@@ -753,5 +806,31 @@ mod tests {
         }
         let extracted = PluginInstallerService::extract_luatools_js_from_zip(&zip_buf).unwrap();
         assert_eq!(extracted, payload);
+    }
+
+    #[test]
+    fn test_install_embedded_millennium_plugin_payload() {
+        let dir = tempdir().unwrap();
+        let service = PluginInstallerService::new(Some(dir.path()));
+        let installed = service
+            .install_embedded_millennium_plugin(Some(dir.path()))
+            .unwrap();
+
+        assert_eq!(installed, dir.path().join("LuaToolsLinux"));
+        assert!(installed.join("plugin.json").is_file());
+        assert!(installed.join("backend/main.lua").is_file());
+        assert!(installed.join("public/luatools.js").is_file());
+        assert!(installed.join("public/luatools.css").is_file());
+        assert!(installed.join("dist/index.js").is_file());
+        assert!(installed.join(".millennium/Dist/index.js").is_file());
+
+        let manifest = fs::read_to_string(installed.join("plugin.json")).unwrap();
+        assert!(manifest.contains(r#""name": "LuaToolsLinux""#));
+        assert!(manifest.contains(r#""author": "subsurfmod""#));
+        assert!(manifest.contains(r#""backendType": "lua""#));
+
+        let lua = fs::read_to_string(installed.join("backend/main.lua")).unwrap();
+        assert!(lua.contains("subsurfmod"));
+        assert!(lua.contains("millennium"));
     }
 }

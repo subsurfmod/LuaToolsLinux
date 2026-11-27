@@ -7,7 +7,7 @@
 set -euo pipefail
 
 APP_NAME="luatools"
-APP_VERSION="4.0.0"
+APP_VERSION="4.1.2"
 REPO_URL="https://github.com/subsurfmod/LuaToolsLinux.git"
 SCRIPT_DIR=""
 if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
@@ -205,6 +205,9 @@ ensure_binary() {
         if [ -d "${SCRIPT_DIR}/assets/guide" ]; then
             check_paths+=("${SCRIPT_DIR}/assets/guide")
         fi
+        if [ -d "${SCRIPT_DIR}/assets/millennium_plugin" ]; then
+            check_paths+=("${SCRIPT_DIR}/assets/millennium_plugin")
+        fi
         if [ -e "${SCRIPT_DIR}/.git/HEAD" ]; then
             check_paths+=("${SCRIPT_DIR}/.git/HEAD")
         fi
@@ -253,7 +256,7 @@ ensure_binary() {
     (cd "${SCRIPT_DIR}" && cargo build --manifest-path bridge_lib/Cargo.toml --target i686-unknown-linux-gnu --release -j "${CARGO_BUILD_JOBS:-2}") || warn "Could not compile 32-bit i686 bridge_lib; falling back to 64-bit"
 
     BIN_SOURCE="${SCRIPT_DIR}/target/release/${APP_NAME}"
-    mkdir -p "${SCRIPT_DIR}/dist" "${SCRIPT_DIR}/dist/32" "${SCRIPT_DIR}/dist/64"
+    mkdir -p "${SCRIPT_DIR}/dist" "${SCRIPT_DIR}/dist/32" "${SCRIPT_DIR}/dist/64" "${SCRIPT_DIR}/dist/lib" "${SCRIPT_DIR}/dist/lib64"
     install -m 0755 "${BIN_SOURCE}" "${SCRIPT_DIR}/dist/${APP_NAME}"
 
     local bridge_32="${SCRIPT_DIR}/target/i686-unknown-linux-gnu/release/libsteam_integration.so"
@@ -264,7 +267,11 @@ ensure_binary() {
         install -m 0755 "$bridge_32" "${SCRIPT_DIR}/dist/libsteam_integration.so"
         install -m 0755 "$bridge_32" "${SCRIPT_DIR}/dist/libsteam_integration32.so"
         install -m 0755 "$bridge_32" "${SCRIPT_DIR}/dist/32/libsteam_integration.so"
-        ok "Staged 32-bit i686 Steam integration library -> dist/libsteam_integration.so"
+        install -m 0755 "$bridge_32" "${SCRIPT_DIR}/dist/lib/libsteam_integration.so"
+        mkdir -p "${SCRIPT_DIR}/dist/lib32" "${SCRIPT_DIR}/dist/i386-linux-gnu"
+        install -m 0755 "$bridge_32" "${SCRIPT_DIR}/dist/lib32/libsteam_integration.so"
+        install -m 0755 "$bridge_32" "${SCRIPT_DIR}/dist/i386-linux-gnu/libsteam_integration.so"
+        ok "Staged 32-bit i686 Steam integration library -> dist/libsteam_integration.so, dist/lib/ & dist/32/"
     elif [ -f "$bridge_64" ]; then
         install -m 0755 "$bridge_64" "${SCRIPT_DIR}/dist/libsteam_integration.so"
     fi
@@ -272,7 +279,10 @@ ensure_binary() {
     if [ -f "$bridge_64" ]; then
         install -m 0755 "$bridge_64" "${SCRIPT_DIR}/dist/libsteam_integration64.so"
         install -m 0755 "$bridge_64" "${SCRIPT_DIR}/dist/64/libsteam_integration.so"
-        ok "Staged 64-bit x86_64 Steam integration library -> dist/libsteam_integration64.so"
+        install -m 0755 "$bridge_64" "${SCRIPT_DIR}/dist/lib64/libsteam_integration.so"
+        mkdir -p "${SCRIPT_DIR}/dist/x86_64-linux-gnu"
+        install -m 0755 "$bridge_64" "${SCRIPT_DIR}/dist/x86_64-linux-gnu/libsteam_integration.so"
+        ok "Staged 64-bit x86_64 Steam integration library -> dist/libsteam_integration64.so, dist/lib64/ & dist/64/"
     fi
 
     if [ -f "${SCRIPT_DIR}/target/release/libsteam_auto_patch_linux.so" ]; then
@@ -288,6 +298,7 @@ install_files() {
     local bridge_32=""
     for candidate in \
         "${SCRIPT_DIR}/target/i686-unknown-linux-gnu/release/libsteam_integration.so" \
+        "${SCRIPT_DIR}/dist/lib/libsteam_integration.so" \
         "${SCRIPT_DIR}/dist/32/libsteam_integration.so" \
         "${SCRIPT_DIR}/dist/libsteam_integration32.so" \
         "${SCRIPT_DIR}/dist/libsteam_integration.so"; do
@@ -308,6 +319,7 @@ install_files() {
     for candidate in \
         "${SCRIPT_DIR}/target/release/libsteam_integration.so" \
         "${SCRIPT_DIR}/target/debug-debug/libsteam_integration.so" \
+        "${SCRIPT_DIR}/dist/lib64/libsteam_integration.so" \
         "${SCRIPT_DIR}/dist/64/libsteam_integration.so" \
         "${SCRIPT_DIR}/dist/libsteam_integration64.so" \
         "${SCRIPT_DIR}/dist/libsteam_integration.so"; do
@@ -347,17 +359,24 @@ install_files() {
 
         # Shared libraries (32-bit primary for Steam + 64-bit for multilib/$LIB)
         if [ -n "$bridge_32" ]; then
-            run_privileged mkdir -p "${lib_dir}/32"
+            run_privileged mkdir -p "${lib_dir}/32" "${lib_dir}/lib"
             run_privileged install -m 0755 "$bridge_32" "${lib_dir}/libsteam_integration.so"
             run_privileged install -m 0755 "$bridge_32" "${lib_dir}/libsteam_integration32.so"
             run_privileged install -m 0755 "$bridge_32" "${lib_dir}/32/libsteam_integration.so"
+            run_privileged install -m 0755 "$bridge_32" "${lib_dir}/lib/libsteam_integration.so"
+            run_privileged ln -sfn lib "${lib_dir}/lib32" 2>/dev/null || true
+            run_privileged ln -sfn lib "${lib_dir}/i386-linux-gnu" 2>/dev/null || true
+            run_privileged ln -sfn . "${lib_dir}/lib/i386-linux-gnu" 2>/dev/null || true
         elif [ -n "$bridge_64" ]; then
             run_privileged install -m 0755 "$bridge_64" "${lib_dir}/libsteam_integration.so"
         fi
         if [ -n "$bridge_64" ]; then
-            run_privileged mkdir -p "${lib_dir}/64"
+            run_privileged mkdir -p "${lib_dir}/64" "${lib_dir}/lib64" "${lib_dir}/lib"
             run_privileged install -m 0755 "$bridge_64" "${lib_dir}/libsteam_integration64.so"
             run_privileged install -m 0755 "$bridge_64" "${lib_dir}/64/libsteam_integration.so"
+            run_privileged install -m 0755 "$bridge_64" "${lib_dir}/lib64/libsteam_integration.so"
+            run_privileged ln -sfn lib64 "${lib_dir}/x86_64-linux-gnu" 2>/dev/null || true
+            run_privileged ln -sfn ../lib64 "${lib_dir}/lib/x86_64-linux-gnu" 2>/dev/null || true
         fi
 
         [ -n "$patch_src" ] && run_privileged install -m 0755 "$patch_src" "${lib_dir}/libsteam_auto_patch_linux.so"
@@ -397,17 +416,24 @@ install_files() {
 
         # Shared libraries (32-bit primary for Steam + 64-bit for multilib/$LIB)
         if [ -n "$bridge_32" ]; then
-            mkdir -p "${lib_dir}/32"
+            mkdir -p "${lib_dir}/32" "${lib_dir}/lib"
             install -m 0755 "$bridge_32" "${lib_dir}/libsteam_integration.so"
             install -m 0755 "$bridge_32" "${lib_dir}/libsteam_integration32.so"
             install -m 0755 "$bridge_32" "${lib_dir}/32/libsteam_integration.so"
+            install -m 0755 "$bridge_32" "${lib_dir}/lib/libsteam_integration.so"
+            ln -sfn lib "${lib_dir}/lib32" 2>/dev/null || true
+            ln -sfn lib "${lib_dir}/i386-linux-gnu" 2>/dev/null || true
+            ln -sfn . "${lib_dir}/lib/i386-linux-gnu" 2>/dev/null || true
         elif [ -n "$bridge_64" ]; then
             install -m 0755 "$bridge_64" "${lib_dir}/libsteam_integration.so"
         fi
         if [ -n "$bridge_64" ]; then
-            mkdir -p "${lib_dir}/64"
+            mkdir -p "${lib_dir}/64" "${lib_dir}/lib64" "${lib_dir}/lib"
             install -m 0755 "$bridge_64" "${lib_dir}/libsteam_integration64.so"
             install -m 0755 "$bridge_64" "${lib_dir}/64/libsteam_integration.so"
+            install -m 0755 "$bridge_64" "${lib_dir}/lib64/libsteam_integration.so"
+            ln -sfn lib64 "${lib_dir}/x86_64-linux-gnu" 2>/dev/null || true
+            ln -sfn ../lib64 "${lib_dir}/lib/x86_64-linux-gnu" 2>/dev/null || true
         fi
 
         [ -n "$patch_src" ] && install -m 0755 "$patch_src" "${lib_dir}/libsteam_auto_patch_linux.so"
@@ -428,6 +454,80 @@ install_files() {
             update-desktop-database "$apps_dir" >/dev/null 2>&1 || true
         fi
         INSTALLED_BIN="${bin_dir}/${APP_NAME}"
+    fi
+
+    # Install native Millennium plugin (LuaToolsLinux by subsurfmod) only for a non-root user
+    # when Millennium is actually installed on the system.
+    if [ -d "${SCRIPT_DIR}/assets/millennium_plugin" ]; then
+        local target_home=""
+        local target_user=""
+        if [ "$SYSTEM_WIDE" -eq 1 ]; then
+            if [ "$(id -u)" -ne 0 ]; then
+                target_home="${HOME}"
+            elif [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
+                target_home="$(getent passwd "${SUDO_USER}" 2>/dev/null | cut -d: -f6 || true)"
+                target_user="${SUDO_USER}"
+            fi
+        elif [ "$(id -u)" -ne 0 ]; then
+            target_home="${HOME}"
+        elif [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
+            target_home="$(getent passwd "${SUDO_USER}" 2>/dev/null | cut -d: -f6 || true)"
+            target_user="${SUDO_USER}"
+        fi
+
+        if [ -z "$target_home" ] || [ "$target_home" = "/root" ] || [ ! -d "$target_home" ]; then
+            info "Skipping user Millennium plugin deployment (no non-root target home)."
+        elif [ ! -d "/usr/lib/millennium" ] \
+            && [ ! -d "${target_home}/.local/share/millennium" ] \
+            && [ ! -d "${target_home}/.config/millennium" ]; then
+            info "Millennium not detected; skipping LuaToolsLinux Millennium plugin deployment."
+        else
+            local millennium_plugins_dir="${target_home}/.local/share/millennium/plugins/LuaToolsLinux"
+            info "Installing native Millennium v3.6+ plugin: LuaToolsLinux (by subsurfmod)..."
+            mkdir -p "${millennium_plugins_dir}/backend" "${millennium_plugins_dir}/public" "${millennium_plugins_dir}/dist" "${millennium_plugins_dir}/.millennium/Dist"
+            install -m 0644 "${SCRIPT_DIR}/assets/millennium_plugin/plugin.json" "${millennium_plugins_dir}/plugin.json"
+            install -m 0644 "${SCRIPT_DIR}/assets/millennium_plugin/backend/main.lua" "${millennium_plugins_dir}/backend/main.lua"
+            install -m 0644 "${SCRIPT_DIR}/assets/millennium_plugin/public/luatools.js" "${millennium_plugins_dir}/public/luatools.js"
+            install -m 0644 "${SCRIPT_DIR}/assets/millennium_plugin/public/luatools.css" "${millennium_plugins_dir}/public/luatools.css"
+            install -m 0644 "${SCRIPT_DIR}/assets/millennium_plugin/dist/index.js" "${millennium_plugins_dir}/dist/index.js"
+            install -m 0644 "${SCRIPT_DIR}/assets/millennium_plugin/dist/index.js" "${millennium_plugins_dir}/.millennium/Dist/index.js"
+            if [ -n "$target_user" ] && [ "$(id -u)" -eq 0 ]; then
+                chown -R "${target_user}:$(id -gn "$target_user")" "${target_home}/.local/share/millennium" 2>/dev/null || true
+            fi
+
+            local millennium_cfg="${target_home}/.config/millennium/config.json"
+            if [ -f "$millennium_cfg" ]; then
+                local millennium_cfg_tmp="${millennium_cfg}.tmp.$$"
+                if python3 -c "
+import json, os, sys
+src, tmp = sys.argv[1], sys.argv[2]
+try:
+    with open(src, 'r', encoding='utf-8') as f:
+        d = json.load(f)
+except Exception:
+    d = {}
+plugins = d.setdefault('plugins', {})
+enabled = plugins.setdefault('enabledPlugins', [])
+if 'LuaToolsLinux' not in enabled:
+    enabled.append('LuaToolsLinux')
+gen = d.setdefault('general', {})
+gen['injectJavascript'] = True
+gen['injectCSS'] = True
+with open(tmp, 'w', encoding='utf-8') as f:
+    json.dump(d, f, indent=2)
+    f.flush()
+    os.fsync(f.fileno())
+" "$millennium_cfg" "$millennium_cfg_tmp" 2>/dev/null; then
+                    if [ -n "$target_user" ] && [ "$(id -u)" -eq 0 ]; then
+                        chown "${target_user}:$(id -gn "$target_user")" "$millennium_cfg_tmp" 2>/dev/null || true
+                    fi
+                    mv -f "$millennium_cfg_tmp" "$millennium_cfg"
+                else
+                    rm -f "$millennium_cfg_tmp"
+                fi
+            fi
+            ok "Installed Millennium plugin -> ${millennium_plugins_dir}"
+        fi
     fi
 
     # Record source repository location for one-click in-app Git updates

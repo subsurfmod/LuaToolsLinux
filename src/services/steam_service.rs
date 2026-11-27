@@ -315,6 +315,31 @@ impl SteamService {
         if let Some(audit) = ld_audit {
             cmd.env("LD_AUDIT", audit);
         }
+        // Ensure multilib $LIB libsteam_integration.so is always preloaded on non-Flatpak Steam launches
+        // (even when launched via relaunch_steam_sls / HTTP server) so both 32-bit and 64-bit Steam +
+        // steamwebhelper receive null-safe V_strncpy and multi-user Millennium socket isolation.
+        if program != Path::new("flatpak") {
+            if let Some(home) = dirs::home_dir() {
+                let lib_base = home.join(".local/lib/luatools");
+                if lib_base.join("lib/libsteam_integration.so").is_file()
+                    && lib_base.join("lib64/libsteam_integration.so").is_file()
+                {
+                    let multilib_entry =
+                        format!("{}/$LIB/libsteam_integration.so", lib_base.display());
+                    let existing = std::env::var("LD_PRELOAD").unwrap_or_default();
+                    let cleaned: Vec<&str> = existing
+                        .split(':')
+                        .filter(|s| !s.is_empty() && !s.contains("libsteam_integration.so"))
+                        .collect();
+                    let new_preload = if cleaned.is_empty() {
+                        multilib_entry
+                    } else {
+                        format!("{}:{}", multilib_entry, cleaned.join(":"))
+                    };
+                    cmd.env("LD_PRELOAD", new_preload);
+                }
+            }
+        }
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());

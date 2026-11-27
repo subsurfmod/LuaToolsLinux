@@ -65,7 +65,7 @@ use crate::ui::state::{
     UpdateBannerState,
 };
 use crate::ui::theme::{
-    apply_papercut_monotone_theme, display_font, draw_rem_medallion, nav_rail_button,
+    apply_papercut_monotone_theme, display_font, draw_rem_medallion_interactive, nav_rail_button,
     primary_button, semibold_font, Palette,
 };
 use crate::VERSION;
@@ -458,6 +458,11 @@ pub struct LuaToolsApp {
     pub about_modal_open: bool,
     pub telemetry_modal_open: bool,
     pub qa_capture: Option<QaCaptureState>,
+    pub(crate) emblem_overlay_open: bool,
+    pub(crate) emblem_overlay_opened_at: Option<std::time::Instant>,
+    pub(crate) emblem_overlay_texture: Option<TextureHandle>,
+    pub(crate) emblem_knock_count: u8,
+    pub(crate) emblem_last_knock: Option<std::time::Instant>,
 }
 
 impl LuaToolsApp {
@@ -744,6 +749,11 @@ impl LuaToolsApp {
             about_modal_open: false,
             telemetry_modal_open: false,
             qa_capture,
+            emblem_overlay_open: false,
+            emblem_overlay_opened_at: None,
+            emblem_overlay_texture: None,
+            emblem_knock_count: 0,
+            emblem_last_knock: None,
         };
 
         app.detect_steam_and_sync();
@@ -1053,6 +1063,11 @@ impl LuaToolsApp {
             about_modal_open: false,
             telemetry_modal_open: false,
             qa_capture: None,
+            emblem_overlay_open: false,
+            emblem_overlay_opened_at: None,
+            emblem_overlay_texture: None,
+            emblem_knock_count: 0,
+            emblem_last_knock: None,
         };
         app.populate_qa_demo_data();
         app.rebuild_depot_picks();
@@ -1268,11 +1283,6 @@ impl LuaToolsApp {
                     .sync_plugin_file(&self.slssteam_service);
             }
 
-            self.cef_bridge.steam_root = Some(inst.root.clone());
-            if self.settings_service.settings.cef_bridge_enabled {
-                self.cef_bridge.start();
-            }
-
             let desired_port = self.settings_service.settings.http_server_port;
             if !self.settings_service.settings.http_server_enabled {
                 if let Some(mut srv) = self.http_server.take() {
@@ -1282,7 +1292,7 @@ impl LuaToolsApp {
                 let needs_restart = self
                     .http_server
                     .as_ref()
-                    .map(|s| s.port != desired_port)
+                    .map(|s| s.requested_port != desired_port)
                     .unwrap_or(true);
                 if needs_restart {
                     if let Some(mut srv) = self.http_server.take() {
@@ -1298,7 +1308,21 @@ impl LuaToolsApp {
                         self.rpc_tx.clone(),
                         wakeup,
                     );
+                    let _ = crate::services::millennium_service::MillenniumService::ensure_luatoolslinux_plugin_installed(Some(&inst.root));
                 }
+            }
+
+            self.cef_bridge.steam_root = Some(inst.root.clone());
+            if let Some(ref srv) = self.http_server {
+                self.cef_bridge
+                    .set_rpc_endpoint(srv.port, Some(srv.rpc_token.clone()));
+            } else {
+                self.cef_bridge.set_rpc_endpoint(desired_port, None);
+            }
+            if self.settings_service.settings.cef_bridge_enabled {
+                self.cef_bridge.start();
+            } else if self.cef_bridge.is_running() {
+                self.cef_bridge.stop();
             }
 
             if self.settings_service.settings.donate_keys {
@@ -1338,6 +1362,7 @@ impl LuaToolsApp {
             if let Some(mut srv) = self.http_server.take() {
                 srv.stop();
             }
+            self.cef_bridge.rpc_token = None;
             self.recent_installed.clear();
             self.library_rows.clear();
             self.status_text =
@@ -3056,7 +3081,7 @@ impl LuaToolsApp {
         self.wired_progress = 0.02;
         self.wired_status_text = format!("Starting Wired ({})…", action);
         let title = match action {
-            "steam_unlocker" => "Installing Steam Unlocker",
+            "steam_unlocker" => "Installing Steam Unlocker + Millennium",
             _ => "Installing Steam Unlocker",
         };
         self.start_action_modal(
@@ -3066,26 +3091,45 @@ impl LuaToolsApp {
             Some(0.02),
         );
 
+        let wired = self.wired_service.clone();
         let tx = self.msg_tx.clone();
         let ctx_c = ctx.clone();
         thread::spawn(move || {
-            let _tx_p = tx.clone();
-            let _ctx_p = ctx_c.clone();
+            let tx_p = tx.clone();
+            let ctx_p = ctx_c.clone();
             let res: Result<String, String> = match action {
                 "steam_unlocker" => {
+                    let _ = tx_p.send(AppMessage::WiredProgress {
+                        pct: 0.15,
+                        msg: "Installing Steam Unlocker (SLSsteam)...".into(),
+                    });
+                    ctx_p.request_repaint();
+
                     // Run the curl command to install the Steam Unlocker
                     let output = std::process::Command::new("bash")
                         .arg("-c")
                         .arg("curl -fsSL \"https://runn.i.ng/Deadboy666/h3adcr-b/refs/heads/main/headcrab.sh\" | bash")
                         .output();
                     match output {
-                        Ok(out) => {
-                            if out.status.success() {
-                                Ok("Steam Unlocker installed successfully.".into())
-                            } else {
-                                Err(format!("Installation failed: {}", String::from_utf8_lossy(&out.stderr)))
+                        Ok(out) if out.status.success() => {
+                            match wired.install_millennium_steambrew(|p, msg| {
+                                let _ = tx_p.send(AppMessage::WiredProgress {
+                                    pct: 0.55 + p * 0.42,
+                                    msg,
+                                });
+                                ctx_p.request_repaint();
+                            }) {
+                                Ok(_) => Ok("Steam Unlocker & Millennium installed successfully.".into()),
+                                Err(e) => Err(format!(
+                                    "Steam Unlocker installed, but Millennium failed: {}",
+                                    e
+                                )),
                             }
                         }
+                        Ok(out) => Err(format!(
+                            "Installation failed: {}",
+                            String::from_utf8_lossy(&out.stderr)
+                        )),
                         Err(e) => Err(format!("Failed to execute installer: {}", e)),
                     }
                 }
@@ -5031,6 +5075,40 @@ impl LuaToolsApp {
         }
     }
 
+    pub(crate) fn open_emblem_overlay(&mut self) {
+        self.emblem_knock_count = 0;
+        self.emblem_last_knock = None;
+        self.emblem_overlay_open = true;
+        self.emblem_overlay_opened_at = Some(std::time::Instant::now());
+    }
+
+    pub(crate) fn close_emblem_overlay(&mut self) {
+        self.emblem_overlay_open = false;
+        self.emblem_overlay_opened_at = None;
+        self.emblem_overlay_texture = None;
+    }
+
+    pub(crate) fn register_emblem_knock(&mut self) {
+        let now = std::time::Instant::now();
+        let expired = self
+            .emblem_last_knock
+            .map(|prev| now.duration_since(prev) > std::time::Duration::from_millis(3500))
+            .unwrap_or(true);
+        if expired {
+            self.emblem_knock_count = 1;
+        } else {
+            self.emblem_knock_count = self.emblem_knock_count.saturating_add(1);
+        }
+        self.emblem_last_knock = Some(now);
+
+        match self.emblem_knock_count {
+            3 => self.notify("…a faint hum beneath the paper.", ToastKind::Info),
+            4 => self.notify("One more knock…", ToastKind::Info),
+            5.. => self.open_emblem_overlay(),
+            _ => {}
+        }
+    }
+
     fn execute_quick_command(&mut self, ctx: &egui::Context) {
         let raw = self.command_input.trim().to_string();
         if raw.is_empty() {
@@ -5041,6 +5119,12 @@ impl LuaToolsApp {
             return;
         }
         self.command_input.clear();
+
+        let lowered = raw.to_ascii_lowercase();
+        if matches!(lowered.as_str(), "3301" | "cicada 3301" | "cicada3301") {
+            self.open_emblem_overlay();
+            return;
+        }
 
         if raw.to_ascii_lowercase().starts_with("luatools://") {
             self.handle_protocol_url(&raw, ctx);
@@ -5100,6 +5184,7 @@ impl LuaToolsApp {
         // 1. Top Bar — Strict 3-Column StripBuilder (mathematically zero overlap at any width)
         //    Houses Brand (left), Search bar (center), and Steam status + corner Git Update button (top-right).
         let mut run_omnibox = false;
+        let mut click_brand_knock = false;
         let mut click_rescan = false;
         let mut click_open_steam_setup = false;
         let mut click_start_update = false;
@@ -5142,17 +5227,33 @@ impl LuaToolsApp {
                         // Left: Cut-Paper Rem Medallion + Rich Display Title
                         strip.cell(|ui| {
                             ui.spacing_mut().item_spacing.x = 9.0;
-                            draw_rem_medallion(ui, 30.0);
+                            let med_resp = draw_rem_medallion_interactive(ui, 30.0)
+                                .on_hover_text("Rem watches quietly…");
+                            if med_resp.hovered() {
+                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                            }
+                            if med_resp.clicked() {
+                                click_brand_knock = true;
+                            }
                             ui.label(
                                 RichText::new("LuaTools")
                                     .font(display_font(18.5))
                                     .color(Palette::TEXT_PRIMARY),
                             );
-                            ui.label(
-                                RichText::new(VERSION)
-                                    .font(FontId::new(11.0, FontFamily::Monospace))
-                                    .color(Palette::TEXT_MUTED),
+                            let ver_resp = ui.add(
+                                egui::Label::new(
+                                    RichText::new(VERSION)
+                                        .font(FontId::new(11.0, FontFamily::Monospace))
+                                        .color(Palette::TEXT_MUTED),
+                                )
+                                .sense(Sense::click()),
                             );
+                            if ver_resp.hovered() {
+                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                            }
+                            if ver_resp.clicked() {
+                                click_brand_knock = true;
+                            }
                         });
 
                         // Center: Single Clean Bounded Search Box + Search Button
@@ -5365,6 +5466,9 @@ impl LuaToolsApp {
                     });
             });
 
+        if click_brand_knock {
+            self.register_emblem_knock();
+        }
         if run_omnibox {
             self.execute_quick_command(ctx);
         }

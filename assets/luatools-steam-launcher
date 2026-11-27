@@ -37,35 +37,59 @@ if [ "${LUATOOLS_NO_AUTOLAUNCH:-0}" != "1" ] && [ ! -f "${XDG_CONFIG_HOME:-$HOME
   fi
 fi
 
-# Locate 32-bit libsteam_integration.so
+# Strip any pre-existing libsteam_integration.so from LD_PRELOAD to avoid duplicates
+if [ -n "${LD_PRELOAD:-}" ]; then
+  CLEANED_PRELOAD="$(echo "$LD_PRELOAD" | tr ':' '\n' | grep -v 'libsteam_integration.so' | tr '\n' ':' | sed 's/:$//')"
+  export LD_PRELOAD="$CLEANED_PRELOAD"
+fi
+
+# Locate integration library: prefer multilib $LIB if both 32-bit and 64-bit are available
 INTEGRATION_LIB=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
-for cand in \
-  "${HOME}/.local/lib/luatools/32/libsteam_integration.so" \
-  "${HOME}/.local/lib/luatools/libsteam_integration32.so" \
-  "${HOME}/.local/lib/luatools/libsteam_integration.so" \
-  "/usr/local/lib/luatools/32/libsteam_integration.so" \
-  "/usr/local/lib/luatools/libsteam_integration32.so" \
-  "/usr/local/lib/luatools/libsteam_integration.so" \
-  "/usr/lib/luatools/32/libsteam_integration.so" \
-  "/usr/lib/luatools/libsteam_integration32.so" \
-  "/usr/lib/luatools/libsteam_integration.so" \
-  "${SCRIPT_DIR}/../dist/32/libsteam_integration.so" \
-  "${SCRIPT_DIR}/../dist/libsteam_integration32.so" \
-  "${SCRIPT_DIR}/../dist/libsteam_integration.so" \
-  "${SCRIPT_DIR}/../target/i686-unknown-linux-gnu/release/libsteam_integration.so"; do
-  if [ -f "$cand" ]; then
-    if command -v file >/dev/null 2>&1; then
-      if file -L "$cand" | grep -q "ELF 32-bit"; then
+
+for base in \
+  "${HOME}/.local/lib/luatools" \
+  "/usr/local/lib/luatools" \
+  "/usr/lib/luatools" \
+  "${SCRIPT_DIR}/../dist"; do
+  if [ -f "${base}/lib/libsteam_integration.so" ] && [ -f "${base}/lib64/libsteam_integration.so" ]; then
+    INTEGRATION_LIB="${base}/\$LIB/libsteam_integration.so"
+    break
+  fi
+done
+
+if [ -z "$INTEGRATION_LIB" ]; then
+  for cand in \
+    "${HOME}/.local/lib/luatools/lib/libsteam_integration.so" \
+    "${HOME}/.local/lib/luatools/32/libsteam_integration.so" \
+    "${HOME}/.local/lib/luatools/libsteam_integration32.so" \
+    "${HOME}/.local/lib/luatools/libsteam_integration.so" \
+    "/usr/local/lib/luatools/lib/libsteam_integration.so" \
+    "/usr/local/lib/luatools/32/libsteam_integration.so" \
+    "/usr/local/lib/luatools/libsteam_integration32.so" \
+    "/usr/local/lib/luatools/libsteam_integration.so" \
+    "/usr/lib/luatools/lib/libsteam_integration.so" \
+    "/usr/lib/luatools/32/libsteam_integration.so" \
+    "/usr/lib/luatools/libsteam_integration32.so" \
+    "/usr/lib/luatools/libsteam_integration.so" \
+    "${SCRIPT_DIR}/../dist/lib/libsteam_integration.so" \
+    "${SCRIPT_DIR}/../dist/32/libsteam_integration.so" \
+    "${SCRIPT_DIR}/../dist/libsteam_integration32.so" \
+    "${SCRIPT_DIR}/../dist/libsteam_integration.so" \
+    "${SCRIPT_DIR}/../target/i686-unknown-linux-gnu/release/libsteam_integration.so"; do
+    if [ -f "$cand" ]; then
+      if command -v file >/dev/null 2>&1; then
+        if file -L "$cand" | grep -q "ELF 32-bit"; then
+          INTEGRATION_LIB="$cand"
+          break
+        fi
+      else
         INTEGRATION_LIB="$cand"
         break
       fi
-    else
-      INTEGRATION_LIB="$cand"
-      break
     fi
-  fi
-done
+  done
+fi
 
 # Locate Steam binary
 STEAM_BIN=""

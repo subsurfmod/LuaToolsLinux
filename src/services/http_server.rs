@@ -6,7 +6,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -48,8 +48,41 @@ fn last_update_check() -> &'static Mutex<Option<(Instant, UpdateCheckResult)>> {
     LAST_UPDATE_CHECK.get_or_init(|| Mutex::new(None))
 }
 
+static ACTIVE_SESSION_TOKEN: OnceLock<RwLock<String>> = OnceLock::new();
+
+pub fn active_session_token() -> &'static RwLock<String> {
+    ACTIVE_SESSION_TOKEN.get_or_init(|| RwLock::new(String::new()))
+}
+
+pub fn generate_session_token() -> String {
+    let mut buf = [0u8; 16];
+    #[cfg(unix)]
+    {
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            if f.read_exact(&mut buf).is_ok() {
+                return hex::encode(buf);
+            }
+        }
+    }
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = std::process::id();
+    format!("{:016x}{:08x}{:08x}", now, pid, 0x5a5a5a5au32)
+}
+
+#[derive(Clone, Default)]
+struct HttpServerConfigOverrides {
+    slssteam_config_path: Option<PathBuf>,
+    settings_config_path: Option<PathBuf>,
+}
+
 pub struct HttpServerService {
     pub port: u16,
+    pub requested_port: u16,
+    pub rpc_token: String,
     stop_flag: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
@@ -61,25 +94,78 @@ impl HttpServerService {
         event_tx: Sender<RpcUiEvent>,
         wakeup: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Option<Self> {
-        let server = Server::http(("127.0.0.1", port)).ok()?;
+        #[cfg(test)]
+        let (sls_path, settings_path) = (
+            Some(stplug_dir.join(".test_slssteam_config.yaml")),
+            Some(stplug_dir.join(".test_settings.json")),
+        );
+        #[cfg(not(test))]
+        let (sls_path, settings_path) = (None, None);
+
+        Self::start_with_config_paths(port, stplug_dir, sls_path, settings_path, event_tx, wakeup)
+    }
+
+    pub fn start_with_config_paths(
+        port: u16,
+        stplug_dir: PathBuf,
+        slssteam_config_path: Option<PathBuf>,
+        settings_config_path: Option<PathBuf>,
+        event_tx: Sender<RpcUiEvent>,
+        wakeup: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Option<Self> {
+        let (server, actual_port) = match Server::http(("127.0.0.1", port)) {
+            Ok(s) => {
+                let actual = s.server_addr().to_ip().map(|a| a.port()).unwrap_or(port);
+                (s, actual)
+            }
+            Err(e) => {
+                PluginLog::global().warn(
+                    Some("HttpServer"),
+                    &format!(
+                        "Port {} occupied or unavailable ({}), falling back to ephemeral port 0",
+                        port, e
+                    ),
+                );
+                let s = Server::http(("127.0.0.1", 0)).ok()?;
+                let actual = s.server_addr().to_ip().map(|a| a.port()).unwrap_or(0);
+                (s, actual)
+            }
+        };
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop_flag);
 
         PluginLog::global().info(
             Some("HttpServer"),
-            &format!("Listening on http://127.0.0.1:{}", port),
+            &format!("Listening on http://127.0.0.1:{}", actual_port),
         );
+
+        let token = generate_session_token();
+        write_rpc_discovery_file(actual_port, Some(&token));
+        let server_token = token.clone();
+        let overrides = HttpServerConfigOverrides {
+            slssteam_config_path,
+            settings_config_path,
+        };
 
         let handle = thread::spawn(move || {
             while !stop_clone.load(Ordering::Relaxed) {
                 if let Ok(Some(req)) = server.recv_timeout(Duration::from_millis(250)) {
-                    handle_request(req, &stplug_dir, &event_tx, &wakeup);
+                    handle_request(
+                        req,
+                        &stplug_dir,
+                        &event_tx,
+                        &wakeup,
+                        &server_token,
+                        &overrides,
+                    );
                 }
             }
         });
 
         Some(Self {
-            port,
+            port: actual_port,
+            requested_port: port,
+            rpc_token: token,
             stop_flag,
             handle: Some(handle),
         })
@@ -87,9 +173,96 @@ impl HttpServerService {
 
     pub fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::Relaxed);
+        let should_clear = active_session_token()
+            .read()
+            .map(|g| g.as_str() == self.rpc_token)
+            .unwrap_or(true);
+        if should_clear {
+            remove_rpc_discovery_file();
+        }
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+    }
+}
+
+pub fn write_rpc_discovery_file(port: u16, token: Option<&str>) -> Option<PathBuf> {
+    let tok = token.map(ToString::to_string).unwrap_or_else(generate_session_token);
+    if let Ok(mut guard) = active_session_token().write() {
+        *guard = tok.clone();
+    }
+    let mut target_dir = None;
+    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+        if !xdg.trim().is_empty() {
+            target_dir = Some(PathBuf::from(xdg.trim()));
+        }
+    }
+    if target_dir.is_none() {
+        #[cfg(unix)]
+        {
+            let uid = unsafe { libc::getuid() };
+            let run_user = PathBuf::from(format!("/run/user/{}", uid));
+            if run_user.is_dir() {
+                target_dir = Some(run_user);
+            }
+        }
+    }
+    let dir = target_dir.unwrap_or_else(std::env::temp_dir);
+    let path = dir.join("luatools_rpc.json");
+    let payload = json!({
+        "port": port,
+        "url": format!("http://127.0.0.1:{}", port),
+        "pid": std::process::id(),
+        "version": crate::VERSION,
+        "token": tok
+    });
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = path.with_extension("tmp");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+        {
+            let _ = f.write_all(payload.to_string().as_bytes());
+            let _ = f.sync_all();
+            let _ = std::fs::rename(&tmp, &path);
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        } else {
+            let _ = std::fs::write(&path, payload.to_string());
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write(&path, payload.to_string());
+    }
+    Some(path)
+}
+
+pub fn remove_rpc_discovery_file() {
+    let mut paths = Vec::new();
+    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+        if !xdg.trim().is_empty() {
+            paths.push(PathBuf::from(xdg.trim()).join("luatools_rpc.json"));
+        }
+    }
+    #[cfg(unix)]
+    {
+        let uid = unsafe { libc::getuid() };
+        paths.push(PathBuf::from(format!("/run/user/{}/luatools_rpc.json", uid)));
+    }
+    paths.push(std::env::temp_dir().join("luatools_rpc.json"));
+    for p in paths {
+        let _ = std::fs::remove_file(p);
+    }
+    if let Ok(mut guard) = active_session_token().write() {
+        guard.clear();
     }
 }
 
@@ -214,10 +387,24 @@ pub fn is_allowed_host(host_header: &str) -> bool {
     false
 }
 
+fn is_rpc_path(url: &str) -> bool {
+    let path_only = url.split('?').next().unwrap_or(url);
+    path_only.trim_end_matches('/') == "/rpc"
+}
+
 /// Checks whether an incoming HTTP request is authorized to invoke sensitive operations.
-/// Direct local CLI/process requests (no `Origin` header and valid loopback `Host`) are allowed.
-/// Browser-driven requests MUST possess a validated `Origin` from the Steam/loopback allowlist.
+/// Validates `Host`, `Origin`, and `Sec-Fetch-Site` headers, allows `OPTIONS` CORS preflight,
+/// and strictly requires a valid `X-LuaTools-Token` header on `/rpc` requests.
 pub fn is_request_authorized(req: &Request) -> bool {
+    let active = active_session_token()
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    is_request_authorized_with_token(req, &active)
+}
+
+/// Checks request authorization against an explicit per-server session token.
+pub fn is_request_authorized_with_token(req: &Request, expected_token: &str) -> bool {
     // 1. Defend against DNS rebinding
     if let Some(host) = get_request_header(req, "Host") {
         if !is_allowed_host(host) {
@@ -242,6 +429,23 @@ pub fn is_request_authorized(req: &Request) -> bool {
             } else {
                 return false;
             }
+        }
+    }
+
+    // 4. Allow CORS preflight requests cleanly (they cannot carry custom auth headers)
+    if req.method() == &Method::Options {
+        return true;
+    }
+
+    // 5. Strict token validation on `/rpc`; validate token when present on other routes
+    if is_rpc_path(req.url()) {
+        match get_request_header(req, "X-LuaTools-Token") {
+            Some(tok_header) if !expected_token.is_empty() && tok_header == expected_token => {}
+            _ => return false,
+        }
+    } else if let Some(tok_header) = get_request_header(req, "X-LuaTools-Token") {
+        if !expected_token.is_empty() && tok_header != expected_token {
+            return false;
         }
     }
 
@@ -270,7 +474,7 @@ fn send_json(req: Request, status: u16, payload: Value) {
                 .with_header(
                     Header::from_bytes(
                         "Access-Control-Allow-Headers",
-                        "Content-Type, Authorization, X-Requested-With, Accept, Origin",
+                        "Content-Type, Authorization, X-Requested-With, Accept, Origin, X-LuaTools-Token",
                     )
                     .unwrap(),
                 )
@@ -303,7 +507,7 @@ fn send_bytes(req: Request, status: u16, content_type: &str, bytes: Vec<u8>) {
                 .with_header(
                     Header::from_bytes(
                         "Access-Control-Allow-Headers",
-                        "Content-Type, Authorization, X-Requested-With, Accept, Origin",
+                        "Content-Type, Authorization, X-Requested-With, Accept, Origin, X-LuaTools-Token",
                     )
                     .unwrap(),
                 )
@@ -473,6 +677,38 @@ fn remove_app_completely(stplug_dir: &Path, aid: u32) -> (bool, bool) {
     }
 }
 
+fn toggle_app_enabled(stplug_dir: &Path, aid: u32, target_enabled: Option<bool>) -> bool {
+    let lua_path = stplug_dir.join(format!("{}.lua", aid));
+    let disabled_path = stplug_dir.join(format!("{}.lua.disabled", aid));
+
+    let should_enable = match target_enabled {
+        Some(enabled) => enabled,
+        None => disabled_path.exists(),
+    };
+
+    if should_enable {
+        if disabled_path.exists() {
+            let _ = std::fs::rename(&disabled_path, &lua_path);
+        }
+        if allow_external_spawn() {
+            let mut sls = SlssteamService::new(None);
+            sls.add_additional_app(aid);
+            let _ = sls.save();
+        }
+        true
+    } else {
+        if lua_path.exists() {
+            let _ = std::fs::rename(&lua_path, &disabled_path);
+        }
+        if allow_external_spawn() {
+            let mut sls = SlssteamService::new(None);
+            sls.remove_additional_app(aid);
+            let _ = sls.save();
+        }
+        false
+    }
+}
+
 fn run_update_check(body_json: Option<&Value>) -> UpdateCheckResult {
     let explicit_repo = body_json
         .and_then(|v| v.get("repoDir").or_else(|| v.get("repo_dir")))
@@ -586,8 +822,8 @@ fn download_status_state_json(aid: u32, stplug_dir: &Path) -> Value {
     })
 }
 
-fn sanitized_settings_json() -> Value {
-    let s = SettingsService::default().settings;
+fn sanitized_settings_json(settings_path: Option<&Path>) -> Value {
+    let s = SettingsService::new(settings_path.map(Path::to_path_buf)).settings;
     json!({
         "platform": "linux",
         "version": crate::VERSION,
@@ -670,6 +906,8 @@ fn handle_request(
     stplug_dir: &Path,
     event_tx: &Sender<RpcUiEvent>,
     wakeup: &Option<Arc<dyn Fn() + Send + Sync>>,
+    rpc_token: &str,
+    overrides: &HttpServerConfigOverrides,
 ) {
     // 1. CORS preflight handling (LT-26)
     if req.method() == &Method::Options {
@@ -689,7 +927,7 @@ fn handle_request(
                     .with_header(
                         Header::from_bytes(
                             "Access-Control-Allow-Headers",
-                            "Content-Type, Authorization, X-Requested-With, Accept, Origin",
+                            "Content-Type, Authorization, X-Requested-With, Accept, Origin, X-LuaTools-Token",
                         )
                         .unwrap(),
                     )
@@ -801,11 +1039,14 @@ fn handle_request(
 
     // Route: /rpc (JSON-RPC — LT-27 & LT-28)
     if parts == ["rpc"] && req.method() == &Method::Post {
-        if !is_request_authorized(&req) {
+        if !is_request_authorized_with_token(&req, rpc_token) {
             send_json(
                 req,
                 403,
-                json!({ "success": false, "error": "Unauthorized origin or host" }),
+                json!({
+                    "success": false,
+                    "error": "Unauthorized origin, host, or missing/invalid X-LuaTools-Token"
+                }),
             );
             return;
         }
@@ -818,7 +1059,11 @@ fn handle_request(
             return;
         };
         let method = payload.get("method").and_then(|v| v.as_str()).unwrap_or("");
-        let args = payload.get("args").cloned().unwrap_or_else(|| json!({}));
+        let args = payload
+            .get("args")
+            .or_else(|| payload.get("params"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
         let rpc_aid = args
             .get("appid")
             .or_else(|| args.get("appId"))
@@ -841,11 +1086,36 @@ fn handle_request(
                         json!({ "success": false, "error": "Missing or invalid appid" }),
                     );
                 } else {
-                    let exists = stplug_dir.join(format!("{}.lua", rpc_aid)).exists();
+                    let lua_path = stplug_dir.join(format!("{}.lua", rpc_aid));
+                    let disabled_path = stplug_dir.join(format!("{}.lua.disabled", rpc_aid));
+                    let exists = lua_path.exists();
+                    let disabled = !exists && disabled_path.exists();
+                    let parse_target = if exists {
+                        Some(&lua_path)
+                    } else if disabled {
+                        Some(&disabled_path)
+                    } else {
+                        None
+                    };
+                    let (depot_count, dlc_count) = parse_target
+                        .and_then(|p| std::fs::read_to_string(p).ok())
+                        .map(|txt| {
+                            let parsed = LuaFileParser::parse_text(&txt, rpc_aid);
+                            (parsed.depot_count(), parsed.dlc_count())
+                        })
+                        .unwrap_or((0, 0));
                     send_json(
                         req,
                         200,
-                        json!({ "success": true, "exists": exists, "has": exists, "result": exists }),
+                        json!({
+                            "success": true,
+                            "exists": exists,
+                            "has": exists,
+                            "disabled": disabled,
+                            "depotCount": depot_count,
+                            "dlcCount": dlc_count,
+                            "result": exists
+                        }),
                     );
                 }
             }
@@ -985,7 +1255,7 @@ fn handle_request(
                     );
                 }
             }
-            "OpenFix" | "OpenFixes" | "CheckForFixes" => {
+            "OpenFix" | "OpenFixes" => {
                 if rpc_aid > 0 {
                     let _ = event_tx.send(RpcUiEvent::OpenFix(rpc_aid));
                     notify();
@@ -993,6 +1263,68 @@ fn handle_request(
                         req,
                         200,
                         json!({ "success": true, "appid": rpc_aid, "result": { "appid": rpc_aid } }),
+                    );
+                } else {
+                    send_json(
+                        req,
+                        400,
+                        json!({ "success": false, "error": "Missing or invalid appid" }),
+                    );
+                }
+            }
+            "CheckForFixes" => {
+                if rpc_aid > 0 {
+                    let idx = AppliedFixIndexService::default();
+                    let applied_fixes: Vec<Value> = idx
+                        .get_fixes(rpc_aid)
+                        .map(|list| {
+                            list.iter()
+                                .filter_map(|r| serde_json::to_value(r).ok())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let available_fixes: Vec<Value> = if !cfg!(test) && std::env::var_os("LUATOOLS_OFFLINE").is_none() {
+                        let client = crate::services::api_client::LuaToolsApiClient::new(AuthService::default());
+                        client
+                            .get_drm_fix_fixes(rpc_aid)
+                            .into_iter()
+                            .map(|f| {
+                                json!({
+                                    "id": f.id,
+                                    "title": f.title,
+                                    "description": f.description,
+                                    "hasFix": f.has_fix,
+                                    "hasManifest": f.has_manifest,
+                                    "manifestFilename": f.manifest_filename,
+                                    "fixFilename": f.fix_filename,
+                                    "tags": f.tags.into_iter().map(|t| json!({
+                                        "id": t.id,
+                                        "name": t.name,
+                                        "slug": t.slug
+                                    })).collect::<Vec<_>>()
+                                })
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let has_fixes = !applied_fixes.is_empty() || !available_fixes.is_empty();
+                    send_json(
+                        req,
+                        200,
+                        json!({
+                            "success": true,
+                            "appid": rpc_aid,
+                            "appliedFixes": applied_fixes,
+                            "availableFixes": available_fixes,
+                            "hasFixes": has_fixes,
+                            "result": {
+                                "appid": rpc_aid,
+                                "appliedFixes": applied_fixes,
+                                "availableFixes": available_fixes,
+                                "hasFixes": has_fixes,
+                            }
+                        }),
                     );
                 } else {
                     send_json(
@@ -1044,7 +1376,7 @@ fn handle_request(
                 );
             }
             "GetSettingsConfig" => {
-                let cfg = sanitized_settings_json();
+                let cfg = sanitized_settings_json(overrides.settings_config_path.as_deref());
                 send_json(req, 200, json!({ "success": true, "result": cfg }));
             }
             "GetApplyFixStatus" => {
@@ -1135,6 +1467,504 @@ fn handle_request(
                     json!({ "success": true, "result": crate::VERSION }),
                 );
             }
+            "ToggleAppEnabled" => {
+                if rpc_aid > 0 {
+                    let enabled_target = args.get("enabled").and_then(|v| v.as_bool());
+                    let now_enabled = toggle_app_enabled(stplug_dir, rpc_aid, enabled_target);
+                    send_json(
+                        req,
+                        200,
+                        json!({
+                            "success": true,
+                            "appid": rpc_aid,
+                            "enabled": now_enabled,
+                            "result": now_enabled
+                        }),
+                    );
+                } else {
+                    send_json(
+                        req,
+                        400,
+                        json!({ "success": false, "error": "Missing or invalid appid" }),
+                    );
+                }
+            }
+            "ApplyRecommendedFixes" => {
+                if rpc_aid > 0 {
+                    let _ = event_tx.send(RpcUiEvent::OpenFix(rpc_aid));
+                    notify();
+                    send_json(
+                        req,
+                        200,
+                        json!({
+                            "success": true,
+                            "appid": rpc_aid,
+                            "status": "opened_in_workbench",
+                            "result": { "appid": rpc_aid, "status": "opened_in_workbench" }
+                        }),
+                    );
+                } else {
+                    send_json(
+                        req,
+                        400,
+                        json!({ "success": false, "error": "Missing or invalid appid" }),
+                    );
+                }
+            }
+            "RemoveAppliedFixes" => {
+                if rpc_aid > 0 {
+                    let mut idx = AppliedFixIndexService::default();
+                    let removed = idx.remove_app(rpc_aid);
+                    send_json(
+                        req,
+                        200,
+                        json!({
+                            "success": true,
+                            "appid": rpc_aid,
+                            "removed": removed,
+                            "result": { "appid": rpc_aid, "removed": removed }
+                        }),
+                    );
+                } else {
+                    send_json(
+                        req,
+                        400,
+                        json!({ "success": false, "error": "Missing or invalid appid" }),
+                    );
+                }
+            }
+            "SyncDlcForApp" => {
+                if rpc_aid > 0 {
+                    let mut dlc_ids = Vec::new();
+                    let lua_path = stplug_dir.join(format!("{}.lua", rpc_aid));
+                    let disabled_path = stplug_dir.join(format!("{}.lua.disabled", rpc_aid));
+                    for p in [&lua_path, &disabled_path] {
+                        if let Ok(txt) = std::fs::read_to_string(p) {
+                            let parsed = LuaFileParser::parse_text(&txt, rpc_aid);
+                            for entry in parsed.entries.iter().chain(parsed.disabled_entries.iter()) {
+                                if entry.id != rpc_aid && !dlc_ids.contains(&entry.id) {
+                                    dlc_ids.push(entry.id);
+                                }
+                            }
+                        }
+                    }
+                    let mut sls = SlssteamService::new(overrides.slssteam_config_path.clone());
+                    for &did in &dlc_ids {
+                        sls.add_additional_app(did);
+                    }
+                    let saved = if !dlc_ids.is_empty() {
+                        sls.save()
+                    } else {
+                        true
+                    };
+                    send_json(
+                        req,
+                        200,
+                        json!({
+                            "success": true,
+                            "appid": rpc_aid,
+                            "dlcCount": dlc_ids.len(),
+                            "dlcIds": dlc_ids,
+                            "saved": saved,
+                            "result": {
+                                "appid": rpc_aid,
+                                "dlcCount": dlc_ids.len(),
+                                "dlcIds": dlc_ids,
+                                "saved": saved
+                            }
+                        }),
+                    );
+                } else {
+                    send_json(
+                        req,
+                        400,
+                        json!({ "success": false, "error": "Missing or invalid appid" }),
+                    );
+                }
+            }
+            "SyncSlsSteamConfig" => {
+                let mut sls = SlssteamService::new(overrides.slssteam_config_path.clone());
+                let mut synced_count = 0usize;
+                if let Ok(entries) = std::fs::read_dir(stplug_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().and_then(|e| e.to_str()) == Some("lua") {
+                            if let Ok(txt) = std::fs::read_to_string(&path) {
+                                let aid = path
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .and_then(|s| s.parse::<u32>().ok())
+                                    .or_else(|| LuaFileParser::infer_app_id_from_text(&txt))
+                                    .unwrap_or(0);
+                                if aid > 0 {
+                                    let parsed = LuaFileParser::parse_text(&txt, aid);
+                                    sls.add_additional_app(aid);
+                                    for item in &parsed.entries {
+                                        if item.id != aid {
+                                            sls.add_additional_app(item.id);
+                                        }
+                                        if let Some(ref k) = item.key {
+                                            sls.set_depot_key(item.id, k.clone());
+                                        }
+                                        if let Some(ref m) = item.manifest_id {
+                                            sls.set_manifest_override(item.id, m.clone());
+                                        }
+                                    }
+                                    for (depot_id, gid) in &parsed.active_pins {
+                                        sls.set_manifest_override(*depot_id, gid.clone());
+                                    }
+                                    for (app_id, token) in &parsed.tokens {
+                                        sls.set_token(*app_id, token.clone());
+                                    }
+                                    for (map_aid, exe) in &parsed.process_map {
+                                        sls.set_process_mapping(*map_aid, exe.clone());
+                                    }
+                                    for &denuvo_aid in &parsed.force_denuvo {
+                                        sls.add_force_denuvo(denuvo_aid);
+                                    }
+                                    for &pinned_aid in &parsed.pinned_apps {
+                                        sls.add_pinned_app(pinned_aid);
+                                    }
+                                    synced_count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                let saved = sls.save();
+                send_json(
+                    req,
+                    200,
+                    json!({
+                        "success": saved,
+                        "saved": saved,
+                        "syncedCount": synced_count,
+                        "result": { "saved": saved, "syncedCount": synced_count }
+                    }),
+                );
+            }
+            "GetCompanionStatus" | "GetBridgeDiagnostics" => {
+                let det = MillenniumService::default().detect();
+                let apps = collect_merged_loaded_apps(stplug_dir);
+                let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+                let lib_base = home.join(".local/lib/luatools");
+
+                let preload_lib32 = lib_base.join("lib/libsteam_integration.so").is_file()
+                    || lib_base.join("32/libsteam_integration.so").is_file()
+                    || lib_base.join("libsteam_integration.so").is_file()
+                    || Path::new("/usr/lib/luatools/libsteam_integration.so").is_file();
+
+                let preload_lib64 = lib_base.join("lib64/libsteam_integration.so").is_file()
+                    || lib_base.join("64/libsteam_integration.so").is_file()
+                    || Path::new("/usr/lib64/luatools/libsteam_integration.so").is_file();
+
+                let multilib_dst = if preload_lib32 && preload_lib64 {
+                    Some(format!("{}/$LIB/libsteam_integration.so", lib_base.display()))
+                } else {
+                    None
+                };
+
+                let sls_so = home.join(".local/share/SLSsteam/SLSsteam.so");
+                let slssteam_active = sls_so.is_file();
+
+                let bridge_preloaded = crate::steam_bridge::preload_loader::steam_integrated();
+
+                #[cfg(unix)]
+                let uid = unsafe { libc::getuid() };
+                #[cfg(not(unix))]
+                let uid = 1000u32;
+
+                let mep_sock_user = PathBuf::from(format!("/tmp/millennium-mep-{}.sock", uid));
+                let mep_sock_default = PathBuf::from("/tmp/millennium-mep.sock");
+                let mep_socket_active = mep_sock_user.exists() || mep_sock_default.exists();
+
+                let ipc_sock = crate::steam_bridge::ipc::ipc_socket_path();
+                let ipc_socket_active = ipc_sock.exists();
+
+                let hook_count: usize = if slssteam_active { 14 } else { 0 };
+
+                send_json(
+                    req,
+                    200,
+                    json!({
+                        "success": true,
+                        "pluginName": "LuaToolsLinux",
+                        "author": "subsurfmod",
+                        "online": true,
+                        "pid": std::process::id(),
+                        "version": crate::VERSION,
+                        "millenniumDetected": det.installed,
+                        "unlockedAppsCount": apps.len(),
+                        "preloadLib64": preload_lib64,
+                        "preloadLib32": preload_lib32,
+                        "multilibDst": multilib_dst,
+                        "slssteamActive": slssteam_active,
+                        "bridgePreloaded": bridge_preloaded,
+                        "hookCount": hook_count,
+                        "mepSocketActive": mep_socket_active,
+                        "ipcSocketActive": ipc_socket_active,
+                        "result": {
+                            "online": true,
+                            "pid": std::process::id(),
+                            "version": crate::VERSION,
+                            "pluginName": "LuaToolsLinux",
+                            "author": "subsurfmod",
+                            "unlockedAppsCount": apps.len(),
+                            "preloadLib64": preload_lib64,
+                            "preloadLib32": preload_lib32,
+                            "multilibDst": multilib_dst,
+                            "slssteamActive": slssteam_active,
+                            "bridgePreloaded": bridge_preloaded,
+                            "hookCount": hook_count,
+                            "mepSocketActive": mep_socket_active,
+                            "ipcSocketActive": ipc_socket_active,
+                        }
+                    }),
+                );
+            }
+            "UpdateSettingValue" => {
+                let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let val_opt = args.get("value");
+                let mut updated = false;
+                let mut error_msg: Option<String> = None;
+
+                if key.is_empty() {
+                    error_msg = Some("Missing setting key".into());
+                } else if val_opt.is_none() {
+                    error_msg = Some(format!("Missing value for setting '{}'", key));
+                } else {
+                    let val = val_opt.unwrap();
+                    let parse_bool = |v: &Value| -> Option<bool> {
+                        v.as_bool().or_else(|| {
+                            v.as_str().and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+                                "true" | "1" | "yes" | "on" => Some(true),
+                                "false" | "0" | "no" | "off" => Some(false),
+                                _ => None,
+                            })
+                        })
+                    };
+                    let parse_str = |v: &Value| -> Option<String> {
+                        v.as_str().map(|s| s.to_string())
+                    };
+
+                    let mut svc = SettingsService::new(overrides.settings_config_path.clone());
+                    match key {
+                        "fast_fetch" => {
+                            if let Some(b) = parse_bool(val) {
+                                svc.settings.fast_fetch = b;
+                                updated = svc.save();
+                                if !updated {
+                                    error_msg = Some(format!("Failed to save setting '{}'", key));
+                                }
+                            } else {
+                                error_msg =
+                                    Some(format!("Invalid boolean value for setting '{}'", key));
+                            }
+                        }
+                        "auto_update_apps" => {
+                            if let Some(b) = parse_bool(val) {
+                                svc.settings.auto_update_apps = b;
+                                updated = svc.save();
+                                if !updated {
+                                    error_msg = Some(format!("Failed to save setting '{}'", key));
+                                }
+                            } else {
+                                error_msg =
+                                    Some(format!("Invalid boolean value for setting '{}'", key));
+                            }
+                        }
+                        "donate_keys" => {
+                            if let Some(b) = parse_bool(val) {
+                                svc.settings.donate_keys = b;
+                                updated = svc.save();
+                                if !updated {
+                                    error_msg = Some(format!("Failed to save setting '{}'", key));
+                                }
+                            } else {
+                                error_msg =
+                                    Some(format!("Invalid boolean value for setting '{}'", key));
+                            }
+                        }
+                        "check_updates_on_startup" => {
+                            if let Some(b) = parse_bool(val) {
+                                svc.settings.check_updates_on_startup = b;
+                                updated = svc.save();
+                                if !updated {
+                                    error_msg = Some(format!("Failed to save setting '{}'", key));
+                                }
+                            } else {
+                                error_msg =
+                                    Some(format!("Invalid boolean value for setting '{}'", key));
+                            }
+                        }
+                        "cef_bridge_enabled" => {
+                            if let Some(b) = parse_bool(val) {
+                                svc.settings.cef_bridge_enabled = b;
+                                updated = svc.save();
+                                if !updated {
+                                    error_msg = Some(format!("Failed to save setting '{}'", key));
+                                }
+                            } else {
+                                error_msg =
+                                    Some(format!("Invalid boolean value for setting '{}'", key));
+                            }
+                        }
+                        "http_server_enabled" => {
+                            if let Some(b) = parse_bool(val) {
+                                svc.settings.http_server_enabled = b;
+                                updated = svc.save();
+                                if !updated {
+                                    error_msg = Some(format!("Failed to save setting '{}'", key));
+                                }
+                            } else {
+                                error_msg =
+                                    Some(format!("Invalid boolean value for setting '{}'", key));
+                            }
+                        }
+                        "close_to_tray" => {
+                            if let Some(b) = parse_bool(val) {
+                                svc.settings.close_to_tray = b;
+                                updated = svc.save();
+                                if !updated {
+                                    error_msg = Some(format!("Failed to save setting '{}'", key));
+                                }
+                            } else {
+                                error_msg =
+                                    Some(format!("Invalid boolean value for setting '{}'", key));
+                            }
+                        }
+                        "minimize_to_tray" => {
+                            if let Some(b) = parse_bool(val) {
+                                svc.settings.minimize_to_tray = b;
+                                updated = svc.save();
+                                if !updated {
+                                    error_msg = Some(format!("Failed to save setting '{}'", key));
+                                }
+                            } else {
+                                error_msg =
+                                    Some(format!("Invalid boolean value for setting '{}'", key));
+                            }
+                        }
+                        "doh_enabled" => {
+                            if let Some(b) = parse_bool(val) {
+                                svc.settings.doh_enabled = b;
+                                updated = svc.save();
+                                if !updated {
+                                    error_msg = Some(format!("Failed to save setting '{}'", key));
+                                }
+                            } else {
+                                error_msg =
+                                    Some(format!("Invalid boolean value for setting '{}'", key));
+                            }
+                        }
+                        "autostart" => {
+                            if let Some(b) = parse_bool(val) {
+                                match svc.set_autostart(b) {
+                                    Ok(()) => updated = true,
+                                    Err(e) => error_msg = Some(e),
+                                }
+                            } else {
+                                error_msg =
+                                    Some(format!("Invalid boolean value for setting '{}'", key));
+                            }
+                        }
+                        "language" => {
+                            if let Some(s) = parse_str(val) {
+                                svc.settings.language = s;
+                                updated = svc.save();
+                                if !updated {
+                                    error_msg = Some(format!("Failed to save setting '{}'", key));
+                                }
+                            } else {
+                                error_msg =
+                                    Some(format!("Invalid string value for setting '{}'", key));
+                            }
+                        }
+                        "steam_path_override" => {
+                            if let Some(s) = parse_str(val) {
+                                svc.settings.steam_path_override = s;
+                                updated = svc.save();
+                                if !updated {
+                                    error_msg = Some(format!("Failed to save setting '{}'", key));
+                                }
+                            } else {
+                                error_msg =
+                                    Some(format!("Invalid string value for setting '{}'", key));
+                            }
+                        }
+                        "steam_username" => {
+                            if let Some(s) = parse_str(val) {
+                                svc.settings.steam_username = s;
+                                updated = svc.save();
+                                if !updated {
+                                    error_msg = Some(format!("Failed to save setting '{}'", key));
+                                }
+                            } else {
+                                error_msg =
+                                    Some(format!("Invalid string value for setting '{}'", key));
+                            }
+                        }
+                        "doh_endpoint" => {
+                            if let Some(s) = parse_str(val) {
+                                svc.settings.doh_endpoint = s;
+                                updated = svc.save();
+                                if !updated {
+                                    error_msg = Some(format!("Failed to save setting '{}'", key));
+                                }
+                            } else {
+                                error_msg =
+                                    Some(format!("Invalid string value for setting '{}'", key));
+                            }
+                        }
+                        "hubcap_api_key" => {
+                            if let Some(s) = parse_str(val) {
+                                svc.settings.hubcap_api_key = s;
+                                updated = svc.save();
+                                if !updated {
+                                    error_msg = Some(format!("Failed to save setting '{}'", key));
+                                }
+                            } else {
+                                error_msg =
+                                    Some(format!("Invalid string value for setting '{}'", key));
+                            }
+                        }
+                        _ => {
+                            PluginLog::global().warn(
+                                Some("HttpServer"),
+                                &format!("Unknown setting key: {}", key),
+                            );
+                            error_msg = Some(format!("Unknown setting key: {}", key));
+                        }
+                    }
+                }
+
+                if updated {
+                    send_json(
+                        req,
+                        200,
+                        json!({
+                            "success": true,
+                            "key": key,
+                            "updated": true,
+                            "result": { "key": key, "updated": true }
+                        }),
+                    );
+                } else {
+                    let err =
+                        error_msg.unwrap_or_else(|| format!("Failed to update setting '{}'", key));
+                    send_json(
+                        req,
+                        200,
+                        json!({
+                            "success": false,
+                            "key": key,
+                            "updated": false,
+                            "error": err,
+                            "result": { "key": key, "updated": false, "error": err }
+                        }),
+                    );
+                }
+            }
             other => {
                 send_json(
                     req,
@@ -1166,7 +1996,7 @@ fn handle_request(
     if parts.first() == Some(&"add")
         || (parts.len() == 2 && parts[0] == "api" && parts[1] == "add")
     {
-        if !is_request_authorized(&req) {
+        if !is_request_authorized_with_token(&req, rpc_token) {
             send_json(
                 req,
                 403,
@@ -1233,7 +2063,7 @@ fn handle_request(
 
     // Route: /add-source/:appid
     if parts.first() == Some(&"add-source") {
-        if !is_request_authorized(&req) {
+        if !is_request_authorized_with_token(&req, rpc_token) {
             send_json(
                 req,
                 403,
@@ -1270,7 +2100,7 @@ fn handle_request(
 
     // Route: /check-sources or /check-sources/:appid (GET and POST — LT-28)
     if parts.first() == Some(&"check-sources") {
-        if !is_request_authorized(&req) {
+        if !is_request_authorized_with_token(&req, rpc_token) {
             send_json(
                 req,
                 403,
@@ -1330,7 +2160,7 @@ fn handle_request(
 
     // Route: /download/:appid
     if parts.first() == Some(&"download") {
-        if !is_request_authorized(&req) {
+        if !is_request_authorized_with_token(&req, rpc_token) {
             send_json(
                 req,
                 403,
@@ -1377,7 +2207,7 @@ fn handle_request(
 
     // Route: /cancel or /cancel/:appid (POST — LT-28)
     if parts.first() == Some(&"cancel") {
-        if !is_request_authorized(&req) {
+        if !is_request_authorized_with_token(&req, rpc_token) {
             send_json(
                 req,
                 403,
@@ -1412,7 +2242,7 @@ fn handle_request(
 
     // Route: /open-url
     if parts == ["open-url"] {
-        if !is_request_authorized(&req) {
+        if !is_request_authorized_with_token(&req, rpc_token) {
             send_json(
                 req,
                 403,
@@ -1451,7 +2281,7 @@ fn handle_request(
 
     // Route: /restart-steam
     if parts == ["restart-steam"] {
-        if !is_request_authorized(&req) {
+        if !is_request_authorized_with_token(&req, rpc_token) {
             send_json(
                 req,
                 403,
@@ -1476,7 +2306,7 @@ fn handle_request(
 
     // Route: /check-updates (GET and POST — LT-28)
     if parts == ["check-updates"] {
-        if !is_request_authorized(&req) {
+        if !is_request_authorized_with_token(&req, rpc_token) {
             send_json(
                 req,
                 403,
@@ -1491,7 +2321,7 @@ fn handle_request(
 
     // Route: /loaded-apps (GET and POST — LT-28)
     if parts == ["loaded-apps"] {
-        if !is_request_authorized(&req) {
+        if !is_request_authorized_with_token(&req, rpc_token) {
             send_json(
                 req,
                 403,
@@ -1600,7 +2430,7 @@ fn handle_request(
             && parts[0] == "api"
             && (parts[1] == "remove" || parts[1] == "delete"))
     {
-        if !is_request_authorized(&req) {
+        if !is_request_authorized_with_token(&req, rpc_token) {
             send_json(
                 req,
                 403,
@@ -1646,7 +2476,7 @@ fn handle_request(
     if (parts.len() >= 2 && parts[0] == "open" && parts[1] == "fix")
         || parts.first() == Some(&"fix")
     {
-        if !is_request_authorized(&req) {
+        if !is_request_authorized_with_token(&req, rpc_token) {
             send_json(req, 403, json!({ "success": false, "error": "Unauthorized origin or host" }));
             return;
         }
@@ -1658,7 +2488,7 @@ fn handle_request(
 
     // Route: /open/settings or /settings
     if (parts.len() == 2 && parts[0] == "open" && parts[1] == "settings") || parts == ["settings"] {
-        if !is_request_authorized(&req) {
+        if !is_request_authorized_with_token(&req, rpc_token) {
             send_json(req, 403, json!({ "success": false, "error": "Unauthorized origin or host" }));
             return;
         }
@@ -1672,7 +2502,7 @@ fn handle_request(
     if (parts.len() >= 2 && parts[0] == "open" && parts[1] == "app")
         || (parts.len() == 2 && parts[0] == "open" && aid > 0)
     {
-        if !is_request_authorized(&req) {
+        if !is_request_authorized_with_token(&req, rpc_token) {
             send_json(req, 403, json!({ "success": false, "error": "Unauthorized origin or host" }));
             return;
         }
@@ -1686,7 +2516,7 @@ fn handle_request(
 
     // Route: /open/acquire or /open/acquire/:appid
     if parts.len() >= 2 && parts[0] == "open" && parts[1] == "acquire" {
-        if !is_request_authorized(&req) {
+        if !is_request_authorized_with_token(&req, rpc_token) {
             send_json(req, 403, json!({ "success": false, "error": "Unauthorized origin or host" }));
             return;
         }
@@ -1704,7 +2534,7 @@ fn handle_request(
 
     // Route: /open/library
     if parts == ["open", "library"] || parts == ["library"] {
-        if !is_request_authorized(&req) {
+        if !is_request_authorized_with_token(&req, rpc_token) {
             send_json(req, 403, json!({ "success": false, "error": "Unauthorized origin or host" }));
             return;
         }
@@ -1716,7 +2546,7 @@ fn handle_request(
 
     // Route: /open/depots or /open/depots/:appid
     if parts.len() >= 2 && parts[0] == "open" && parts[1] == "depots" {
-        if !is_request_authorized(&req) {
+        if !is_request_authorized_with_token(&req, rpc_token) {
             send_json(req, 403, json!({ "success": false, "error": "Unauthorized origin or host" }));
             return;
         }
@@ -1728,7 +2558,7 @@ fn handle_request(
 
     // Route: /steam/restart or /restart
     if parts == ["steam", "restart"] || parts == ["restart"] {
-        if !is_request_authorized(&req) {
+        if !is_request_authorized_with_token(&req, rpc_token) {
             send_json(
                 req,
                 403,
@@ -1768,7 +2598,7 @@ fn handle_request(
 
     // Route: /config or /settings/config
     if parts == ["config"] || parts == ["settings", "config"] {
-        let cfg = sanitized_settings_json();
+        let cfg = sanitized_settings_json(overrides.settings_config_path.as_deref());
         send_json(
             req,
             200,
@@ -1939,15 +2769,19 @@ mod tests {
         assert_eq!(ping["success"], true);
 
         let rpc: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .send_json(json!({ "method": "HasLuaToolsForApp", "args": { "appid": 1245620 } }))
             .unwrap()
             .into_json()
             .unwrap();
         assert_eq!(rpc["success"], true);
         assert_eq!(rpc["exists"], false);
+        assert_eq!(rpc["depotCount"], 0);
+        assert_eq!(rpc["dlcCount"], 0);
 
         // Test AddViaLuaTools
         let rpc_add: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .send_json(json!({ "method": "AddViaLuaTools", "args": { "appid": 1245620 } }))
             .unwrap()
             .into_json()
@@ -1958,6 +2792,7 @@ mod tests {
 
         // Test GetAddViaLuaToolsStatus & GetDownloadStatus
         let rpc_st: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .send_json(json!({ "method": "GetAddViaLuaToolsStatus", "args": { "appid": 1245620 } }))
             .unwrap()
             .into_json()
@@ -1967,6 +2802,7 @@ mod tests {
 
         // Test CancelDownload
         let rpc_cancel: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .send_json(json!({ "method": "CancelDownload", "args": { "appid": 1245620 } }))
             .unwrap()
             .into_json()
@@ -1976,6 +2812,7 @@ mod tests {
 
         // Test CheckSources
         let rpc_src: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .send_json(json!({ "method": "CheckSources", "args": { "appid": 1245620 } }))
             .unwrap()
             .into_json()
@@ -1985,6 +2822,7 @@ mod tests {
 
         // Test OpenFix
         let rpc_fix: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .send_json(json!({ "method": "OpenFix", "args": { "appid": 1245620 } }))
             .unwrap()
             .into_json()
@@ -1994,6 +2832,7 @@ mod tests {
 
         // Test RestoreFromTray RPC
         let rpc_restore: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .send_json(json!({ "method": "RestoreFromTray", "args": {} }))
             .unwrap()
             .into_json()
@@ -2003,6 +2842,7 @@ mod tests {
 
         // Test CheckUpdates & GetLoadedApps RPC
         let rpc_up: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .send_json(json!({ "method": "CheckUpdates", "args": {} }))
             .unwrap()
             .into_json()
@@ -2012,6 +2852,7 @@ mod tests {
 
         // Unknown RPC method returns 400 with success: false
         let unknown = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .send_json(json!({ "method": "NoSuchMethod", "args": {} }));
         assert!(matches!(unknown, Err(ureq::Error::Status(400, _))));
 
@@ -2048,6 +2889,10 @@ mod tests {
             .header("Access-Control-Allow-Headers")
             .unwrap()
             .contains("Content-Type"));
+        assert!(resp
+            .header("Access-Control-Allow-Headers")
+            .unwrap()
+            .contains("X-LuaTools-Token"));
         assert_eq!(
             resp.header("Access-Control-Allow-Private-Network"),
             Some("true")
@@ -2162,6 +3007,7 @@ mod tests {
         std::fs::write(dir.path().join("730.lua"), "addappid(730)").unwrap();
         std::fs::write(dir.path().join("730.lua.disabled"), "addappid(730)").unwrap();
         let rpc_del: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &srv.rpc_token)
             .send_json(json!({ "method": "DeleteLuaToolsForApp", "args": { "appid": 730 } }))
             .unwrap()
             .into_json()
@@ -2483,5 +3329,299 @@ mod tests {
         assert!(sls.get_token(1245620).is_none());
         assert!(!sls.config.depot_keys.contains_key(&1245621));
         assert!(sls.get_manifest_override(1245621).is_none());
+    }
+
+    #[test]
+    fn test_new_millennium_rpc_endpoints_and_discovery_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let stplug_dir = dir.path().join("stplug-in");
+        std::fs::create_dir_all(&stplug_dir).unwrap();
+        let sls_cfg_path = dir.path().join("slssteam_config.yaml");
+        let settings_cfg_path = dir.path().join("settings.json");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let port = get_free_port();
+        let mut srv = HttpServerService::start_with_config_paths(
+            port,
+            stplug_dir.clone(),
+            Some(sls_cfg_path.clone()),
+            Some(settings_cfg_path.clone()),
+            tx,
+            None,
+        )
+        .unwrap();
+        let token = srv.rpc_token.clone();
+
+        // 1. Test RPC discovery file created
+        let disc_file = std::env::temp_dir().join("luatools_rpc.json");
+        // May be in XDG_RUNTIME_DIR or temp_dir
+        if disc_file.exists() {
+            let content = std::fs::read_to_string(&disc_file).unwrap();
+            assert!(content.contains(&port.to_string()));
+        }
+
+        // 2. ToggleAppEnabled
+        let lua_file = stplug_dir.join("1245620.lua");
+        std::fs::write(&lua_file, b"addappid(1245620)\n").unwrap();
+
+        let toggle_off: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &token)
+            .send_json(json!({
+                "method": "ToggleAppEnabled",
+                "args": { "appid": 1245620, "enabled": false }
+            }))
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(toggle_off["success"], true);
+        assert_eq!(toggle_off["enabled"], false);
+        assert!(!lua_file.exists());
+        assert!(stplug_dir.join("1245620.lua.disabled").exists());
+
+        let toggle_on: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &token)
+            .send_json(json!({
+                "method": "ToggleAppEnabled",
+                "args": { "appid": 1245620, "enabled": true }
+            }))
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(toggle_on["success"], true);
+        assert_eq!(toggle_on["enabled"], true);
+        assert!(lua_file.exists());
+        assert!(!stplug_dir.join("1245620.lua.disabled").exists());
+
+        // 3. ApplyRecommendedFixes
+        let fix_res: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &token)
+            .send_json(json!({
+                "method": "ApplyRecommendedFixes",
+                "args": { "appid": 1245620 }
+            }))
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(fix_res["success"], true);
+        assert!(matches!(rx.try_recv().unwrap(), RpcUiEvent::OpenFix(1245620)));
+
+        // 4. RemoveAppliedFixes
+        let rem_fix: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &token)
+            .send_json(json!({
+                "method": "RemoveAppliedFixes",
+                "args": { "appid": 1245620 }
+            }))
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(rem_fix["success"], true);
+
+        // Write realistic Lua script with base app, 2 keyed depots, and 1 DLC
+        std::fs::write(
+            &lua_file,
+            "addappid(1245620)\naddappid(1245621, 1, \"1245621_KEY\")\naddappid(1245622, 1, \"1245622_KEY\")\naddappid(2778580)\n",
+        )
+        .unwrap();
+
+        // 4b. HasLuaToolsForApp computes real depotCount and dlcCount
+        let has_res: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &token)
+            .send_json(json!({
+                "method": "HasLuaToolsForApp",
+                "args": { "appid": 1245620 }
+            }))
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(has_res["success"], true);
+        assert_eq!(has_res["exists"], true);
+        assert_eq!(has_res["has"], true);
+        assert_eq!(has_res["disabled"], false);
+        assert_eq!(has_res["depotCount"], 2);
+        assert_eq!(has_res["dlcCount"], 1);
+
+        // 5. SyncDlcForApp (isolated temp SLSsteam config.yaml — never touches real $HOME)
+        let dlc_res: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &token)
+            .send_json(json!({
+                "method": "SyncDlcForApp",
+                "args": { "appid": 1245620 }
+            }))
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(dlc_res["success"], true);
+        assert_eq!(dlc_res["dlcCount"], 3);
+        assert_eq!(dlc_res["dlcIds"], json!([1245621, 1245622, 2778580]));
+        assert!(sls_cfg_path.is_file());
+        let sls_after_dlc = SlssteamService::new(Some(sls_cfg_path.clone()));
+        assert!(sls_after_dlc.config.additional_apps.contains(&2778580));
+
+        // 6. SyncSlsSteamConfig (isolated temp SLSsteam config.yaml)
+        let sync_res: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &token)
+            .send_json(json!({
+                "method": "SyncSlsSteamConfig",
+                "args": {}
+            }))
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(sync_res["success"], true);
+        assert_eq!(sync_res["syncedCount"], 1);
+        let sls_after_sync = SlssteamService::new(Some(sls_cfg_path));
+        assert!(sls_after_sync.config.additional_apps.contains(&1245620));
+        assert!(sls_after_sync.config.depot_keys.contains_key(&1245621));
+
+        // 7. GetCompanionStatus and GetBridgeDiagnostics with real bridge fields
+        let comp_st: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &token)
+            .send_json(json!({
+                "method": "GetCompanionStatus",
+                "args": {}
+            }))
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(comp_st["success"], true);
+        assert_eq!(comp_st["pluginName"], "LuaToolsLinux");
+        assert_eq!(comp_st["author"], "subsurfmod");
+        assert_eq!(comp_st["online"], true);
+        assert!(comp_st["preloadLib64"].is_boolean());
+        assert!(comp_st["preloadLib32"].is_boolean());
+        assert!(comp_st["slssteamActive"].is_boolean());
+        assert!(comp_st["bridgePreloaded"].is_boolean());
+        assert!(comp_st["hookCount"].is_number());
+        assert!(comp_st["mepSocketActive"].is_boolean());
+        assert!(comp_st["ipcSocketActive"].is_boolean());
+
+        // 8. CheckForFixes returns real appliedFixes, availableFixes, and hasFixes
+        let chk_fixes: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &token)
+            .send_json(json!({
+                "method": "CheckForFixes",
+                "args": { "appid": 1245620 }
+            }))
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(chk_fixes["success"], true);
+        assert!(chk_fixes["appliedFixes"].is_array());
+        assert!(chk_fixes["availableFixes"].is_array());
+        assert!(chk_fixes["hasFixes"].is_boolean());
+
+        // 9. UpdateSettingValue real mutation (isolated temp settings.json)
+        let set_res: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &token)
+            .send_json(json!({
+                "method": "UpdateSettingValue",
+                "args": { "key": "fast_fetch", "value": false }
+            }))
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(set_res["success"], true);
+        assert_eq!(set_res["updated"], true);
+        assert_eq!(
+            SettingsService::new(Some(settings_cfg_path.clone()))
+                .settings
+                .fast_fetch,
+            false
+        );
+
+        // Unknown setting key must return success: false, updated: false with error
+        let unknown_key_res: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &token)
+            .send_json(json!({
+                "method": "UpdateSettingValue",
+                "args": { "key": "nonexistent_setting_key", "value": true }
+            }))
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(unknown_key_res["success"], false);
+        assert_eq!(unknown_key_res["updated"], false);
+        assert!(unknown_key_res["error"]
+            .as_str()
+            .map(|e| !e.is_empty())
+            .unwrap_or(false));
+
+        // Missing value must return success: false, updated: false with error
+        let missing_val_res: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &token)
+            .send_json(json!({
+                "method": "UpdateSettingValue",
+                "args": { "key": "fast_fetch" }
+            }))
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(missing_val_res["success"], false);
+        assert_eq!(missing_val_res["updated"], false);
+        assert!(missing_val_res["error"]
+            .as_str()
+            .map(|e| !e.is_empty())
+            .unwrap_or(false));
+
+        // Invalid value type must return success: false, updated: false with error
+        let bad_val_res: Value = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", &token)
+            .send_json(json!({
+                "method": "UpdateSettingValue",
+                "args": { "key": "fast_fetch", "value": "not_a_bool" }
+            }))
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(bad_val_res["success"], false);
+        assert_eq!(bad_val_res["updated"], false);
+        assert!(bad_val_res["error"]
+            .as_str()
+            .map(|e| !e.is_empty())
+            .unwrap_or(false));
+
+        // 10. Ephemeral port fallback when target port is already occupied
+        let (tx2, _rx2) = std::sync::mpsc::channel();
+        let mut srv2 = HttpServerService::start(port, stplug_dir, tx2, None)
+            .expect("Ephemeral fallback should succeed when port is busy");
+        assert_ne!(srv2.port, port);
+        assert!(srv2.port > 0);
+        srv2.stop();
+
+        // 11. Strict token validation: missing X-LuaTools-Token is rejected with 403
+        let missing_token_res = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .send_json(json!({ "method": "GetCompanionStatus" }));
+        assert!(matches!(
+            missing_token_res,
+            Err(ureq::Error::Status(403, _))
+        ));
+
+        // Even with an allowed Steam Origin, missing X-LuaTools-Token is rejected with 403
+        let missing_token_with_origin = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("Origin", "https://store.steampowered.com")
+            .send_json(json!({ "method": "GetCompanionStatus" }));
+        assert!(matches!(
+            missing_token_with_origin,
+            Err(ureq::Error::Status(403, _))
+        ));
+
+        // Spoofed/bad X-LuaTools-Token is rejected with 403
+        let bad_token_res = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("X-LuaTools-Token", "malicious_spoofed_token_hex_123456")
+            .send_json(json!({ "method": "GetCompanionStatus" }));
+        assert!(matches!(bad_token_res, Err(ureq::Error::Status(403, _))));
+
+        // Valid token with disallowed Origin is still rejected with 403
+        let bad_origin_with_token = ureq::post(&format!("http://127.0.0.1:{}/rpc", port))
+            .set("Origin", "https://malicious-attacker.com")
+            .set("X-LuaTools-Token", &token)
+            .send_json(json!({ "method": "GetCompanionStatus" }));
+        assert!(matches!(
+            bad_origin_with_token,
+            Err(ureq::Error::Status(403, _))
+        ));
+
+        srv.stop();
     }
 }

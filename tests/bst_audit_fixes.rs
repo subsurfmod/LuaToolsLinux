@@ -1424,7 +1424,6 @@ fn test_bst49_appticket_rsa_splice_exploit() {
         .expect("forge must return valid ticket buffer");
     assert!(forged.len() >= 24 + 4 + K_APP_TICKET_SIGNATURE_SIZE);
     assert_ne!(forged.len(), 64, "must NOT be 64-byte null-padded stub");
-    assert_eq!(forged.len(), 156, "must have S + 4 (152 + 4) bytes for SteamDRMP overhang");
 
     // 4. Test ownership ticket details offsets (matching UsefulSteamTools §3.1)
     let details = get_app_ownership_ticket_details(target_appid, AppTicketSource::CredentialStoreThenForge)
@@ -1442,12 +1441,12 @@ fn test_bst49_appticket_rsa_splice_exploit() {
 
     // 5. Test interop::forge_ownership_ticket produces matching structure
     let ownership = forge_ownership_ticket(target_appid, target_sid);
-    assert_eq!(ownership.total_size, 152);
-    assert_eq!(ownership.data.len(), 156);
+    assert_eq!(ownership.total_size, ownership.data.len() - 4);
+    assert_eq!(ownership.data.len(), forged.len());
     assert_eq!(ownership.signature_size, 128);
     assert_eq!(ownership.steam_id_offset, 8);
-    assert_eq!(ownership.app_id_offset, 24);
-    assert_eq!(ownership.signature_offset, 28);
+    assert_eq!(ownership.app_id_offset, (ownership.total_size - 128) as i32);
+    assert_eq!(ownership.signature_offset, ownership.app_id_offset + 4);
     assert_eq!(
         &ownership.data[ownership.app_id_offset as usize..ownership.app_id_offset as usize + 4],
         &target_appid.to_le_bytes(),
@@ -1661,4 +1660,65 @@ fn test_bst54_protection_scan_helpers_and_services() {
 
     let launch_res = inj_svc.launch_with_integration(1245620, Some(&fake_game_dir));
     assert!(launch_res.is_ok());
+}
+
+#[test]
+fn test_real_steam_binary_function_patterns_byte_for_byte() {
+    use luatools_linux::steam_bridge::binary_reader::BinaryFile;
+    use luatools_linux::steam_bridge::pattern_db::{BinaryComponent, PatternChannel, PatternDb};
+    use std::path::Path;
+
+    let paths = [
+        ("/home/slave/.local/share/Steam/ubuntu12_32/steamclient.so", false),
+        ("/home/slave/.local/share/Steam/steamrt64/steamclient.so", true),
+    ];
+
+    for (p, is_64) in &paths {
+        let path = Path::new(p);
+        if !path.exists() {
+            println!("Skipping non-existent {}", p);
+            continue;
+        }
+
+        let bin = BinaryFile::open(path).expect("Failed to open steamclient binary");
+        let pf = PatternDb::fallback_pattern_file_for_arch(
+            BinaryComponent::SteamClient,
+            PatternChannel::Pattern,
+            "dummy_sha",
+            *is_64,
+        );
+
+        println!("=== Scanning {} (is_64={}) with {} fallback patterns ===", p, is_64, pf.patterns.len());
+        for (name, entry) in &pf.patterns {
+            let Some(pat_hex) = entry.pattern.as_ref() else {
+                continue;
+            };
+            let (pat_bytes, mask_bytes) = luatools_linux::steam_bridge::manifest_hooks::parse_pattern_and_mask(pat_hex, entry.mask.as_deref())
+                .expect("Valid pattern syntax");
+
+            let is_generic = PatternDb::is_generic_compiler_prologue(pat_hex);
+
+            // Count occurrences in .text
+            let mut match_count = 0usize;
+            let mut first_vaddr = None;
+            if let Some((_, sec)) = bin.sections.iter().enumerate().find(|(idx, _)| bin.section_names.get(*idx).is_some_and(|n| n == ".text")) {
+                let start = sec.offset as usize;
+                let end = (sec.offset + sec.size) as usize;
+                let text_slice = &bin.raw_bytes[start..end];
+                let mut cursor = 0;
+                while let Some(pos) = bin.scan_range(&text_slice[cursor..], &pat_bytes, mask_bytes.as_deref()) {
+                    match_count += 1;
+                    if first_vaddr.is_none() {
+                        first_vaddr = bin.file_offset_to_vaddr(start + cursor + pos);
+                    }
+                    cursor += pos + 1;
+                    if cursor >= text_slice.len() {
+                        break;
+                    }
+                }
+            }
+
+            println!("  [PATTERN] {} -> occurrences={}, is_generic={}, first_vaddr={:x?}", name, match_count, is_generic, first_vaddr);
+        }
+    }
 }

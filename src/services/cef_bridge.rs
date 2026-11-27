@@ -93,6 +93,7 @@ pub fn probe_cef_port(port: u16) -> CefPortProbe {
 pub struct CefBridgeService {
     pub steam_root: Option<PathBuf>,
     pub http_port: u16,
+    pub rpc_token: Option<String>,
     stop_flag: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
     handle: Option<JoinHandle<()>>,
@@ -103,9 +104,22 @@ impl CefBridgeService {
         Self {
             steam_root,
             http_port,
+            rpc_token: None,
             stop_flag: Arc::new(AtomicBool::new(false)),
             status: Arc::new(Mutex::new("Stopped".into())),
             handle: None,
+        }
+    }
+
+    /// Updates the local HTTP RPC port and session auth token used by CEF bridge calls
+    /// and injected Store scripts, restarting the worker thread if already running and changed.
+    pub fn set_rpc_endpoint(&mut self, http_port: u16, rpc_token: Option<String>) {
+        let changed = self.http_port != http_port || self.rpc_token != rpc_token;
+        self.http_port = http_port;
+        self.rpc_token = rpc_token;
+        if changed && self.is_running() {
+            self.stop();
+            self.start();
         }
     }
 
@@ -243,20 +257,26 @@ impl CefBridgeService {
         let stop = Arc::clone(&self.stop_flag);
         let status = Arc::clone(&self.status);
         let port = self.http_port;
+        let rpc_token = self.rpc_token.clone();
         let steam_root = self.steam_root.clone();
 
         self.handle = Some(thread::spawn(move || {
-            // Startup self-heal of .cef-enable-remote-debugging symlink (LT-22)
-            if let Some(ref sr) = steam_root {
-                if let Err(e) = Self::self_heal_cef_marker(sr) {
-                    PluginLog::global().warn(
-                        Some("CefBridge"),
-                        &format!("CEF marker self-heal skipped: {}", e),
-                    );
+            let mut yielded_to_millennium = false;
+
+            // Startup self-heal of .cef-enable-remote-debugging symlink (LT-22),
+            // skipped when Millennium's native plugin is already active via --remote-debugging-pipe.
+            if !is_millennium_native_plugin_active(steam_root.as_deref()) {
+                if let Some(ref sr) = steam_root {
+                    if let Err(e) = Self::self_heal_cef_marker(sr) {
+                        PluginLog::global().warn(
+                            Some("CefBridge"),
+                            &format!("CEF marker self-heal skipped: {}", e),
+                        );
+                    }
                 }
+                *status.lock().unwrap_or_else(|e| e.into_inner()) = "Polling CDP :8080...".into();
             }
 
-            *status.lock().unwrap_or_else(|e| e.into_inner()) = "Polling CDP :8080...".into();
             let agent = ureq::AgentBuilder::new()
                 .timeout(Duration::from_secs(2))
                 .build();
@@ -264,6 +284,43 @@ impl CefBridgeService {
             let mut logged_port_conflict = false;
 
             while !stop.load(Ordering::Relaxed) {
+                // Touchpoint 4: If Steam's steamwebhelper is running with Millennium's
+                // --remote-debugging-pipe AND the LuaToolsLinux Millennium plugin is enabled,
+                // yield cleanly instead of endlessly polling TCP :8080.
+                if is_millennium_native_plugin_active(steam_root.as_deref()) {
+                    if !yielded_to_millennium {
+                        let msg =
+                            "Active via Millennium Native Plugin (LuaToolsLinux by subsurfmod)";
+                        PluginLog::global().info(
+                            Some("CefBridge"),
+                            &format!(
+                                "Detected steamwebhelper --remote-debugging-pipe with LuaToolsLinux Millennium plugin enabled; yielding CDP :8080 polling ({})",
+                                msg
+                            ),
+                        );
+                        *status.lock().unwrap_or_else(|e| e.into_inner()) = msg.into();
+                        yielded_to_millennium = true;
+                        logged_port_conflict = false;
+                    }
+                    for _ in 0..20 {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(250));
+                    }
+                    continue;
+                }
+
+                if yielded_to_millennium {
+                    yielded_to_millennium = false;
+                    PluginLog::global().info(
+                        Some("CefBridge"),
+                        "Millennium native plugin no longer active; resuming CDP :8080 fallback polling",
+                    );
+                    *status.lock().unwrap_or_else(|e| e.into_inner()) =
+                        "Polling CDP :8080...".into();
+                }
+
                 match agent.get(CEF_DEBUG_URL).call() {
                     Ok(resp) => match resp.into_json::<Vec<Value>>() {
                         Ok(tabs) => {
@@ -293,10 +350,12 @@ impl CefBridgeService {
                                         let ws_url = ws.to_string();
                                         let stop_tab = Arc::clone(&stop);
                                         let root_opt = steam_root.clone();
+                                        let tok_opt = rpc_token.clone();
                                         thread::spawn(move || {
-                                            bridge_ws_tab_with_stop(
+                                            bridge_ws_tab_with_token(
                                                 &ws_url,
                                                 port,
+                                                tok_opt.as_deref(),
                                                 root_opt.as_deref(),
                                                 Some(&stop_tab),
                                             );
@@ -382,19 +441,151 @@ impl Drop for CefBridgeService {
     }
 }
 
-/// Locates `luatools.js` across the exact canonical search paths written by
-/// `PluginInstallerService::install_ltsp_js_payload` (LT-19 / LT-23).
-pub fn find_luatools_js(steam_root: Option<&Path>) -> Option<PathBuf> {
+/// Inspects Linux `/proc` to check whether a running `steamwebhelper` process
+/// was launched by Millennium with `--remote-debugging-pipe` (which suppresses `:8080`).
+pub fn is_steamwebhelper_using_debug_pipe() -> bool {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let fname = entry.file_name();
+        let Some(pid_str) = fname.to_str() else {
+            continue;
+        };
+        if !pid_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let proc_dir = entry.path();
+        let comm_matches = fs::read_to_string(proc_dir.join("comm"))
+            .map(|c| c.trim().to_ascii_lowercase().starts_with("steamwebhelper"))
+            .unwrap_or(false);
+        let Ok(cmdline_bytes) = fs::read(proc_dir.join("cmdline")) else {
+            continue;
+        };
+        let cmdline = String::from_utf8_lossy(&cmdline_bytes);
+        let is_webhelper = comm_matches || cmdline.to_ascii_lowercase().contains("steamwebhelper");
+        if is_webhelper
+            && cmdline
+                .split('\0')
+                .any(|arg| arg == "--remote-debugging-pipe" || arg.starts_with("--remote-debugging-pipe="))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_luatoolslinux_plugin_enabled_in(
+    plugin_json_paths: &[PathBuf],
+    config_paths: &[PathBuf],
+) -> bool {
+    let manifest_present = plugin_json_paths.iter().any(|p| p.is_file());
+    if !manifest_present {
+        return false;
+    }
+
+    for cfg in config_paths {
+        let Ok(raw) = fs::read_to_string(cfg) else {
+            continue;
+        };
+        let Ok(val) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+
+        // Shape 1: config.json { "plugins": { "enabledPlugins": ["LuaToolsLinux", ...] } }
+        if let Some(list) = val
+            .get("plugins")
+            .and_then(|p| p.get("enabledPlugins"))
+            .and_then(|e| e.as_array())
+        {
+            if list.iter().any(|item| item.as_str() == Some("LuaToolsLinux")) {
+                return true;
+            }
+        }
+
+        // Shape 2: top-level enabledPlugins / enabled_plugins array
+        for key in ["enabledPlugins", "enabled_plugins"] {
+            if let Some(list) = val.get(key).and_then(|v| v.as_array()) {
+                if list.iter().any(|item| item.as_str() == Some("LuaToolsLinux")) {
+                    return true;
+                }
+            }
+        }
+
+        // Shape 3: plugins.json array of objects [ { "name": "LuaToolsLinux", "enabled": true } ]
+        if let Some(arr) = val.as_array() {
+            for item in arr {
+                let enabled = item
+                    .get("enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let name = item
+                    .get("name")
+                    .or_else(|| item.get("common_name"))
+                    .or_else(|| item.get("id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if enabled && name.eq_ignore_ascii_case("LuaToolsLinux") {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Checks whether the native `LuaToolsLinux` Millennium plugin manifest exists on disk
+/// and `"LuaToolsLinux"` is enabled in Millennium's configuration.
+pub fn is_luatoolslinux_millennium_plugin_enabled(steam_root: Option<&Path>) -> bool {
+    let mut plugin_jsons = Vec::new();
+    if let Ok(env_data) = std::env::var("MILLENNIUM__DATA_PATH") {
+        let trimmed = env_data.trim();
+        if !trimmed.is_empty() {
+            plugin_jsons.push(PathBuf::from(trimmed).join("plugins/LuaToolsLinux/plugin.json"));
+        }
+    }
+    if let Ok(xdg_data) = std::env::var("XDG_DATA_HOME") {
+        let trimmed = xdg_data.trim();
+        if !trimmed.is_empty() {
+            plugin_jsons.push(
+                PathBuf::from(trimmed).join("millennium/plugins/LuaToolsLinux/plugin.json"),
+            );
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        plugin_jsons.push(home.join(".local/share/millennium/plugins/LuaToolsLinux/plugin.json"));
+    }
+    let config_paths = crate::services::millennium_service::MillenniumService::config_paths(steam_root);
+    is_luatoolslinux_plugin_enabled_in(&plugin_jsons, &config_paths)
+}
+
+/// Touchpoint 4 check: returns true when Steam's `steamwebhelper` is running with
+/// Millennium's `--remote-debugging-pipe` AND the `LuaToolsLinux` Millennium plugin is enabled.
+pub fn is_millennium_native_plugin_active(steam_root: Option<&Path>) -> bool {
+    is_steamwebhelper_using_debug_pipe() && is_luatoolslinux_millennium_plugin_enabled(steam_root)
+}
+
+fn find_luatools_js_with_home(steam_root: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(root) = steam_root {
         candidates.push(root.join("steamui/LuaTools/luatools.js"));
     }
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = home {
+        candidates.push(home.join(".local/share/millennium/plugins/LuaToolsLinux/public/luatools.js"));
         candidates.push(home.join(".local/share/luatools/plugins/luatools/luatools.js"));
         candidates.push(home.join(".local/share/Steam/steamui/LuaTools/luatools.js"));
         candidates.push(home.join(".local/share/millennium/plugins/luatools/public/luatools.js"));
     }
     candidates.into_iter().find(|p| p.is_file())
+}
+
+/// Locates `luatools.js` across the canonical search paths, checking
+/// `millennium/plugins/LuaToolsLinux/public/luatools.js` before legacy lowercase
+/// `millennium/plugins/luatools/public/luatools.js` (LT-19 / LT-23).
+pub fn find_luatools_js(steam_root: Option<&Path>) -> Option<PathBuf> {
+    let home = dirs::home_dir();
+    find_luatools_js_with_home(steam_root, home.as_deref())
 }
 
 pub fn ensure_luatools_js_installed(steam_root: Option<&Path>) -> Result<PathBuf, String> {
@@ -405,10 +596,14 @@ pub fn ensure_luatools_js_installed(steam_root: Option<&Path>) -> Result<PathBuf
     installer.ensure_luatools_js_installed(steam_root)
 }
 
-fn build_polyfill_js(http_port: u16) -> String {
+fn build_polyfill_js(http_port: u16, rpc_token: Option<&str>) -> String {
     let version = crate::VERSION;
+    let token_json =
+        serde_json::to_string(rpc_token.unwrap_or("")).unwrap_or_else(|_| "\"\"".into());
     format!(
         r#"(function() {{
+  window.__LUATOOLS_RPC_PORT__ = {http_port};
+  window.__LUATOOLS_RPC_TOKEN__ = {token_json};
   if (window.__luatoolsLinuxPolyfill) return;
   window.__luatoolsLinuxPolyfill = true;
   const BASE = "http://127.0.0.1:{http_port}";
@@ -478,6 +673,7 @@ fn build_polyfill_js(http_port: u16) -> String {
     backendPort: {http_port},
     backendUrl: BASE,
     baseUrl: BASE,
+    rpcToken: {token_json},
     pollInterval: 500,
     platform: "linux",
     version: "{version}"
@@ -582,7 +778,7 @@ pub fn connect_ws_local(ws_url: &str) -> Result<WebSocket<TcpStream>, String> {
 }
 
 pub fn bridge_ws_tab(ws_url: &str, http_port: u16, steam_root: Option<&Path>) -> bool {
-    bridge_ws_tab_with_stop(ws_url, http_port, steam_root, None)
+    bridge_ws_tab_with_token(ws_url, http_port, None, steam_root, None)
 }
 
 pub fn bridge_ws_tab_with_stop(
@@ -591,7 +787,28 @@ pub fn bridge_ws_tab_with_stop(
     steam_root: Option<&Path>,
     stop: Option<&AtomicBool>,
 ) -> bool {
-    let mut js = build_polyfill_js(http_port);
+    bridge_ws_tab_with_token(ws_url, http_port, None, steam_root, stop)
+}
+
+pub fn bridge_ws_tab_with_token(
+    ws_url: &str,
+    http_port: u16,
+    rpc_token: Option<&str>,
+    steam_root: Option<&Path>,
+    stop: Option<&AtomicBool>,
+) -> bool {
+    let effective_token: Option<String> = rpc_token
+        .filter(|t| !t.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            crate::services::http_server::active_session_token()
+                .read()
+                .ok()
+                .filter(|t| !t.is_empty())
+                .map(|t| t.clone())
+        });
+
+    let mut js = build_polyfill_js(http_port, effective_token.as_deref());
     if let Ok(p) = ensure_luatools_js_installed(steam_root) {
         if let Ok(extra) = fs::read_to_string(p) {
             js.push('\n');
@@ -718,8 +935,12 @@ pub fn bridge_ws_tab_with_stop(
                                     .and_then(|m| m.as_str())
                                     .unwrap_or("");
                                 let args = item.get("args").cloned().unwrap_or_else(|| json!({}));
-                                let rpc_res = match agent
-                                    .post(&format!("http://127.0.0.1:{}/rpc", http_port))
+                                let mut rpc_req =
+                                    agent.post(&format!("http://127.0.0.1:{}/rpc", http_port));
+                                if let Some(ref tok) = effective_token {
+                                    rpc_req = rpc_req.set("X-LuaTools-Token", tok);
+                                }
+                                let rpc_res = match rpc_req
                                     .send_json(json!({ "method": method, "args": args }))
                                 {
                                     Ok(r) => r.into_string().unwrap_or_else(|_| {
@@ -991,14 +1212,18 @@ mod tests {
         });
 
         let ws_url = format!("ws://127.0.0.1:{}/devtools/page/TAB1", ws_port);
-        assert!(bridge_ws_tab_with_stop(
+        assert!(bridge_ws_tab_with_token(
             &ws_url,
-            http_port,
+            srv.port,
+            Some(&srv.rpc_token),
             None,
             Some(&stop)
         ));
         let received = server.join().unwrap();
         assert!(received.len() >= 6);
+        assert!(received[3].contains("__LUATOOLS_RPC_PORT__"));
+        assert!(received[3].contains("__LUATOOLS_RPC_TOKEN__"));
+        assert!(received[3].contains(&srv.rpc_token));
         assert!(received[4].contains("__lt_drain"));
         assert!(received[5].contains("__lt_resolve"));
         assert!(received[5].contains("req-42"));
@@ -1086,5 +1311,59 @@ mod tests {
     fn connect_ws_local_rejects_non_loopback() {
         let err = connect_ws_local("ws://1.1.1.1:8080/devtools").unwrap_err();
         assert!(err.contains("Forbidden non-loopback WebSocket address"));
+    }
+
+    #[test]
+    fn find_luatools_js_prefers_millennium_luatoolslinux_over_lowercase_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let canonical = home.join(".local/share/millennium/plugins/LuaToolsLinux/public/luatools.js");
+        let legacy = home.join(".local/share/millennium/plugins/luatools/public/luatools.js");
+
+        // Fallback to lowercase when LuaToolsLinux is absent
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, "// legacy").unwrap();
+        assert_eq!(find_luatools_js_with_home(None, Some(home)), Some(legacy.clone()));
+
+        // Prefer LuaToolsLinux/public/luatools.js when both exist
+        fs::create_dir_all(canonical.parent().unwrap()).unwrap();
+        fs::write(&canonical, "// canonical").unwrap();
+        assert_eq!(
+            find_luatools_js_with_home(None, Some(home)),
+            Some(canonical.clone())
+        );
+    }
+
+    #[test]
+    fn detects_enabled_luatoolslinux_millennium_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_json = dir.path().join("LuaToolsLinux/plugin.json");
+        let cfg_json = dir.path().join("config.json");
+
+        // Missing plugin.json -> false even if listed in config.json
+        fs::write(
+            &cfg_json,
+            r#"{"plugins":{"enabledPlugins":["LuaToolsLinux"]}}"#,
+        )
+        .unwrap();
+        assert!(!is_luatoolslinux_plugin_enabled_in(
+            &[plugin_json.clone()],
+            &[cfg_json.clone()]
+        ));
+
+        // Present plugin.json + enabled in config.json -> true
+        fs::create_dir_all(plugin_json.parent().unwrap()).unwrap();
+        fs::write(&plugin_json, r#"{"name":"LuaToolsLinux"}"#).unwrap();
+        assert!(is_luatoolslinux_plugin_enabled_in(
+            &[plugin_json.clone()],
+            &[cfg_json.clone()]
+        ));
+
+        // Disabled in config.json -> false
+        fs::write(&cfg_json, r#"{"plugins":{"enabledPlugins":["protondb"]}}"#).unwrap();
+        assert!(!is_luatoolslinux_plugin_enabled_in(
+            &[plugin_json],
+            &[cfg_json]
+        ));
     }
 }

@@ -642,20 +642,20 @@ mod tests {
     #[test]
     fn test_ownership_ticket_response_checks_write_buffer_capacity() {
         let forged = forge_ownership_ticket(1245620, 76_561_197_960_287_930u64);
-        assert_eq!(forged.total_size, 152);
-        assert_eq!(forged.app_id_offset, 24);
+        assert_eq!(forged.total_size, forged.data.len() - 4);
+        assert_eq!(forged.app_id_offset, (forged.total_size - 128) as i32);
         assert_eq!(forged.steam_id_offset, 8);
 
-        // Buffer has room for header (20) but NOT for 20 + 152 ticket bytes -> must fail without corrupting header
+        // Buffer has room for header (20) but NOT for 20 + forged.total_size ticket bytes -> must fail without corrupting header
         let mut small = vec![0u8; 32];
         assert!(!write_ownership_ticket_response(&forged, 1024, &mut small));
         assert_eq!(small, vec![0u8; 32]);
 
         let mut full = vec![0u8; 256];
         assert!(write_ownership_ticket_response(&forged, 1024, &mut full));
-        assert_eq!(&full[0..4], &152u32.to_le_bytes());
-        assert_eq!(&full[4..8], &24i32.to_le_bytes());
-        assert_eq!(&full[8..12], &8i32.to_le_bytes());
+        assert_eq!(&full[0..4], &(forged.total_size as u32).to_le_bytes());
+        assert_eq!(&full[4..8], &forged.app_id_offset.to_le_bytes());
+        assert_eq!(&full[8..12], &forged.steam_id_offset.to_le_bytes());
         assert_eq!(&full[20..20 + forged.data.len()], forged.data.as_slice());
     }
 

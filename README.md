@@ -4,11 +4,11 @@
   <p><strong>Native Rust &amp; egui desktop suite for Linux &amp; Steam Deck — add Steam games, set up SLSsteam in one click, manage DLC &amp; depots, and apply game fixes.</strong></p>
   <p>
     <a href="https://github.com/subsurfmod/LuaToolsLinux/releases/latest">
-      <img src="https://img.shields.io/badge/RELEASE-v4.0.0-1A3A6B?style=for-the-badge&logo=github&logoColor=white" alt="Release v4.0.0">
+      <img src="https://img.shields.io/badge/RELEASE-v4.1.2-1A3A6B?style=for-the-badge&logo=github&logoColor=white" alt="Release v4.1.2">
     </a>
     <img src="https://img.shields.io/badge/RUST-100%25%20NATIVE-DEA584?style=for-the-badge&logo=rust&logoColor=111111" alt="Rust">
     <img src="https://img.shields.io/badge/LINUX-x86__64%20%7C%20i686-FCC624?style=for-the-badge&logo=linux&logoColor=111111" alt="Linux x86_64 and i686">
-    <img src="https://img.shields.io/badge/TESTS-603%20PASSING-2EA043?style=for-the-badge&logo=checkmarx&logoColor=white" alt="603 Passing Tests">
+    <img src="https://img.shields.io/badge/TESTS-617%20PASSING-2EA043?style=for-the-badge&logo=checkmarx&logoColor=white" alt="617 Passing Tests">
     <a href="LICENSE">
       <img src="https://img.shields.io/badge/LICENSE-GPL--3.0-blue?style=for-the-badge" alt="GPL-3.0 License">
     </a>
@@ -20,11 +20,11 @@
 
 ---
 
-## Why LuaTools Linux v4.0.0?
+## Why LuaTools Linux v4.1.2?
 
 **LuaTools Linux** is a fast, lightweight, native **Rust + egui** desktop application built specifically for Linux gaming and the Steam Deck. It brings the full LuaTools workflow to Linux without Wine overhead, combining a dual-architecture (`x86_64` + `i686`) Steam bridge, one-click rootless **SLSsteam** setup, a sandboxed Lua 5.4 runtime, depot/DLC management, and one-click game fixes in a single binary.
 
-### Key v4.0.0 Highlights
+### Key v4.1.2 Highlights
 
 - **Native `egui` Desktop App** — Crisp, responsive dark UI on both **Wayland** and **X11** with a streamlined English interface, instant progress/completion feedback on every button (`ActionProgressModal`), and live topbar Steam controls (`Launch Steam`, `Restart Steam`, `Kill Steam`).
 - **Prebuilt Binary Auto-Updater & Live Compiler Feed** — Update in one click from the top-right **Update** badge or `luatools --update`, complete with SHA-256 release verification, monotonic progress tracking, and a live streaming monospace Rust compiler log when building from source.
@@ -53,18 +53,18 @@ curl -fsSL https://raw.githubusercontent.com/subsurfmod/LuaToolsLinux/main/insta
 
 ### Native Packages (`.deb` / `.rpm` / `.tar.gz`)
 
-Download the latest v4.0.0 package from the [GitHub Releases](https://github.com/subsurfmod/LuaToolsLinux/releases/latest) page, or build packages locally with `./packaging/build-packages.sh`:
+Download the latest v4.1.2 package from the [GitHub Releases](https://github.com/subsurfmod/LuaToolsLinux/releases/latest) page, or build packages locally with `./packaging/build-packages.sh`:
 
 ```bash
 # Ubuntu / Debian / Pop!_OS
-sudo apt install ./luatools-linux_4.0.0_amd64.deb
+sudo apt install ./luatools-linux_4.1.2_amd64.deb
 
 # Fedora / RHEL / openSUSE
-sudo dnf install ./luatools-linux-4.0.0-1.*.rpm
+sudo dnf install ./luatools-linux-4.1.2-1.*.rpm
 
 # Portable Tarball (Arch Linux / Steam Deck / any distro)
-tar -xzf luatools-linux-4.0.0-x86_64.tar.gz
-cd luatools-linux-4.0.0-x86_64
+tar -xzf luatools-linux-4.1.2-x86_64.tar.gz
+cd luatools-linux-4.1.2-x86_64
 ./install.sh --yes
 ```
 

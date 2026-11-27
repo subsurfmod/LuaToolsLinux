@@ -203,7 +203,7 @@ fn decode_one_instruction(data: &[u8], is_64bit: bool) -> Result<(usize, RelocTy
     }
 
     // 1-byte opcodes
-    if (0x50..=0x5F).contains(&b) || b == 0x90 || b == 0xC3 || b == 0xCC {
+    if (0x50..=0x5F).contains(&b) || matches!(b, 0x90 | 0xC3 | 0xCC | 0xC9 | 0x98 | 0x99 | 0xFC | 0xFD) {
         return Ok((pos, RelocType::None));
     }
     // push imm
@@ -295,28 +295,42 @@ fn decode_one_instruction(data: &[u8], is_64bit: bool) -> Result<(usize, RelocTy
 
     let mode = (modrm >> 6) & 3;
     let rm = modrm & 7;
-    let is_rip_rel = is_64bit && mode == 0 && rm == 5;
     let mut disp_offset = 0;
+    let mut has_sib = false;
+    let mut sib_base_is_ebp = false;
 
     if mode != 3 && rm == 4 {
-        // SIB byte
+        // SIB byte present
+        has_sib = true;
         if pos >= data.len() {
             return Err("expected SIB byte".to_string());
         }
         let sib = data[pos];
         pos += 1;
-        if mode == 0 && (sib & 7) == 5 {
+        if (sib & 7) == 5 {
+            sib_base_is_ebp = true;
+        }
+    }
+
+    if mode == 1 {
+        // 8-bit displacement (for both SIB and non-SIB)
+        pos += 1;
+    } else if mode == 2 {
+        // 32-bit displacement (for both SIB and non-SIB)
+        pos += 4;
+    } else if mode == 0 {
+        if has_sib {
+            if sib_base_is_ebp {
+                disp_offset = pos;
+                pos += 4;
+            }
+        } else if rm == 5 {
             disp_offset = pos;
             pos += 4;
         }
-    } else if mode == 0 && rm == 5 {
-        disp_offset = pos;
-        pos += 4;
-    } else if mode == 1 {
-        pos += 1;
-    } else if mode == 2 {
-        pos += 4;
     }
+
+    let is_rip_rel = is_64bit && mode == 0 && !has_sib && rm == 5;
 
     // Immediate operands
     if is_0f3a {
@@ -475,7 +489,7 @@ impl MemoryPatch {
         self.original_bytes = orig_slice.to_vec();
         self.orig_len = overwrite_len;
 
-        let (trampoline, alloc_size) = Self::allocate_trampoline(TRAMPOLINE_SIZE)?;
+        let (trampoline, alloc_size) = Self::allocate_trampoline(self.target, TRAMPOLINE_SIZE)?;
 
         let ret_addr = (self.target as usize)
             .checked_add(overwrite_len)
@@ -492,7 +506,63 @@ impl MemoryPatch {
 
             match inst.reloc {
                 RelocType::None => {}
-                RelocType::Rel32Call { disp_offset } | RelocType::Rel32Jmp { disp_offset } => {
+                RelocType::Rel32Call { disp_offset } => {
+                    let orig_inst_addr = (self.target as usize) + inst.offset;
+                    let tramp_inst_addr = (trampoline as usize) + inst.offset;
+                    let orig_disp = {
+                        let disp_ptr = self.target.add(inst.offset + disp_offset) as *const i32;
+                        ptr::read_unaligned(disp_ptr)
+                    };
+                    let orig_target = (orig_inst_addr + inst.len).wrapping_add(orig_disp as usize);
+
+                    // On 32-bit x86, check if target is an i686 PIC thunk (__x86.get_pc_thunk.*) or inline `call $+5`.
+                    // If so, rewrite to load the original return address directly into the register or stack
+                    // so the GOT offset calculation in the original function remains byte-exact and references
+                    // the real GOT rather than trampoline memory.
+                    #[cfg(target_arch = "x86")]
+                    if inst.len == 5 {
+                        if orig_disp == 0 {
+                            // Inline PIC thunk: `call $+5` (E8 00 00 00 00) followed by `pop reg`.
+                            // Replace `call $+5` (5B) with `push imm32 (orig_inst_addr + 5)` (5B, `68 <u32>`),
+                            // so the following `pop reg` in the trampoline gets the exact original PC value
+                            // without making an out-of-line call or executing hook bytes.
+                            let tramp_inst = trampoline.add(inst.offset);
+                            *tramp_inst = 0x68; // push imm32
+                            let ret_val = (orig_inst_addr + inst.len) as u32;
+                            ptr::copy_nonoverlapping(ret_val.to_le_bytes().as_ptr(), tramp_inst.add(1), 4);
+                            continue;
+                        }
+
+                        let target_ptr = orig_target as *const u8;
+                        if is_readable(target_ptr as *const std::ffi::c_void, 4) {
+                            let b0 = ptr::read_unaligned(target_ptr);
+                            let b1 = ptr::read_unaligned(target_ptr.add(1));
+                            let b2 = ptr::read_unaligned(target_ptr.add(2));
+                            let b3 = ptr::read_unaligned(target_ptr.add(3));
+                            if b0 == 0x8B && (b1 & 0xC7) == 0x04 && b2 == 0x24 && b3 == 0xC3 {
+                                // mov reg, [esp]; ret
+                                let reg = (b1 >> 3) & 7;
+                                let tramp_inst = trampoline.add(inst.offset);
+                                *tramp_inst = 0xB8 + reg; // mov reg, imm32
+                                let ret_val = (orig_inst_addr + inst.len) as u32;
+                                ptr::copy_nonoverlapping(ret_val.to_le_bytes().as_ptr(), tramp_inst.add(1), 4);
+                                continue;
+                            }
+                        }
+                    }
+
+                    let new_disp = (orig_target as isize).wrapping_sub((tramp_inst_addr + inst.len) as isize);
+                    if new_disp < i32::MIN as isize || new_disp > i32::MAX as isize {
+                        let _ = libc::munmap(trampoline as *mut libc::c_void, alloc_size);
+                        return Err(format!(
+                            "relative call at 0x{:x} cannot be relocated: distance {} exceeds 32-bit range",
+                            orig_inst_addr, new_disp
+                        ));
+                    }
+                    let disp_ptr = trampoline.add(inst.offset + disp_offset) as *mut i32;
+                    ptr::write_unaligned(disp_ptr, new_disp as i32);
+                }
+                RelocType::Rel32Jmp { disp_offset } => {
                     let orig_inst_addr = (self.target as usize) + inst.offset;
                     let tramp_inst_addr = (trampoline as usize) + inst.offset;
                     let orig_disp = {
@@ -504,7 +574,7 @@ impl MemoryPatch {
                     if new_disp < i32::MIN as isize || new_disp > i32::MAX as isize {
                         let _ = libc::munmap(trampoline as *mut libc::c_void, alloc_size);
                         return Err(format!(
-                            "relative call/jmp at 0x{:x} cannot be relocated: distance {} exceeds 32-bit range",
+                            "relative jmp at 0x{:x} cannot be relocated: distance {} exceeds 32-bit range",
                             orig_inst_addr, new_disp
                         ));
                     }
@@ -701,15 +771,20 @@ impl MemoryPatch {
         tramp()
     }
 
-    fn allocate_trampoline(size: usize) -> Result<(*mut u8, usize), String> {
+    fn allocate_trampoline(hint: *mut u8, size: usize) -> Result<(*mut u8, usize), String> {
         let page_size = system_page_size();
         let alloc_size = size
             .checked_add(page_size - 1)
             .ok_or_else(|| "trampoline size overflow".to_string())?
             & !(page_size - 1);
+        let hint_page = if hint.is_null() {
+            ptr::null_mut()
+        } else {
+            ((hint as usize) & !(page_size - 1)) as *mut libc::c_void
+        };
         let ptr = unsafe {
             libc::mmap(
-                ptr::null_mut(),
+                hint_page,
                 alloc_size,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
@@ -878,5 +953,46 @@ mod tests {
             assert!(is_range_in_module_image(handle, sym as usize, 4));
         }
         assert!(!is_range_in_module_image(handle, 0x1000, 4));
+    }
+
+    #[test]
+    fn test_decoder_decodes_sib_and_modrm_displacements_byte_exact() {
+        // 48 89 5C 24 08 -> mov QWORD PTR [rsp+0x8], rbx (5 bytes, SIB with disp8)
+        let bytes_sib_disp8 = [0x48, 0x89, 0x5C, 0x24, 0x08];
+        let (len, reloc) = decode_one_instruction(&bytes_sib_disp8, true).unwrap();
+        assert_eq!(len, 5);
+        assert!(matches!(reloc, RelocType::None));
+
+        // 48 8B 84 24 00 01 00 00 -> mov rax, [rsp+0x100] (8 bytes, SIB with disp32)
+        let bytes_sib_disp32 = [0x48, 0x8B, 0x84, 0x24, 0x00, 0x01, 0x00, 0x00];
+        let (len, reloc) = decode_one_instruction(&bytes_sib_disp32, true).unwrap();
+        assert_eq!(len, 8);
+        assert!(matches!(reloc, RelocType::None));
+
+        // 48 8B 05 10 20 00 00 -> mov rax, [rip+0x2010] (7 bytes, RIP-relative)
+        let bytes_rip = [0x48, 0x8B, 0x05, 0x10, 0x20, 0x00, 0x00];
+        let (len, reloc) = decode_one_instruction(&bytes_rip, true).unwrap();
+        assert_eq!(len, 7);
+        assert!(matches!(reloc, RelocType::RipRelative { disp_offset: 3 }));
+    }
+
+    #[test]
+    fn test_decoder_decodes_pic_thunk_call_and_imm_opcodes() {
+        // E8 00 00 00 00 -> call $+5 (5 bytes, Rel32Call with disp 0)
+        let bytes_call_0 = [0xE8, 0x00, 0x00, 0x00, 0x00];
+        let (len, reloc) = decode_one_instruction(&bytes_call_0, false).unwrap();
+        assert_eq!(len, 5);
+        match reloc {
+            RelocType::Rel32Call { disp_offset } => {
+                assert_eq!(disp_offset, 1);
+            }
+            _ => panic!("expected Rel32Call"),
+        }
+
+        // 5B -> pop ebx (1 byte)
+        let bytes_pop_ebx = [0x5B];
+        let (len, reloc) = decode_one_instruction(&bytes_pop_ebx, false).unwrap();
+        assert_eq!(len, 1);
+        assert!(matches!(reloc, RelocType::None));
     }
 }

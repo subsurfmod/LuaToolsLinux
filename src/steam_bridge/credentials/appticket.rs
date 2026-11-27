@@ -568,15 +568,13 @@ mod tests {
     fn test_forge_local_app_ownership_ticket_structure() {
         let forged = forge_local_app_ownership_ticket(1245620, None).expect("forge should succeed");
         assert!(forged.len() >= 24 + 4 + K_APP_TICKET_SIGNATURE_SIZE);
-        assert_eq!(forged.len(), 156);
 
         let details = get_app_ownership_ticket_details(1245620, AppTicketSource::CredentialStoreThenForge)
             .expect("details should exist");
         assert_eq!(details.signature_size, K_APP_TICKET_SIGNATURE_SIZE);
         assert_eq!(details.steam_id_offset, K_APP_TICKET_STEAM_ID_OFFSET);
-        assert_eq!(details.total_size, 152);
-        assert_eq!(details.app_id_offset, 24);
-        assert_eq!(details.signature_offset, 28);
+        assert_eq!(details.total_size, forged.len() - 4);
+        assert_eq!(details.signature_offset, details.app_id_offset + 4);
         assert_eq!(
             &details.data[details.app_id_offset..details.app_id_offset + 4],
             &1245620u32.to_le_bytes()

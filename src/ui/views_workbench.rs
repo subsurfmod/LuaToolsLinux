@@ -26,9 +26,9 @@ use crate::ui::lua_editor::validate_lua_text;
 use crate::ui::state::{AppMessage, DepotsSubTab, SettingsSubTab, ToastKind, UpdateBannerState};
 use crate::ui::theme::{
     chip_button, danger_button, display_font, draw_rem_medallion, format_bytes, ghost_button,
-    inset_paper_sheet, lua_layouter, paper_card, paper_card_padded, pick_directory_native,
-    pick_files_native, primary_button, secondary_button, section_header, semibold_font,
-    status_badge, table_button, BadgeTone, Palette,
+    help_tip_icon, inset_paper_sheet, lua_layouter, paper_card, paper_card_padded,
+    pick_directory_native, pick_files_native, primary_button, secondary_button, section_header,
+    semibold_font, status_badge, table_button, BadgeTone, Palette,
 };
 use crate::ui::views_primary::clean_list_row;
 
@@ -2349,11 +2349,20 @@ impl LuaToolsApp {
         paper_card(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 10.0;
-            ui.label(
-                RichText::new("Steam Installation & Manifest Behavior")
-                    .font(display_font(17.5))
-                    .color(Palette::TEXT_PRIMARY),
-            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(
+                    RichText::new("Steam Installation & Manifest Behavior")
+                        .font(display_font(17.5))
+                        .color(Palette::TEXT_PRIMARY),
+                );
+                help_tip_icon(
+                    ui,
+                    "settings_help_general_steam_install",
+                    "Steam Installation & Manifest Behavior",
+                    "Controls where LuaTools finds your Steam folder and how it manages added games. Most Linux and Steam Deck users can leave the folder box blank so Steam is found automatically. Only browse for a folder if your Steam install lives in a custom path or on another drive.",
+                );
+            });
             ui.label(
                 RichText::new(
                     "Leave the override empty to auto-detect ~/.local/share/Steam, ~/.steam/steam, or Flatpak Steam.",
@@ -2384,34 +2393,61 @@ impl LuaToolsApp {
 
             ui.add_space(4.0);
             let mut general_prefs_changed = false;
-            if ui
-                .checkbox(
-                    &mut self.settings_service.settings.auto_update_apps,
-                    "Allow games to auto-update in Steam",
-                )
-                .on_hover_text("Comments out setManifestid pins on standard installs so Steam can download new updates.")
-                .changed()
-            {
-                general_prefs_changed = true;
-            }
-            if ui
-                .checkbox(
-                    &mut self.settings_service.settings.fast_fetch,
-                    "Auto-pick fastest available download source (FastFetch)",
-                )
-                .changed()
-            {
-                general_prefs_changed = true;
-            }
-            if ui
-                .checkbox(
-                    &mut self.settings_service.settings.donate_keys,
-                    "Share newly found decryption keys to help the community",
-                )
-                .changed()
-            {
-                general_prefs_changed = true;
-            }
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if ui
+                    .checkbox(
+                        &mut self.settings_service.settings.auto_update_apps,
+                        "Allow games to auto-update in Steam",
+                    )
+                    .on_hover_text("Comments out setManifestid pins on standard installs so Steam can download new updates.")
+                    .changed()
+                {
+                    general_prefs_changed = true;
+                }
+                help_tip_icon(
+                    ui,
+                    "settings_help_general_auto_update",
+                    "Auto-Update Games in Steam",
+                    "Lets Steam download new official patches for games you add through LuaTools. Keep this checked if you want your games to stay up to date automatically. Uncheck it if you use mods or older game builds that break when Steam updates.",
+                );
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if ui
+                    .checkbox(
+                        &mut self.settings_service.settings.fast_fetch,
+                        "Auto-pick fastest available download source (FastFetch)",
+                    )
+                    .changed()
+                {
+                    general_prefs_changed = true;
+                }
+                help_tip_icon(
+                    ui,
+                    "settings_help_general_fast_fetch",
+                    "FastFetch Download Source",
+                    "Automatically tests available manifest servers and picks the fastest one when you add a game. Most users should keep this on for quicker downloads. Turning it off makes LuaTools try servers in its standard fallback order instead.",
+                );
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if ui
+                    .checkbox(
+                        &mut self.settings_service.settings.donate_keys,
+                        "Share newly found decryption keys to help the community",
+                    )
+                    .changed()
+                {
+                    general_prefs_changed = true;
+                }
+                help_tip_icon(
+                    ui,
+                    "settings_help_general_donate_keys",
+                    "Share Decryption Keys",
+                    "Anonymously shares newly discovered Steam depot decryption keys from your local Steam config so other users can download those games too. It never uploads your Steam login, password, or personal files. Keep it on to help the community, or turn it off to disable sharing.",
+                );
+            });
             if general_prefs_changed {
                 let _ = self.settings_service.save();
             }
@@ -2419,7 +2455,7 @@ impl LuaToolsApp {
             ui.add_space(6.0);
             let mut confirm_restart_steam = false;
             let mut confirm_kill_steam = false;
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 if secondary_button(ui, "Rescan Steam").clicked() {
                     self.detect_steam_and_sync();
@@ -2450,6 +2486,12 @@ impl LuaToolsApp {
                 {
                     confirm_kill_steam = true;
                 }
+                help_tip_icon(
+                    ui,
+                    "settings_help_general_steam_actions",
+                    "Steam Control Buttons",
+                    "Rescan Steam searches again if you just installed or moved Steam, and Donate Keys Now uploads new depot keys immediately. Restart Steam cleanly reopens Steam so newly added games appear in your library. Kill Steam force-closes every Steam process if Steam freezes.",
+                );
             });
             if confirm_restart_steam {
                 self.request_confirm_action(
@@ -2484,11 +2526,20 @@ impl LuaToolsApp {
             egui::Sides::new().show(
                 ui,
                 |ui| {
-                    ui.label(
-                        RichText::new("Desktop Autostart & System Tray")
-                            .font(display_font(17.5))
-                            .color(Palette::TEXT_PRIMARY),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(
+                            RichText::new("Desktop Autostart & System Tray")
+                                .font(display_font(17.5))
+                                .color(Palette::TEXT_PRIMARY),
+                        );
+                        help_tip_icon(
+                            ui,
+                            "settings_help_general_autostart_tray",
+                            "Desktop Autostart & System Tray",
+                            "Controls whether LuaTools opens when you log in and whether it stays tucked into your taskbar tray area. You can safely leave these off if you prefer opening LuaTools only when you need it. Turning them on keeps background helpers like the Steam Store button ready automatically.",
+                        );
+                    });
                 },
                 |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
@@ -2512,38 +2563,65 @@ impl LuaToolsApp {
                 .color(Palette::TEXT_MUTED),
             );
 
-            if ui
-                .checkbox(
-                    &mut self.settings_service.settings.autostart,
-                    "Start LuaTools automatically on OS login (--minimized --tray-locked)",
-                )
-                .on_hover_text(
-                    "Writes or removes ~/.config/autostart/luatools.desktop (also controllable via --autostart-enable / --autostart-disable)",
-                )
-                .changed()
-            {
-                autostart_toggled = Some(self.settings_service.settings.autostart);
-            }
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if ui
+                    .checkbox(
+                        &mut self.settings_service.settings.autostart,
+                        "Start LuaTools automatically on OS login (--minimized --tray-locked)",
+                    )
+                    .on_hover_text(
+                        "Writes or removes ~/.config/autostart/luatools.desktop (also controllable via --autostart-enable / --autostart-disable)",
+                    )
+                    .changed()
+                {
+                    autostart_toggled = Some(self.settings_service.settings.autostart);
+                }
+                help_tip_icon(
+                    ui,
+                    "settings_help_general_autostart",
+                    "Start Automatically on Login",
+                    "Adds a standard Linux startup entry so LuaTools starts quietly in the background whenever you log into your desktop. Turn this on if you regularly use the Steam Store button or live file watcher. Unchecking it removes the startup entry right away.",
+                );
+            });
 
-            if ui
-                .checkbox(
-                    &mut self.settings_service.settings.close_to_tray,
-                    "Keep running in system tray when closing window (falls back safely to normal close if no tray host exists)",
-                )
-                .changed()
-            {
-                tray_prefs_changed = true;
-            }
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if ui
+                    .checkbox(
+                        &mut self.settings_service.settings.close_to_tray,
+                        "Keep running in system tray when closing window (falls back safely to normal close if no tray host exists)",
+                    )
+                    .changed()
+                {
+                    tray_prefs_changed = true;
+                }
+                help_tip_icon(
+                    ui,
+                    "settings_help_general_close_tray",
+                    "Keep Running in System Tray",
+                    "Clicking the window's X button hides LuaTools to your system tray instead of quitting completely, keeping background Steam helpers active. If your desktop (such as Steam Deck Game Mode) has no tray, closing the window exits normally so the app never disappears out of reach.",
+                );
+            });
 
-            if ui
-                .checkbox(
-                    &mut self.settings_service.settings.minimize_to_tray,
-                    "Hide window to system tray when minimized (stays in taskbar if no tray host exists)",
-                )
-                .changed()
-            {
-                tray_prefs_changed = true;
-            }
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if ui
+                    .checkbox(
+                        &mut self.settings_service.settings.minimize_to_tray,
+                        "Hide window to system tray when minimized (stays in taskbar if no tray host exists)",
+                    )
+                    .changed()
+                {
+                    tray_prefs_changed = true;
+                }
+                help_tip_icon(
+                    ui,
+                    "settings_help_general_minimize_tray",
+                    "Hide to Tray When Minimized",
+                    "Moves LuaTools off your taskbar and into the small system tray icon when you minimize the window. Turn this on if you like a clean taskbar while downloads or watchers run. Leave it off to keep minimized windows on your normal taskbar.",
+                );
+            });
         });
 
         if let Some(enable) = autostart_toggled {
@@ -2584,11 +2662,20 @@ impl LuaToolsApp {
             egui::Sides::new().show(
                 ui,
                 |ui| {
-                    ui.label(
-                        RichText::new("LuaTools Account (Discord)")
-                            .font(display_font(17.5))
-                            .color(Palette::TEXT_PRIMARY),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(
+                            RichText::new("LuaTools Account (Discord)")
+                                .font(display_font(17.5))
+                                .color(Palette::TEXT_PRIMARY),
+                        );
+                        help_tip_icon(
+                            ui,
+                            "settings_help_account_discord",
+                            "LuaTools Account (Discord)",
+                            "Connects your Discord account to lua.tools so LuaTools can download game manifests for you. You only need to sign in once — click 'Sign In with Browser' for the quickest setup. Click Sign Out anytime to disconnect your account from this computer.",
+                        );
+                    });
                 },
                 |ui| {
                     if self.auth_service.is_signed_in() {
@@ -2623,7 +2710,7 @@ impl LuaToolsApp {
                 );
             }
 
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 if primary_button(ui, "Sign In with Browser").clicked() {
                     let auth = self.auth_service.clone();
@@ -2662,6 +2749,12 @@ impl LuaToolsApp {
                         "Enter the 6-character code from Discord /login:".into();
                     self.text_prompt_modal.value.clear();
                 }
+                help_tip_icon(
+                    ui,
+                    "settings_help_account_bot_code",
+                    "6-Character Discord Bot Code",
+                    "An easy backup sign-in method if your browser or Steam Deck won't pass a login back to LuaTools. Run /login with the LuaTools Discord bot to get a 6-character code, then click this button and type it in. Most desktop users can simply use 'Sign In with Browser' instead.",
+                );
                 if self.auth_service.is_signed_in() && danger_button(ui, "Sign Out").clicked() {
                     self.auth_service.sign_out();
                     self.settings_usage_text.clear();
@@ -2675,11 +2768,20 @@ impl LuaToolsApp {
         paper_card(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 10.0;
-            ui.label(
-                RichText::new("Hubcap Manifest Provider")
-                    .font(display_font(17.5))
-                    .color(Palette::TEXT_PRIMARY),
-            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(
+                    RichText::new("Hubcap Manifest Provider")
+                        .font(display_font(17.5))
+                        .color(Palette::TEXT_PRIMARY),
+                );
+                help_tip_icon(
+                    ui,
+                    "settings_help_account_hubcap",
+                    "Hubcap Manifest Provider",
+                    "An optional extra manifest source from hubcapmanifest.com that gives LuaTools another place to look if a game isn't found on the main source. You can safely leave this blank for everyday use. If you have an smm_ API key, paste it here and click 'Verify Key' to confirm it works and view your daily quota.",
+                );
+            });
             ui.label(
                 RichText::new("Optional API key from hubcapmanifest.com (smm_ + 96 hex chars).")
                     .size(12.5)
@@ -2764,11 +2866,20 @@ impl LuaToolsApp {
         paper_card(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 10.0;
-            ui.label(
-                RichText::new("Steam DepotDownloader Session")
-                    .font(display_font(17.5))
-                    .color(Palette::TEXT_PRIMARY),
-            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(
+                    RichText::new("Steam DepotDownloader Session")
+                        .font(display_font(17.5))
+                        .color(Palette::TEXT_PRIMARY),
+                );
+                help_tip_icon(
+                    ui,
+                    "settings_help_account_depotdownloader",
+                    "Steam DepotDownloader Session",
+                    "Used only when downloading raw game files directly from Steam's servers inside the Depots & Vault tab. Leave the username blank if you don't use manual depot downloads or only download public files. If Steam asks for an account, click 'Sign In via QR (Terminal)' to scan a Steam Guard QR code once so future downloads work automatically.",
+                );
+            });
             ui.label(
                 RichText::new(
                     "Official SteamRE/DepotDownloader authenticates with your Steam account for owned depots (-remember-password) or runs anonymously for public depots.",
@@ -2826,11 +2937,20 @@ impl LuaToolsApp {
             egui::Sides::new().show(
                 ui,
                 |ui| {
-                    ui.label(
-                        RichText::new("1-Click Steam Unlocker")
-                            .font(display_font(17.5))
-                            .color(Palette::TEXT_PRIMARY),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(
+                            RichText::new("1-Click Steam Unlocker")
+                                .font(display_font(17.5))
+                                .color(Palette::TEXT_PRIMARY),
+                        );
+                        help_tip_icon(
+                            ui,
+                            "settings_help_setup_unlocker",
+                            "1-Click Steam Unlocker",
+                            "Installs the core add-ons (SLSsteam and Millennium) that let Steam recognize and launch games added with LuaTools. Almost every user needs to click 'Install Steam Unlocker + Millennium' once during first-time setup — no admin password needed. Clicking Uninstall cleanly removes these add-ons if you ever want stock Steam back.",
+                        );
+                    });
                 },
                 |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
@@ -2846,7 +2966,7 @@ impl LuaToolsApp {
             );
             ui.label(
                 RichText::new(
-                    "Install Steam Unlocker so Steam can recognize and launch games added with LuaTools. No root password required.",
+                    "Install Steam Unlocker (SLSsteam + Millennium) so Steam can recognize and launch games added with LuaTools. No root password required.",
                 )
                 .size(12.5)
                 .color(Palette::TEXT_MUTED),
@@ -2882,6 +3002,12 @@ impl LuaToolsApp {
                     } else {
                         status_badge(ui, "Missing", BadgeTone::Warn);
                     }
+                    help_tip_icon(
+                        ui,
+                        "settings_help_setup_unlocker_sha256",
+                        "Unlocker File Verification (SHA-256)",
+                        "Shows the digital fingerprint of the installed Steam Unlocker files on your PC. 'SHA-256 Verified' confirms the file is installed and intact, while 'Missing' means you should run the Install button below. You only need 'Copy' if someone asks for your checksum while troubleshooting.",
+                    );
                 });
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
@@ -2914,7 +3040,7 @@ impl LuaToolsApp {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 ui.add_enabled_ui(!self.wired_busy, |ui| {
-                    if primary_button(ui, "Install Steam Unlocker").clicked() {
+                    if primary_button(ui, "Install Steam Unlocker + Millennium").clicked() {
                         wired_act = Some("steam_unlocker");
                     }
                     if wired_st.accela_installed && secondary_button(ui, "Launch ACCELA").clicked() {
@@ -2980,11 +3106,20 @@ impl LuaToolsApp {
             egui::Sides::new().show(
                 ui,
                 |ui| {
-                    ui.label(
-                        RichText::new("SLSsteam Options")
-                            .font(display_font(17.5))
-                            .color(Palette::TEXT_PRIMARY),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(
+                            RichText::new("SLSsteam Options")
+                                .font(display_font(17.5))
+                                .color(Palette::TEXT_PRIMARY),
+                        );
+                        help_tip_icon(
+                            ui,
+                            "settings_help_setup_slssteam",
+                            "SLSsteam Options",
+                            "Controls how the Steam Unlocker behaves once installed and shows how many unlocked games and keys are currently synced. Most users can keep the defaults as they are. Click 'Sync Unlocker Settings Now' anytime to write your latest choices straight to Steam's unlocker config.",
+                        );
+                    });
                 },
                 |ui| {
                     if plugin_installed {
@@ -3005,26 +3140,44 @@ impl LuaToolsApp {
                 .size(12.5)
                 .color(Palette::TEXT_MUTED),
             );
-            if ui
-                .checkbox(
-                    &mut cfg.play_not_owned,
-                    "Allow playing unowned games in Steam (recommended)",
-                )
-                .changed()
-            {
-                sync_play_unowned = true;
-            }
-            if ui
-                .checkbox(
-                    &mut cfg.limit_downloads,
-                    "Keep downloads inside Steam Library folders only",
-                )
-                .changed()
-            {
-                sls_toggled = true;
-            }
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if ui
+                    .checkbox(
+                        &mut cfg.play_not_owned,
+                        "Allow playing unowned games in Steam (recommended)",
+                    )
+                    .changed()
+                {
+                    sync_play_unowned = true;
+                }
+                help_tip_icon(
+                    ui,
+                    "settings_help_setup_play_unowned",
+                    "Allow Playing Unowned Games",
+                    "Tells Steam to show a normal 'Play' button instead of 'Purchase' for games you added through LuaTools. Keep this checked unless you are intentionally testing without it. Toggling it updates your Steam unlocker config immediately.",
+                );
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if ui
+                    .checkbox(
+                        &mut cfg.limit_downloads,
+                        "Keep downloads inside Steam Library folders only",
+                    )
+                    .changed()
+                {
+                    sls_toggled = true;
+                }
+                help_tip_icon(
+                    ui,
+                    "settings_help_setup_limit_downloads",
+                    "Limit Downloads to Steam Folders",
+                    "Keeps game downloads restricted to your regular Steam Library folders so files do not accidentally get saved elsewhere. Most users can safely leave this on its default setting. Only change it if you intentionally download games outside Steam's library folders.",
+                );
+            });
             ui.horizontal(|ui| {
-                let w = (ui.available_width() - 100.0).max(180.0);
+                let w = (ui.available_width() - 130.0).max(180.0);
                 ui.add_sized(
                     [w, 32.0],
                     TextEdit::singleline(&mut cfg.workshop_path)
@@ -3041,6 +3194,12 @@ impl LuaToolsApp {
                         }
                     });
                 }
+                help_tip_icon(
+                    ui,
+                    "settings_help_setup_custom_depotdownloader",
+                    "Custom DepotDownloader Path",
+                    "Lets you point LuaTools to your own DepotDownloader executable file. Almost everyone should leave this box empty so LuaTools uses the version managed in Updates & Tools. Only pick a file here if you maintain a custom DepotDownloader build yourself.",
+                );
             });
             if secondary_button(ui, "Sync Unlocker Settings Now").clicked() {
                 sync_play_unowned = true;
@@ -3086,11 +3245,20 @@ impl LuaToolsApp {
             egui::Sides::new().show(
                 ui,
                 |ui| {
-                    ui.label(
-                        RichText::new("Cloud Save Redirect (Steam Cloud Revival)")
-                            .font(display_font(17.5))
-                            .color(Palette::TEXT_PRIMARY),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(
+                            RichText::new("Cloud Save Redirect (Steam Cloud Revival)")
+                                .font(display_font(17.5))
+                                .color(Palette::TEXT_PRIMARY),
+                        );
+                        help_tip_icon(
+                            ui,
+                            "settings_help_setup_cloud_redirect",
+                            "Cloud Save Redirect",
+                            "Brings back Steam Cloud save syncing for games added with LuaTools using the CloudRedirect plugin. You only need this for games whose saves you want backed up or synced between devices like a PC and Steam Deck. Tick the games you want (or enter an AppID), then click 'Sync to CloudRedirect' to save your list.",
+                        );
+                    });
                 },
                 |ui| match &cr_status {
                     CloudRedirectStatus::Active => {
@@ -3187,11 +3355,20 @@ impl LuaToolsApp {
         paper_card(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 10.0;
-            ui.label(
-                RichText::new("Steam Store Page Plugin & URI Links")
-                    .font(display_font(17.5))
-                    .color(Palette::TEXT_PRIMARY),
-            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(
+                    RichText::new("Steam Store Page Plugin & URI Links")
+                        .font(display_font(17.5))
+                        .color(Palette::TEXT_PRIMARY),
+                );
+                help_tip_icon(
+                    ui,
+                    "settings_help_setup_store_plugin",
+                    "Steam Store Page Plugin & Links",
+                    "Adds a direct LuaTools install button inside Steam Store game pages and lets your browser open luatools:// links straight into this app. Install this if you want to add games right while browsing Steam instead of typing AppIDs manually. You can safely skip it if you prefer searching inside LuaTools.",
+                );
+            });
             ui.label(
                 RichText::new(
                     "Adds LuaTools install buttons inside the Steam Store and registers luatools:// browser links on your desktop.",
@@ -3208,16 +3385,25 @@ impl LuaToolsApp {
                         Palette::TEXT_SECONDARY
                     }),
             );
-            if ui
-                .checkbox(
-                    &mut self.settings_service.settings.cef_bridge_enabled,
-                    "Enable Steam Store CEF Bridge (needed on Linux so Steam Store pages allow the LuaTools button)",
-                )
-                .on_hover_text("Connects Steam's local CEF DevTools (:8080) to LuaTools local RPC (:6767)")
-                .changed()
-            {
-                cef_toggled = true;
-            }
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if ui
+                    .checkbox(
+                        &mut self.settings_service.settings.cef_bridge_enabled,
+                        "Enable Steam Store CEF Bridge (needed on Linux so Steam Store pages allow the LuaTools button)",
+                    )
+                    .on_hover_text("Connects Steam's local CEF DevTools (:8080) to LuaTools local RPC (:6767)")
+                    .changed()
+                {
+                    cef_toggled = true;
+                }
+                help_tip_icon(
+                    ui,
+                    "settings_help_setup_cef_bridge",
+                    "Steam Store CEF Bridge",
+                    "Runs a tiny local helper inside LuaTools that talks to Steam's built-in browser so the Store Page button works properly on Linux. Turn this on if you use the Steam Store button and it doesn't appear or respond. Turn it off if you don't use the Steam Store plugin.",
+                );
+            });
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
                 if primary_button(ui, "Install Store Page Plugin (LTSP)")
@@ -3266,6 +3452,12 @@ impl LuaToolsApp {
                     );
                     self.probe_bridge_async(ui.ctx());
                 }
+                help_tip_icon(
+                    ui,
+                    "settings_help_setup_store_buttons",
+                    "Store Plugin Setup Buttons",
+                    "'Install Store Page Plugin' downloads the LuaTools button into Steam's Millennium plugins folder. 'Register luatools:// Links' teaches your Linux desktop to open luatools:// links in this app. 'Enable Steam CEF Debugging' creates a small Steam marker file needed on Linux (restart Steam afterward), and 'Check Millennium Status' verifies that Steam sees the plugin.",
+                );
             });
         });
 
@@ -3328,31 +3520,55 @@ impl LuaToolsApp {
         paper_card(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 10.0;
-            ui.label(
-                RichText::new("Application Self-Updater (Git)")
-                    .font(display_font(17.5))
-                    .color(Palette::TEXT_PRIMARY),
-            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(
+                    RichText::new("Application Self-Updater (Git)")
+                        .font(display_font(17.5))
+                        .color(Palette::TEXT_PRIMARY),
+                );
+                help_tip_icon(
+                    ui,
+                    "settings_help_updates_git_updater",
+                    "App Self-Updater (Git)",
+                    "Downloads the newest version of LuaToolsLinux from GitHub and rebuilds it in place so you get bug fixes and new features easily. Most users can leave the URL and folder boxes blank to use the built-in defaults. Click 'Check for Updates' to see if a newer release is out, or 'Pull & Update Now' to install it.",
+                );
+            });
             ui.label(
                 RichText::new(&self.settings_update_status)
                     .size(12.5)
                     .color(Palette::BLUE_LIGHT),
             );
-            if ui
-                .checkbox(
-                    &mut self.settings_service.settings.check_updates_on_startup,
-                    "Check for updates automatically on startup",
-                )
-                .changed()
-            {
-                let _ = self.settings_service.save();
-            }
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if ui
+                    .checkbox(
+                        &mut self.settings_service.settings.check_updates_on_startup,
+                        "Check for updates automatically on startup",
+                    )
+                    .changed()
+                {
+                    let _ = self.settings_service.save();
+                }
+                help_tip_icon(
+                    ui,
+                    "settings_help_updates_auto_check",
+                    "Check Updates on Startup",
+                    "Quickly checks GitHub when LuaTools opens and shows a banner if a newer version is available. It never updates automatically behind your back — you always decide when to install. Turn this off if you prefer staying offline or checking manually.",
+                );
+            });
 
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Remote URL:")
                         .size(12.5)
                         .color(Palette::TEXT_SECONDARY),
+                );
+                help_tip_icon(
+                    ui,
+                    "settings_help_updates_git_paths",
+                    "Custom Git Remote & Repo Folder",
+                    "Only needed for developers or users testing a custom fork of LuaToolsLinux. Everyone else should leave both Remote URL and Local Repo blank so LuaTools automatically uses the official GitHub repository and its default folder.",
                 );
                 let w = (ui.available_width() - 12.0).max(180.0);
                 ui.add_sized(
@@ -3447,11 +3663,20 @@ impl LuaToolsApp {
             |ui| {
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.label(
-                        RichText::new("External Toolchain")
-                            .font(display_font(17.5))
-                            .color(Palette::TEXT_PRIMARY),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(
+                            RichText::new("External Toolchain")
+                                .font(display_font(17.5))
+                                .color(Palette::TEXT_PRIMARY),
+                        );
+                        help_tip_icon(
+                            ui,
+                            "settings_help_updates_toolchain",
+                            "External Helper Tools",
+                            "Optional open-source tools that unlock extra features like offline play, manual depot downloads, and DRM unpacking. LuaTools downloads and sets up each tool in its own local folder when you click 'Install / Update'. You only need to install the specific tools you plan to use.",
+                        );
+                    });
                     ui.label(
                         RichText::new(
                             "Optional helper tools for offline Steam emulation, depot downloading, and unpacking SteamStub executables:",
@@ -3506,6 +3731,29 @@ impl LuaToolsApp {
                 }
                 _ => "",
             };
+            let tool_help_id = format!("settings_help_tool_{}", spec.key);
+            let (tool_help_title, tool_help_body) = match spec.key {
+                "depotdownloader" => (
+                    "DepotDownloaderMod",
+                    "Downloads game content files directly from Steam's servers using manifest files and decryption keys. Install this if you want to download games or specific DLC depots inside the 'Depots & Vault' tab. Clicking 'Install / Update' fetches the latest release into LuaTools's local tools folder.",
+                ),
+                "goldberg" => (
+                    "Goldberg Steam Emulator",
+                    "Replaces a game's Steam library file so the game can run completely offline without needing Steam online checks. Recommended for most users — installing this enables the 1-click 'Offline Patch (Goldberg)' and 'Recommended Fixes' buttons. Clicking 'Install / Update' downloads the Linux and Windows/Proton files automatically.",
+                ),
+                "steamautopatch" => (
+                    "SteamAutoPatch",
+                    "Automatically patches an entire game folder with the Goldberg offline emulator and creates the Steam interface files the game expects. Useful when a game won't start normally and needs a quick offline patch. Click 'Install / Update' first, then use 'Run on Game Folder…' to pick the game's folder.",
+                ),
+                "stub_remover" => (
+                    "StubRemover (Steamless)",
+                    "Removes Steam's outer wrapper (SteamStub DRM) from older Windows game .exe files using Wine so they can launch with an offline emulator. You can safely skip this unless a game immediately crashes or refuses to open after patching. Install it first, then click 'Unpack .exe…' and choose the game's main executable.",
+                ),
+                _ => (
+                    spec.name,
+                    "Optional helper tool managed by LuaTools. Click 'Install / Update' to download the latest release into your local tools folder, or 'Open Folder' to inspect its files.",
+                ),
+            };
 
             paper_card_padded(ui, Margin::same(16), |ui| {
                 ui.set_width(ui.available_width());
@@ -3514,11 +3762,13 @@ impl LuaToolsApp {
                     ui,
                     |ui| {
                         ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
                             ui.label(
                                 RichText::new(spec.name)
                                     .font(semibold_font(14.5))
                                     .color(Palette::TEXT_PRIMARY),
                             );
+                            help_tip_icon(ui, &tool_help_id, tool_help_title, tool_help_body);
                             ui.label(
                                 RichText::new(format!("github.com/{}", spec.github_repo))
                                     .font(FontId::new(11.5, FontFamily::Monospace))
@@ -3638,11 +3888,20 @@ impl LuaToolsApp {
             egui::Sides::new().show(
                 ui,
                 |ui| {
-                    ui.label(
-                        RichText::new("Bug-Fixing Telemetry & Privacy Controls")
-                            .font(display_font(17.5))
-                            .color(Palette::TEXT_PRIMARY),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(
+                            RichText::new("Bug-Fixing Telemetry & Privacy Controls")
+                                .font(display_font(17.5))
+                                .color(Palette::TEXT_PRIMARY),
+                        );
+                        help_tip_icon(
+                            ui,
+                            "settings_help_diag_telemetry",
+                            "Diagnostic Telemetry & Privacy",
+                            "Saves a local log of crashes, errors, and basic Linux system info (like distro and display driver) so bugs are much easier to fix. Your Steam username, passwords, Discord tokens, and game keys are automatically stripped out before anything is written. Nothing leaves your PC unless you share a report or set a remote URL below.",
+                        );
+                    });
                 },
                 |ui| {
                     if self.settings_service.settings.telemetry_enabled {
@@ -3667,15 +3926,24 @@ impl LuaToolsApp {
                 .color(Palette::TEXT_MUTED),
             );
 
-            if ui
-                .checkbox(
-                    &mut self.settings_service.settings.telemetry_enabled,
-                    "Enable anonymous diagnostic & crash telemetry for bug fixing",
-                )
-                .changed()
-            {
-                toggled_telemetry = true;
-            }
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if ui
+                    .checkbox(
+                        &mut self.settings_service.settings.telemetry_enabled,
+                        "Enable anonymous diagnostic & crash telemetry for bug fixing",
+                    )
+                    .changed()
+                {
+                    toggled_telemetry = true;
+                }
+                help_tip_icon(
+                    ui,
+                    "settings_help_diag_telemetry_toggle",
+                    "Enable Diagnostic Logging",
+                    "Turns local crash and error recording on or off. Leave it on if you want helpful logs ready in case something breaks; turn it off if you prefer LuaTools to record nothing at all. Click 'Clear Collected Data' anytime to wipe past entries.",
+                );
+            });
 
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
@@ -3740,11 +4008,20 @@ impl LuaToolsApp {
         paper_card(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 10.0;
-            ui.label(
-                RichText::new("Share Diagnostics for Bug Fixing")
-                    .font(display_font(17.5))
-                    .color(Palette::TEXT_PRIMARY),
-            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(
+                    RichText::new("Share Diagnostics for Bug Fixing")
+                        .font(display_font(17.5))
+                        .color(Palette::TEXT_PRIMARY),
+                );
+                help_tip_icon(
+                    ui,
+                    "settings_help_diag_share",
+                    "Share a Bug Report",
+                    "Helps you report a problem without hunting down log files by hand. 'Report Bug on GitHub' opens a pre-filled issue page, 'Copy Diagnostic Markdown' copies a privacy-cleaned summary to your clipboard, and 'Export Report File' saves it to a folder you choose. You only need these buttons when something goes wrong and you want help.",
+                );
+            });
             ui.label(
                 RichText::new(
                     "Generate a clean, PII-scrubbed Markdown summary of your Linux environment and recent errors to attach to a bug report.",
@@ -3797,11 +4074,20 @@ impl LuaToolsApp {
         paper_card(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 10.0;
-            ui.label(
-                RichText::new("Optional Remote Telemetry Collector")
-                    .font(display_font(17.5))
-                    .color(Palette::TEXT_PRIMARY),
-            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(
+                    RichText::new("Optional Remote Telemetry Collector")
+                        .font(display_font(17.5))
+                        .color(Palette::TEXT_PRIMARY),
+                );
+                help_tip_icon(
+                    ui,
+                    "settings_help_diag_remote",
+                    "Remote Telemetry Collector (Optional)",
+                    "Lets advanced users or testers automatically forward scrubbed crash reports to their own HTTPS server or Discord webhook. Regular users should leave this box completely blank so all logs stay 100% on your own computer. If you enter a URL, click 'Test Endpoint' to check that it receives a sample ping.",
+                );
+            });
             ui.label(
                 RichText::new(
                     "Leave blank to keep telemetry 100% local, or configure an HTTPS JSON collector / Discord webhook URL to receive scrubbed bug events automatically when telemetry is enabled.",
@@ -3872,11 +4158,20 @@ impl LuaToolsApp {
             egui::Sides::new().show(
                 ui,
                 |ui| {
-                    ui.label(
-                        RichText::new("DNS-over-HTTPS (DoH) Resolver")
-                            .font(display_font(17.5))
-                            .color(Palette::TEXT_PRIMARY),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(
+                            RichText::new("DNS-over-HTTPS (DoH) Resolver")
+                                .font(display_font(17.5))
+                                .color(Palette::TEXT_PRIMARY),
+                        );
+                        help_tip_icon(
+                            ui,
+                            "settings_help_diag_doh",
+                            "DNS-over-HTTPS (DoH)",
+                            "Looks up Steam web addresses over an encrypted connection (Cloudflare 1.1.1.1 by default) instead of your ISP's plain DNS. Most users can leave this off if downloads and store lookups already work normally. Turn it on if your network or ISP blocks or slows down Steam lookups, then click 'Test Resolution' to confirm it works.",
+                        );
+                    });
                 },
                 |ui| {
                     if self.settings_service.settings.doh_enabled {
@@ -3894,20 +4189,29 @@ impl LuaToolsApp {
                 .color(Palette::TEXT_MUTED),
             );
 
-            if ui
-                .checkbox(
-                    &mut self.settings_service.settings.doh_enabled,
-                    "Enable DNS-over-HTTPS for Steam domain resolution",
-                )
-                .on_hover_text("Encrypts DNS queries for Steam API and CDN domains")
-                .changed()
-            {
-                crate::services::doh_resolver::DohResolver::configure_global(
-                    self.settings_service.settings.doh_enabled,
-                    &self.settings_service.settings.doh_endpoint,
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if ui
+                    .checkbox(
+                        &mut self.settings_service.settings.doh_enabled,
+                        "Enable DNS-over-HTTPS for Steam domain resolution",
+                    )
+                    .on_hover_text("Encrypts DNS queries for Steam API and CDN domains")
+                    .changed()
+                {
+                    crate::services::doh_resolver::DohResolver::configure_global(
+                        self.settings_service.settings.doh_enabled,
+                        &self.settings_service.settings.doh_endpoint,
+                    );
+                    let _ = self.settings_service.save();
+                }
+                help_tip_icon(
+                    ui,
+                    "settings_help_diag_doh_toggle",
+                    "Turn On Encrypted Steam DNS",
+                    "Switches LuaTools from your system's normal DNS to encrypted DNS-over-HTTPS for Steam API and store requests. Changes apply immediately and save automatically. Leave it unchecked if you use a custom local DNS or VPN that should handle lookups instead.",
                 );
-                let _ = self.settings_service.save();
-            }
+            });
 
             ui.horizontal(|ui| {
                 let w = (ui.available_width() - 140.0).max(180.0);
@@ -3988,11 +4292,20 @@ impl LuaToolsApp {
             egui::Sides::new().show(
                 ui,
                 |ui| {
-                    ui.label(
-                        RichText::new("Recorded Telemetry Events (Newest First)")
-                            .font(display_font(17.0))
-                            .color(Palette::TEXT_PRIMARY),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(
+                            RichText::new("Recorded Telemetry Events (Newest First)")
+                                .font(display_font(17.0))
+                                .color(Palette::TEXT_PRIMARY),
+                        );
+                        help_tip_icon(
+                            ui,
+                            "settings_help_diag_events_log",
+                            "Recorded Event Log",
+                            "Shows the exact privacy-scrubbed entries saved on your computer so you can inspect everything LuaTools has logged. Look here for red ERROR or yellow WARN rows if a feature did not work as expected, or click 'Refresh' to load the newest entries.",
+                        );
+                    });
                 },
                 |ui| {
                     if ghost_button(ui, "Refresh").clicked() {
@@ -4111,11 +4424,20 @@ impl LuaToolsApp {
             egui::Sides::new().show(
                 ui,
                 |ui| {
-                    ui.label(
-                        RichText::new("Steam Client Interop (libsteam_integration.so)")
-                            .font(display_font(17.5))
-                            .color(Palette::TEXT_PRIMARY),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(
+                            RichText::new("Steam Client Interop (libsteam_integration.so)")
+                                .font(display_font(17.5))
+                                .color(Palette::TEXT_PRIMARY),
+                        );
+                        help_tip_icon(
+                            ui,
+                            "settings_help_bridge_interop",
+                            "Native Steam Bridge (Advanced)",
+                            "An optional Linux helper library that runs alongside Steam to handle live ownership checks, AppID 480 multiplayer redirects, depot keys, and version pins without needing root access. Most beginners can skip this if 1-Click Steam Unlocker already works for them. Click 'Install Integration (No Root)' to set up a safe launcher script, or 'Uninstall Integration' to remove it cleanly.",
+                        );
+                    });
                 },
                 |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
@@ -4161,10 +4483,19 @@ impl LuaToolsApp {
                 .color(Palette::TEXT_MUTED),
             );
 
-            ui.checkbox(
-                &mut self.bridge_system_preload,
-                "Enable system-wide LD_PRELOAD in /etc/ld.so.preload (requires administrator/root; optional — per-launch launcher works without it)",
-            );
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.checkbox(
+                    &mut self.bridge_system_preload,
+                    "Enable system-wide LD_PRELOAD in /etc/ld.so.preload (requires administrator/root; optional — per-launch launcher works without it)",
+                );
+                help_tip_icon(
+                    ui,
+                    "settings_help_bridge_system_preload",
+                    "System-Wide Preload (/etc/ld.so.preload)",
+                    "Loads the Steam bridge automatically across your whole system so Steam uses it even when launched from regular desktop icons. Most users should leave this UNCHECKED because it requires your admin password and edits a system file. Only enable it if you specifically want global preloading; otherwise use the normal no-root install.",
+                );
+            });
             ui.label(
                 RichText::new("Recommended: leave unchecked. Use ~/.local/bin/luatools-steam-launcher to start Steam instead.")
                     .size(11.0)
@@ -4252,11 +4583,20 @@ impl LuaToolsApp {
             egui::Sides::new().show(
                 ui,
                 |ui| {
-                    ui.label(
-                        RichText::new("ELF64 Binary & Pattern Tracker Status")
-                            .font(display_font(17.5))
-                            .color(Palette::TEXT_PRIMARY),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(
+                            RichText::new("ELF64 Binary & Pattern Tracker Status")
+                                .font(display_font(17.5))
+                                .color(Palette::TEXT_PRIMARY),
+                        );
+                        help_tip_icon(
+                            ui,
+                            "settings_help_bridge_elf_patterns",
+                            "Steam Binary & Pattern Scanner",
+                            "Reads your installed Steam files (steamclient.so and steamui.so) to find the exact spots where the native bridge connects. You can safely ignore this unless a Steam update broke bridge features. Clicking 'Scan Binaries & Load Patterns' inspects Steam safely without changing any Steam files.",
+                        );
+                    });
                 },
                 |ui| {
                     if st.patterns_loaded {
@@ -4323,11 +4663,20 @@ impl LuaToolsApp {
             egui::Sides::new().show(
                 ui,
                 |ui| {
-                    ui.label(
-                        RichText::new("Live stplug-in/ Hot-Reload Watcher (inotify)")
-                            .font(display_font(17.5))
-                            .color(Palette::TEXT_PRIMARY),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(
+                            RichText::new("Live stplug-in/ Hot-Reload Watcher (inotify)")
+                                .font(display_font(17.5))
+                                .color(Palette::TEXT_PRIMARY),
+                        );
+                        help_tip_icon(
+                            ui,
+                            "settings_help_bridge_hot_reload",
+                            "Live File Hot-Reload Watcher",
+                            "Watches your Steam stplug-in folder in real time and tells the Steam bridge whenever a .lua file is added, edited, or deleted. Start this if you often tweak .lua scripts or DLCs and want changes noticed right away without restarting Steam. You can safely leave it stopped if you rarely edit game configs.",
+                        );
+                    });
                 },
                 |ui| {
                     if hr_running {
