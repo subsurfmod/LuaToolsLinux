@@ -9,10 +9,10 @@ use crate::services::file_hash::{FileHash, FileHashService};
 
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use flate2::read::GzDecoder;
@@ -29,7 +29,91 @@ const ACCELA_REPO: &str = "ciscosweater/enter-the-wired";
 const ACCELA_FALLBACK_URL: &str =
     "https://github.com/ciscosweater/enter-the-wired/releases/download/latest/deps.tar.gz";
 pub const SLSSTEAM_REPO: &str = "swwayps/slsteam-moon";
-const MILLENNIUM_INSTALL_CMD: &str = r#"curl -fsSL "https://steambrew.app/install.sh" | bash"#;
+const MILLENNIUM_INSTALL_CMD: &str =
+    r#"curl -fsSL "https://steambrew.app/install.sh" | bash -s -- --yes"#;
+const SUDO_SECRET_ENV: &str = "LUATOOLS_ASKPASS_SECRET";
+
+/// Temporary, mode-0700 `SUDO_ASKPASS` + `PATH` `sudo -A` shim directory that is
+/// automatically removed on drop. The password itself is NEVER written to disk;
+/// the askpass helper reads it exclusively from `LUATOOLS_ASKPASS_SECRET`.
+struct SudoAskpassGuard {
+    root: PathBuf,
+    askpass_script: PathBuf,
+    shim_bin_dir: PathBuf,
+}
+
+impl SudoAskpassGuard {
+    fn create_for_env_secret() -> Result<Self, String> {
+        let askpass_body = format!("#!/bin/sh\nprintf '%s\\n' \"${}\"\n", SUDO_SECRET_ENV);
+        Self::create_with_askpass_body(&askpass_body)
+    }
+
+    fn create_for_gui_prompt() -> Result<Option<Self>, String> {
+        let has_display = std::env::var_os("DISPLAY").is_some()
+            || std::env::var_os("WAYLAND_DISPLAY").is_some();
+        if !has_display {
+            return Ok(None);
+        }
+        let body = if which_in_path("zenity").is_some() {
+            "#!/bin/sh\nexec zenity --password --title=\"Install Millennium (SteamBrew)\"\n"
+        } else if which_in_path("kdialog").is_some() {
+            "#!/bin/sh\nexec kdialog --password \"Administrator password required to install Millennium (SteamBrew):\"\n"
+        } else {
+            return Ok(None);
+        };
+        Self::create_with_askpass_body(body).map(Some)
+    }
+
+    fn create_with_askpass_body(askpass_body: &str) -> Result<Self, String> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir()
+            .join(format!("luatools_sudo_{}_{}", std::process::id(), nanos));
+        let shim_bin_dir = root.join("bin");
+        fs::create_dir_all(&shim_bin_dir)
+            .map_err(|e| format!("Failed to create sudo askpass directory: {}", e))?;
+        let _ = fs::set_permissions(&root, fs::Permissions::from_mode(0o700));
+        let _ = fs::set_permissions(&shim_bin_dir, fs::Permissions::from_mode(0o700));
+
+        let askpass_script = root.join("askpass.sh");
+        fs::write(&askpass_script, askpass_body)
+            .map_err(|e| format!("Failed to write askpass helper: {}", e))?;
+        fs::set_permissions(&askpass_script, fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("Failed to secure askpass helper: {}", e))?;
+
+        let real_sudo = which_in_path("sudo")
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "/usr/bin/sudo".to_string());
+        let sudo_shim = shim_bin_dir.join("sudo");
+        let shim_body = format!(
+            "#!/bin/sh\nexec {} -A \"$@\"\n",
+            shell_single_quote(&real_sudo)
+        );
+        fs::write(&sudo_shim, shim_body)
+            .map_err(|e| format!("Failed to write sudo -A shim: {}", e))?;
+        fs::set_permissions(&sudo_shim, fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("Failed to secure sudo -A shim: {}", e))?;
+
+        Ok(Self {
+            root,
+            askpass_script,
+            shim_bin_dir,
+        })
+    }
+
+    fn prepended_path(&self) -> String {
+        let cur = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
+        format!("{}:{}", self.shim_bin_dir.display(), cur)
+    }
+}
+
+impl Drop for SudoAskpassGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct WiredStatus {
@@ -374,11 +458,93 @@ impl WiredService {
         }
     }
 
-    pub fn install_slssteam<F>(&self, mut progress_cb: F) -> Result<PathBuf, String>
+    /// Returns `true` if `sudo` can run non-interactively right now (passwordless sudoers or
+    /// cached credential timestamp). Returns `true` in unit tests / `LUATOOLS_MOCK_LAUNCH=1`.
+    pub fn has_passwordless_sudo() -> bool {
+        let mock_launch = std::env::var("LUATOOLS_MOCK_LAUNCH")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if cfg!(test) || mock_launch {
+            return true;
+        }
+        Command::new("sudo")
+            .args(["-n", "true"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Validates an administrator (`sudo`) password via `sudo -S -v -p ""` without touching disk
+    /// or logging the password.
+    pub fn verify_sudo_password(password: &str) -> Result<(), String> {
+        let mock_launch = std::env::var("LUATOOLS_MOCK_LAUNCH")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if cfg!(test) || mock_launch {
+            return Ok(());
+        }
+        if password.is_empty() {
+            return Err("Administrator password cannot be empty.".into());
+        }
+        let mut child = Command::new("sudo")
+            .args(["-S", "-k", "-v", "-p", ""])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to invoke sudo: {}", e))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(password.as_bytes());
+            let _ = stdin.write_all(b"\n");
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|e| format!("Failed waiting for sudo validation: {}", e))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if err.to_ascii_lowercase().contains("not in the sudoers") {
+                Err("Your user account is not in the sudoers file. Choose 'Unlocker Only (No Sudo)' or add your user to sudoers.".into())
+            } else {
+                Err("Incorrect administrator password (sudo authentication failed).".into())
+            }
+        }
+    }
+
+    pub fn install_slssteam<F>(&self, progress_cb: F) -> Result<PathBuf, String>
     where
         F: FnMut(f32, String),
     {
-        progress_cb(0.05, "Checking SLSsteam release on GitHub...".into());
+        self.install_slssteam_with_options(true, None, progress_cb)
+            .map(|(so_path, _)| so_path)
+    }
+
+    /// Downloads and installs `swwayps/slsteam-moon` (`SLSsteam.so`, `pattern-refresh`,
+    /// `Lumen` if bundled, default `config.yaml`, and `~/.local/bin/steam-sls`), and optionally
+    /// installs Millennium (SteamBrew) using the supplied administrator password (if needed).
+    /// Returns `(so_path, optional_millennium_warning)`.
+    pub fn install_slssteam_with_options<F>(
+        &self,
+        include_millennium: bool,
+        sudo_password: Option<&str>,
+        mut progress_cb: F,
+    ) -> Result<(PathBuf, Option<String>), String>
+    where
+        F: FnMut(f32, String),
+    {
+        // Fail fast before downloading if the user provided a sudo password that does not validate.
+        if include_millennium {
+            if let Some(pw) = sudo_password {
+                progress_cb(0.02, "Verifying administrator password for Millennium…".into());
+                Self::verify_sudo_password(pw)?;
+            }
+        }
+
+        progress_cb(0.05, format!("Checking {} release on GitHub…", SLSSTEAM_REPO));
         let agent = AgentBuilder::new().timeout(Duration::from_secs(90)).build();
         let ua = format!("LuaToolsLinux/{}", VERSION);
         let url = format!(
@@ -432,7 +598,7 @@ impl WiredService {
 
         progress_cb(
             0.15,
-            format!("Downloading SLSsteam {} ({})...", tag, file_name),
+            format!("Downloading slsteam-moon {} ({})…", tag, file_name),
         );
         let dl_resp = agent
             .get(download_url)
@@ -444,7 +610,7 @@ impl WiredService {
             })?;
 
         if let Err(e) = stream_response_to_file(dl_resp, &archive_path, &mut |p, m| {
-            progress_cb(0.15 + p * 0.65, m);
+            progress_cb(0.15 + p * 0.55, m);
         }) {
             let _ = fs::remove_dir_all(&tmp_dir);
             return Err(e);
@@ -460,21 +626,48 @@ impl WiredService {
         }
 
         progress_cb(
-            0.80,
-            "Extracting SLSsteam.so and configuring launcher...".into(),
+            0.75,
+            "Extracting SLSsteam.so, pattern-refresh, and configuring steam-sls launcher…".into(),
         );
         let install_res = self.finish_slssteam_from_archive(&archive_path, &tmp_dir);
         let _ = fs::remove_dir_all(&tmp_dir);
         let so_path = install_res?;
 
-        match self.install_millennium_steambrew(|p, m| progress_cb(0.85 + p * 0.13, m)) {
+        if !include_millennium {
+            progress_cb(
+                1.0,
+                format!(
+                    "slsteam-moon {} installed ({}; Millennium skipped by choice)",
+                    tag,
+                    so_path.display()
+                ),
+            );
+            return Ok((so_path, None));
+        }
+
+        match self.install_millennium_steambrew_with_sudo(sudo_password, |p, m| {
+            progress_cb(0.80 + p * 0.18, m)
+        }) {
             Ok(_) => {
                 progress_cb(
                     1.0,
-                    format!("SLSsteam + Millennium installed ({})", so_path.display()),
+                    format!(
+                        "slsteam-moon {} + Millennium installed ({})",
+                        tag,
+                        so_path.display()
+                    ),
                 );
+                Ok((so_path, None))
             }
             Err(e) => {
+                if sudo_password.is_some() {
+                    return Err(format!(
+                        "slsteam-moon {} installed ({}), but Millennium failed: {}",
+                        tag,
+                        so_path.display(),
+                        e
+                    ));
+                }
                 log::warn!(
                     "Optional Millennium (SteamBrew) installation failed (continuing with SLSsteam): {}",
                     e
@@ -482,23 +675,38 @@ impl WiredService {
                 progress_cb(
                     1.0,
                     format!(
-                        "SLSsteam installed ({}); optional Millennium install skipped: {}",
+                        "slsteam-moon {} installed ({}); Millennium skipped: {}",
+                        tag,
                         so_path.display(),
                         e
                     ),
                 );
+                Ok((so_path, Some(e)))
             }
         }
-        Ok(so_path)
     }
 
-    /// Installs Millennium via SteamBrew (`curl -fsSL "https://steambrew.app/install.sh" | bash`).
+    /// Installs Millennium via SteamBrew (`curl -fsSL "https://steambrew.app/install.sh" | bash -s -- --yes`).
     /// Skipped in unit tests, `LUATOOLS_MOCK_LAUNCH=1`, or sandboxed (`uses_system_home == false`) instances.
-    pub fn install_millennium_steambrew<F>(&self, mut progress_cb: F) -> Result<String, String>
+    pub fn install_millennium_steambrew<F>(&self, progress_cb: F) -> Result<String, String>
     where
         F: FnMut(f32, String),
     {
-        progress_cb(0.05, "Installing Millennium (SteamBrew)...".into());
+        self.install_millennium_steambrew_with_sudo(None, progress_cb)
+    }
+
+    /// Installs Millennium via SteamBrew with optional administrator password support.
+    /// Uses a private `0700` `SUDO_ASKPASS` + `sudo -A` PATH shim so `steambrew.app/install.sh`
+    /// can copy into `/usr/lib/millennium` non-interactively without ever writing the password to disk.
+    pub fn install_millennium_steambrew_with_sudo<F>(
+        &self,
+        sudo_password: Option<&str>,
+        mut progress_cb: F,
+    ) -> Result<String, String>
+    where
+        F: FnMut(f32, String),
+    {
+        progress_cb(0.05, "Installing Millennium (SteamBrew)…".into());
         let mock_launch = std::env::var("LUATOOLS_MOCK_LAUNCH")
             .map(|v| v == "1")
             .unwrap_or(false);
@@ -508,11 +716,47 @@ impl WiredService {
             return Ok(msg);
         }
 
-        let output = Command::new("bash")
-            .arg("-c")
+        // Prepare sudo elevation helper if passwordless sudo is not already active
+        let mut _askpass_guard: Option<SudoAskpassGuard> = None;
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
             .arg(MILLENNIUM_INSTALL_CMD)
+            .stdin(Stdio::null());
+
+        if let Some(pw) = sudo_password {
+            Self::verify_sudo_password(pw)?;
+            let guard = SudoAskpassGuard::create_for_env_secret()?;
+            cmd.env("SUDO_ASKPASS", &guard.askpass_script);
+            cmd.env(SUDO_SECRET_ENV, pw);
+            cmd.env("PATH", guard.prepended_path());
+            _askpass_guard = Some(guard);
+        } else if !Self::has_passwordless_sudo() {
+            if let Some(guard) = SudoAskpassGuard::create_for_gui_prompt()? {
+                progress_cb(
+                    0.15,
+                    "Waiting for administrator password in system dialog…".into(),
+                );
+                cmd.env("SUDO_ASKPASS", &guard.askpass_script);
+                cmd.env("PATH", guard.prepended_path());
+                _askpass_guard = Some(guard);
+            } else {
+                return Err(
+                    "Administrator (sudo) password is required to install Millennium into /usr/lib/millennium. Enter your sudo password in the popup or choose 'Unlocker Only (No Sudo)'."
+                        .into(),
+                );
+            }
+        }
+
+        progress_cb(
+            0.30,
+            "Running SteamBrew Millennium installer (curl steambrew.app/install.sh --yes)…".into(),
+        );
+        let output = cmd
             .output()
             .map_err(|e| format!("Failed to execute Millennium installer: {}", e))?;
+
+        // Drop guard immediately so the temporary askpass directory is wiped before returning
+        drop(_askpass_guard);
 
         if output.status.success() {
             let _ = crate::services::millennium_service::MillenniumService::ensure_luatoolslinux_plugin_installed(None);
@@ -701,6 +945,18 @@ impl WiredService {
                      LUMEN_BACKEND_DIR=\"$LUMEN_DIR/luatools/backend\" \\\n\
                      LUMEN_LUA_DIR=\"$LUMEN_DIR/lua\" \\\n\
                      setsid \"$LUMEN_DIR/lumen\" >/dev/null 2>&1 < /dev/null &\n\
+             fi\n\
+             \n\
+             # 4b. Refresh slsteam-moon signed patterns for current Steam client (best-effort)\n\
+             if [ -x \"$SLSDIR/pattern-refresh\" ]; then\n\
+                 _slsm_cfg=\"${{XDG_CONFIG_HOME:-$HOME/.config}}\"\n\
+                 for _sr in \"$HOME/.local/share/Steam\" \"$HOME/.steam/steam\" \"$HOME/.steam/debian-installation\"; do\n\
+                     if [ -f \"$_sr/steamrt64/steamclient.so\" ] || [ -f \"$_sr/ubuntu12_32/steamclient.so\" ]; then\n\
+                         env -u LD_AUDIT -u LD_PRELOAD -u LD_LIBRARY_PATH \\\n\
+                             \"$SLSDIR/pattern-refresh\" --steam-root \"$_sr\" --config-root \"$_slsm_cfg\" >/dev/null 2>&1 || true\n\
+                         break\n\
+                     fi\n\
+                 done\n\
              fi\n\
              \n\
              # 5. Enforce single auditor\n\
@@ -1546,5 +1802,46 @@ Attributes = A lrwxrwxrwx
         assert!(content.contains("'\\''s $(touch pwn) $HOME/SLSsteam.so'"));
         assert!(content.contains("export LD_AUDIT=\"$AUDIT\""));
         assert!(!content.contains("library-inject.so:"));
+    }
+
+    #[test]
+    fn sudo_askpass_guard_keeps_secret_off_disk_and_cleans_up_on_drop() {
+        let root_path;
+        {
+            let guard = SudoAskpassGuard::create_for_env_secret().unwrap();
+            root_path = guard.root.clone();
+            assert!(guard.askpass_script.is_file());
+            let askpass = fs::read_to_string(&guard.askpass_script).unwrap();
+            assert!(askpass.contains(SUDO_SECRET_ENV));
+            let mode = fs::metadata(&guard.askpass_script)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700);
+            let sudo_shim = guard.shim_bin_dir.join("sudo");
+            assert!(sudo_shim.is_file());
+            let shim_content = fs::read_to_string(&sudo_shim).unwrap();
+            assert!(shim_content.contains(" -A \"$@\""));
+            assert!(guard.prepended_path().starts_with(&guard.shim_bin_dir.to_string_lossy().to_string()));
+        }
+        assert!(
+            !root_path.exists(),
+            "SudoAskpassGuard must delete temp dir on Drop"
+        );
+    }
+
+    #[test]
+    fn install_millennium_with_sudo_is_sandbox_safe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = WiredService::new(Some(tmp.path().join("sandbox")));
+        let mut steps = Vec::new();
+        let res = svc
+            .install_millennium_steambrew_with_sudo(Some("dummy-test-pw"), |p, m| {
+                steps.push((p, m))
+            })
+            .expect("sandbox/test millennium install with sudo should skip cleanly");
+        assert!(res.contains("skipped"));
+        assert!(!steps.is_empty());
     }
 }

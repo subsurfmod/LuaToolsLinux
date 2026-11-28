@@ -61,8 +61,8 @@ use crate::services::wired_service::WiredService;
 use crate::ui::state::{
     AcquireTab, ActiveView, AddByAppIdModal, AppMessage, DepotDetailModal, DepotPickRow,
     DepotsSubTab, GameDetailModal, GuideTopic, IntegrationModal, LaunchOptionsModal, LibraryRow,
-    QaCaptureState, SettingsSubTab, TextPromptModal, ToastKind, ToastNotification,
-    UpdateBannerState,
+    QaCaptureState, SettingsSubTab, SudoPasswordModal, TextPromptModal, ToastKind,
+    ToastNotification, UpdateBannerState,
 };
 use crate::ui::theme::{
     apply_papercut_monotone_theme, display_font, draw_rem_medallion_interactive, nav_rail_button,
@@ -457,6 +457,7 @@ pub struct LuaToolsApp {
     pub launch_options_modal: LaunchOptionsModal,
     pub depot_detail_modal: DepotDetailModal,
     pub text_prompt_modal: TextPromptModal,
+    pub sudo_password_modal: SudoPasswordModal,
     pub about_modal_open: bool,
     pub telemetry_modal_open: bool,
     pub qa_capture: Option<QaCaptureState>,
@@ -750,6 +751,7 @@ impl LuaToolsApp {
             launch_options_modal: LaunchOptionsModal::default(),
             depot_detail_modal: DepotDetailModal::default(),
             text_prompt_modal: TextPromptModal::default(),
+            sudo_password_modal: SudoPasswordModal::default(),
             about_modal_open: false,
             telemetry_modal_open: false,
             qa_capture,
@@ -1067,6 +1069,7 @@ impl LuaToolsApp {
             launch_options_modal: LaunchOptionsModal::default(),
             depot_detail_modal: DepotDetailModal::default(),
             text_prompt_modal: TextPromptModal::default(),
+            sudo_password_modal: SudoPasswordModal::default(),
             about_modal_open: false,
             telemetry_modal_open: false,
             qa_capture: None,
@@ -3239,11 +3242,45 @@ impl LuaToolsApp {
         if self.wired_busy {
             return;
         }
+        if action == "steam_unlocker" && !WiredService::has_passwordless_sudo() {
+            self.sudo_password_modal.clear_secret();
+            self.sudo_password_modal.open = true;
+            self.sudo_password_modal.action = action.to_string();
+            self.sudo_password_modal.title = "Administrator Password Required".into();
+            self.sudo_password_modal.reason =
+                "Millennium (SteamBrew) requires sudo to install into /usr/lib/millennium. Enter your Linux login password to install both slsteam-moon and Millennium, or choose 'Unlocker Only (No Sudo)' to install slsteam-moon without root privileges."
+                    .into();
+            self.sudo_password_modal.error_text.clear();
+            self.sudo_password_modal.focus_requested = true;
+            ctx.request_repaint();
+            return;
+        }
+        self.run_wired_action_with_sudo(action, true, None, ctx);
+    }
+
+    pub fn run_wired_action_with_sudo(
+        &mut self,
+        action: &'static str,
+        include_millennium: bool,
+        mut sudo_password: Option<String>,
+        ctx: &egui::Context,
+    ) {
+        if self.wired_busy {
+            if let Some(ref mut pw) = sudo_password {
+                pw.clear();
+            }
+            return;
+        }
         self.wired_busy = true;
         self.wired_progress = 0.02;
-        self.wired_status_text = format!("Starting Wired ({})…", action);
-        let title = match action {
-            "steam_unlocker" => "Installing Steam Unlocker + Millennium",
+        self.wired_status_text = if include_millennium {
+            "Starting slsteam-moon + Millennium installation…".into()
+        } else {
+            "Starting slsteam-moon Unlocker installation…".into()
+        };
+        let title = match (action, include_millennium) {
+            ("steam_unlocker", true) => "Installing Steam Unlocker (slsteam-moon) + Millennium",
+            ("steam_unlocker", false) => "Installing Steam Unlocker (slsteam-moon)",
             _ => "Installing Steam Unlocker",
         };
         self.start_action_modal(
@@ -3261,41 +3298,40 @@ impl LuaToolsApp {
             let ctx_p = ctx_c.clone();
             let res: Result<String, String> = match action {
                 "steam_unlocker" => {
-                    let _ = tx_p.send(AppMessage::WiredProgress {
-                        pct: 0.15,
-                        msg: "Installing Steam Unlocker (SLSsteam)...".into(),
-                    });
-                    ctx_p.request_repaint();
-
-                    // Run the curl command to install the Steam Unlocker
-                    let output = std::process::Command::new("bash")
-                        .arg("-c")
-                        .arg("curl -fsSL \"https://runn.i.ng/Deadboy666/h3adcr-b/refs/heads/main/headcrab.sh\" | bash")
-                        .output();
-                    match output {
-                        Ok(out) if out.status.success() => {
-                            match wired.install_millennium_steambrew(|p, msg| {
-                                let _ = tx_p.send(AppMessage::WiredProgress {
-                                    pct: 0.55 + p * 0.42,
-                                    msg,
-                                });
-                                ctx_p.request_repaint();
-                            }) {
-                                Ok(_) => Ok("Steam Unlocker & Millennium installed successfully.".into()),
-                                Err(e) => Err(format!(
-                                    "Steam Unlocker installed, but Millennium failed: {}",
-                                    e
-                                )),
-                            }
-                        }
-                        Ok(out) => Err(format!(
-                            "Installation failed: {}",
-                            String::from_utf8_lossy(&out.stderr)
+                    let out = wired.install_slssteam_with_options(
+                        include_millennium,
+                        sudo_password.as_deref(),
+                        |pct, msg| {
+                            let _ = tx_p.send(AppMessage::WiredProgress { pct, msg });
+                            ctx_p.request_repaint();
+                        },
+                    );
+                    if let Some(ref mut pw) = sudo_password {
+                        pw.clear();
+                    }
+                    match out {
+                        Ok((so_path, None)) if include_millennium => Ok(format!(
+                            "slsteam-moon ({}) + steam-sls wrapper + Millennium installed successfully.",
+                            so_path.display()
                         )),
-                        Err(e) => Err(format!("Failed to execute installer: {}", e)),
+                        Ok((so_path, None)) => Ok(format!(
+                            "slsteam-moon ({}) + steam-sls wrapper installed (Millennium skipped).",
+                            so_path.display()
+                        )),
+                        Ok((so_path, Some(warn))) => Ok(format!(
+                            "slsteam-moon ({}) installed; Millennium skipped: {}",
+                            so_path.display(),
+                            warn
+                        )),
+                        Err(e) => Err(e),
                     }
                 }
-                _ => Err("Unknown action".into()),
+                _ => {
+                    if let Some(ref mut pw) = sudo_password {
+                        pw.clear();
+                    }
+                    Err("Unknown action".into())
+                }
             };
             let _ = tx.send(AppMessage::WiredFinished {
                 ok: res.is_ok(),

@@ -330,6 +330,25 @@ pub struct DepotDetailModal {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct SudoPasswordModal {
+    pub open: bool,
+    pub action: String,
+    pub title: String,
+    pub reason: String,
+    pub password_input: String,
+    pub show_password: bool,
+    pub error_text: String,
+    pub focus_requested: bool,
+}
+
+impl SudoPasswordModal {
+    pub fn clear_secret(&mut self) {
+        self.password_input.clear();
+        self.show_password = false;
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct TextPromptModal {
     pub open: bool,
     pub kind: String, // "preset" | "rename_variant" | "bot_code"

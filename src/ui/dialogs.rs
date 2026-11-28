@@ -39,6 +39,7 @@ impl LuaToolsApp {
             || self.launch_options_modal.open
             || self.depot_detail_modal.open
             || self.text_prompt_modal.open
+            || self.sudo_password_modal.open
             || self.about_modal_open
             || self.overwrite_diff_modal.open
             || self.guide_zoom_screenshot.is_some();
@@ -70,6 +71,9 @@ impl LuaToolsApp {
                 self.updater_feed.modal_open = false;
             } else if self.guide_zoom_screenshot.is_some() {
                 self.guide_zoom_screenshot = None;
+            } else if self.sudo_password_modal.open {
+                self.sudo_password_modal.clear_secret();
+                self.sudo_password_modal.open = false;
             } else if self.text_prompt_modal.open {
                 self.text_prompt_modal.open = false;
             } else if self.depot_detail_modal.open {
@@ -110,6 +114,7 @@ impl LuaToolsApp {
         self.render_launch_options_modal(ctx);
         self.render_depot_detail_modal(ctx);
         self.render_text_prompt_modal(ctx);
+        self.render_sudo_password_modal(ctx);
         self.render_about_modal(ctx);
         self.render_guide_zoom_modal(ctx);
         self.render_confirm_action_modal(ctx);
@@ -1897,6 +1902,127 @@ impl LuaToolsApp {
         }
     }
 
+    fn render_sudo_password_modal(&mut self, ctx: &egui::Context) {
+        if !self.sudo_password_modal.open {
+            return;
+        }
+        let mut submit_with_sudo = false;
+        let mut install_without_sudo = false;
+        let mut cancel = false;
+
+        let title = if self.sudo_password_modal.title.is_empty() {
+            "Administrator Password Required".to_string()
+        } else {
+            self.sudo_password_modal.title.clone()
+        };
+
+        egui::Window::new(title)
+            .id(egui::Id::new("sudo_password_modal"))
+            .order(egui::Order::Foreground)
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size([490.0, 260.0])
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&self.sudo_password_modal.reason)
+                            .size(12.5)
+                            .color(Palette::TEXT_SECONDARY),
+                    )
+                    .wrap_mode(egui::TextWrapMode::Wrap),
+                );
+                ui.add_space(10.0);
+
+                ui.label(
+                    RichText::new("Linux Administrator (sudo) Password")
+                        .font(semibold_font(12.5))
+                        .color(Palette::TEXT_PRIMARY),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let edit_w = (ui.available_width() - 68.0).max(200.0);
+                    let resp = ui.add_sized(
+                        [edit_w, 30.0],
+                        TextEdit::singleline(&mut self.sudo_password_modal.password_input)
+                            .password(!self.sudo_password_modal.show_password)
+                            .hint_text("Enter your sudo password…"),
+                    );
+                    if self.sudo_password_modal.focus_requested {
+                        resp.request_focus();
+                        self.sudo_password_modal.focus_requested = false;
+                    }
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        submit_with_sudo = true;
+                    }
+                    let toggle_lbl = if self.sudo_password_modal.show_password {
+                        "Hide"
+                    } else {
+                        "Show"
+                    };
+                    if ghost_button(ui, toggle_lbl).clicked() {
+                        self.sudo_password_modal.show_password =
+                            !self.sudo_password_modal.show_password;
+                    }
+                });
+
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Used once in memory via SUDO_ASKPASS to install Millennium — never saved to disk or logged.",
+                    )
+                    .size(11.0)
+                    .color(Palette::TEXT_MUTED),
+                );
+
+                if !self.sudo_password_modal.error_text.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(&self.sudo_password_modal.error_text)
+                            .size(12.0)
+                            .color(Palette::DANGER_TEXT),
+                    );
+                }
+
+                ui.add_space(14.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if primary_button(ui, "Install Unlocker + Millennium").clicked() {
+                        submit_with_sudo = true;
+                    }
+                    if secondary_button(ui, "Unlocker Only (No Sudo)").clicked() {
+                        install_without_sudo = true;
+                    }
+                    if ghost_button(ui, "Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if submit_with_sudo {
+            if self.sudo_password_modal.password_input.is_empty() {
+                self.sudo_password_modal.error_text =
+                    "Enter your sudo password, or click 'Unlocker Only (No Sudo)'.".into();
+                self.sudo_password_modal.focus_requested = true;
+            } else {
+                let pw = std::mem::take(&mut self.sudo_password_modal.password_input);
+                self.sudo_password_modal.clear_secret();
+                self.sudo_password_modal.error_text.clear();
+                self.sudo_password_modal.open = false;
+                self.run_wired_action_with_sudo("steam_unlocker", true, Some(pw), ctx);
+            }
+        } else if install_without_sudo {
+            self.sudo_password_modal.clear_secret();
+            self.sudo_password_modal.error_text.clear();
+            self.sudo_password_modal.open = false;
+            self.run_wired_action_with_sudo("steam_unlocker", false, None, ctx);
+        } else if cancel {
+            self.sudo_password_modal.clear_secret();
+            self.sudo_password_modal.error_text.clear();
+            self.sudo_password_modal.open = false;
+        }
+    }
+
     fn render_about_modal(&mut self, ctx: &egui::Context) {
         if !self.about_modal_open {
             return;
@@ -2335,7 +2461,7 @@ impl LuaToolsApp {
                             ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
                             if primary_button(ui, "Apply Recommended Fixes Now")
                                 .on_hover_text(
-                                    "Enables Play-Unowned, sets AppID 480 redirect, and applies Goldberg if installed locally",
+                                    "Enables Play-Unowned and applies Goldberg if installed locally (does not force Spacewar AppID 480)",
                                 )
                                 .clicked()
                             {
@@ -2866,18 +2992,9 @@ impl LuaToolsApp {
                 applied.push("Added to Play-Unowned redirect set".to_string());
             }
 
-            // 2. Set AppID redirect to 480
-            let cur_spoof = self
-                .steam_bridge_service
-                .get_app_id_spoof(app_id)
-                .or_else(|| self.slssteam_service.get_fake_app_id(app_id));
-            if cur_spoof != Some(480) {
-                self.steam_bridge_service.set_app_id_spoof(app_id, 480);
-                self.slssteam_service.set_fake_app_id(app_id, 480);
-                let _ = self.slssteam_service.save();
-                applied.push("Set AppID redirect to 480".to_string());
-            }
-            self.integration_modal.spoof_id_input = "480".into();
+            // 2. Do NOT force Spacewar (480) FakeAppId here — setting 480 hijacks Steam
+            // ownership tickets and causes 0 B install dialogs on normal games. Users can still
+            // set a custom AppID spoof manually when using an Online-Fix multiplayer patch.
 
             // 3. Run SteamAutoPatch if game is installed
             if let Some(path) = install_path {
@@ -3079,5 +3196,45 @@ mod overlay_tests {
         let _ = ctx.run(esc_raw, |ctx| app.render_shell(ctx));
         assert!(!app.emblem_overlay_open);
         assert!(app.emblem_overlay_texture.is_none());
+    }
+
+    #[test]
+    fn sudo_password_modal_renders_and_clears_secret_on_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let mut app = LuaToolsApp::new_headless_demo(&ctx, tmp.path());
+
+        app.sudo_password_modal.open = true;
+        app.sudo_password_modal.title = "Administrator Password Required".into();
+        app.sudo_password_modal.reason = "Millennium needs sudo".into();
+        app.sudo_password_modal.password_input = "super-secret-pw".into();
+        app.sudo_password_modal.show_password = true;
+
+        let raw = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0))),
+            ..Default::default()
+        };
+        let full = ctx.run(raw, |ctx| app.render_shell(ctx));
+        assert!(!ctx.tessellate(full.shapes, 1.0).is_empty());
+        assert!(app.sudo_password_modal.open);
+
+        let esc_raw = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0))),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(esc_raw, |ctx| app.render_shell(ctx));
+        assert!(!app.sudo_password_modal.open);
+        assert!(
+            app.sudo_password_modal.password_input.is_empty(),
+            "Escape must clear sudo password buffer from memory"
+        );
+        assert!(!app.sudo_password_modal.show_password);
     }
 }
