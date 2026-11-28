@@ -261,7 +261,7 @@ pub(crate) enum UiInternalMsg {
         status: String,
         progress: Option<f32>,
     },
-    LiveSteamPidPolled(Option<u32>),
+    LiveSteamPidPolled(Option<u32>, bool),
     LtspInstallFinished {
         ok: bool,
         msg: String,
@@ -1717,7 +1717,15 @@ impl LuaToolsApp {
         let ctx_c = ctx.clone();
         thread::spawn(move || {
             let pid = crate::steam_bridge::preload_loader::find_steam_pid();
-            let _ = ui_tx.send(UiInternalMsg::LiveSteamPidPolled(pid));
+            let active = pid.is_some_and(|p| {
+                crate::steam_bridge::preload_loader::is_loaded(
+                    p,
+                    crate::steam_bridge::preload_loader::integration_lib_name(),
+                )
+            }) || crate::steam_bridge::ipc::IpcClient::new()
+                .ping()
+                .unwrap_or(false);
+            let _ = ui_tx.send(UiInternalMsg::LiveSteamPidPolled(pid, active));
             ctx_c.request_repaint();
         });
     }
@@ -2422,11 +2430,70 @@ impl LuaToolsApp {
                     })
         });
 
+        let has_sub_depots = lua
+            .entries
+            .iter()
+            .any(|e| !disabled_depot_ids.contains(&e.id) && e.id != aid && e.has_key());
+        let infer_os = |entry: &crate::parsers::lua_parser::LuaEntry,
+                        depot: Option<&ContentDepot>|
+         -> Option<&'static str> {
+            let raw_os = depot
+                .and_then(|d| d.os.as_deref())
+                .or(entry.os.as_deref())
+                .unwrap_or("");
+            let comment = entry.comment.as_deref().unwrap_or("");
+            let combined = format!("{} {}", raw_os, comment).to_ascii_lowercase();
+            if combined.contains("linux") {
+                Some("linux")
+            } else if combined.contains("windows") || combined.contains("win64") || combined.contains("win32") {
+                Some("windows")
+            } else if combined.contains("macos") || combined.contains("osx") || combined.contains("darwin") {
+                Some("macos")
+            } else {
+                None
+            }
+        };
+        let infer_arch = |entry: &crate::parsers::lua_parser::LuaEntry,
+                          depot: Option<&ContentDepot>|
+         -> Option<&'static str> {
+            let raw_arch = depot
+                .and_then(|d| d.arch.as_deref())
+                .or(entry.arch.as_deref())
+                .unwrap_or("");
+            let comment = entry.comment.as_deref().unwrap_or("");
+            let combined = format!("{} {}", raw_arch, comment).to_ascii_lowercase();
+            if combined.contains("64") {
+                Some("64")
+            } else if combined.contains("32") {
+                Some("32")
+            } else {
+                None
+            }
+        };
+        let has_native_linux_depot = lua.entries.iter().any(|e| {
+            !disabled_depot_ids.contains(&e.id)
+                && infer_os(e, depot_map.get(&e.id)) == Some("linux")
+        });
+        let preferred_os = if has_native_linux_depot {
+            "linux"
+        } else {
+            "windows"
+        };
+        let has_preferred_64 = lua.entries.iter().any(|e| {
+            !disabled_depot_ids.contains(&e.id)
+                && infer_os(e, depot_map.get(&e.id)) == Some(preferred_os)
+                && infer_arch(e, depot_map.get(&e.id)) == Some("64")
+        });
+
         for entry in lua.entries {
             if disabled_depot_ids.contains(&entry.id) {
                 continue;
             }
-            if entry.id == aid && entry.manifest_id.is_none() && !entry.has_key() {
+            if entry.id == aid
+                && entry.manifest_id.is_none()
+                && entry.commented_manifest_id.is_none()
+                && (!entry.has_key() || (has_sub_depots && !depot_map.contains_key(&entry.id)))
+            {
                 continue;
             }
             // Skip keyless/manifestless DLC AppID entitlements that are not content depots
@@ -2483,8 +2550,26 @@ impl LuaToolsApp {
                     }
                 }
             };
-            let is_selected =
-                blocked_reason.is_none() && !depot.is_shared && !depot.is_dlc() && lang_matches;
+            let entry_os = infer_os(&entry, Some(&depot));
+            let entry_arch = infer_arch(&entry, Some(&depot));
+            let os_matches = match entry_os {
+                None => true,
+                Some(o) => o == preferred_os,
+            };
+            let arch_matches = match entry_arch {
+                None => true,
+                Some("64") => true,
+                Some(_) => !has_preferred_64,
+            };
+            let is_base_placeholder =
+                entry.id == aid && has_sub_depots && manifest_id.is_none() && depot.size == 0;
+            let is_selected = blocked_reason.is_none()
+                && !depot.is_shared
+                && !depot.is_dlc()
+                && !is_base_placeholder
+                && lang_matches
+                && os_matches
+                && arch_matches;
             let size = entry.size_on_disk.unwrap_or(depot.size);
             self.depots_picks.push(DepotPickRow {
                 depot,
@@ -2979,13 +3064,24 @@ impl LuaToolsApp {
                 },
             ) {
                 Ok((pid_opt, msg)) => {
-                    let _ = ui_tx.send(UiInternalMsg::LiveSteamPidPolled(pid_opt));
+                    let active = pid_opt.is_some_and(|p| {
+                        crate::steam_bridge::preload_loader::is_loaded(
+                            p,
+                            crate::steam_bridge::preload_loader::integration_lib_name(),
+                        )
+                    });
+                    let _ = ui_tx.send(UiInternalMsg::LiveSteamPidPolled(pid_opt, active));
                     let _ = tx.send(AppMessage::SteamRestarted { ok: true, msg });
                 }
                 Err(err) => {
-                    let _ = ui_tx.send(UiInternalMsg::LiveSteamPidPolled(
-                        crate::steam_bridge::preload_loader::find_steam_pid(),
-                    ));
+                    let live = crate::steam_bridge::preload_loader::find_steam_pid();
+                    let active = live.is_some_and(|p| {
+                        crate::steam_bridge::preload_loader::is_loaded(
+                            p,
+                            crate::steam_bridge::preload_loader::integration_lib_name(),
+                        )
+                    });
+                    let _ = ui_tx.send(UiInternalMsg::LiveSteamPidPolled(live, active));
                     let _ = tx.send(AppMessage::SteamRestarted {
                         ok: false,
                         msg: err,
@@ -3010,7 +3106,7 @@ impl LuaToolsApp {
         thread::spawn(move || {
             match crate::steam_bridge::preload_loader::kill_all_steam_instances() {
                 Ok(0) => {
-                    let _ = ui_tx.send(UiInternalMsg::LiveSteamPidPolled(None));
+                    let _ = ui_tx.send(UiInternalMsg::LiveSteamPidPolled(None, false));
                     let _ = tx.send(AppMessage::SteamRestarted {
                         ok: true,
                         msg: "No running Steam instances found.".into(),
@@ -3018,7 +3114,13 @@ impl LuaToolsApp {
                 }
                 Ok(count) => {
                     let live = crate::steam_bridge::preload_loader::find_steam_pid();
-                    let _ = ui_tx.send(UiInternalMsg::LiveSteamPidPolled(live));
+                    let active = live.is_some_and(|p| {
+                        crate::steam_bridge::preload_loader::is_loaded(
+                            p,
+                            crate::steam_bridge::preload_loader::integration_lib_name(),
+                        )
+                    });
+                    let _ = ui_tx.send(UiInternalMsg::LiveSteamPidPolled(live, active));
                     let _ = tx.send(AppMessage::SteamRestarted {
                         ok: true,
                         msg: format!(
@@ -3028,9 +3130,14 @@ impl LuaToolsApp {
                     });
                 }
                 Err(e) => {
-                    let _ = ui_tx.send(UiInternalMsg::LiveSteamPidPolled(
-                        crate::steam_bridge::preload_loader::find_steam_pid(),
-                    ));
+                    let live = crate::steam_bridge::preload_loader::find_steam_pid();
+                    let active = live.is_some_and(|p| {
+                        crate::steam_bridge::preload_loader::is_loaded(
+                            p,
+                            crate::steam_bridge::preload_loader::integration_lib_name(),
+                        )
+                    });
+                    let _ = ui_tx.send(UiInternalMsg::LiveSteamPidPolled(live, active));
                     let _ = tx.send(AppMessage::SteamRestarted { ok: false, msg: e });
                 }
             }
@@ -3100,13 +3207,24 @@ impl LuaToolsApp {
                 },
             ) {
                 Ok((pid_opt, msg)) => {
-                    let _ = ui_tx.send(UiInternalMsg::LiveSteamPidPolled(pid_opt));
+                    let active = pid_opt.is_some_and(|p| {
+                        crate::steam_bridge::preload_loader::is_loaded(
+                            p,
+                            crate::steam_bridge::preload_loader::integration_lib_name(),
+                        )
+                    });
+                    let _ = ui_tx.send(UiInternalMsg::LiveSteamPidPolled(pid_opt, active));
                     let _ = tx.send(AppMessage::SteamRestarted { ok: true, msg });
                 }
                 Err(err) => {
-                    let _ = ui_tx.send(UiInternalMsg::LiveSteamPidPolled(
-                        crate::steam_bridge::preload_loader::find_steam_pid(),
-                    ));
+                    let live = crate::steam_bridge::preload_loader::find_steam_pid();
+                    let active = live.is_some_and(|p| {
+                        crate::steam_bridge::preload_loader::is_loaded(
+                            p,
+                            crate::steam_bridge::preload_loader::integration_lib_name(),
+                        )
+                    });
+                    let _ = ui_tx.send(UiInternalMsg::LiveSteamPidPolled(live, active));
                     let _ = tx.send(AppMessage::SteamRestarted {
                         ok: false,
                         msg: err,
@@ -4067,12 +4185,13 @@ impl LuaToolsApp {
                     self.status_text = status.clone();
                     self.update_action_modal(&op_key, status, progress);
                 }
-                UiInternalMsg::LiveSteamPidPolled(pid) => {
+                UiInternalMsg::LiveSteamPidPolled(pid, integration_active) => {
                     self.steam_poll_in_flight = false;
                     self.live_steam_pid = pid;
                     self.steam_poll_completed = true;
                     if let Ok(mut st) = self.steam_bridge_service.status.lock() {
                         st.steam_pid = pid;
+                        st.integration_active = integration_active;
                     }
                 }
             }

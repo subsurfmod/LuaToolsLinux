@@ -243,36 +243,42 @@ impl LuaToolsApp {
             .fixed_size([510.0, 255.0])
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                egui::Sides::new().show(
-                    ui,
-                    |ui| {
-                        let status_col = match state {
-                            ActionModalState::Succeeded => Palette::GO_TEXT,
-                            ActionModalState::Failed => Palette::DANGER_TEXT,
-                            _ => Palette::TEXT_PRIMARY,
-                        };
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(&status)
-                                    .font(semibold_font(13.0))
-                                    .color(status_col),
-                            )
-                            .wrap_mode(egui::TextWrapMode::Wrap),
-                        );
-                    },
-                    |ui| match state {
-                        ActionModalState::Running => {
-                            status_badge(ui, &format!("Running · {}", elapsed), BadgeTone::Blue);
+                ui.horizontal(|ui| {
+                    let status_col = match state {
+                        ActionModalState::Succeeded => Palette::GO_TEXT,
+                        ActionModalState::Failed => Palette::DANGER_TEXT,
+                        _ => Palette::TEXT_PRIMARY,
+                    };
+                    let left_w = (ui.available_width() - 118.0).max(180.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(left_w, 0.0),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&status)
+                                        .font(semibold_font(13.0))
+                                        .color(status_col),
+                                )
+                                .wrap_mode(egui::TextWrapMode::Wrap),
+                            );
+                        },
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        match state {
+                            ActionModalState::Running => {
+                                status_badge(ui, &format!("Running · {}", elapsed), BadgeTone::Blue);
+                            }
+                            ActionModalState::Succeeded => {
+                                status_badge(ui, &format!("Done · {}", elapsed), BadgeTone::Ready);
+                            }
+                            ActionModalState::Failed => {
+                                status_badge(ui, &format!("Failed · {}", elapsed), BadgeTone::Danger);
+                            }
+                            ActionModalState::Idle => {}
                         }
-                        ActionModalState::Succeeded => {
-                            status_badge(ui, &format!("Done · {}", elapsed), BadgeTone::Ready);
-                        }
-                        ActionModalState::Failed => {
-                            status_badge(ui, &format!("Failed · {}", elapsed), BadgeTone::Danger);
-                        }
-                        ActionModalState::Idle => {}
-                    },
-                );
+                    });
+                });
 
                 ui.add_space(8.0);
                 if is_running {

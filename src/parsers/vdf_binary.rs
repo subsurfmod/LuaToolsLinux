@@ -591,13 +591,39 @@ impl AppInfoFile {
                 write_vdf(&mut blob, new_table, &mut intern, self.indexed_keys());
 
                 let mut meta = vec![0u8; meta_len];
-                meta[0..4].copy_from_slice(&1u32.to_le_bytes()); // info_state = 1
+                meta[0..4].copy_from_slice(&2u32.to_le_bytes()); // info_state = 2 (normal; 1 = prerelease/no info!)
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as u32)
                     .unwrap_or(0);
                 meta[4..8].copy_from_slice(&now.to_le_bytes()); // last_updated
-                meta[36..40].copy_from_slice(&1u32.to_le_bytes()); // change_number = 1
+                let change_num = new_table
+                    .get_table("appinfo")
+                    .and_then(|t| t.get_text("_change_number").parse::<u32>().ok())
+                    .filter(|&n| n > 0)
+                    .unwrap_or(1);
+                meta[36..40].copy_from_slice(&change_num.to_le_bytes()); // change_number
+                // Populate real 20-byte PICS sha[20] if carried via _sha hex or hash blob as fallback
+                if meta.len() >= 36 {
+                    let pics_sha_bytes = new_table
+                        .get_table("appinfo")
+                        .and_then(|t| {
+                            let s = t.get_text("_sha");
+                            if s.len() == 40 {
+                                hex::decode(s).ok()
+                            } else {
+                                None
+                            }
+                        });
+                    if let Some(sha_vec) = pics_sha_bytes.filter(|v| v.len() == 20) {
+                        meta[16..36].copy_from_slice(&sha_vec);
+                    } else {
+                        let mut hasher = Sha1::new();
+                        hasher.update(&blob);
+                        let digest = hasher.finalize();
+                        meta[16..36].copy_from_slice(&digest);
+                    }
+                }
 
                 if meta.len() >= 60 {
                     let mut hasher = Sha1::new();
@@ -680,6 +706,83 @@ impl AppInfoFile {
         edits.insert(app_id, table);
         self.save_with_edits(dest, &edits)
     }
+
+    /// Converts a real `api.steamcmd.net/v1/info/<appid>` JSON `data.<appid>` object into a full
+    /// `appinfo` `VdfTable` (including real `common`, `config`, `depots`, `manifests/public/{gid,size,download}`,
+    /// `config/oslist`, and `branches`) and splices it into `appinfo.vdf` with `info_state = 2`.
+    pub fn splice_steamcmd_json_app(
+        &self,
+        dest: &Path,
+        app_id: u32,
+        app_json: &serde_json::Value,
+    ) -> Result<(), String> {
+        let table = build_pics_table_from_steamcmd_json(app_id, app_json)?;
+        let mut edits = HashMap::new();
+        edits.insert(app_id, table);
+        self.save_with_edits(dest, &edits)
+    }
+}
+
+fn json_value_to_vdf_table(obj: &serde_json::Map<String, serde_json::Value>) -> VdfTable {
+    let mut tbl = VdfTable::default();
+    for (k, v) in obj {
+        // Keep internal _change_number/_sha only on root? Skip internal steamcmd keys inside nested nodes
+        if k.starts_with('_') {
+            continue;
+        }
+        match v {
+            serde_json::Value::Object(child_map) => {
+                tbl.items.push(VdfProperty {
+                    name: k.clone(),
+                    raw_name: None,
+                    vtype: TYPE_TABLE,
+                    value: VdfValue::Table(json_value_to_vdf_table(child_map)),
+                });
+            }
+            serde_json::Value::String(s) => {
+                tbl.set_text(k, s);
+            }
+            serde_json::Value::Number(n) => {
+                tbl.set_text(k, &n.to_string());
+            }
+            serde_json::Value::Bool(b) => {
+                tbl.set_text(k, if *b { "1" } else { "0" });
+            }
+            _ => {}
+        }
+    }
+    tbl
+}
+
+/// Builds a complete PICS `appinfo` root `VdfTable` from a `api.steamcmd.net/v1/info/<appid>`
+/// JSON object (`data.<appid>`), preserving real depot manifests, sizes, branches, and oslists.
+pub fn build_pics_table_from_steamcmd_json(
+    app_id: u32,
+    app_json: &serde_json::Value,
+) -> Result<VdfTable, String> {
+    let obj = app_json
+        .as_object()
+        .ok_or_else(|| "SteamCMD app info JSON is not an object".to_string())?;
+    let mut appinfo = json_value_to_vdf_table(obj);
+    if appinfo.get_text("appid").is_empty() {
+        appinfo.set_text("appid", &app_id.to_string());
+    }
+    // Preserve _change_number and _sha for v41 header metadata extraction in save_with_edits
+    if let Some(cn) = obj.get("_change_number").and_then(|v| v.as_u64()) {
+        appinfo.set_text("_change_number", &cn.to_string());
+    }
+    if let Some(sha) = obj.get("_sha").and_then(|v| v.as_str()) {
+        appinfo.set_text("_sha", sha);
+    }
+
+    let mut root = VdfTable::default();
+    root.items.push(VdfProperty {
+        name: "appinfo".into(),
+        raw_name: None,
+        vtype: TYPE_TABLE,
+        value: VdfValue::Table(appinfo),
+    });
+    Ok(root)
 }
 
 /// Builds a standard PICS KeyValues `appinfo` root table with common and depot/manifest metadata.

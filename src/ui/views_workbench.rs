@@ -1315,11 +1315,19 @@ impl LuaToolsApp {
 
             ui.add_space(12.0);
 
-            // Reserve comfortable bottom room for action buttons + progress bar so low text never clips
-            let reserve_bottom = if self.depots_downloading { 96.0 } else { 64.0 };
-            let table_h = (ui.available_height() - reserve_bottom).max(140.0);
+            // Reserve comfortable bottom room for action buttons + progress bar + active queue card so nothing ever clips
+            let has_queue_banner = !self.download_queue.active_tasks().is_empty()
+                || !self.download_queue.pending_tasks().is_empty();
+            let reserve_bottom = match (self.depots_downloading, has_queue_banner) {
+                (true, true) => 178.0,
+                (true, false) => 116.0,
+                (false, true) => 142.0,
+                (false, false) => 76.0,
+            };
+            let table_h = (ui.available_height() - reserve_bottom).clamp(130.0, 460.0);
             inset_paper_sheet(ui, Margin::same(8), |ui| {
                 ui.set_min_height(table_h);
+                ui.set_max_height(table_h);
                 if self.depots_picks.is_empty() {
                     ui.vertical_centered(|ui| {
                         ui.add_space(40.0);
@@ -1332,6 +1340,7 @@ impl LuaToolsApp {
                 }
 
                 TableBuilder::new(ui)
+                    .max_scroll_height((table_h - 46.0).max(96.0))
                     .striped(true)
                     .cell_layout(Layout::left_to_right(Align::Center))
                     .column(Column::exact(36.0))
@@ -1418,18 +1427,28 @@ impl LuaToolsApp {
             egui::Sides::new().show(
                 ui,
                 |ui| {
+                    let max_lbl_w = (ui.available_width() - 210.0).max(160.0);
+                    ui.set_max_width(max_lbl_w);
                     if !dl_status_txt.is_empty() {
-                        ui.label(
-                            RichText::new(&dl_status_txt)
-                                .size(12.0)
-                                .color(Palette::TEXT_SECONDARY),
-                        );
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&dl_status_txt)
+                                    .size(12.0)
+                                    .color(Palette::TEXT_SECONDARY),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(&dl_status_txt);
                     } else {
-                        ui.label(
-                            RichText::new(acct_hint)
-                                .size(12.0)
-                                .color(Palette::TEXT_MUTED),
-                        );
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&acct_hint)
+                                    .size(12.0)
+                                    .color(Palette::TEXT_MUTED),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(&acct_hint);
                     }
                 },
                 |ui| {

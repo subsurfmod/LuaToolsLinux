@@ -543,8 +543,10 @@ impl WiredService {
         fs::create_dir_all(&sls_dir).map_err(|e| e.to_string())?;
 
         let target_so = sls_dir.join("SLSsteam.so");
-        fs::copy(&found_so, &target_so).map_err(|e| e.to_string())?;
-        let _ = fs::set_permissions(&target_so, fs::Permissions::from_mode(0o755));
+        let tmp_so = sls_dir.join("SLSsteam.so.new");
+        fs::copy(&found_so, &tmp_so).map_err(|e| e.to_string())?;
+        let _ = fs::set_permissions(&tmp_so, fs::Permissions::from_mode(0o755));
+        fs::rename(&tmp_so, &target_so).map_err(|e| e.to_string())?;
         // LT-49 & LT-65: Cryptographic SHA-256 active unlocker verification
         let fhs = FileHashService::new();
         let so_hash = fhs.hash_file(&target_so, "SLSsteam.so");
@@ -552,6 +554,16 @@ impl WiredService {
             return Err("Installed SLSsteam.so failed SHA-256 integrity check (empty/unreadable).".into());
         }
         log::info!("Installed SLSsteam.so SHA-256: {}", so_hash.sha256);
+
+        // Also install slsteam-moon's signed pattern-refresh helper if bundled
+        if let Some(pat_bin) = find_file_recursive(&extract_dir, "pattern-refresh") {
+            let target_pat = sls_dir.join("pattern-refresh");
+            let tmp_pat = sls_dir.join("pattern-refresh.new");
+            if fs::copy(&pat_bin, &tmp_pat).is_ok() {
+                let _ = fs::set_permissions(&tmp_pat, fs::Permissions::from_mode(0o755));
+                let _ = fs::rename(&tmp_pat, &target_pat);
+            }
+        }
 
         // Flaw 2 & Fix 2: Never keep or install deprecated library-inject.so
         let old_lib_inject = sls_dir.join("library-inject.so");

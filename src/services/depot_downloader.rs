@@ -40,6 +40,22 @@ fn is_valid_depot_key(key: &str) -> bool {
     k.len() == 64 && k.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// Detects Unicode block-art QR code lines printed by `DepotDownloader -qr` so they
+/// never pollute the 1-line UI progress status or hang headless downloads.
+fn is_qr_or_block_art_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let block_chars = trimmed
+        .chars()
+        .filter(|&c| matches!(c, '█' | '▀' | '▄' | '▌' | '▐' | '░' | '▒' | '▓' | '■' | '□'))
+        .count();
+    block_chars >= 4
+        || trimmed.contains("Use the Steam Mobile App to sign in")
+        || trimmed.contains("Scan the following QR code")
+}
+
 struct TempFileGuard(PathBuf);
 
 impl Drop for TempFileGuard {
@@ -374,11 +390,10 @@ impl DepotDownloaderService {
             args.push("-username".to_string());
             args.push(clean_user.to_string());
             args.push("-remember-password".to_string());
-        } else {
-            // Only use -qr for anonymous login; -remember-password requires -username or explicit QR flow
-            // DepotDownloader requires -username when using -remember-password
-            args.push("-qr".to_string());
         }
+        // Never pass `-qr` in headless background downloads (stdin is null, so DepotDownloader
+        // would print an unscannable Unicode QR code to stdout and hang at 0% forever).
+        // Omitting `-username` and `-qr` cleanly uses anonymous Steam CDN login.
         args
     }
 
@@ -1127,11 +1142,16 @@ impl DepotDownloaderService {
         let pct_re = pct_regex();
         let mut last_stdout = String::new();
         let mut recent_stdout = Vec::new();
+        let mut hit_headless_qr = false;
         let timeout = opts.download_timeout();
         let start = std::time::Instant::now();
 
         let wait_res = loop {
             while let Ok(clean) = out_rx.try_recv() {
+                if is_qr_or_block_art_line(&clean) {
+                    hit_headless_qr = true;
+                    break;
+                }
                 last_stdout = clean.clone();
                 recent_stdout.push(clean.clone());
                 if recent_stdout.len() > 6 {
@@ -1143,6 +1163,16 @@ impl DepotDownloaderService {
                     .and_then(|m| m.as_str().parse::<f32>().ok())
                     .unwrap_or(-1.0);
                 progress_cb(pct, clean);
+            }
+
+            if hit_headless_qr {
+                let _ = child.kill();
+                let _ = child.wait();
+                cleanup_partial_depot_temp(download_dir);
+                break Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Steam account login required for this depot — click 'Sign In (QR)' once in the Depots tab and set your Steam Username in Settings › Account.",
+                ));
             }
 
             match child.try_wait() {
@@ -1172,6 +1202,10 @@ impl DepotDownloaderService {
                     }
                     match out_rx.recv_timeout(Duration::from_millis(100)) {
                         Ok(clean) => {
+                            if is_qr_or_block_art_line(&clean) {
+                                hit_headless_qr = true;
+                                continue;
+                            }
                             last_stdout = clean.clone();
                             recent_stdout.push(clean.clone());
                             if recent_stdout.len() > 6 {
@@ -1195,6 +1229,9 @@ impl DepotDownloaderService {
             let _ = h.join();
         }
         while let Ok(clean) = out_rx.try_recv() {
+            if is_qr_or_block_art_line(&clean) {
+                continue;
+            }
             last_stdout = clean.clone();
             recent_stdout.push(clean.clone());
             if recent_stdout.len() > 6 {
@@ -1384,9 +1421,10 @@ mod tests {
             .windows(2)
             .any(|w| w == ["-manifestfile", "/tmp/3321461_1669007755731719796.manifest"]));
         assert!(!args.iter().any(|a| a == "-username"));
-        // -remember-password requires -username, so for anonymous login we only use -qr
+        // Headless anonymous downloads must omit both -remember-password and -qr so DepotDownloader
+        // never hangs printing an interactive QR code to stdout.
         assert!(!args.iter().any(|a| a == "-remember-password"), "-remember-password should NOT be used without -username");
-        assert!(args.iter().any(|a| a == "-qr"), "-qr should be present for anonymous login");
+        assert!(!args.iter().any(|a| a == "-qr"), "-qr must NOT be passed in headless background downloads");
         assert!(args.windows(2).any(|w| w == ["-max-downloads", "8"]));
         assert!(args
             .windows(2)

@@ -1144,7 +1144,11 @@ impl LuaInstaller {
     ) {
         sls.add_additional_app(app_id);
         sls.config.play_not_owned = true;
-        // Do NOT set fake_app_id to 480: AppID 480 spoofing is strictly reserved for multiplayer Online-Fixes.
+        // Clean up any stale legacy Spacewar (480) FakeAppId poisoning on normal game installs.
+        // AppID 480 spoofing is strictly reserved for explicit Online-Fix multiplayer patches.
+        if sls.get_fake_app_id(app_id) == Some(480) {
+            sls.remove_fake_app_id(app_id);
+        }
 
         // LT-31 / LNX-02: Prune disabled DLC/depot entries so per-depot toggles remove them from SLSsteam
         for disabled in &lua.disabled_entries {
@@ -1266,31 +1270,100 @@ impl LuaInstaller {
                 );
             } else {
                 let _ = Self::write_depot_keys_to_config_vdf(&vdf_path, &lua.entries);
-                let _ = Self::inject_proton_compat_tool_mapping(&vdf_path, app_id);
+                // Only force Proton CompatToolMapping when the title has NO native Linux depots
+                let has_native_linux_depot = lua.entries.iter().any(|e| {
+                    e.os.as_deref()
+                        .is_some_and(|o| o.eq_ignore_ascii_case("linux"))
+                        || e.comment
+                            .as_deref()
+                            .is_some_and(|c| c.to_ascii_lowercase().contains("linux"))
+                });
+                if !has_native_linux_depot {
+                    let _ = Self::inject_proton_compat_tool_mapping(&vdf_path, app_id);
+                }
             }
         }
 
-        // Fix 6: PICS Provisioning & appinfo.vdf v41 Splicing
-        // 1. Save picsbuffer_<appid>.bin and picsbuffer_<appid>.yaml to SLSsteam dir
+        // Fix 6: Real PICS Provisioning & appinfo.vdf v41 Splicing
+        // Prefer real SteamCMD PICS metadata (with actual depot sizes, oslists, branches, and manifests)
+        // so Steam never shows "0 B" in the Install dialog. Write into slsteam-moon's cache layout too.
         let sls_dir = sls.config_path.parent().unwrap_or_else(|| Path::new("."));
         let depots_vec: Vec<(u32, Option<String>)> = lua
             .entries
             .iter()
-            .map(|e| (e.id, e.manifest_id.clone()))
+            .map(|e| {
+                (
+                    e.id,
+                    e.manifest_id
+                        .clone()
+                        .or_else(|| e.commented_manifest_id.clone()),
+                )
+            })
             .collect();
-        Self::write_pics_buffers(sls_dir, app_id, &depots_vec);
 
-        // 2. Splice app entry into appcache/appinfo.vdf
-        if let Some(root) = steam_root {
-            let appcache = root.join("appcache");
-            let appinfo_path = appcache.join("appinfo.vdf");
-            if !appinfo_path.exists() {
-                let _ = crate::parsers::vdf_binary::AppInfoFile::create_empty_v41(&appinfo_path);
+        let real_pics_json = if cfg!(test) {
+            None
+        } else {
+            Self::fetch_steamcmd_pics_json(app_id)
+        };
+
+        if let Some(ref pics_json) = real_pics_json {
+            let cache_dir = sls_dir.join("cache");
+            if let Ok(table) =
+                crate::parsers::vdf_binary::build_pics_table_from_steamcmd_json(app_id, pics_json)
+            {
+                let _ = fs::create_dir_all(&cache_dir);
+                let mut blob = Vec::new();
+                let mut strings = Vec::new();
+                let mut intern = |k: &[u8]| -> u32 {
+                    strings.push(k.to_vec());
+                    (strings.len() - 1) as u32
+                };
+                crate::parsers::vdf_binary::write_vdf(&mut blob, &table, &mut intern, false);
+                let _ = fs::write(cache_dir.join(format!("picsbuffer_{}.bin", app_id)), &blob);
             }
-            if let Ok(af) = crate::parsers::vdf_binary::AppInfoFile::open(&appinfo_path) {
-                let _ = af.splice_pics_app(&appinfo_path, app_id, None, &depots_vec);
+            if let Some(root) = steam_root {
+                let appcache = root.join("appcache");
+                let appinfo_path = appcache.join("appinfo.vdf");
+                if !appinfo_path.exists() {
+                    let _ = crate::parsers::vdf_binary::AppInfoFile::create_empty_v41(&appinfo_path);
+                }
+                if let Ok(af) = crate::parsers::vdf_binary::AppInfoFile::open(&appinfo_path) {
+                    let _ = af.splice_steamcmd_json_app(&appinfo_path, app_id, pics_json);
+                }
+            }
+        } else {
+            Self::write_pics_buffers(sls_dir, app_id, &depots_vec);
+            if let Some(root) = steam_root {
+                let appcache = root.join("appcache");
+                let appinfo_path = appcache.join("appinfo.vdf");
+                if !appinfo_path.exists() {
+                    let _ = crate::parsers::vdf_binary::AppInfoFile::create_empty_v41(&appinfo_path);
+                }
+                // Only splice a minimal fallback stub if Steam does not already have this app in appinfo.vdf
+                if let Ok(af) = crate::parsers::vdf_binary::AppInfoFile::open(&appinfo_path) {
+                    if af.read_app(app_id).ok().flatten().is_none() {
+                        let _ = af.splice_pics_app(&appinfo_path, app_id, None, &depots_vec);
+                    }
+                }
             }
         }
+    }
+
+    /// Fetches real PICS product-info JSON (`data.<appid>`) from `api.steamcmd.net` with a short timeout.
+    pub fn fetch_steamcmd_pics_json(app_id: u32) -> Option<serde_json::Value> {
+        let url = format!("https://api.steamcmd.net/v1/info/{}", app_id);
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(3))
+            .timeout(std::time::Duration::from_secs(5))
+            .build();
+        let resp = agent
+            .get(&url)
+            .set("User-Agent", "LuaToolsLinux/4.1.4")
+            .call()
+            .ok()?;
+        let val: serde_json::Value = resp.into_json().ok()?;
+        val.get("data")?.get(app_id.to_string()).cloned()
     }
 
     /// Fix 6: Writes `picsbuffer_<appid>.bin` and `picsbuffer_<appid>.yaml` for PICS provisioning.
