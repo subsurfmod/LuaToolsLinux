@@ -28,7 +28,7 @@ use crate::VERSION;
 const ACCELA_REPO: &str = "ciscosweater/enter-the-wired";
 const ACCELA_FALLBACK_URL: &str =
     "https://github.com/ciscosweater/enter-the-wired/releases/download/latest/deps.tar.gz";
-const SLSSTEAM_REPO: &str = "AceSLS/SLSsteam";
+pub const SLSSTEAM_REPO: &str = "swwayps/slsteam-moon";
 const MILLENNIUM_INSTALL_CMD: &str = r#"curl -fsSL "https://steambrew.app/install.sh" | bash"#;
 
 #[derive(Debug, Clone)]
@@ -553,15 +553,32 @@ impl WiredService {
         }
         log::info!("Installed SLSsteam.so SHA-256: {}", so_hash.sha256);
 
-        if let Some(inj) = find_file_recursive(&extract_dir, "library-inject.so") {
-            let target_inj = sls_dir.join("library-inject.so");
-            if fs::copy(&inj, &target_inj).is_ok() {
-                let _ = fs::set_permissions(&target_inj, fs::Permissions::from_mode(0o755));
-                let inj_hash = fhs.hash_file(&target_inj, "library-inject.so");
-                if !inj_hash.sha256.is_empty() {
-                    log::info!("Installed library-inject.so SHA-256: {}", inj_hash.sha256);
-                }
+        // Flaw 2 & Fix 2: Never keep or install deprecated library-inject.so
+        let old_lib_inject = sls_dir.join("library-inject.so");
+        if old_lib_inject.exists() {
+            let _ = fs::remove_file(old_lib_inject);
+        }
+
+        // Extract standalone Lumen binary and assets if present in slsteam-moon bundle
+        let lumen_dir = self.share_dir.join("Lumen");
+        let _ = fs::create_dir_all(&lumen_dir);
+        if let Some(lumen_bin) = find_file_recursive(&extract_dir, "lumen") {
+            let target_lumen = lumen_dir.join("lumen");
+            if fs::copy(&lumen_bin, &target_lumen).is_ok() {
+                let _ = fs::set_permissions(&target_lumen, fs::Permissions::from_mode(0o755));
+                log::info!("Installed standalone Lumen binary to {}", target_lumen.display());
             }
+        }
+        let extract_lua = extract_dir.join("lua");
+        if extract_lua.is_dir() {
+            let target_lua = lumen_dir.join("lua");
+            let _ = copy_dir_recursive(&extract_lua, &target_lua);
+        }
+        let extract_backend = extract_dir.join("luatools").join("backend");
+        if extract_backend.is_dir() {
+            let target_backend = lumen_dir.join("luatools").join("backend");
+            let _ = fs::create_dir_all(&target_backend);
+            let _ = copy_dir_recursive(&extract_backend, &target_backend);
         }
 
         // Seed default ~/.config/SLSsteam/config.yaml if user doesn't have one yet
@@ -578,14 +595,15 @@ impl WiredService {
             }
         }
 
-        // Install a clean user-local `steam-sls` wrapper script in `~/.local/bin/steam-sls`
+        // Install single-auditor user-local `steam-sls` wrapper script in `~/.local/bin/steam-sls`
         let _ = self.write_steam_sls_wrapper(&target_so, &sls_dir);
 
         Ok(target_so)
     }
 
     /// Generates and installs a clean user-local `steam-sls` wrapper script in `~/.local/bin/steam-sls`.
-    /// Includes optional background auto-start `luatools --minimized --tray-locked &` (LT-20).
+    /// Enforces the single-auditor rule, auto-cleans stale auditors, resolves the true Steam binary,
+    /// sets up Wayland libextest, and launches the Lumen CDP bridge.
     pub fn write_steam_sls_wrapper(
         &self,
         target_so: &Path,
@@ -595,27 +613,26 @@ impl WiredService {
             .map_err(|e| format!("Failed to create bin dir: {}", e))?;
         let wrapper = self.bin_dir.join("steam-sls");
 
-        // Build integration library path dynamically based on user's home directory
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let integration_lib = home.join(".local/lib/luatools/libsteam_integration.so");
+        // Clean up deprecated library-inject.so to prevent fatal double-auditor crash
+        let old_lib_inject = sls_dir.join("library-inject.so");
+        if old_lib_inject.exists() {
+            let _ = fs::remove_file(old_lib_inject);
+        }
 
-        // Build LD_AUDIT for SLSsteam (only library-inject.so to avoid 32-bit crashes with SLSsteam.so)
-        let audit = if sls_dir.join("library-inject.so").is_file() {
-            format!(
-                "{}:{}",
-                sls_dir.join("library-inject.so").display(),
-                target_so.display()
-            )
-        } else {
-            target_so.display().to_string()
-        };
+        let audit_target = shell_single_quote(&target_so.to_string_lossy());
+        let sls_dir_str = shell_single_quote(&sls_dir.to_string_lossy());
+        let lumen_dir = self.share_dir.join("Lumen");
+        let lumen_dir_str = shell_single_quote(&lumen_dir.to_string_lossy());
 
-        let integration_lib_q = shell_single_quote(&integration_lib.to_string_lossy());
-        let audit_q = shell_single_quote(&audit);
         let script = format!(
             "#!/usr/bin/env bash\n\
+             set -u\n\
+             \n\
+             SLSDIR={sls_dir_str}\n\
+             AUDIT={audit_target}\n\
+             LUMEN_DIR={lumen_dir_str}\n\
+             \n\
              # Auto-start LuaTools companion in background minimized to tray unless opted out (LT-20)\n\
-             # Opt out via LUATOOLS_NO_AUTOLAUNCH=1 or creating ~/.config/luatools/no-autolaunch\n\
              if [ \"${{LUATOOLS_NO_AUTOLAUNCH:-0}}\" != \"1\" ] && [ ! -f \"${{XDG_CONFIG_HOME:-$HOME/.config}}/luatools/no-autolaunch\" ]; then\n\
                  if command -v luatools >/dev/null 2>&1; then\n\
                      if ! pgrep -x luatools >/dev/null 2>&1; then\n\
@@ -627,26 +644,66 @@ impl WiredService {
                      fi\n\
                  fi\n\
              fi\n\
-             # Set target platform for LuaTools depot filtering (auto-detect or override via env)\n\
-             export LUATOOLS_TARGET_OS=\"${{LUATOOLS_TARGET_OS:-linux}}\"\n\
-             export LUATOOLS_TARGET_ARCH=\"${{LUATOOLS_TARGET_ARCH:-x86_64}}\"\n\
-             # Include LuaTools integration library via multilib $LIB or single 32-bit ELF\n\
-             LIB_BASE=\"$HOME/.local/lib/luatools\"\n\
-             INTEGRATION_LIB={integration_lib_q}\n\
-             if [ -f \"$LIB_BASE/lib/libsteam_integration.so\" ] && [ -f \"$LIB_BASE/lib64/libsteam_integration.so\" ]; then\n\
-                 export LD_PRELOAD=\"$LIB_BASE/\\$LIB/libsteam_integration.so${{LD_PRELOAD:+:$LD_PRELOAD}}\"\n\
-             elif [ -f \"$INTEGRATION_LIB\" ] && command -v file >/dev/null 2>&1; then\n\
-                 if file -L \"$INTEGRATION_LIB\" | grep -q \"ELF 32-bit\"; then\n\
-                     export LD_PRELOAD=\"${{INTEGRATION_LIB}}${{LD_PRELOAD:+:$LD_PRELOAD}}\"\n\
+             \n\
+             # 1. Clean existing LD_AUDIT to enforce SINGLE auditor rule\n\
+             slsm_clean_audit=\"\"\n\
+             _old_ifs=\"$IFS\"\n\
+             IFS=:\n\
+             for item in ${{LD_AUDIT:-}}; do\n\
+                 case \"$item\" in\n\
+                     ''|*SLSsteam.so|*library-inject.so) continue ;;\n\
+                     *) slsm_clean_audit=\"${{slsm_clean_audit:+$slsm_clean_audit:}}$item\" ;;\n\
+                 esac\n\
+             done\n\
+             IFS=\"$_old_ifs\"\n\
+             \n\
+             # 2. Resolve true Steam binary\n\
+             SELF=\"$(readlink -f \"$0\" 2>/dev/null || echo \"$0\")\"\n\
+             STEAM_BIN=\"\"\n\
+             for c in /usr/games/steam /usr/bin/steam /usr/local/bin/steam \"$HOME/.local/share/Steam/steam.sh\"; do\n\
+                 if [ -x \"$c\" ] && [ \"$(readlink -f \"$c\" 2>/dev/null || echo \"$c\")\" != \"$SELF\" ]; then\n\
+                     STEAM_BIN=\"$c\"\n\
+                     break\n\
                  fi\n\
+             done\n\
+             \n\
+             if [ -z \"$STEAM_BIN\" ]; then\n\
+                 echo \"steam-sls: could not locate real Steam binary\" >&2\n\
+                 exit 127\n\
              fi\n\
-             # SLSsteam via LD_AUDIT (always use for SLSsteam hooks; preserve any existing LD_AUDIT)\n\
-             SLS_AUDIT={audit_q}\n\
-             export LD_AUDIT=\"${{SLS_AUDIT}}${{LD_AUDIT:+:$LD_AUDIT}}\"\n\
-             exec steam \"$@\"\n",
-            integration_lib_q = integration_lib_q,
-            audit_q = audit_q
+             \n\
+             # 3. Handle Wayland libextest for controller input\n\
+             if [ \"${{XDG_SESSION_TYPE:-}}\" = \"wayland\" ]; then\n\
+                 for ext in /usr/lib64/extest/libextest.so /usr/lib/x86_64-linux-gnu/extest/libextest.so; do\n\
+                     if [ -f \"$ext\" ]; then\n\
+                         export LD_PRELOAD=\"${{LD_PRELOAD:+$LD_PRELOAD:}}$ext\"\n\
+                         break\n\
+                     fi\n\
+                 done\n\
+             fi\n\
+             \n\
+             # 4. Launch Lumen CDP bridge detached if present\n\
+             if [ -x \"$LUMEN_DIR/lumen\" ] && ! pgrep -u \"$(id -u)\" -xf \"$LUMEN_DIR/lumen\" >/dev/null 2>&1; then\n\
+                 touch \"$HOME/.steam/steam/.cef-enable-remote-debugging\" 2>/dev/null || true\n\
+                 env -u LD_AUDIT -u LD_PRELOAD -u LD_LIBRARY_PATH \\\n\
+                     LUMEN_BACKEND_DIR=\"$LUMEN_DIR/luatools/backend\" \\\n\
+                     LUMEN_LUA_DIR=\"$LUMEN_DIR/lua\" \\\n\
+                     setsid \"$LUMEN_DIR/lumen\" >/dev/null 2>&1 < /dev/null &\n\
+             fi\n\
+             \n\
+             # 5. Enforce single auditor\n\
+             if [ -n \"$slsm_clean_audit\" ]; then\n\
+                 export LD_AUDIT=\"$AUDIT:$slsm_clean_audit\"\n\
+             else\n\
+                 export LD_AUDIT=\"$AUDIT\"\n\
+             fi\n\
+             \n\
+             exec \"$STEAM_BIN\" \"$@\"\n",
+            sls_dir_str = sls_dir_str,
+            audit_target = audit_target,
+            lumen_dir_str = lumen_dir_str,
         );
+
         fs::write(&wrapper, script)
             .map_err(|e| format!("Failed to write steam-sls wrapper: {}", e))?;
         let _ = fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755));
@@ -694,6 +751,16 @@ fn select_slssteam_asset(assets: &[Value], has_7z: bool, has_zstd: bool) -> Opti
             .unwrap_or("")
             .to_ascii_lowercase()
     };
+
+    // 0. Prioritize slsteam-moon / lumen release bundles (e.g. slsteam-moon-linux-3.0-lumen.zip)
+    if let Some(a) = assets.iter().find(|a| {
+        let n = name_lower(a);
+        !n.contains("debug")
+            && (n.contains("slsteam-moon") || n.contains("lumen"))
+            && (n.ends_with(".zip") || n.ends_with(".tar.gz") || n.ends_with(".tgz"))
+    }) {
+        return Some(a);
+    }
 
     // 1. Native Rust-extractable tar.gz / zip (non-debug)
     if let Some(a) = assets.iter().find(|a| {
@@ -1463,8 +1530,9 @@ Attributes = A lrwxrwxrwx
 
         let wrapper = svc.write_steam_sls_wrapper(&so_path, &weird_dir).unwrap();
         let content = fs::read_to_string(wrapper).unwrap();
-        assert!(content.contains("SLS_AUDIT='"));
+        assert!(content.contains("AUDIT='"));
         assert!(content.contains("'\\''s $(touch pwn) $HOME/SLSsteam.so'"));
-        assert!(content.contains("export LD_AUDIT=\"${SLS_AUDIT}${LD_AUDIT:+:$LD_AUDIT}\""));
+        assert!(content.contains("export LD_AUDIT=\"$AUDIT\""));
+        assert!(!content.contains("library-inject.so:"));
     }
 }

@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [4.1.4] - 2026-11-28
+
+> **Release (`v4.1.4`)**: Aligns LuaTools Linux with the modern 64-bit `swwayps/slsteam-moon` + `Lumen` Linux stack, resolving the 0-Byte / 0 mounted depots bug (`appinfo.vdf` v41 PICS splicing & Proton `CompatToolMapping`), eliminating dual-auditor `rtld-audit` crashes and Spacewar `480` AppID poisoning, and adding dynamic CEF port + `/proc/net/tcp` peer UID authentication and pressure-vessel RPC discovery mirroring.
+
+### Fixed & Improved
+- **`slsteam-moon` & `Lumen` Stack Alignment (`src/services/wired_service.rs`, `src/services/steam_service.rs`, `src/steam_bridge/preload_loader.rs`)**:
+  - Switched `SLSSTEAM_REPO` upstream to `swwayps/slsteam-moon` and prioritized `slsteam-moon-linux-*-lumen.zip` bundles with automatic standalone `Lumen` extraction.
+  - Enforced the single-auditor `LD_AUDIT` rule (`SLSsteam.so` only) in `steam-sls` and `SteamService`, purging deprecated `library-inject.so` to prevent `glibc` `rtld-audit` aborts.
+  - Removed mutual-exclusion logic in `preload_loader.rs` that skipped `SLSsteam.so` when `libsteam_integration.so` was present; preserved Wayland `libextest.so` and detached `Lumen` launch.
+- **`appinfo.vdf` v41 PICS Provisioning & Proton Auto-Mapping (`src/parsers/vdf_binary.rs`, `src/services/lua_installer.rs`)**:
+  - Added `MAGIC_41` (`0x07564429`) support, `AppInfoFile::create_empty_v41`, and `AppInfoFile::splice_pics_app` with 20-byte SHA-1 binary hashes to splice depots and manifests into `appcache/appinfo.vdf`.
+  - Added `LuaInstaller::write_pics_buffers` (`picsbuffer_<appid>.bin`/`.yaml`) and idempotent `LuaInstaller::inject_proton_compat_tool_mapping` (`proton_experimental`) in `config.vdf` so Windows-only games install cleanly on Linux.
+- **AppID & Cloud Packet Hygiene (`src/services/play_unowned_service.rs`, `src/services/steam_library_service.rs`, `src/services/lua_installer.rs`, `src/steam_bridge/netpacket/netpacket_cloud.rs`)**:
+  - Removed unconditional `FakeAppIds: 480` (Spacewar) poisoning on unowned game installs, reserving AppID `480` strictly for Online-Fix multiplayer patches.
+  - Gated cloud NetPacket carrier interception on `is_app_cloud_redirected`.
+- **Dynamic CEF Port, Pressure-Vessel RPC Mirror & Store WebKit Hardening (`src/services/cef_bridge.rs`, `src/services/http_server.rs`, `assets/millennium_plugin/`)**:
+  - Added dynamic CEF debug port resolution from `~/.local/share/Lumen/cef_port` with `/proc/net/tcp` peer UID verification.
+  - Mirrored `luatools_rpc.json` (`0600`) to `~/.config/luatools/` so Steam Runtime 3 (`pressure-vessel` / `srt-bwrap`) containers can discover the companion RPC server.
+  - Hardened Store WebKit widget mounting with a DOM `MutationObserver`, `pushState`/`replaceState` route hooks, and resilient `Millennium` / HTTP RPC fallback.
+
+---
+
 ## [4.1.3] - 2026-11-27
 
 > **Release (`v4.1.3`)**: Hardens native Millennium v3.6.3 plugin runtime compatibility, companion HTTP/CEF/bridge security and stability, self-updater semver and multilib synchronization, Home Setup Hub & `?` tooltip UX, and cross-distro `$LIB` multilib packaging — verified with **631 passing workspace tests**.

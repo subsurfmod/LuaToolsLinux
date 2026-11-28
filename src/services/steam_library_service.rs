@@ -126,9 +126,7 @@ impl SteamLibraryService {
         self.add_to_library_folders(library, app_id)?;
 
         sls.add_additional_app(app_id);
-        if sls.get_fake_app_id(app_id).is_none() {
-            sls.set_fake_app_id(app_id, 480);
-        }
+        // Do NOT set fake_app_id to 480: AppID 480 spoofing is strictly reserved for multiplayer Online-Fixes.
         sls.config.play_not_owned = true;
         if !sls.save() {
             return Err("Cannot save SLSsteam config.yaml".to_string());
@@ -388,9 +386,9 @@ mod tests {
         assert!(vdf_after.contains("\"1245620\"\t\t\"0\""));
         assert!(!vdf_after.contains("\\n"));
 
-        // Verify SLSsteam synced
+        // Verify SLSsteam synced (without 480 Spacewar poisoning)
         assert!(sls.config.additional_apps.contains(&1245620));
-        assert_eq!(sls.get_fake_app_id(1245620), Some(480));
+        assert_eq!(sls.get_fake_app_id(1245620), None);
 
         // Remove from library and verify clean state
         svc.remove_game_from_library(1245620, &mut sls).unwrap();

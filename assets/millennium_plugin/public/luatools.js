@@ -82,11 +82,15 @@
   }
 
   async function callPlugin(method, args) {
-    if (!window.Millennium || !window.Millennium.callServerMethod) {
+    const mill =
+      (window.Millennium && typeof window.Millennium.callServerMethod === 'function' && window.Millennium) ||
+      (window.MILLENNIUM_API && window.MILLENNIUM_API.Millennium && typeof window.MILLENNIUM_API.Millennium.callServerMethod === 'function' && window.MILLENNIUM_API.Millennium) ||
+      null;
+    if (!mill) {
       return callHttpFallback(method, args);
     }
     try {
-      const res = await window.Millennium.callServerMethod(PLUGIN_NAME, method, [args || {}]);
+      const res = await mill.callServerMethod(PLUGIN_NAME, method, [args || {}]);
       return parseRpcResponse(res);
     } catch (err) {
       console.error('[LuaToolsLinux] Call failed:', method, err);
@@ -94,17 +98,61 @@
     }
   }
 
+  let mountObserver = null;
+  let mountTimeout = null;
+
+  function clearMountObserver() {
+    if (mountObserver) {
+      mountObserver.disconnect();
+      mountObserver = null;
+    }
+    if (mountTimeout) {
+      clearTimeout(mountTimeout);
+      mountTimeout = null;
+    }
+  }
+
+  function findPurchaseTarget() {
+    return (
+      document.querySelector('.game_area_purchase_game_wrapper') ||
+      document.querySelector('#game_area_purchase') ||
+      document.querySelector('.game_area_purchase_game') ||
+      document.querySelector('.queue_actions_ctn') ||
+      document.querySelector('.game_area_purchase')
+    );
+  }
+
   function createWidget(appId, state) {
     const existing = document.getElementById('luatools-store-container');
     if (existing) existing.remove();
 
-    const target =
-      document.querySelector('.game_area_purchase_game_wrapper') ||
-      document.querySelector('#game_area_purchase') ||
-      document.querySelector('.game_area_purchase_game') ||
-      document.querySelector('.queue_actions_ctn');
+    const target = findPurchaseTarget();
+    if (!target || !target.parentNode) {
+      clearMountObserver();
+      const observeRoot = document.body || document.documentElement;
+      if (observeRoot) {
+        mountObserver = new MutationObserver(() => {
+          if (currentAppId !== appId) {
+            clearMountObserver();
+            return;
+          }
+          const t = findPurchaseTarget();
+          if (t && t.parentNode) {
+            clearMountObserver();
+            createWidget(appId, state);
+          }
+        });
+        mountObserver.observe(observeRoot, { childList: true, subtree: true });
+        mountTimeout = setTimeout(clearMountObserver, 15000);
+      } else {
+        mountTimeout = setTimeout(() => {
+          if (currentAppId === appId) createWidget(appId, state);
+        }, 250);
+      }
+      return;
+    }
 
-    if (!target) return;
+    clearMountObserver();
 
     const container = document.createElement('div');
     container.id = 'luatools-store-container';
@@ -434,6 +482,7 @@
     const newAppId = getAppIdFromUrl();
     if (newAppId !== currentAppId) {
       clearStatusPoll();
+      clearMountObserver();
       currentAppId = newAppId;
       if (newAppId) {
         initAppWidget(newAppId);
@@ -446,7 +495,13 @@
     origPushState.apply(this, arguments);
     setTimeout(onRouteChange, 100);
   };
+  const origReplaceState = history.replaceState;
+  history.replaceState = function () {
+    origReplaceState.apply(this, arguments);
+    setTimeout(onRouteChange, 100);
+  };
   window.addEventListener('popstate', onRouteChange);
+  setInterval(onRouteChange, 1000);
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {

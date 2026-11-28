@@ -1037,6 +1037,13 @@ pub fn handle_recv_cloud_carrier(ctx: &mut NetPacketContext) -> Result<(), Strin
         return Ok(());
     }
 
+    if ctx.app_id != 0 {
+        let (redirected, _) = is_app_cloud_redirected(ctx.app_id);
+        if !redirected {
+            return Ok(());
+        }
+    }
+
     let (hdr_slice, _) = split_proto_frame(ctx);
     let parsed_hdr = decode_cmsg_protobuf_header(hdr_slice);
     let is_cloud_packet = parsed_hdr

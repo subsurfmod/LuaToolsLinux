@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           luatools-linux
-Version:        4.1.3
+Version:        4.1.4
 Release:        1%{?dist}
 Summary:        Native Rust workstation for Steam stplug-in lua manifests, depots, and fixes
 License:        GPL-3.0-or-later
@@ -85,6 +85,8 @@ install -m 0644 "%{_sourcedir}/luatools.desktop" "%{buildroot}%{_datadir}/applic
 %{_datadir}/licenses/%{name}/LICENSE
 
 %changelog
+* Sat Nov 28 2026 LuaTools Linux Contributors <noreply@lua.tools> - 4.1.4-1
+- Release v4.1.4: Align with swwayps/slsteam-moon & Lumen (single-auditor steam-sls wrapper, dynamic cef_port + /proc/net/tcp peer UID verification, appinfo.vdf v41 PICS splicing, Proton CompatToolMapping injection, remove Spacewar 480 FakeAppIds poisoning, and pressure-vessel RPC discovery mirror)
 * Fri Nov 27 2026 LuaTools Linux Contributors <noreply@lua.tools> - 4.1.3-1
 - Release v4.1.3: Millennium v3.6.3 native plugin runtime compatibility (require("json"), logger:info, positional/table RPC args, table returns, native .millennium/Dist/webkit.js), HTTP/CEF/bridge hardening, self-updater semver/multilib fixes, Home Hub & ? tooltip fixes, and cyclic symlink / packaging fixes
 * Fri Nov 27 2026 LuaTools Linux Contributors <noreply@lua.tools> - 4.1.2-1

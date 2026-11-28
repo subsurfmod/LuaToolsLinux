@@ -782,24 +782,12 @@ pub fn generate_ld_preload_launcher(
              fi\n\
            fi\n\
          fi\n\
-         # When 32-bit libsteam_integration.so is active via LD_PRELOAD, launch Steam directly without SLSsteam.so (LD_AUDIT)\n\
+         # Ensure SLSsteam is always invoked as the primary loader target\n\
          STEAM_TARGET=\"{steam}\"\n\
-         if [ \"$IS_ELF32\" -ne 1 ]; then\n\
-           if [ -x \"$HOME/.local/bin/steam-sls\" ]; then\n\
-             STEAM_TARGET=\"$HOME/.local/bin/steam-sls\"\n\
-           else\n\
-             SLS_DIR=\"$HOME/.local/share/SLSsteam\"\n\
-             AUDIT_LIBS=\"\"\n\
-             if [ -f \"$SLS_DIR/library-inject.so\" ]; then\n\
-               AUDIT_LIBS=\"$SLS_DIR/library-inject.so\"\n\
-             fi\n\
-             if [ -f \"$SLS_DIR/SLSsteam.so\" ]; then\n\
-               AUDIT_LIBS=\"${{AUDIT_LIBS:+$AUDIT_LIBS:}}$SLS_DIR/SLSsteam.so\"\n\
-             fi\n\
-             if [ -n \"$AUDIT_LIBS\" ]; then\n\
-               export LD_AUDIT=\"$AUDIT_LIBS\"\n\
-             fi\n\
-           fi\n\
+         if [ -x \"$HOME/.local/bin/steam-sls\" ]; then\n\
+           STEAM_TARGET=\"$HOME/.local/bin/steam-sls\"\n\
+         elif [ -f \"$HOME/.local/share/SLSsteam/SLSsteam.so\" ]; then\n\
+           export LD_AUDIT=\"$HOME/.local/share/SLSsteam/SLSsteam.so\"\n\
          fi\n\
          export LD_LIBRARY_PATH=\"$NEW_LD_LIBRARY_PATH\"\n\
          if [ \"$DEBUGGER\" = \"gdb\" ]; then\n\

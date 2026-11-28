@@ -100,8 +100,8 @@ fn full_workstation_end_to_end_pipeline() {
         Some("1111111111111111111")
     );
 
-    // SLSsteam sync verification: key stays in DepotKeys, token in AppTokens, DLC in DlcData
-    assert_eq!(sls_svc.get_fake_app_id(1245620), Some(480));
+    // SLSsteam sync verification: key stays in DepotKeys, token in AppTokens, DLC in DlcData (Fix 4: no fake_app_id poisoning)
+    assert_eq!(sls_svc.get_fake_app_id(1245620), None);
     assert_eq!(sls_svc.get_token(1245620), Some("tok_elden_999"));
     assert_eq!(
         sls_svc.config.depot_keys.get(&1245621).map(String::as_str),

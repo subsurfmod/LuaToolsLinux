@@ -1144,9 +1144,7 @@ impl LuaInstaller {
     ) {
         sls.add_additional_app(app_id);
         sls.config.play_not_owned = true;
-        if sls.get_fake_app_id(app_id).is_none() {
-            sls.set_fake_app_id(app_id, 480);
-        }
+        // Do NOT set fake_app_id to 480: AppID 480 spoofing is strictly reserved for multiplayer Online-Fixes.
 
         // LT-31 / LNX-02: Prune disabled DLC/depot entries so per-depot toggles remove them from SLSsteam
         for disabled in &lua.disabled_entries {
@@ -1268,8 +1266,128 @@ impl LuaInstaller {
                 );
             } else {
                 let _ = Self::write_depot_keys_to_config_vdf(&vdf_path, &lua.entries);
+                let _ = Self::inject_proton_compat_tool_mapping(&vdf_path, app_id);
             }
         }
+
+        // Fix 6: PICS Provisioning & appinfo.vdf v41 Splicing
+        // 1. Save picsbuffer_<appid>.bin and picsbuffer_<appid>.yaml to SLSsteam dir
+        let sls_dir = sls.config_path.parent().unwrap_or_else(|| Path::new("."));
+        let depots_vec: Vec<(u32, Option<String>)> = lua
+            .entries
+            .iter()
+            .map(|e| (e.id, e.manifest_id.clone()))
+            .collect();
+        Self::write_pics_buffers(sls_dir, app_id, &depots_vec);
+
+        // 2. Splice app entry into appcache/appinfo.vdf
+        if let Some(root) = steam_root {
+            let appcache = root.join("appcache");
+            let appinfo_path = appcache.join("appinfo.vdf");
+            if !appinfo_path.exists() {
+                let _ = crate::parsers::vdf_binary::AppInfoFile::create_empty_v41(&appinfo_path);
+            }
+            if let Ok(af) = crate::parsers::vdf_binary::AppInfoFile::open(&appinfo_path) {
+                let _ = af.splice_pics_app(&appinfo_path, app_id, None, &depots_vec);
+            }
+        }
+    }
+
+    /// Fix 6: Writes `picsbuffer_<appid>.bin` and `picsbuffer_<appid>.yaml` for PICS provisioning.
+    pub fn write_pics_buffers(
+        sls_dir: &Path,
+        app_id: u32,
+        depots: &[(u32, Option<String>)],
+    ) {
+        let _ = fs::create_dir_all(sls_dir);
+        let yaml_path = sls_dir.join(format!("picsbuffer_{}.yaml", app_id));
+        let mut yaml_content = format!("AppId: {}\nDepots:\n", app_id);
+        for (did, manifest_opt) in depots {
+            if let Some(manifest) = manifest_opt {
+                yaml_content.push_str(&format!("  {}:\n    Manifest: \"{}\"\n", did, manifest));
+            } else {
+                yaml_content.push_str(&format!("  {}:\n", did));
+            }
+        }
+        let _ = fs::write(&yaml_path, yaml_content);
+
+        let bin_path = sls_dir.join(format!("picsbuffer_{}.bin", app_id));
+        let table = crate::parsers::vdf_binary::build_pics_app_table(app_id, None, depots);
+        let mut blob = Vec::new();
+        let mut strings = Vec::new();
+        let mut intern = |k: &[u8]| -> u32 {
+            strings.push(k.to_vec());
+            (strings.len() - 1) as u32
+        };
+        crate::parsers::vdf_binary::write_vdf(&mut blob, &table, &mut intern, false);
+        let _ = fs::write(&bin_path, blob);
+    }
+
+    /// Fix 7: Injects Proton compatibility tool mapping for `app_id` into `config.vdf`.
+    pub fn inject_proton_compat_tool_mapping(vdf_path: &Path, app_id: u32) -> bool {
+        let app_key = format!("\"{}\"", app_id);
+        let Ok(content) = fs::read_to_string(vdf_path) else {
+            let minimal = format!(
+                "\"Software\"\n{{\n\t\"Valve\"\n\t{{\n\t\t\"Steam\"\n\t\t{{\n\t\t\t\"CompatToolMapping\"\n\t\t\t{{\n\t\t\t\t\"{}\"\n\t\t\t\t{{\n\t\t\t\t\t\"name\"\t\t\"proton_experimental\"\n\t\t\t\t\t\"config\"\t\t\"\"\n\t\t\t\t\t\"priority\"\t\t\"250\"\n\t\t\t\t}}\n\t\t\t}}\n\t\t}}\n\t}}\n}}\n",
+                app_id
+            );
+            if let Some(parent) = vdf_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            return fs::write(vdf_path, minimal).is_ok();
+        };
+
+        if let Some(pos) = content.find("\"CompatToolMapping\"") {
+            if let Some(close_brace) = content[pos..].find("\n\t\t\t}") {
+                let section = &content[pos..pos + close_brace];
+                if section.contains(&app_key) {
+                    return true;
+                }
+            }
+            if let Some(open_brace) = content[pos..].find('{') {
+                let insert_idx = pos + open_brace + 1;
+                let snippet = format!(
+                    "\n\t\t\t\t\"{}\"\n\t\t\t\t{{\n\t\t\t\t\t\"name\"\t\t\"proton_experimental\"\n\t\t\t\t\t\"config\"\t\t\"\"\n\t\t\t\t\t\"priority\"\t\t\"250\"\n\t\t\t\t}}",
+                    app_id
+                );
+                let mut new_content = String::with_capacity(content.len() + snippet.len());
+                new_content.push_str(&content[..insert_idx]);
+                new_content.push_str(&snippet);
+                new_content.push_str(&content[insert_idx..]);
+                let tmp = vdf_path.with_extension("vdf.tmp");
+                if fs::write(&tmp, &new_content).is_ok() {
+                    return fs::rename(&tmp, vdf_path).is_ok();
+                }
+            }
+        } else if let Some(pos) = content.find("\"Steam\"") {
+            if let Some(open_brace) = content[pos..].find('{') {
+                let insert_idx = pos + open_brace + 1;
+                let snippet = format!(
+                    "\n\t\t\t\"CompatToolMapping\"\n\t\t\t{{\n\t\t\t\t\"{}\"\n\t\t\t\t{{\n\t\t\t\t\t\"name\"\t\t\"proton_experimental\"\n\t\t\t\t\t\"config\"\t\t\"\"\n\t\t\t\t\t\"priority\"\t\t\"250\"\n\t\t\t\t}}\n\t\t\t}}",
+                    app_id
+                );
+                let mut new_content = String::with_capacity(content.len() + snippet.len());
+                new_content.push_str(&content[..insert_idx]);
+                new_content.push_str(&snippet);
+                new_content.push_str(&content[insert_idx..]);
+                let tmp = vdf_path.with_extension("vdf.tmp");
+                if fs::write(&tmp, &new_content).is_ok() {
+                    return fs::rename(&tmp, vdf_path).is_ok();
+                }
+            }
+        } else {
+            let snippet = format!(
+                "\n\"Software\"\n{{\n\t\"Valve\"\n\t{{\n\t\t\"Steam\"\n\t\t{{\n\t\t\t\"CompatToolMapping\"\n\t\t\t{{\n\t\t\t\t\"{}\"\n\t\t\t\t{{\n\t\t\t\t\t\"name\"\t\t\"proton_experimental\"\n\t\t\t\t\t\"config\"\t\t\"\"\n\t\t\t\t\t\"priority\"\t\t\"250\"\n\t\t\t\t}}\n\t\t\t}}\n\t\t}}\n\t}}\n}}\n",
+                app_id
+            );
+            let mut new_content = content;
+            new_content.push_str(&snippet);
+            let tmp = vdf_path.with_extension("vdf.tmp");
+            if fs::write(&tmp, &new_content).is_ok() {
+                return fs::rename(&tmp, vdf_path).is_ok();
+            }
+        }
+        false
     }
 
     fn write_depot_keys_to_config_vdf(path: &Path, entries: &[crate::parsers::lua_parser::LuaEntry]) -> bool {
@@ -1599,5 +1717,34 @@ mod tests {
             assert!(sls.config.denuvo_games.is_empty());
             assert!(EticketClient::get_custom_url().is_none());
         });
+    }
+
+    #[test]
+    fn test_pics_buffers_and_compat_tool_mapping_injection() {
+        let dir = tempfile::tempdir().unwrap();
+        let sls_dir = dir.path().join("SLSsteam");
+        fs::create_dir_all(&sls_dir).unwrap();
+
+        // 1. Verify PICS buffer generation
+        let depots = vec![(1245621, Some("998877".to_string())), (1245622, None)];
+        LuaInstaller::write_pics_buffers(&sls_dir, 1245620, &depots);
+        assert!(sls_dir.join("picsbuffer_1245620.yaml").is_file());
+        assert!(sls_dir.join("picsbuffer_1245620.bin").is_file());
+        let yaml_text = fs::read_to_string(sls_dir.join("picsbuffer_1245620.yaml")).unwrap();
+        assert!(yaml_text.contains("1245620"));
+        assert!(yaml_text.contains("998877"));
+
+        // 2. Verify Proton CompatToolMapping injection
+        let config_vdf = dir.path().join("config.vdf");
+        assert!(LuaInstaller::inject_proton_compat_tool_mapping(&config_vdf, 1245620));
+        let vdf_text = fs::read_to_string(&config_vdf).unwrap();
+        assert!(vdf_text.contains("\"CompatToolMapping\""));
+        assert!(vdf_text.contains("\"1245620\""));
+        assert!(vdf_text.contains("\"proton_experimental\""));
+
+        // Idempotent injection does not duplicate
+        assert!(LuaInstaller::inject_proton_compat_tool_mapping(&config_vdf, 1245620));
+        let vdf_text2 = fs::read_to_string(&config_vdf).unwrap();
+        assert_eq!(vdf_text2.matches("\"1245620\"").count(), 1);
     }
 }

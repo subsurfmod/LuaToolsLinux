@@ -86,9 +86,8 @@ impl PlayUnownedService {
 
     pub fn enable_for_app(&self, app_id: u32, sls: &mut SlssteamService) -> Result<(), String> {
         sls.add_additional_app(app_id);
-        if sls.get_fake_app_id(app_id).is_none() {
-            sls.set_fake_app_id(app_id, 480);
-        }
+        // REMOVED: Do NOT set fake_app_id to 480!
+        // AppID 480 spoofing is strictly reserved for multiplayer Online-Fixes.
         sls.config.play_not_owned = true;
         self.sync_plugin_file(sls)?;
         Ok(())

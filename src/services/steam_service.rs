@@ -166,17 +166,14 @@ impl SteamService {
 
         let resolve_audit = |sls_dirs: &[PathBuf]| -> Option<String> {
             for sls_dir in sls_dirs {
-                let lib_inject_so = sls_dir.join("library-inject.so");
+                // Flaw 2 & Fix 2: Clean up deprecated library-inject.so; enforce SINGLE auditor (SLSsteam.so)
+                let old_lib_inject = sls_dir.join("library-inject.so");
+                if old_lib_inject.exists() {
+                    let _ = fs::remove_file(old_lib_inject);
+                }
                 let sls_so = sls_dir.join("SLSsteam.so");
-                let mut audit_entries = Vec::new();
-                if lib_inject_so.is_file() {
-                    audit_entries.push(lib_inject_so.to_string_lossy().into_owned());
-                }
                 if sls_so.is_file() {
-                    audit_entries.push(sls_so.to_string_lossy().into_owned());
-                }
-                if !audit_entries.is_empty() {
-                    return Some(audit_entries.join(":"));
+                    return Some(sls_so.to_string_lossy().into_owned());
                 }
             }
             None

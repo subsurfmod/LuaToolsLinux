@@ -68,7 +68,7 @@ local json = {
 local luatools_backend = {
     name = "LuaToolsLinux",
     author = "subsurfmod",
-    version = "4.1.3",
+    version = "4.1.4",
     default_port = 6767,
     port = 6767,
     token = nil,
@@ -116,16 +116,21 @@ local function get_current_uid()
     return nil
 end
 
--- Discover per-UID companion endpoint from $XDG_RUNTIME_DIR/luatools_rpc.json
+-- Discover per-UID companion endpoint from $XDG_RUNTIME_DIR or ~/.config/luatools/luatools_rpc.json
+-- (Steam Runtime 3 pressure-vessel isolates /run/user/<uid>, while ~/.config/luatools is shared.)
 local function discover_endpoint()
     local uid = get_current_uid()
     local xdg_runtime = os.getenv("XDG_RUNTIME_DIR")
+    local home = get_home_dir()
     local paths = {}
     if xdg_runtime and xdg_runtime ~= "" then
         table.insert(paths, xdg_runtime .. "/luatools_rpc.json")
     end
     if uid and uid ~= "" then
         table.insert(paths, "/run/user/" .. uid .. "/luatools_rpc.json")
+    end
+    if home and home ~= "" and home ~= "." then
+        table.insert(paths, home .. "/.config/luatools/luatools_rpc.json")
     end
     table.insert(paths, "/tmp/luatools_rpc.json")
 
@@ -137,18 +142,30 @@ local function discover_endpoint()
             if content and content ~= "" then
                 local data = json.decode(content)
                 if type(data) == "table" and data.port then
+                    local new_endpoint = "http://127.0.0.1:" .. tostring(data.port)
+                    local new_token = data.token or ""
+                    local changed = (luatools_backend.endpoint ~= new_endpoint)
+                        or (luatools_backend.token ~= new_token)
+                        or (not luatools_backend.connected)
                     luatools_backend.port = data.port
-                    luatools_backend.token = data.token or ""
-                    luatools_backend.endpoint = "http://127.0.0.1:" .. tostring(data.port)
-                    log_info("[LuaToolsLinux by subsurfmod] Discovered companion endpoint on " .. luatools_backend.endpoint)
+                    luatools_backend.token = new_token
+                    luatools_backend.endpoint = new_endpoint
+                    luatools_backend.connected = true
+                    if changed then
+                        log_info("[LuaToolsLinux by subsurfmod] Discovered companion endpoint on " .. luatools_backend.endpoint .. " via " .. path)
+                    end
                     return true
                 end
             end
         end
     end
 
+    if luatools_backend.connected or luatools_backend.token ~= "" then
+        log_warn("[LuaToolsLinux] Could not find luatools_rpc.json in runtime or ~/.config/luatools; falling back to default port " .. tostring(luatools_backend.default_port))
+    end
     luatools_backend.port = luatools_backend.default_port
-    luatools_backend.token = nil
+    luatools_backend.token = ""
+    luatools_backend.connected = false
     luatools_backend.endpoint = "http://127.0.0.1:" .. tostring(luatools_backend.default_port)
     return false
 end
@@ -171,7 +188,12 @@ local function rpc_call(method, params)
         headers["X-LuaTools-Token"] = luatools_backend.token
     end
 
-    local ok, response, err = pcall(http.post, luatools_backend.endpoint .. "/rpc", {
+    -- Millennium v3.6.3 Lua_HttpPost pushes a synthetic table without replacing stack #2,
+    -- causing Lua_HttpRequest (which reads stack #1 & #2) to default to HTTP GET if method
+    -- is omitted from arg #2. Always call http.request (or pass method = "POST" in arg #2).
+    local http_fn = http.request or http.post
+    local ok, response, err = pcall(http_fn, luatools_backend.endpoint .. "/rpc", {
+        method = "POST",
         data = payload,
         headers = headers,
         timeout = 10
@@ -203,6 +225,7 @@ local function rpc_call(method, params)
             raw = response.body
         }
     else
+        log_warn("[LuaToolsLinux] RPC call " .. tostring(method) .. " returned HTTP " .. tostring(response.status) .. ": " .. tostring(response.body))
         local decoded = json.decode(response.body)
         if type(decoded) == "table" then
             if decoded.success == nil then
@@ -291,6 +314,19 @@ local function parse_args(positional_keys, ...)
     local first = select(1, ...)
     if n == 1 then
         if type(first) == "table" then
+            -- Unwrap single-element wrapper array `[ { ... } ]` when called as callServerMethod(plugin, method, [args])
+            if type(first[1]) == "table" and next(first, 1) == nil then
+                local has_named = false
+                for k, _ in pairs(first) do
+                    if type(k) == "string" then
+                        has_named = true
+                        break
+                    end
+                end
+                if not has_named then
+                    return first[1]
+                end
+            end
             return first
         elseif type(first) == "string" and first ~= "" then
             local trimmed = first:match("^%s*(.-)%s*$")

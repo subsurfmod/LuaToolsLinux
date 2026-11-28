@@ -7,17 +7,21 @@
 pub mod binary_reader;
 pub mod cloud_redirect;
 pub mod config_file_watcher;
+// Deprecated (Fix 8): Legacy Windows OpenSteamTool credentials module; superseded by native slsteam-moon hooks
 pub mod credentials;
 pub mod denuvo_auth;
 pub mod extract_tickets;
 pub mod injection;
+// Deprecated (Fix 8): Legacy Windows OpenSteamTool 32-bit IPC wrappers; superseded by 64-bit steamrt64 slsteam-moon
 pub mod interop;
 pub mod ipc;
 pub mod manifest_donor;
 pub mod manifest_hooks;
 pub mod memory_patch;
+// Deprecated (Fix 8): Legacy Windows OpenSteamTool NetPacket hooks; superseded by slsteam-moon native NetPacket hooks
 pub mod netpacket;
 pub mod ost_config;
+// Deprecated (Fix 8): Legacy Windows OpenSteamTool platform memory helpers; superseded by native Linux hooks
 pub mod ost_platform;
 pub mod pattern_db;
 pub mod preload_loader;

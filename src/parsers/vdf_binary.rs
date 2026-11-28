@@ -10,6 +10,7 @@ use sha1::{Digest, Sha1};
 pub const MAGIC_27: u32 = 0x0756_4427;
 pub const MAGIC_28: u32 = 0x0756_4428;
 pub const MAGIC_29: u32 = 0x0756_4429;
+pub const MAGIC_41: u32 = 0x0756_4429;
 
 pub const TYPE_TABLE: u8 = 0x00;
 pub const TYPE_STRING: u8 = 0x01;
@@ -278,7 +279,7 @@ fn read_vdf<R: Read>(
     }
 }
 
-fn write_vdf<F>(buf: &mut Vec<u8>, table: &VdfTable, intern_fn: &mut F, indexed_keys: bool)
+pub fn write_vdf<F>(buf: &mut Vec<u8>, table: &VdfTable, intern_fn: &mut F, indexed_keys: bool)
 where
     F: FnMut(&[u8]) -> u32,
 {
@@ -372,7 +373,7 @@ impl AppInfoFile {
 
         let magic = read_u32_le(&mut r)?;
         let universe = read_u32_le(&mut r)?;
-        if magic != MAGIC_27 && magic != MAGIC_28 && magic != MAGIC_29 {
+        if magic != MAGIC_27 && magic != MAGIC_28 && magic != MAGIC_29 && magic != MAGIC_41 {
             return Err(format!("Unsupported appinfo.vdf magic 0x{:08X}", magic));
         }
 
@@ -583,6 +584,38 @@ impl AppInfoFile {
             }
         }
 
+        // Fix 6: Splice newly added apps from edits that are not present in original index_order
+        for (&new_app_id, new_table) in edits {
+            if !self.index_map.contains_key(&new_app_id) {
+                let mut blob = Vec::new();
+                write_vdf(&mut blob, new_table, &mut intern, self.indexed_keys());
+
+                let mut meta = vec![0u8; meta_len];
+                meta[0..4].copy_from_slice(&1u32.to_le_bytes()); // info_state = 1
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as u32)
+                    .unwrap_or(0);
+                meta[4..8].copy_from_slice(&now.to_le_bytes()); // last_updated
+                meta[36..40].copy_from_slice(&1u32.to_le_bytes()); // change_number = 1
+
+                if meta.len() >= 60 {
+                    let mut hasher = Sha1::new();
+                    hasher.update(&blob);
+                    let digest = hasher.finalize();
+                    meta[40..60].copy_from_slice(&digest);
+                }
+
+                let new_size = (meta.len() + blob.len()) as u32;
+                out.write_all(&new_app_id.to_le_bytes())
+                    .map_err(|e| e.to_string())?;
+                out.write_all(&new_size.to_le_bytes())
+                    .map_err(|e| e.to_string())?;
+                out.write_all(&meta).map_err(|e| e.to_string())?;
+                out.write_all(&blob).map_err(|e| e.to_string())?;
+            }
+        }
+
         out.write_all(&0u32.to_le_bytes())
             .map_err(|e| e.to_string())?;
 
@@ -603,6 +636,110 @@ impl AppInfoFile {
         out.flush().map_err(|e| e.to_string())?;
         Ok(())
     }
+
+    /// Creates a minimal, structurally valid modern `appinfo.vdf` v41 (magic 0x07564429) file.
+    pub fn create_empty_v41(path: &Path) -> Result<Self, String> {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let f = File::create(path).map_err(|e| e.to_string())?;
+        let mut w = BufWriter::new(f);
+        w.write_all(&MAGIC_41.to_le_bytes()).map_err(|e| e.to_string())?;
+        w.write_all(&1u32.to_le_bytes()).map_err(|e| e.to_string())?; // universe = 1 (Public)
+        w.write_all(&20i64.to_le_bytes()).map_err(|e| e.to_string())?; // string_table_offset = 20
+        w.write_all(&0u32.to_le_bytes()).map_err(|e| e.to_string())?; // end of app entries
+        w.write_all(&0u32.to_le_bytes()).map_err(|e| e.to_string())?; // string_count = 0
+        w.flush().map_err(|e| e.to_string())?;
+        Self::open(path)
+    }
+
+    /// Splices or merges a PICS app definition (including mounted depots & manifests) into `appinfo.vdf`.
+    pub fn splice_pics_app(
+        &self,
+        dest: &Path,
+        app_id: u32,
+        game_name: Option<&str>,
+        depots: &[(u32, Option<String>)],
+    ) -> Result<(), String> {
+        let mut edits = HashMap::new();
+        let table = match self.read_app(app_id) {
+            Ok(Some(mut existing)) => {
+                let body = existing.ensure_table("appinfo");
+                let depots_tbl = body.ensure_table("depots");
+                for (depot_id, manifest_opt) in depots {
+                    let d_entry = depots_tbl.ensure_table(&depot_id.to_string());
+                    if let Some(ref m_id) = manifest_opt {
+                        let m_tbl = d_entry.ensure_table("manifests");
+                        m_tbl.set_text("public", m_id);
+                    }
+                }
+                existing
+            }
+            _ => build_pics_app_table(app_id, game_name, depots),
+        };
+        edits.insert(app_id, table);
+        self.save_with_edits(dest, &edits)
+    }
+}
+
+/// Builds a standard PICS KeyValues `appinfo` root table with common and depot/manifest metadata.
+pub fn build_pics_app_table(
+    app_id: u32,
+    game_name: Option<&str>,
+    depots: &[(u32, Option<String>)],
+) -> VdfTable {
+    let mut root = VdfTable::default();
+    let mut appinfo = VdfTable::default();
+    appinfo.set_text("appid", &app_id.to_string());
+
+    let mut common = VdfTable::default();
+    if let Some(name) = game_name {
+        common.set_text("name", name);
+    }
+    common.set_text("type", "Game");
+    appinfo.items.push(VdfProperty {
+        name: "common".into(),
+        raw_name: None,
+        vtype: TYPE_TABLE,
+        value: VdfValue::Table(common),
+    });
+
+    let mut depots_table = VdfTable::default();
+    for (depot_id, manifest_opt) in depots {
+        let mut depot_entry = VdfTable::default();
+        if let Some(manifest_id) = manifest_opt {
+            let mut manifests = VdfTable::default();
+            manifests.set_text("public", manifest_id);
+            depot_entry.items.push(VdfProperty {
+                name: "manifests".into(),
+                raw_name: None,
+                vtype: TYPE_TABLE,
+                value: VdfValue::Table(manifests),
+            });
+        }
+        depots_table.items.push(VdfProperty {
+            name: depot_id.to_string(),
+            raw_name: None,
+            vtype: TYPE_TABLE,
+            value: VdfValue::Table(depot_entry),
+        });
+    }
+
+    appinfo.items.push(VdfProperty {
+        name: "depots".into(),
+        raw_name: None,
+        vtype: TYPE_TABLE,
+        value: VdfValue::Table(depots_table),
+    });
+
+    root.items.push(VdfProperty {
+        name: "appinfo".into(),
+        raw_name: None,
+        vtype: TYPE_TABLE,
+        value: VdfValue::Table(appinfo),
+    });
+
+    root
 }
 
 #[derive(Debug, Clone)]
@@ -1307,5 +1444,38 @@ mod tests_vdf_extended {
         assert_eq!(section.len(), meta_payload.len());
         let meta = ManifestFile::parse_metadata(section).unwrap();
         assert_eq!(meta.depot_id, 1245620);
+    }
+
+    #[test]
+    fn test_v41_appinfo_creation_and_splicing() {
+        let dir = tempfile::tempdir().unwrap();
+        let appinfo_path = dir.path().join("appinfo.vdf");
+
+        // 1. Create empty v41 appinfo.vdf
+        let af = AppInfoFile::create_empty_v41(&appinfo_path).unwrap();
+        assert_eq!(af.magic, MAGIC_41);
+        assert!(af.indexed_keys());
+
+        // 2. Splice PICS app definition with depots and manifests
+        let spliced_path = dir.path().join("appinfo_spliced.vdf");
+        af.splice_pics_app(
+            &spliced_path,
+            1245620,
+            Some("ELDEN RING"),
+            &[(1245621, Some("998877".into())), (1245622, None)],
+        )
+        .unwrap();
+
+        // 3. Verify spliced app can be read back cleanly
+        let reloaded = AppInfoFile::open(&spliced_path).unwrap();
+        let app = reloaded.read_app(1245620).unwrap().unwrap();
+        let body = app.get_table("appinfo").unwrap();
+        let common = body.get_table("common").unwrap();
+        assert_eq!(common.get_text("name"), "ELDEN RING");
+        let depots = body.get_table("depots").unwrap();
+        let d1 = depots.get_table("1245621").unwrap();
+        let m1 = d1.get_table("manifests").unwrap();
+        assert_eq!(m1.get_text("public"), "998877");
+        assert!(depots.get_table("1245622").is_some());
     }
 }

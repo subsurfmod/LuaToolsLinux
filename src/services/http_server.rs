@@ -191,6 +191,12 @@ fn discovery_file_lock() -> &'static Mutex<()> {
     DISCOVERY_FILE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn shared_config_discovery_dir() -> Option<PathBuf> {
+    let dir = dirs::home_dir()?.join(".config").join("luatools");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir)
+}
+
 fn discovery_file_candidates() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
@@ -202,6 +208,11 @@ fn discovery_file_candidates() -> Vec<PathBuf> {
     {
         let uid = unsafe { libc::getuid() };
         paths.push(PathBuf::from(format!("/run/user/{}/luatools_rpc.json", uid)));
+    }
+    if !cfg!(test) {
+        if let Some(cfg_dir) = shared_config_discovery_dir() {
+            paths.push(cfg_dir.join("luatools_rpc.json"));
+        }
     }
     paths.push(std::env::temp_dir().join("luatools_rpc.json"));
     paths
@@ -329,7 +340,20 @@ pub fn write_rpc_discovery_file(port: u16, token: Option<&str>) -> Option<PathBu
         }
     }
     let dir = target_dir.unwrap_or_else(std::env::temp_dir);
-    write_rpc_discovery_file_in(&dir, port, &tok)
+    let primary = write_rpc_discovery_file_in(&dir, port, &tok);
+    // Steam Runtime 3 (pressure-vessel / srt-bwrap) mounts a private isolated tmpfs at
+    // /run/user/<uid>, hiding host $XDG_RUNTIME_DIR/luatools_rpc.json from Millennium's
+    // libmillennium_luavm_x64 child process. Mirror the 0600 discovery file into
+    // ~/.config/luatools/luatools_rpc.json, which is per-user isolated and bind-mounted
+    // inside pressure-vessel.
+    if !cfg!(test) {
+        if let Some(cfg_dir) = shared_config_discovery_dir() {
+            if cfg_dir != dir {
+                let _ = write_rpc_discovery_file_in(&cfg_dir, port, &tok);
+            }
+        }
+    }
+    primary
 }
 
 pub fn remove_rpc_discovery_file_for(port: u16, token: &str) {

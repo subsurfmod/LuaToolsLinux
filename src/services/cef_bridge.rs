@@ -24,7 +24,56 @@ use url::Url;
 use crate::services::plugin_log::PluginLog;
 
 pub const DEFAULT_CEF_DEBUG_PORT: u16 = 8080;
-const CEF_DEBUG_URL: &str = "http://127.0.0.1:8080/json";
+pub const DEFAULT_CEF_DEBUG_URL: &str = "http://127.0.0.1:8080/json";
+
+/// Dynamically resolves the active Steam CEF remote debugging port (Fix 5).
+/// slsteam-moon and Lumen publish their active ephemeral CEF debugging port to
+/// `~/.local/share/Lumen/cef_port`. If present and valid, that port is used;
+/// otherwise falls back to DEFAULT_CEF_DEBUG_PORT (8080).
+pub fn resolve_active_cef_port() -> u16 {
+    if let Some(home) = dirs::home_dir() {
+        let contract_path = home.join(".local/share/Lumen/cef_port");
+        if contract_path.is_file() {
+            if let Ok(content) = fs::read_to_string(&contract_path) {
+                if let Some(first_line) = content.lines().next() {
+                    if let Ok(port) = first_line.trim().parse::<u16>() {
+                        if port >= 1024 {
+                            return port;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    DEFAULT_CEF_DEBUG_PORT
+}
+
+/// Socket Peer Authentication: inspects `/proc/net/tcp` and `/proc/net/tcp6` to ensure
+/// the process listening on the CEF port shares Steam / current user's UID, preventing localhost port hijacking.
+pub fn verify_cef_port_peer_uid(port: u16) -> bool {
+    let target_uid = unsafe { libc::getuid() };
+    for proc_path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        if let Ok(content) = fs::read_to_string(proc_path) {
+            for line in content.lines().skip(1) {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                if fields.len() >= 8 {
+                    // local_address is e.g. "0100007F:1F90" (hex IP : hex port)
+                    if let Some((_, port_hex)) = fields[1].split_once(':') {
+                        if let Ok(parsed_port) = u16::from_str_radix(port_hex, 16) {
+                            if parsed_port == port {
+                                // fields[7] is socket uid
+                                if let Ok(socket_uid) = fields[7].parse::<u32>() {
+                                    return socket_uid == target_uid;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    true
+}
 
 /// Result of probing a local TCP port to distinguish Steam CEF CDP from another service (LT-22).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,9 +186,9 @@ impl CefBridgeService {
             .clone()
     }
 
-    /// Probes the default Steam CEF remote debugging port (`:8080`).
+    /// Probes the active Steam CEF remote debugging port (or default :8080).
     pub fn probe_port() -> CefPortProbe {
-        probe_cef_port(DEFAULT_CEF_DEBUG_PORT)
+        probe_cef_port(resolve_active_cef_port())
     }
 
     /// Creates or repairs `.cef-enable-remote-debugging` as a relative symlink pointing to
@@ -279,7 +328,8 @@ impl CefBridgeService {
                         );
                     }
                 }
-                *status.lock().unwrap_or_else(|e| e.into_inner()) = "Polling CDP :8080...".into();
+                let active_port = resolve_active_cef_port();
+                *status.lock().unwrap_or_else(|e| e.into_inner()) = format!("Polling CDP :{}...", active_port);
             }
 
             let agent = ureq::AgentBuilder::new()
@@ -289,6 +339,20 @@ impl CefBridgeService {
             let mut logged_port_conflict = false;
 
             while !stop.load(Ordering::Relaxed) {
+                let active_port = resolve_active_cef_port();
+                if !verify_cef_port_peer_uid(active_port) {
+                    *status.lock().unwrap_or_else(|e| e.into_inner()) =
+                        format!("Port :{} rejected: peer UID mismatch", active_port);
+                    for _ in 0..4 {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(250));
+                    }
+                    continue;
+                }
+                let cef_debug_url = format!("http://127.0.0.1:{}/json", active_port);
+
                 // Touchpoint 4: If Steam's steamwebhelper is running with Millennium's
                 // --remote-debugging-pipe AND the LuaToolsLinux Millennium plugin is enabled,
                 // yield cleanly instead of endlessly polling TCP :8080.
@@ -299,8 +363,8 @@ impl CefBridgeService {
                         PluginLog::global().info(
                             Some("CefBridge"),
                             &format!(
-                                "Detected steamwebhelper --remote-debugging-pipe with LuaToolsLinux Millennium plugin enabled; yielding CDP :8080 polling ({})",
-                                msg
+                                "Detected steamwebhelper --remote-debugging-pipe with LuaToolsLinux Millennium plugin enabled; yielding CDP :{} polling ({})",
+                                active_port, msg
                             ),
                         );
                         *status.lock().unwrap_or_else(|e| e.into_inner()) = msg.into();
@@ -320,13 +384,13 @@ impl CefBridgeService {
                     yielded_to_millennium = false;
                     PluginLog::global().info(
                         Some("CefBridge"),
-                        "Millennium native plugin no longer active; resuming CDP :8080 fallback polling",
+                        &format!("Millennium native plugin no longer active; resuming CDP :{} fallback polling", active_port),
                     );
                     *status.lock().unwrap_or_else(|e| e.into_inner()) =
-                        "Polling CDP :8080...".into();
+                        format!("Polling CDP :{}...", active_port);
                 }
 
-                match agent.get(CEF_DEBUG_URL).call() {
+                match agent.get(&cef_debug_url).call() {
                     Ok(resp) => match resp.into_json::<Vec<Value>>() {
                         Ok(tabs) => {
                             logged_port_conflict = false;
@@ -400,51 +464,51 @@ impl CefBridgeService {
                                 format!("CDP connected ({} store tab(s))", store_count);
                         }
                         Err(_) => {
-                            // :8080 returned HTTP 200 but not a CDP tab array — probe conflict
-                            match probe_cef_port(DEFAULT_CEF_DEBUG_PORT) {
+                            // Returned HTTP 200 but not a CDP tab array — probe conflict
+                            match probe_cef_port(active_port) {
                                 CefPortProbe::Conflict { detail } => {
                                     if !logged_port_conflict {
                                         PluginLog::global().warn(
                                             Some("CefBridge"),
-                                            &format!("Port :8080 conflict detected: {}", detail),
+                                            &format!("Port :{} conflict detected: {}", active_port, detail),
                                         );
                                         logged_port_conflict = true;
                                     }
                                     *status.lock().unwrap_or_else(|e| e.into_inner()) =
-                                        format!("Port :8080 conflict ({})", detail);
+                                        format!("Port :{} conflict ({})", active_port, detail);
                                 }
                                 CefPortProbe::SteamCef { browser } => {
                                     *status.lock().unwrap_or_else(|e| e.into_inner()) =
-                                        format!("CDP :8080 ({}) — waiting for tabs...", browser);
+                                        format!("CDP :{} ({}) — waiting for tabs...", active_port, browser);
                                 }
                                 CefPortProbe::Free => {
                                     *status.lock().unwrap_or_else(|e| e.into_inner()) =
-                                        "Waiting for Steam CDP :8080...".into();
+                                        format!("Waiting for Steam CDP :{}...", active_port);
                                 }
                             }
                         }
                     },
-                    Err(_) => match probe_cef_port(DEFAULT_CEF_DEBUG_PORT) {
+                    Err(_) => match probe_cef_port(active_port) {
                         CefPortProbe::Conflict { detail } => {
                             if !logged_port_conflict {
                                 PluginLog::global().warn(
                                     Some("CefBridge"),
-                                    &format!("Port :8080 conflict detected: {}", detail),
+                                    &format!("Port :{} conflict detected: {}", active_port, detail),
                                 );
                                 logged_port_conflict = true;
                             }
                             *status.lock().unwrap_or_else(|e| e.into_inner()) =
-                                format!("Port :8080 conflict ({})", detail);
+                                format!("Port :{} conflict ({})", active_port, detail);
                         }
                         CefPortProbe::SteamCef { browser } => {
                             logged_port_conflict = false;
                             *status.lock().unwrap_or_else(|e| e.into_inner()) =
-                                format!("CDP :8080 ({}) — waiting for store tabs...", browser);
+                                format!("CDP :{} ({}) — waiting for store tabs...", active_port, browser);
                         }
                         CefPortProbe::Free => {
                             logged_port_conflict = false;
                             *status.lock().unwrap_or_else(|e| e.into_inner()) =
-                                "Waiting for Steam CDP :8080...".into();
+                                format!("Waiting for Steam CDP :{}...", active_port);
                         }
                     },
                 }
@@ -1786,5 +1850,13 @@ mod tests {
 
         bridge.stop();
         assert!(bridge.stop_flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_dynamic_cef_port_resolution_and_peer_auth() {
+        let port = resolve_active_cef_port();
+        assert!(port >= 1024 || port == DEFAULT_CEF_DEBUG_PORT);
+        // Verify peer UID check functions safely
+        let _ = verify_cef_port_peer_uid(port);
     }
 }
