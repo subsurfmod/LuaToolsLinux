@@ -3,7 +3,7 @@
   "name": "LuaToolsLinux",
   "common_name": "LuaTools Linux",
   "description": "Direct Steam game manifests, depot keys, DLC unlockers, and game fixes integration via LuaTools Linux.",
-  "version": "4.1.4",
+  "version": "4.1.5",
   "author": "subsurfmod",
   "backendType": "lua",
   "useBackend": true,

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [4.1.5] - 2026-11-28
+
+> **Patch Release (`v4.1.5`)**: Wires the real `swwayps/slsteam-moon` + `pattern-refresh` unlocker installer, adds a secure in-app sudo password popup for Millennium (SteamBrew), fixes broken manifest backend HTTPS URLs, resolves headless DepotDownloader QR hangs & UI clipping, removes Spacewar `480` Quick Setup poisoning, and fixes `0 B` Steam install dialogs.
+
+### Fixed & Improved
+- **Real `slsteam-moon` Unlocker & `pattern-refresh` Installer (`src/ui/app.rs`, `src/services/wired_service.rs`)**:
+  - Replaced legacy `headcrab.sh` (`AceSLS/SLSsteam`) shell call in `trigger_wired_action("steam_unlocker")` with `WiredService::install_slssteam_with_options`, installing `swwayps/slsteam-moon` v3.0 (`SLSsteam.so` + `pattern-refresh`) and the single-auditor `~/.local/bin/steam-sls` wrapper.
+  - Added best-effort `pattern-refresh --steam-root ... --config-root ...` execution inside `~/.local/bin/steam-sls` prior to launching Steam.
+- **Millennium (SteamBrew) Sudo Password Popup (`src/ui/dialogs.rs`, `src/ui/state.rs`, `src/services/wired_service.rs`)**:
+  - Added an in-app **Administrator Password Required** modal (`SudoPasswordModal`) with masked password input, Show/Hide toggle, Enter-to-submit, **Install Unlocker + Millennium**, and **Unlocker Only (No Sudo)** options.
+  - Added `SudoAskpassGuard` (`0700` temp dir, password passed strictly via `LUATOOLS_ASKPASS_SECRET` env and never written to disk) + `--yes` flag for `steambrew.app/install.sh` so non-TTY GUI installs work reliably on machines requiring `sudo`.
+- **Manifest Backend, Depots UI, Bridge Status & `0 B` Fixes (`src/services/api_client.rs`, `src/services/plugin_add_service.rs`, `src/services/donate_keys.rs`, `src/services/depot_downloader.rs`, `src/services/lua_installer.rs`, `src/ui/views_workbench.rs`, `src/ui/dialogs.rs`)**:
+  - Switched `167.235.229.108` manifest/donate-keys endpoints from broken HTTPS port `443` to HTTP port `80` (fixing `"No available manifest found for AppID"`).
+  - Fixed headless DepotDownloader `-qr` hang & Unicode QR block-art stdout spam, smart OS/arch depot pre-selection, Depots table bottom cutoff, `ActionProgressModal` badge text overlap, and live `integration_active` polling in `LiveSteamPidPolled`.
+  - Removed unconditional Spacewar `480` `FakeAppIds` assignment from **Quick Setup** in the Integration modal, and fixed `appinfo.vdf` v41 `info_state = 2` + `api.steamcmd.net` PICS JSON splicing.
+
+---
+
 ## [4.1.4] - 2026-11-28
 
 > **Release (`v4.1.4`)**: Aligns LuaTools Linux with the modern 64-bit `swwayps/slsteam-moon` + `Lumen` Linux stack, resolving the 0-Byte / 0 mounted depots bug (`appinfo.vdf` v41 PICS splicing & Proton `CompatToolMapping`), eliminating dual-auditor `rtld-audit` crashes and Spacewar `480` AppID poisoning, and adding dynamic CEF port + `/proc/net/tcp` peer UID authentication and pressure-vessel RPC discovery mirroring.

@@ -1,5 +1,5 @@
 // LuaToolsLinux - Millennium v3.6.3 Canonical WebKit Injection Bundle
-// Plugin: LuaToolsLinux (v4.1.4)
+// Plugin: LuaToolsLinux (v4.1.5)
 // Author: subsurfmod (https://github.com/subsurfmod/LuaToolsLinux)
 // Loaded natively by Millennium v3.6.3 from .millennium/Dist/webkit.js
 (function () {

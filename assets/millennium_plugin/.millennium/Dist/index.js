@@ -4,7 +4,7 @@
 // Loaded in Steam Client SharedJSContext (steamloopback.host)
 (function () {
   'use strict';
-  console.log('[LuaToolsLinux] Initializing Steam Client UI bundle (v4.1.4 by subsurfmod)');
+  console.log('[LuaToolsLinux] Initializing Steam Client UI bundle (v4.1.5 by subsurfmod)');
 
   const PLUGIN_NAME = 'LuaToolsLinux';
 
@@ -36,7 +36,7 @@
   window.LuaToolsLinux = {
     name: 'LuaToolsLinux',
     author: 'subsurfmod',
-    version: '4.1.4',
+    version: '4.1.5',
     callBackend: callBackend,
     openWorkbench: () => callBackend('OpenSettings', {}),
     syncSlsSteam: () => callBackend('SyncSlsSteamConfig', {}),

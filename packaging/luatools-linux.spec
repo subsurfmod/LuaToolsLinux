@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           luatools-linux
-Version:        4.1.4
+Version:        4.1.5
 Release:        1%{?dist}
 Summary:        Native Rust workstation for Steam stplug-in lua manifests, depots, and fixes
 License:        GPL-3.0-or-later
@@ -85,6 +85,8 @@ install -m 0644 "%{_sourcedir}/luatools.desktop" "%{buildroot}%{_datadir}/applic
 %{_datadir}/licenses/%{name}/LICENSE
 
 %changelog
+* Sat Nov 28 2026 LuaTools Linux Contributors <noreply@lua.tools> - 4.1.5-1
+- Patch Release v4.1.5: Wire real swwayps/slsteam-moon + pattern-refresh installer (replacing legacy headcrab.sh), add in-app SUDO_ASKPASS password popup + --yes flag for Millennium (SteamBrew), fix 167.235.229.108 HTTP manifest endpoints, fix headless DepotDownloader QR hang & UI clipping, fix live bridge Active polling & modal badge overlap, remove Spacewar 480 poisoning from Quick Setup, and improve appinfo.vdf v41 PICS splicing
 * Sat Nov 28 2026 LuaTools Linux Contributors <noreply@lua.tools> - 4.1.4-1
 - Release v4.1.4: Align with swwayps/slsteam-moon & Lumen (single-auditor steam-sls wrapper, dynamic cef_port + /proc/net/tcp peer UID verification, appinfo.vdf v41 PICS splicing, Proton CompatToolMapping injection, remove Spacewar 480 FakeAppIds poisoning, and pressure-vessel RPC discovery mirror)
 * Fri Nov 27 2026 LuaTools Linux Contributors <noreply@lua.tools> - 4.1.3-1

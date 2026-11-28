@@ -1359,7 +1359,7 @@ impl LuaInstaller {
             .build();
         let resp = agent
             .get(&url)
-            .set("User-Agent", "LuaToolsLinux/4.1.4")
+            .set("User-Agent", "LuaToolsLinux/4.1.5")
             .call()
             .ok()?;
         let val: serde_json::Value = resp.into_json().ok()?;

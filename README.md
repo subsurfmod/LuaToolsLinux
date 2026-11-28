@@ -4,7 +4,7 @@
   <p><strong>Native Rust &amp; egui desktop suite for Linux &amp; Steam Deck — add Steam games, set up SLSsteam in one click, manage DLC &amp; depots, and apply game fixes.</strong></p>
   <p>
     <a href="https://github.com/subsurfmod/LuaToolsLinux/releases/latest">
-      <img src="https://img.shields.io/badge/RELEASE-v4.1.4-1A3A6B?style=for-the-badge&logo=github&logoColor=white" alt="Release v4.1.4">
+      <img src="https://img.shields.io/badge/RELEASE-v4.1.5-1A3A6B?style=for-the-badge&logo=github&logoColor=white" alt="Release v4.1.5">
     </a>
     <img src="https://img.shields.io/badge/RUST-100%25%20NATIVE-DEA584?style=for-the-badge&logo=rust&logoColor=111111" alt="Rust">
     <img src="https://img.shields.io/badge/LINUX-x86__64%20%7C%20i686-FCC624?style=for-the-badge&logo=linux&logoColor=111111" alt="Linux x86_64 and i686">
@@ -20,11 +20,11 @@
 
 ---
 
-## Why LuaTools Linux v4.1.4?
+## Why LuaTools Linux v4.1.5?
 
 **LuaTools Linux** is a fast, lightweight, native **Rust + egui** desktop application built specifically for Linux gaming and the Steam Deck. It brings the full LuaTools workflow to Linux without Wine overhead, combining a dual-architecture (`x86_64` + `i686`) Steam bridge, one-click rootless **SLSsteam** (`slsteam-moon` + `Lumen`) setup, a sandboxed Lua 5.4 runtime, depot/DLC management, and one-click game fixes in a single binary.
 
-### Key v4.1.4 Highlights
+### Key v4.1.5 Highlights
 
 - **Native `egui` Desktop App** — Crisp, responsive dark UI on both **Wayland** and **X11** with a streamlined English interface, instant progress/completion feedback on every button (`ActionProgressModal`), and live topbar Steam controls (`Launch Steam`, `Restart Steam`, `Kill Steam`).
 - **Prebuilt Binary Auto-Updater & Live Compiler Feed** — Update in one click from the top-right **Update** badge or `luatools --update`, complete with SHA-256 release verification, monotonic progress tracking, and a live streaming monospace Rust compiler log when building from source.
@@ -53,18 +53,18 @@ curl -fsSL https://raw.githubusercontent.com/subsurfmod/LuaToolsLinux/main/insta
 
 ### Native Packages (`.deb` / `.rpm` / `.tar.gz`)
 
-Download the latest v4.1.4 package from the [GitHub Releases](https://github.com/subsurfmod/LuaToolsLinux/releases/latest) page, or build packages locally with `./packaging/build-packages.sh`:
+Download the latest v4.1.5 package from the [GitHub Releases](https://github.com/subsurfmod/LuaToolsLinux/releases/latest) page, or build packages locally with `./packaging/build-packages.sh`:
 
 ```bash
 # Ubuntu / Debian / Pop!_OS
-sudo apt install ./luatools-linux_4.1.4_amd64.deb
+sudo apt install ./luatools-linux_4.1.5_amd64.deb
 
 # Fedora / RHEL / openSUSE
-sudo dnf install ./luatools-linux-4.1.4-1.*.rpm
+sudo dnf install ./luatools-linux-4.1.5-1.*.rpm
 
 # Portable Tarball (Arch Linux / Steam Deck / any distro)
-tar -xzf luatools-linux-4.1.4-x86_64.tar.gz
-cd luatools-linux-4.1.4-x86_64
+tar -xzf luatools-linux-4.1.5-x86_64.tar.gz
+cd luatools-linux-4.1.5-x86_64
 ./install.sh --yes
 ```
 
