@@ -883,7 +883,7 @@ mod tests {
         let manifest = fs::read_to_string(installed.join("plugin.json")).unwrap();
         assert!(manifest.contains(r#""name": "LuaToolsLinux""#));
         assert!(manifest.contains(r#""author": "subsurfmod""#));
-        assert!(manifest.contains(r#""version": "4.1.5""#));
+        assert!(manifest.contains(r#""version": "4.1.6""#));
         assert!(manifest.contains(r#""backendType": "lua""#));
 
         let lua = fs::read_to_string(installed.join("backend/main.lua")).unwrap();

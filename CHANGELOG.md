@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [4.1.6] - 2026-11-28
+
+> **Patch Release (`v4.1.6`)**: Fixes a critical in-place `appinfo.vdf` truncation bug in `AppInfoFile::save_with_edits` that corrupted `appcache/appinfo.vdf` to 16 bytes whenever a game was added — causing `slsteam-moon` to quarantine the cache and preventing newly added games from appearing in Steam's Library or showing their real install sizes.
+
+### Fixed
+- **Atomic In-Place `appinfo.vdf` Writes (`src/parsers/vdf_binary.rs`)**:
+  - Fixed `AppInfoFile::save_with_edits` opening `File::create(dest)` while `BufReader` was reading `self.path` — when called in-place (`dest == self.path`), it truncated `appinfo.vdf` to 16 bytes with `string_table_offset = 0`, triggering `slsteam-moon` quarantine (`string table offset out of range`). Now writes atomically to a sibling temp file and renames on completion.
+  - Added regression test `save_with_edits_in_place_is_atomic_and_preserves_existing_apps`.
+- **Cooperation with Live `slsteam-moon` PICS Provisioning (`src/services/lua_installer.rs`)**:
+  - Prevented `LuaInstaller` from mutating `appcache/appinfo.vdf` while Steam / `slsteam-moon` is running (letting `slsteam-moon`'s locked `AppInfoProvision` handle live splicing without races), never creates a fake 1-app `appinfo.vdf` before Steam creates its own, and preserves existing CM-provisioned `picsbuffer_<appid>.bin`/`.yaml` files.
+
+---
+
 ## [4.1.5] - 2026-11-28
 
 > **Patch Release (`v4.1.5`)**: Wires the real `swwayps/slsteam-moon` + `pattern-refresh` unlocker installer, adds a secure in-app sudo password popup for Millennium (SteamBrew), fixes broken manifest backend HTTPS URLs, resolves headless DepotDownloader QR hangs & UI clipping, removes Spacewar `480` Quick Setup poisoning, and fixes `0 B` Steam install dialogs.

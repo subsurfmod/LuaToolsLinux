@@ -1307,43 +1307,58 @@ impl LuaInstaller {
             Self::fetch_steamcmd_pics_json(app_id)
         };
 
+        // Do not fight with a live Steam / slsteam-moon instance over appinfo.vdf or overwrite
+        // real CM-provisioned picsbuffer_<appid>.bin/.yaml files that slsteam-moon already cached.
+        let steam_running = !cfg!(test)
+            && crate::steam_bridge::preload_loader::find_steam_pid().is_some();
+        let sls_cache_dir = sls_dir.join("cache");
+        let existing_cm_cache = sls_cache_dir.join(format!("picsbuffer_{}.bin", app_id)).is_file()
+            && sls_cache_dir.join(format!("picsbuffer_{}.yaml", app_id)).is_file();
+
         if let Some(ref pics_json) = real_pics_json {
-            let cache_dir = sls_dir.join("cache");
-            if let Ok(table) =
-                crate::parsers::vdf_binary::build_pics_table_from_steamcmd_json(app_id, pics_json)
-            {
-                let _ = fs::create_dir_all(&cache_dir);
-                let mut blob = Vec::new();
-                let mut strings = Vec::new();
-                let mut intern = |k: &[u8]| -> u32 {
-                    strings.push(k.to_vec());
-                    (strings.len() - 1) as u32
-                };
-                crate::parsers::vdf_binary::write_vdf(&mut blob, &table, &mut intern, false);
-                let _ = fs::write(cache_dir.join(format!("picsbuffer_{}.bin", app_id)), &blob);
-            }
-            if let Some(root) = steam_root {
-                let appcache = root.join("appcache");
-                let appinfo_path = appcache.join("appinfo.vdf");
-                if !appinfo_path.exists() {
-                    let _ = crate::parsers::vdf_binary::AppInfoFile::create_empty_v41(&appinfo_path);
+            if !existing_cm_cache {
+                if let Ok(table) =
+                    crate::parsers::vdf_binary::build_pics_table_from_steamcmd_json(app_id, pics_json)
+                {
+                    let _ = fs::create_dir_all(&sls_cache_dir);
+                    let mut blob = Vec::new();
+                    let mut strings = Vec::new();
+                    let mut intern = |k: &[u8]| -> u32 {
+                        strings.push(k.to_vec());
+                        (strings.len() - 1) as u32
+                    };
+                    crate::parsers::vdf_binary::write_vdf(&mut blob, &table, &mut intern, false);
+                    let _ = fs::write(
+                        sls_cache_dir.join(format!("picsbuffer_{}.bin", app_id)),
+                        &blob,
+                    );
                 }
-                if let Ok(af) = crate::parsers::vdf_binary::AppInfoFile::open(&appinfo_path) {
-                    let _ = af.splice_steamcmd_json_app(&appinfo_path, app_id, pics_json);
+            }
+            if !steam_running {
+                if let Some(root) = steam_root {
+                    let appinfo_path = root.join("appcache").join("appinfo.vdf");
+                    // Only splice into an existing Steam-created appinfo.vdf (never forge a 1-app
+                    // cache before Steam creates its own, and rely on atomic save_with_edits).
+                    if appinfo_path.is_file() {
+                        if let Ok(af) = crate::parsers::vdf_binary::AppInfoFile::open(&appinfo_path) {
+                            let _ = af.splice_steamcmd_json_app(&appinfo_path, app_id, pics_json);
+                        }
+                    }
                 }
             }
         } else {
-            Self::write_pics_buffers(sls_dir, app_id, &depots_vec);
-            if let Some(root) = steam_root {
-                let appcache = root.join("appcache");
-                let appinfo_path = appcache.join("appinfo.vdf");
-                if !appinfo_path.exists() {
-                    let _ = crate::parsers::vdf_binary::AppInfoFile::create_empty_v41(&appinfo_path);
-                }
-                // Only splice a minimal fallback stub if Steam does not already have this app in appinfo.vdf
-                if let Ok(af) = crate::parsers::vdf_binary::AppInfoFile::open(&appinfo_path) {
-                    if af.read_app(app_id).ok().flatten().is_none() {
-                        let _ = af.splice_pics_app(&appinfo_path, app_id, None, &depots_vec);
+            if !existing_cm_cache {
+                Self::write_pics_buffers(sls_dir, app_id, &depots_vec);
+            }
+            if !steam_running {
+                if let Some(root) = steam_root {
+                    let appinfo_path = root.join("appcache").join("appinfo.vdf");
+                    if appinfo_path.is_file() {
+                        if let Ok(af) = crate::parsers::vdf_binary::AppInfoFile::open(&appinfo_path) {
+                            if af.read_app(app_id).ok().flatten().is_none() {
+                                let _ = af.splice_pics_app(&appinfo_path, app_id, None, &depots_vec);
+                            }
+                        }
                     }
                 }
             }
@@ -1359,7 +1374,7 @@ impl LuaInstaller {
             .build();
         let resp = agent
             .get(&url)
-            .set("User-Agent", "LuaToolsLinux/4.1.5")
+            .set("User-Agent", "LuaToolsLinux/4.1.6")
             .call()
             .ok()?;
         let val: serde_json::Value = resp.into_json().ok()?;

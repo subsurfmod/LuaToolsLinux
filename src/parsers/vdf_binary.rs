@@ -516,98 +516,111 @@ impl AppInfoFile {
         dest: &Path,
         edits: &HashMap<u32, VdfTable>,
     ) -> Result<(), String> {
-        let mut strings_bytes = self.string_bytes.clone();
-        // LT-54: Key v29 string-pool lookup by exact raw bytes so distinct non-UTF-8 keys never
-        // collide or get lossily replaced with UTF-8 U+FFFD bytes on re-serialization.
-        let mut lookup: HashMap<Vec<u8>, u32> = HashMap::with_capacity(self.string_bytes.len());
-        for (i, raw) in self.string_bytes.iter().enumerate() {
-            lookup.entry(raw.clone()).or_insert(i as u32);
-        }
+        // Atomic write via sibling temp file so in-place saves (`dest == self.path`) NEVER
+        // truncate `self.path` while `src` is reading from it.
+        let tmp_name = format!(
+            ".{}.luatools.{}.tmp",
+            dest.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("appinfo.vdf"),
+            std::process::id()
+        );
+        let tmp_dest = dest
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(tmp_name);
 
-        let mut intern = |key_bytes: &[u8]| -> u32 {
-            if let Some(&idx) = lookup.get(key_bytes) {
-                return idx;
+        let write_result: Result<(), String> = (|| {
+            let mut strings_bytes = self.string_bytes.clone();
+            // LT-54: Key v29 string-pool lookup by exact raw bytes so distinct non-UTF-8 keys never
+            // collide or get lossily replaced with UTF-8 U+FFFD bytes on re-serialization.
+            let mut lookup: HashMap<Vec<u8>, u32> = HashMap::with_capacity(self.string_bytes.len());
+            for (i, raw) in self.string_bytes.iter().enumerate() {
+                lookup.entry(raw.clone()).or_insert(i as u32);
             }
-            let idx = strings_bytes.len() as u32;
-            let owned = key_bytes.to_vec();
-            lookup.insert(owned.clone(), idx);
-            strings_bytes.push(owned);
-            idx
-        };
 
-        let mut src = BufReader::new(File::open(&self.path).map_err(|e| e.to_string())?);
-        let mut out = BufWriter::new(File::create(dest).map_err(|e| e.to_string())?);
-
-        out.write_all(&self.magic.to_le_bytes())
-            .map_err(|e| e.to_string())?;
-        out.write_all(&self.universe.to_le_bytes())
-            .map_err(|e| e.to_string())?;
-
-        let table_ptr_pos = out.stream_position().map_err(|e| e.to_string())?;
-        if self.indexed_keys() {
-            out.write_all(&0i64.to_le_bytes())
-                .map_err(|e| e.to_string())?;
-        }
-
-        let meta_len = self.meta_length();
-        for &app_id in &self.index_order {
-            let (offset, size) = self.index_map[&app_id];
-            if let Some(edited_table) = edits.get(&app_id) {
-                src.seek(SeekFrom::Start(offset + 8))
-                    .map_err(|e| e.to_string())?;
-                let mut meta = vec![0u8; meta_len];
-                src.read_exact(&mut meta).map_err(|e| e.to_string())?;
-
-                let mut blob = Vec::new();
-                write_vdf(&mut blob, edited_table, &mut intern, self.indexed_keys());
-
-                if meta.len() >= 60 {
-                    let mut hasher = Sha1::new();
-                    hasher.update(&blob);
-                    let digest = hasher.finalize();
-                    meta[40..60].copy_from_slice(&digest);
+            let mut intern = |key_bytes: &[u8]| -> u32 {
+                if let Some(&idx) = lookup.get(key_bytes) {
+                    return idx;
                 }
+                let idx = strings_bytes.len() as u32;
+                let owned = key_bytes.to_vec();
+                lookup.insert(owned.clone(), idx);
+                strings_bytes.push(owned);
+                idx
+            };
 
-                let new_size = (meta.len() + blob.len()) as u32;
-                out.write_all(&app_id.to_le_bytes())
+            let mut src = BufReader::new(File::open(&self.path).map_err(|e| e.to_string())?);
+            let mut out = BufWriter::new(File::create(&tmp_dest).map_err(|e| e.to_string())?);
+
+            out.write_all(&self.magic.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            out.write_all(&self.universe.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+
+            let table_ptr_pos = out.stream_position().map_err(|e| e.to_string())?;
+            if self.indexed_keys() {
+                out.write_all(&0i64.to_le_bytes())
                     .map_err(|e| e.to_string())?;
-                out.write_all(&new_size.to_le_bytes())
-                    .map_err(|e| e.to_string())?;
-                out.write_all(&meta).map_err(|e| e.to_string())?;
-                out.write_all(&blob).map_err(|e| e.to_string())?;
-            } else {
-                src.seek(SeekFrom::Start(offset))
-                    .map_err(|e| e.to_string())?;
-                let mut raw = vec![0u8; 8 + (size as usize)];
-                src.read_exact(&mut raw).map_err(|e| e.to_string())?;
-                out.write_all(&raw).map_err(|e| e.to_string())?;
             }
-        }
 
-        // Fix 6: Splice newly added apps from edits that are not present in original index_order
-        for (&new_app_id, new_table) in edits {
-            if !self.index_map.contains_key(&new_app_id) {
-                let mut blob = Vec::new();
-                write_vdf(&mut blob, new_table, &mut intern, self.indexed_keys());
+            let meta_len = self.meta_length();
+            for &app_id in &self.index_order {
+                let (offset, size) = self.index_map[&app_id];
+                if let Some(edited_table) = edits.get(&app_id) {
+                    src.seek(SeekFrom::Start(offset + 8))
+                        .map_err(|e| e.to_string())?;
+                    let mut meta = vec![0u8; meta_len];
+                    src.read_exact(&mut meta).map_err(|e| e.to_string())?;
 
-                let mut meta = vec![0u8; meta_len];
-                meta[0..4].copy_from_slice(&2u32.to_le_bytes()); // info_state = 2 (normal; 1 = prerelease/no info!)
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as u32)
-                    .unwrap_or(0);
-                meta[4..8].copy_from_slice(&now.to_le_bytes()); // last_updated
-                let change_num = new_table
-                    .get_table("appinfo")
-                    .and_then(|t| t.get_text("_change_number").parse::<u32>().ok())
-                    .filter(|&n| n > 0)
-                    .unwrap_or(1);
-                meta[36..40].copy_from_slice(&change_num.to_le_bytes()); // change_number
-                // Populate real 20-byte PICS sha[20] if carried via _sha hex or hash blob as fallback
-                if meta.len() >= 36 {
-                    let pics_sha_bytes = new_table
+                    let mut blob = Vec::new();
+                    write_vdf(&mut blob, edited_table, &mut intern, self.indexed_keys());
+
+                    if meta.len() >= 60 {
+                        let mut hasher = Sha1::new();
+                        hasher.update(&blob);
+                        let digest = hasher.finalize();
+                        meta[40..60].copy_from_slice(&digest);
+                    }
+
+                    let new_size = (meta.len() + blob.len()) as u32;
+                    out.write_all(&app_id.to_le_bytes())
+                        .map_err(|e| e.to_string())?;
+                    out.write_all(&new_size.to_le_bytes())
+                        .map_err(|e| e.to_string())?;
+                    out.write_all(&meta).map_err(|e| e.to_string())?;
+                    out.write_all(&blob).map_err(|e| e.to_string())?;
+                } else {
+                    src.seek(SeekFrom::Start(offset))
+                        .map_err(|e| e.to_string())?;
+                    let mut raw = vec![0u8; 8 + (size as usize)];
+                    src.read_exact(&mut raw).map_err(|e| e.to_string())?;
+                    out.write_all(&raw).map_err(|e| e.to_string())?;
+                }
+            }
+
+            // Fix 6: Splice newly added apps from edits that are not present in original index_order
+            for (&new_app_id, new_table) in edits {
+                if !self.index_map.contains_key(&new_app_id) {
+                    let mut blob = Vec::new();
+                    write_vdf(&mut blob, new_table, &mut intern, self.indexed_keys());
+
+                    let mut meta = vec![0u8; meta_len];
+                    meta[0..4].copy_from_slice(&2u32.to_le_bytes()); // info_state = 2 (normal; 1 = prerelease/no info!)
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as u32)
+                        .unwrap_or(0);
+                    meta[4..8].copy_from_slice(&now.to_le_bytes()); // last_updated
+                    let change_num = new_table
                         .get_table("appinfo")
-                        .and_then(|t| {
+                        .and_then(|t| t.get_text("_change_number").parse::<u32>().ok())
+                        .filter(|&n| n > 0)
+                        .unwrap_or(1);
+                    meta[36..40].copy_from_slice(&change_num.to_le_bytes()); // change_number
+                    // Populate real 20-byte PICS sha[20] if carried via _sha hex or hash blob as fallback
+                    if meta.len() >= 36 {
+                        let pics_sha_bytes = new_table.get_table("appinfo").and_then(|t| {
                             let s = t.get_text("_sha");
                             if s.len() == 40 {
                                 hex::decode(s).ok()
@@ -615,51 +628,62 @@ impl AppInfoFile {
                                 None
                             }
                         });
-                    if let Some(sha_vec) = pics_sha_bytes.filter(|v| v.len() == 20) {
-                        meta[16..36].copy_from_slice(&sha_vec);
-                    } else {
+                        if let Some(sha_vec) = pics_sha_bytes.filter(|v| v.len() == 20) {
+                            meta[16..36].copy_from_slice(&sha_vec);
+                        } else {
+                            let mut hasher = Sha1::new();
+                            hasher.update(&blob);
+                            let digest = hasher.finalize();
+                            meta[16..36].copy_from_slice(&digest);
+                        }
+                    }
+
+                    if meta.len() >= 60 {
                         let mut hasher = Sha1::new();
                         hasher.update(&blob);
                         let digest = hasher.finalize();
-                        meta[16..36].copy_from_slice(&digest);
+                        meta[40..60].copy_from_slice(&digest);
                     }
+
+                    let new_size = (meta.len() + blob.len()) as u32;
+                    out.write_all(&new_app_id.to_le_bytes())
+                        .map_err(|e| e.to_string())?;
+                    out.write_all(&new_size.to_le_bytes())
+                        .map_err(|e| e.to_string())?;
+                    out.write_all(&meta).map_err(|e| e.to_string())?;
+                    out.write_all(&blob).map_err(|e| e.to_string())?;
                 }
+            }
 
-                if meta.len() >= 60 {
-                    let mut hasher = Sha1::new();
-                    hasher.update(&blob);
-                    let digest = hasher.finalize();
-                    meta[40..60].copy_from_slice(&digest);
+            out.write_all(&0u32.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+
+            if self.indexed_keys() {
+                let table_pos = out.stream_position().map_err(|e| e.to_string())? as i64;
+                out.write_all(&(strings_bytes.len() as u32).to_le_bytes())
+                    .map_err(|e| e.to_string())?;
+                for s in &strings_bytes {
+                    out.write_all(s).map_err(|e| e.to_string())?;
+                    out.write_all(&[0]).map_err(|e| e.to_string())?;
                 }
-
-                let new_size = (meta.len() + blob.len()) as u32;
-                out.write_all(&new_app_id.to_le_bytes())
+                out.seek(SeekFrom::Start(table_ptr_pos))
                     .map_err(|e| e.to_string())?;
-                out.write_all(&new_size.to_le_bytes())
+                out.write_all(&table_pos.to_le_bytes())
                     .map_err(|e| e.to_string())?;
-                out.write_all(&meta).map_err(|e| e.to_string())?;
-                out.write_all(&blob).map_err(|e| e.to_string())?;
             }
+
+            out.flush().map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+
+        if let Err(e) = write_result {
+            let _ = fs::remove_file(&tmp_dest);
+            return Err(e);
         }
-
-        out.write_all(&0u32.to_le_bytes())
-            .map_err(|e| e.to_string())?;
-
-        if self.indexed_keys() {
-            let table_pos = out.stream_position().map_err(|e| e.to_string())? as i64;
-            out.write_all(&(strings_bytes.len() as u32).to_le_bytes())
-                .map_err(|e| e.to_string())?;
-            for s in &strings_bytes {
-                out.write_all(s).map_err(|e| e.to_string())?;
-                out.write_all(&[0]).map_err(|e| e.to_string())?;
-            }
-            out.seek(SeekFrom::Start(table_ptr_pos))
-                .map_err(|e| e.to_string())?;
-            out.write_all(&table_pos.to_le_bytes())
-                .map_err(|e| e.to_string())?;
-        }
-
-        out.flush().map_err(|e| e.to_string())?;
+        fs::rename(&tmp_dest, dest).map_err(|e| {
+            let _ = fs::remove_file(&tmp_dest);
+            e.to_string()
+        })?;
         Ok(())
     }
 
@@ -1580,5 +1604,45 @@ mod tests_vdf_extended {
         let m1 = d1.get_table("manifests").unwrap();
         assert_eq!(m1.get_text("public"), "998877");
         assert!(depots.get_table("1245622").is_some());
+    }
+
+    #[test]
+    fn save_with_edits_in_place_is_atomic_and_preserves_existing_apps() {
+        let dir = tempfile::tempdir().unwrap();
+        let appinfo_path = dir.path().join("appinfo.vdf");
+
+        let af = AppInfoFile::create_empty_v41(&appinfo_path).unwrap();
+        // First in-place splice (dest == self.path)
+        af.splice_pics_app(
+            &appinfo_path,
+            570940,
+            Some("DARK SOULS: REMASTERED"),
+            &[(570941, Some("111111".into()))],
+        )
+        .unwrap();
+
+        // Second in-place splice on non-empty v41 file MUST preserve 570940 AND add 2406770
+        let af2 = AppInfoFile::open(&appinfo_path).unwrap();
+        af2.splice_pics_app(
+            &appinfo_path,
+            2406770,
+            Some("Bodycam"),
+            &[(2406771, Some("222222".into()))],
+        )
+        .unwrap();
+
+        let bytes = fs::read(&appinfo_path).unwrap();
+        assert!(bytes.len() > 16, "in-place save must never truncate appinfo.vdf");
+        let st_off = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        assert!(
+            st_off > 16 && (st_off as usize) < bytes.len(),
+            "string table offset must remain in bounds: st_off={} len={}",
+            st_off,
+            bytes.len()
+        );
+
+        let reloaded = AppInfoFile::open(&appinfo_path).unwrap();
+        assert!(reloaded.read_app(570940).unwrap().is_some());
+        assert!(reloaded.read_app(2406770).unwrap().is_some());
     }
 }

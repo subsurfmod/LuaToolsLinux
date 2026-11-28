@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "bridge_lib"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "ctor",
  "dirs",
@@ -2557,7 +2557,7 @@ dependencies = [
 
 [[package]]
 name = "luatools-linux"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "aes",
  "age",
@@ -4284,7 +4284,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "steam-auto-patch-linux"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "anyhow",
  "configparser",
