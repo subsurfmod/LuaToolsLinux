@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::models::config::default_luatools_cache_dir;
 
-const DONATE_ENDPOINT: &str = "https://167.235.229.108/donatekeys/send";
+const DONATE_ENDPOINT: &str = "http://167.235.229.108/donatekeys/send";
 const DONATE_USER_AGENT: &str = "discord(dot)gg/luatools";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -16,7 +16,7 @@ use crate::services::auth_service::{AuthService, API_BASE_URL, SUPABASE_ANON_KEY
 use crate::services::doh_resolver::DohResolver;
 use crate::services::proxied_file_downloader::ProxiedFileDownloader;
 
-pub const MANIFEST_BACKEND_URL: &str = "https://167.235.229.108";
+pub const MANIFEST_BACKEND_URL: &str = "http://167.235.229.108";
 pub const MANIFEST_BACKEND_UA: &str = "secretgoonpoon";
 pub const HUBCAP_BASE_URL: &str = "https://hubcapmanifest.com";
 pub const DAILY_DOWNLOAD_LIMIT: u32 = 25;
@@ -616,18 +616,11 @@ impl LuaToolsApiClient {
     }
 
     pub fn check_sources(&self, app_id: u32) -> BTreeMap<String, String> {
-        let https_url = format!("https://167.235.229.108/check_apis?appid={}", app_id);
+        let url = format!("{}/check_apis?appid={}", MANIFEST_BACKEND_URL, app_id);
         let resp = Self::agent()
-            .get(&https_url)
+            .get(&url)
             .set("User-Agent", MANIFEST_BACKEND_UA)
-            .call()
-            .or_else(|_| {
-                let url = format!("{}/check_apis?appid={}", MANIFEST_BACKEND_URL, app_id);
-                Self::agent()
-                    .get(&url)
-                    .set("User-Agent", MANIFEST_BACKEND_UA)
-                    .call()
-            });
+            .call();
         let Ok(resp) = resp else {
             return BTreeMap::new();
         };

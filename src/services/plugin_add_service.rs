@@ -332,38 +332,54 @@ impl PluginAddService {
             .build();
 
         let mut probe_candidates = Vec::new();
-        if check_apis_base_url == MANIFEST_BACKEND_URL || check_apis_base_url == "http://167.235.229.108" {
-            probe_candidates.push(format!("https://167.235.229.108/check_apis?appid={}", app_id));
-        }
-        let standard_probe = format!(
-            "{}/check_apis?appid={}",
-            check_apis_base_url.trim_end_matches('/'),
-            app_id
-        );
-        if !probe_candidates.contains(&standard_probe) {
-            probe_candidates.push(standard_probe);
+        let trimmed_base = check_apis_base_url.trim_end_matches('/');
+        if trimmed_base == MANIFEST_BACKEND_URL || trimmed_base == "https://167.235.229.108" {
+            // 167.235.229.108 serves /check_apis on HTTP port 80 (port 443 has a self-signed cert & 404)
+            probe_candidates.push(format!("http://167.235.229.108/check_apis?appid={}", app_id));
+        } else {
+            probe_candidates.push(format!("{}/check_apis?appid={}", trimmed_base, app_id));
         }
 
         for probe_url in probe_candidates {
-            if let Ok(resp) = fast_agent
+            match fast_agent
                 .get(&probe_url)
                 .set("User-Agent", MANIFEST_BACKEND_UA)
                 .call()
             {
-                if let Ok(Value::Object(obj)) = resp.into_json::<Value>() {
-                    let mut pairs: Vec<(String, String)> = obj
-                        .into_iter()
-                        .map(|(k, v)| {
-                            let st = v
-                                .as_str()
-                                .map(ToString::to_string)
-                                .unwrap_or_else(|| v.to_string());
-                            (k, st)
-                        })
-                        .collect();
-                    pairs.sort_by(|a, b| a.0.cmp(&b.0));
-                    source_map.extend(pairs);
-                    break;
+                Ok(resp) => match resp.into_json::<Value>() {
+                    Ok(Value::Object(obj)) => {
+                        let mut pairs: Vec<(String, String)> = obj
+                            .into_iter()
+                            .map(|(k, v)| {
+                                let st = v
+                                    .as_str()
+                                    .map(ToString::to_string)
+                                    .unwrap_or_else(|| v.to_string());
+                                (k, st)
+                            })
+                            .collect();
+                        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                        source_map.extend(pairs);
+                        break;
+                    }
+                    Ok(_) => {
+                        PluginLog::global().warn(
+                            Some("PluginAdd"),
+                            &format!("check_apis {} returned non-object JSON", probe_url),
+                        );
+                    }
+                    Err(e) => {
+                        PluginLog::global().warn(
+                            Some("PluginAdd"),
+                            &format!("check_apis {} JSON parse error: {}", probe_url, e),
+                        );
+                    }
+                },
+                Err(e) => {
+                    PluginLog::global().warn(
+                        Some("PluginAdd"),
+                        &format!("check_apis {} request failed: {}", probe_url, e),
+                    );
                 }
             }
         }
